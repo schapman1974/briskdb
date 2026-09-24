@@ -171,6 +171,7 @@ pub struct DocumentReadOptions {
     batch_size: u64,
     batch_byte_limit: Option<NonZeroU64>,
     plan_diagnostics: bool,
+    execution_stats: bool,
 }
 
 impl DocumentReadOptions {
@@ -184,6 +185,7 @@ impl DocumentReadOptions {
             batch_size: DEFAULT_DOCUMENT_BATCH_SIZE,
             batch_byte_limit: None,
             plan_diagnostics: false,
+            execution_stats: false,
         }
     }
 
@@ -206,6 +208,19 @@ impl DocumentReadOptions {
 
     pub const fn plan_diagnostics(&self) -> bool {
         self.plan_diagnostics
+    }
+
+    /// Opt in to per-request record-read counters for find/get-more, aggregate
+    /// and distinct. This is independent of plan diagnostics and is not retained
+    /// across cursor requests. Counts and find-and-modify reject this option.
+    #[must_use]
+    pub const fn with_execution_stats(mut self, enabled: bool) -> Self {
+        self.execution_stats = enabled;
+        self
+    }
+
+    pub const fn execution_stats(&self) -> bool {
+        self.execution_stats
     }
 
     #[must_use]
@@ -287,7 +302,7 @@ impl DocumentReadOptions {
     }
 
     /// Extract the original payload/pagination fields. Read `plan_diagnostics()`
-    /// before consuming this value if the opt-in metadata flag is also needed.
+    /// and `execution_stats()` before consuming if the opt-in flags are needed.
     pub fn into_parts(
         self,
     ) -> (
@@ -329,6 +344,7 @@ impl fmt::Debug for DocumentReadOptions {
             .field("batch_size", &self.batch_size())
             .field("batch_byte_limit", &self.batch_byte_limit())
             .field("plan_diagnostics", &self.plan_diagnostics)
+            .field("execution_stats", &self.execution_stats)
             .finish()
     }
 }
@@ -412,6 +428,18 @@ mod tests {
 
     #[test]
     fn read_options_validate_bounds_and_hide_bson() {
+        assert!(!DocumentReadOptions::new().execution_stats());
+        assert!(
+            DocumentReadOptions::new()
+                .with_execution_stats(true)
+                .execution_stats()
+        );
+        assert!(
+            !DocumentReadOptions::new()
+                .with_execution_stats(true)
+                .with_execution_stats(false)
+                .execution_stats()
+        );
         assert!(!DocumentReadOptions::new().plan_diagnostics());
         assert!(
             DocumentReadOptions::new()

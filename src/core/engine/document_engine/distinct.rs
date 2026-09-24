@@ -48,6 +48,7 @@ impl Engine {
             namespace,
             collection_id,
             source,
+            read_stats: ReadStats::for_options(&options),
             aggregation: None,
             projection: None,
             sorter: None,
@@ -61,6 +62,9 @@ impl Engine {
             .document_cursor_plan(&state, &options, cancellation.clone(), deadline)
             .await?;
         let mut budget = DocumentResultBudget::new(limits);
+        if options.execution_stats() {
+            budget.add_bytes(DOCUMENT_READ_STATS_BYTES)?;
+        }
         budget.add_plan(&plan)?;
         budget.add_bytes(0)?;
         // Only one bounded source document is buffered per page, independent
@@ -118,6 +122,7 @@ impl Engine {
             request_id,
             Some(plan),
             DocumentResult::Distinct(values.into_boxed_slice()),
-        ))
+        )
+        .with_read_stats(state.finish_read_stats()))
     }
 }

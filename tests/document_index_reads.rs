@@ -31,6 +31,8 @@ mod logical;
 mod membership;
 #[path = "document_index_reads/presence.rs"]
 mod presence;
+#[path = "document_index_reads/read_stats.rs"]
+mod read_stats;
 
 fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
     BsonDocument::from_entries(entries).unwrap()

@@ -28,7 +28,7 @@ use write_transaction::write_transaction;
 
 use super::document_cursor::{
     AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,
-    IndexMetadataCursorState, MetadataCursorState, RetainedCursorState,
+    IndexMetadataCursorState, MetadataCursorState, ReadStats, RetainedCursorState,
 };
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
@@ -57,6 +57,8 @@ const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
 const DOCUMENT_READ_ACCESS_BYTES: u64 = 32;
+// Three counters, bounded shard bookkeeping, and at most 64 u16 shard IDs.
+const DOCUMENT_READ_STATS_BYTES: u64 = 160;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
 const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
@@ -736,6 +738,7 @@ impl Engine {
                     namespace: namespace.clone(),
                     collection_id,
                     source: route,
+                    read_stats: ReadStats::for_options(&options),
                     aggregation: None,
                     projection,
                     sorter,
@@ -758,6 +761,7 @@ impl Engine {
                         result_limits,
                     )
                     .await?;
+                let read_stats = state.finish_read_stats();
                 let cursor_id = if has_more {
                     session
                         .document_cursor_owner
@@ -769,11 +773,10 @@ impl Engine {
                 let batch = crate::document::DocumentCursorBatch::from_validated(
                     namespace, cursor_id, documents,
                 );
-                Ok(DocumentExecution::new(
-                    request_id,
-                    Some(plan),
-                    DocumentResult::Cursor(batch),
-                ))
+                Ok(
+                    DocumentExecution::new(request_id, Some(plan), DocumentResult::Cursor(batch))
+                        .with_read_stats(read_stats),
+                )
             }
             DocumentCommand::ContinueCursor(request) => {
                 let (namespace, id, options) = request.into_parts();
@@ -847,6 +850,7 @@ impl Engine {
                         ))
                     }
                     RetainedCursorState::Documents(mut state) => {
+                        state.read_stats = ReadStats::for_options(&options);
                         let catalog_namespace = namespace.clone();
                         let collection_id = state.collection_id;
                         self.run_document_storage_task(
@@ -883,6 +887,7 @@ impl Engine {
                                 result_limits,
                             )
                             .await?;
+                        let read_stats = state.finish_read_stats();
                         let cursor_id = lease.complete(has_more.then_some(state.into()))?;
                         Ok(DocumentExecution::new(
                             request_id,
@@ -892,7 +897,8 @@ impl Engine {
                                     namespace, cursor_id, documents,
                                 ),
                             ),
-                        ))
+                        )
+                        .with_read_stats(read_stats))
                     }
                 }
             }
@@ -994,6 +1000,7 @@ impl Engine {
                                                 Some(&matcher),
                                                 cancellation,
                                                 deadline,
+                                                None,
                                             )? {
                                                 after = Some(record.natural_order());
                                                 count = count.checked_add(1).ok_or_else(|| {
@@ -1734,6 +1741,7 @@ impl Engine {
                 let id_key = id_key.clone();
                 let shard = *shard;
                 let collection_id = state.collection_id;
+                let stats = state.read_stats.clone();
                 let (id_key, record) = self
                     .run_document_shard(
                         shard,
@@ -1741,6 +1749,9 @@ impl Engine {
                         cancellation.clone(),
                         deadline,
                         move |storage, connection, cancellation| {
+                            if let Some(stats) = &stats {
+                                stats.storage_read(shard);
+                            }
                             let record = storage.get_document_on_connection(
                                 connection,
                                 collection_id,
@@ -1748,6 +1759,9 @@ impl Engine {
                                 &id_key,
                                 cancellation,
                             )?;
+                            if let Some(stats) = &stats {
+                                stats.examine(u64::from(record.is_some()));
+                            }
                             Ok((id_key, record))
                         },
                     )
@@ -1883,6 +1897,7 @@ impl Engine {
                 continue;
             }
             let matcher = matcher.clone();
+            let stats = state.read_stats.clone();
             let record = self
                 .run_document_shard(
                     shard,
@@ -1899,6 +1914,7 @@ impl Engine {
                             matcher.as_deref(),
                             cancellation,
                             deadline,
+                            stats.as_deref(),
                         )
                     },
                 )
@@ -2001,6 +2017,7 @@ impl Engine {
             let shard = u16::try_from(shard_index).expect("document shard index fits u16");
             let after = Some(natural_order);
             let matcher = matcher.clone();
+            let stats = state.read_stats.clone();
             let next = self
                 .run_document_shard(
                     shard,
@@ -2017,6 +2034,7 @@ impl Engine {
                             matcher.as_deref(),
                             cancellation,
                             deadline,
+                            stats.as_deref(),
                         )
                     },
                 )
@@ -2061,6 +2079,11 @@ fn cursor_envelope_bytes(namespace: &DocumentNamespace) -> u64 {
 
 fn cursor_page_base_bytes(state: &CursorState, shards: u16, options: &DocumentReadOptions) -> u64 {
     cursor_envelope_bytes(&state.namespace)
+        + if options.execution_stats() {
+            DOCUMENT_READ_STATS_BYTES
+        } else {
+            0
+        }
         + match &state.source {
             PreparedFilterRoute::Point { id_key, .. } => {
                 DOCUMENT_RESULT_VALUE_BYTES + 10 + id_key.as_bytes().len() as u64
@@ -2088,6 +2111,7 @@ fn next_matching_document(
     matcher: Option<&DocumentMatcher>,
     cancellation: &CancellationToken,
     deadline: Option<Instant>,
+    stats: Option<&ReadStats>,
 ) -> EngineResult<Option<DocumentStorageRecord>> {
     let mut check = || {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -2109,6 +2133,9 @@ fn next_matching_document(
         .flatten();
     loop {
         check()?;
+        if let Some(stats) = stats {
+            stats.storage_read(shard);
+        }
         let record = storage
             .scan_document_candidates_on_connection(
                 connection,
@@ -2124,7 +2151,13 @@ fn next_matching_document(
         let Some(record) = record else {
             return Ok(None);
         };
+        if let Some(stats) = stats {
+            stats.examine(1);
+        }
         if let Some(matcher) = matcher {
+            if let Some(stats) = stats {
+                stats.match_document();
+            }
             if !matcher.matches_with_check(record.document(), &mut check)? {
                 after = Some(record.natural_order());
                 continue;
@@ -2187,10 +2220,8 @@ fn require_delete_options(options: DocumentWriteOptions) -> EngineResult<()> {
 }
 
 fn require_count_options(options: &DocumentReadOptions) -> EngineResult<()> {
-    if options.plan_diagnostics() {
-        return Err(unsupported(
-            "access-path diagnostics are not available for count",
-        ));
+    if options.plan_diagnostics() || options.execution_stats() {
+        return Err(unsupported("read diagnostics are not available for count"));
     }
     require_catalog_read_options(options)
 }
@@ -2669,6 +2700,9 @@ fn enforce_execution_result_limits_with_check(
 ) -> EngineResult<()> {
     check()?;
     let mut budget = DocumentResultBudget::new(limits);
+    if execution.read_stats().is_some() {
+        budget.add_bytes(DOCUMENT_READ_STATS_BYTES)?;
+    }
     if let Some(plan) = execution.plan() {
         budget.add_plan(plan)?;
         check()?;

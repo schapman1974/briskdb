@@ -23,6 +23,7 @@ mod number;
 mod options;
 mod plan;
 mod projection;
+mod read_stats;
 mod result;
 mod sorting;
 mod update;
@@ -85,6 +86,7 @@ pub use plan::{
     DocumentScatterPlan,
 };
 pub use projection::DocumentProjector;
+pub use read_stats::DocumentReadStats;
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
     DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentUpsertedDocument,

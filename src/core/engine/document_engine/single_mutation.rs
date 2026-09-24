@@ -573,7 +573,7 @@ impl Engine {
 }
 
 fn require_single_mutation_read_options(options: &DocumentReadOptions) -> EngineResult<()> {
-    if options.plan_diagnostics() {
+    if options.plan_diagnostics() || options.execution_stats() {
         return Err(unsupported(
             "access-path diagnostics are not available for find-and-modify",
         ));

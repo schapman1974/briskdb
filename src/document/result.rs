@@ -6,8 +6,8 @@ use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 use super::{
     BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCollectionMetadata,
-    DocumentCursorId, DocumentIndexMetadata, DocumentNamespace, DocumentPlan, DocumentRequestId,
-    MAX_DOCUMENT_BATCH_SIZE, encode_document,
+    DocumentCursorId, DocumentIndexMetadata, DocumentNamespace, DocumentPlan, DocumentReadStats,
+    DocumentRequestId, MAX_DOCUMENT_BATCH_SIZE, encode_document,
 };
 
 fn validate_result_document(document: &BsonDocument) -> EngineResult<()> {
@@ -502,6 +502,7 @@ pub struct DocumentExecution {
     request_id: DocumentRequestId,
     plan: Option<DocumentPlan>,
     result: DocumentResult,
+    read_stats: Option<DocumentReadStats>,
 }
 
 impl DocumentExecution {
@@ -514,6 +515,7 @@ impl DocumentExecution {
             request_id,
             plan,
             result,
+            read_stats: None,
         }
     }
 
@@ -529,6 +531,17 @@ impl DocumentExecution {
         &self.result
     }
 
+    pub const fn read_stats(&self) -> Option<DocumentReadStats> {
+        self.read_stats
+    }
+
+    pub(crate) fn with_read_stats(mut self, stats: Option<DocumentReadStats>) -> Self {
+        self.read_stats = stats;
+        self
+    }
+
+    /// Extract the original result fields; inspect `read_stats()` first to
+    /// retain the optional per-request counters separately.
     pub fn into_parts(self) -> (DocumentRequestId, Option<DocumentPlan>, DocumentResult) {
         (self.request_id, self.plan, self.result)
     }
@@ -540,6 +553,7 @@ impl fmt::Debug for DocumentExecution {
             .debug_struct("DocumentExecution")
             .field("request_id", &self.request_id)
             .field("plan", &self.plan)
+            .field("read_stats", &self.read_stats)
             .field("result_kind", &self.result.kind())
             .field("result", &"<redacted>")
             .finish()

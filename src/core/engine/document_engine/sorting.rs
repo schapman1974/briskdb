@@ -143,6 +143,7 @@ impl Engine {
                 let sorter = sorter.clone();
                 let matcher = matcher.clone();
                 let after = state.sort_after.clone();
+                let stats = state.read_stats.clone();
                 window = self
                     .run_document_shard(
                         shard,
@@ -160,6 +161,7 @@ impl Engine {
                                 matcher.as_deref(),
                                 cancellation,
                                 deadline,
+                                stats.as_deref(),
                             )? {
                                 validate_point_record(
                                     &record,

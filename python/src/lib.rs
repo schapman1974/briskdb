@@ -1996,6 +1996,7 @@ impl Session {
         limit = None,
         batch_size = 101,
         plan_diagnostics = false,
+        execution_stats = false,
         request_id = None,
         timeout_ms = None,
         cancellation = None,
@@ -2015,6 +2016,7 @@ impl Session {
         limit: Option<u64>,
         batch_size: u64,
         plan_diagnostics: bool,
+        execution_stats: bool,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
         cancellation: Option<PyRef<'_, CancellationToken>>,
@@ -2023,8 +2025,9 @@ impl Session {
     ) -> PyResult<Py<PyAny>> {
         self.require_document_support()?;
         let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
-        let mut options =
-            document_read_options(skip, limit, batch_size)?.with_plan_diagnostics(plan_diagnostics);
+        let mut options = document_read_options(skip, limit, batch_size)?
+            .with_plan_diagnostics(plan_diagnostics)
+            .with_execution_stats(execution_stats);
         if let Some(projection) = projection {
             options = options.with_projection(document_projection(
                 py,
@@ -2357,7 +2360,7 @@ impl Session {
         )
     }
 
-    #[pyo3(signature = (database, collection, pipeline, *, batch_size = 101, plan_diagnostics = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[pyo3(signature = (database, collection, pipeline, *, batch_size = 101, plan_diagnostics = false, execution_stats = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn aggregate(
         &self,
@@ -2367,6 +2370,7 @@ impl Session {
         pipeline: Py<PyAny>,
         batch_size: u64,
         plan_diagnostics: bool,
+        execution_stats: bool,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
         cancellation: Option<PyRef<'_, CancellationToken>>,
@@ -2401,7 +2405,9 @@ impl Session {
         let request = python_engine_result(DocumentAggregateRequest::new(
             python_engine_result(DocumentNamespace::new(database, collection))?,
             python_engine_result(DocumentPipeline::new(stages))?,
-            document_read_options(0, None, batch_size)?.with_plan_diagnostics(plan_diagnostics),
+            document_read_options(0, None, batch_size)?
+                .with_plan_diagnostics(plan_diagnostics)
+                .with_execution_stats(execution_stats),
         ))?;
         self.execute_document_command(
             py,
@@ -2452,7 +2458,7 @@ impl Session {
         )
     }
 
-    #[pyo3(signature = (database, collection, field, filter = None, *, plan_diagnostics = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[pyo3(signature = (database, collection, field, filter = None, *, plan_diagnostics = false, execution_stats = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn distinct(
         &self,
@@ -2462,6 +2468,7 @@ impl Session {
         field: Py<PyAny>,
         filter: Option<Py<PyAny>>,
         plan_diagnostics: bool,
+        execution_stats: bool,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
         cancellation: Option<PyRef<'_, CancellationToken>>,
@@ -2488,7 +2495,9 @@ impl Session {
             python_engine_result(DocumentNamespace::new(database, collection))?,
             field,
             filter,
-            DocumentReadOptions::new().with_plan_diagnostics(plan_diagnostics),
+            DocumentReadOptions::new()
+                .with_plan_diagnostics(plan_diagnostics)
+                .with_execution_stats(execution_stats),
         ))?;
         self.execute_document_command(
             py,
@@ -2501,7 +2510,7 @@ impl Session {
         )
     }
 
-    #[pyo3(signature = (database, collection, cursor_id, *, batch_size = 101, plan_diagnostics = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[pyo3(signature = (database, collection, cursor_id, *, batch_size = 101, plan_diagnostics = false, execution_stats = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn get_more(
         &self,
@@ -2511,6 +2520,7 @@ impl Session {
         cursor_id: u64,
         batch_size: u64,
         plan_diagnostics: bool,
+        execution_stats: bool,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
         cancellation: Option<PyRef<'_, CancellationToken>>,
@@ -2521,7 +2531,9 @@ impl Session {
         let command = DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
             python_engine_result(DocumentNamespace::new(database, collection))?,
             python_engine_result(DocumentCursorId::new(cursor_id))?,
-            document_read_options(0, None, batch_size)?.with_plan_diagnostics(plan_diagnostics),
+            document_read_options(0, None, batch_size)?
+                .with_plan_diagnostics(plan_diagnostics)
+                .with_execution_stats(execution_stats),
         ));
         self.execute_document_command(
             py,

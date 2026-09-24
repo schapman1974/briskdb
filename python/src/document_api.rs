@@ -19,8 +19,17 @@ pub(crate) fn execution_to_python(
     uuid_representation: PythonUuidRepresentation,
     bson_types: &PythonBsonOutputTypes,
 ) -> PyResult<Py<PyAny>> {
+    let read_stats = execution.read_stats();
     let (request_id, plan, result) = execution.into_parts();
     let output = PyDict::new(py);
+    if let Some(stats) = read_stats {
+        let counters = PyDict::new(py);
+        counters.set_item("storage_reads", stats.storage_reads())?;
+        counters.set_item("documents_examined", stats.documents_examined())?;
+        counters.set_item("matcher_evaluations", stats.matcher_evaluations())?;
+        counters.set_item("shards_read", stats.shards_read().collect::<Vec<_>>())?;
+        output.set_item("read_stats", counters)?;
+    }
     output.set_item(
         "request_id",
         request_id_to_python(py, request_id, bson_types)?,
