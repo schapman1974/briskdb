@@ -437,6 +437,10 @@ pub(super) async fn assert_candidate_checksum(
 #[tokio::test]
 #[ignore = "manual same-root membership candidate benchmark; timing is not a CI assertion"]
 async fn membership_candidate_benchmark() {
+    benchmark(false).await;
+}
+
+pub(super) async fn benchmark(logical: bool) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
@@ -480,10 +484,22 @@ async fn membership_candidate_benchmark() {
             .await;
         }
         for (members, expected) in [(vec![3, 17], 20), (vec![998, 999], 0)] {
-            let query = DocumentFilter::new(doc([(
-                "a",
-                values(members.iter().copied().map(BsonValue::Int32).collect()),
-            )]))
+            let query = DocumentFilter::new(if logical {
+                doc([(
+                    "$or",
+                    BsonValue::Array(
+                        members
+                            .iter()
+                            .map(|value| obj([("a", BsonValue::Int32(*value))]))
+                            .collect(),
+                    ),
+                )])
+            } else {
+                doc([(
+                    "a",
+                    values(members.iter().copied().map(BsonValue::Int32).collect()),
+                )])
+            })
             .unwrap();
             for write in [false, true] {
                 let command = if write {
@@ -519,7 +535,7 @@ async fn membership_candidate_benchmark() {
                     }
                 }
                 println!(
-                    "membership benchmark indexed={indexed} write={write} values={members:?} documents=1000 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
+                    "membership benchmark logical={logical} indexed={indexed} write={write} values={members:?} documents=1000 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
                     started.elapsed().as_micros()
                 );
             }

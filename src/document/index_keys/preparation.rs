@@ -205,25 +205,37 @@ impl DocumentIndexPreparation {
             }
         }
         // Preserve the existing complete-equality preference across indexes.
-        // Only if none applies, consider bounded literal membership tuples.
-        for index in &self.indexes {
-            budget.step()?;
-            let Some(keys) = index
-                .generator
-                .membership_keys_with_budget(matcher, &mut budget)?
-            else {
-                continue;
-            };
-            let mut encoded = Vec::new();
-            encoded.try_reserve_exact(keys.len()).map_err(allocation)?;
-            for key in keys {
-                encoded.push(key.to_bytes_with_check(&mut || budget.step())?);
+        // Necessary finite tuples retain priority over logical alternatives
+        // across indexes. Filters without positive ORs skip the extra pass.
+        for alternatives in [false, true] {
+            if alternatives && !matcher.has_index_alternatives(&mut || budget.step())? {
+                break;
             }
-            return Ok(Some(DocumentIndexProbe {
-                collection_id: self.collection_id,
-                index_id: index.id,
-                selection: DocumentIndexSelection::Keys(encoded),
-            }));
+            for index in &self.indexes {
+                budget.step()?;
+                let keys = if alternatives {
+                    index
+                        .generator
+                        .alternative_keys_with_budget(matcher, &mut budget)?
+                } else {
+                    index
+                        .generator
+                        .membership_keys_with_budget(matcher, &mut budget)?
+                };
+                let Some(keys) = keys else {
+                    continue;
+                };
+                let mut encoded = Vec::new();
+                encoded.try_reserve_exact(keys.len()).map_err(allocation)?;
+                for key in keys {
+                    encoded.push(key.to_bytes_with_check(&mut || budget.step())?);
+                }
+                return Ok(Some(DocumentIndexProbe {
+                    collection_id: self.collection_id,
+                    index_id: index.id,
+                    selection: DocumentIndexSelection::Keys(encoded),
+                }));
+            }
         }
         // Exact equality and finite membership retain priority across indexes.
         // A sparse presence proof scans every entry of the selected index, not

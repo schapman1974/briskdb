@@ -742,6 +742,19 @@ even when statistics underestimate large null-key groups. This bounds frontier
 sorting but can still walk nonmatching SQLite entries; it is not an index-only
 or index-order scan. Existing format, routing and aggregation accounting remain.
 
+Bounded positive `$or` combinations can also supply finite candidate tuples.
+Each indexed path needs a necessary supported equality, literal membership or
+absence witness in every alternative. AND chooses a necessary witness rather
+than intersecting values that may match different array elements. A single
+borrowed-value buffer caps each path at 128 raw operand occurrences, including
+duplicates and failed attempts; existing tuple/byte budgets still apply. Compound
+unions may admit cross-branch combinations, which the full matcher removes.
+Unbounded/unsupported branches, partial indexes and possible sparse all-null
+tuples remain conservative. Necessary finite probes keep priority across indexes,
+then logical probes, then sparse-presence scans. Native and real-driver fixtures
+cover overlapping multikey matches, residuals, mutation/upsert, churn, corruption
+and restart without changing the frozen public equality-probe oracle.
+
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.
 Full predicate/identity rechecks and per-shard transactions remain authoritative.

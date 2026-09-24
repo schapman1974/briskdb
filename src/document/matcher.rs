@@ -12,6 +12,7 @@ use super::{
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
+mod index_alternatives;
 mod pull;
 mod regex_compat;
 mod upsert;

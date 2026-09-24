@@ -15,6 +15,23 @@ impl DocumentIndexKeyGenerator {
         matcher: &DocumentMatcher,
         budget: &mut Budget<'_>,
     ) -> EngineResult<Option<Vec<DocumentIndexKey>>> {
+        self.finite_keys_with_budget(matcher, budget, false)
+    }
+
+    pub(super) fn alternative_keys_with_budget(
+        &self,
+        matcher: &DocumentMatcher,
+        budget: &mut Budget<'_>,
+    ) -> EngineResult<Option<Vec<DocumentIndexKey>>> {
+        self.finite_keys_with_budget(matcher, budget, true)
+    }
+
+    fn finite_keys_with_budget(
+        &self,
+        matcher: &DocumentMatcher,
+        budget: &mut Budget<'_>,
+        alternatives: bool,
+    ) -> EngineResult<Option<Vec<DocumentIndexKey>>> {
         budget.step()?;
         if self.partial.is_some() {
             return Ok(None);
@@ -27,7 +44,14 @@ impl DocumentIndexKeyGenerator {
         let mut count = 1_usize;
         let mut may_be_all_null = true;
         for path in &self.paths {
-            let values = if let Some(value) =
+            let values = if alternatives {
+                let Some(values) =
+                    matcher.alternatives_for_index_path(path, MAX_PROBE_KEYS, budget)?
+                else {
+                    return Ok(None);
+                };
+                values
+            } else if let Some(value) =
                 matcher.equality_for_index_path(path, &mut || budget.step())?
             {
                 vec![value]

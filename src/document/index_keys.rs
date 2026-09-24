@@ -389,6 +389,16 @@ struct Budget<'a> {
     check: &'a mut dyn FnMut() -> EngineResult<()>,
 }
 
+impl super::matcher::MatchControl for Budget<'_> {
+    fn step(&mut self) -> EngineResult<()> {
+        Budget::step(self)
+    }
+
+    fn allocation(&mut self, bytes: usize) -> EngineResult<()> {
+        self.charge(bytes)
+    }
+}
+
 impl<'a> Budget<'a> {
     fn new(check: &'a mut dyn FnMut() -> EngineResult<()>) -> Self {
         Self {
