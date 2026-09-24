@@ -761,6 +761,28 @@ async fn index_creation_rejects_duplicate_options_and_malformed_batches_before_n
         vec![],
         vec![good(); 1001],
         vec![good(), BsonValue::Int32(1)],
+        vec![
+            good(),
+            BsonValue::Document(doc(vec![
+                ("key", keys()),
+                ("expireAfterSeconds", BsonValue::Int32(-1)),
+            ])),
+        ],
+        vec![
+            good(),
+            BsonValue::Document(doc(vec![
+                ("key", keys()),
+                ("expireAfterSeconds", BsonValue::Int32(60)),
+                ("unique", BsonValue::Boolean(true)),
+            ])),
+        ],
+        vec![
+            good(),
+            BsonValue::Document(doc(vec![
+                ("key", keys()),
+                ("background", BsonValue::Int32(1)),
+            ])),
+        ],
     ] {
         let body = doc(vec![
             ("createIndexes", BsonValue::from("absent")),
@@ -822,6 +844,107 @@ async fn index_creation_rejects_duplicate_options_and_malformed_batches_before_n
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn mixed_index_model_replies_are_explicit_and_catalogs_describe_effective_keys() {
+    fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
+        BsonDocument::from_entries(entries).unwrap()
+    }
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let body = doc([
+        ("createIndexes", BsonValue::from("models")),
+        (
+            "indexes",
+            BsonValue::Array(vec![
+                BsonValue::Document(doc([
+                    (
+                        "key",
+                        BsonValue::Document(doc([("token", BsonValue::from("hashed"))])),
+                    ),
+                    ("expireAfterSeconds", BsonValue::Double(0.5)),
+                    ("background", BsonValue::Boolean(true)),
+                ])),
+                BsonValue::Document(doc([
+                    (
+                        "key",
+                        BsonValue::Document(doc([("email", BsonValue::Int32(1))])),
+                    ),
+                    ("unique", BsonValue::Boolean(true)),
+                ])),
+            ]),
+        ),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    let created = send_command(&mut stream, &body).await;
+    assert_eq!(created.get_first("ok"), Some(&BsonValue::Double(1.0)));
+    assert_eq!(
+        created.get_first("numIndexesBefore"),
+        Some(&BsonValue::Int64(1))
+    );
+    assert_eq!(
+        created.get_first("numIndexesAfter"),
+        Some(&BsonValue::Int64(3))
+    );
+    assert_eq!(
+        created.get_first("briskdbIndexWarnings"),
+        Some(&BsonValue::Array(vec![BsonValue::Document(doc([
+            ("name", BsonValue::from("token_hashed")),
+            (
+                "reducedBehavior",
+                BsonValue::Array(vec![
+                    BsonValue::from("hashed: ascending equality indexing"),
+                    BsonValue::from("ttl: expiration is not performed"),
+                    BsonValue::from("background: builds run synchronously"),
+                ])
+            ),
+        ])),]))
+    );
+    let retry = send_command(&mut stream, &body).await;
+    assert_eq!(
+        retry.get_first("numIndexesBefore"),
+        Some(&BsonValue::Int64(3))
+    );
+    assert_eq!(
+        retry.get_first("numIndexesAfter"),
+        Some(&BsonValue::Int64(3))
+    );
+    assert_eq!(
+        retry.get_first("briskdbIndexWarnings"),
+        created.get_first("briskdbIndexWarnings")
+    );
+    let listing = send_command(
+        &mut stream,
+        &doc([
+            ("listIndexes", BsonValue::from("models")),
+            ("$db", BsonValue::from("wire")),
+        ]),
+    )
+    .await;
+    let Some(BsonValue::Document(cursor)) = listing.get_first("cursor") else {
+        panic!("{listing:?}")
+    };
+    let Some(BsonValue::Array(rows)) = cursor.get_first("firstBatch") else {
+        panic!("{cursor:?}")
+    };
+    assert_eq!(rows.len(), 3);
+    let Some(BsonValue::Document(token)) = rows.last() else {
+        panic!("{rows:?}")
+    };
+    assert_eq!(
+        token,
+        &doc([
+            ("name", BsonValue::from("token_hashed")),
+            (
+                "key",
+                BsonValue::Document(doc([("token", BsonValue::Int32(1))]))
+            ),
+        ])
+    );
+    drop(stream);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
 }
 
 #[tokio::test]

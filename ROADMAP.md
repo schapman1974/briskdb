@@ -750,7 +750,13 @@ requires an earlier dependency:
       scans include these records before the complete matcher; unique indexes
       retain strict key semantics. Atomic maintenance, corruption checks, build/drop
       recovery and manifest-v21/digest-v13 downgrade fencing preserve restart safety.
-      The pure key oracle remains unchanged. Mixed IndexModel options remain open.
+      The pure key oracle remains unchanged. Mixed wire IndexModel batches accept
+      non-unique hashed components as ascending equality keys, TTL without
+      expiration, and synchronous background requests with explicit bounded
+      `briskdbIndexWarnings` replies. Unique hashed/TTL and built-in ID degradation
+      are rejected before mutation; effective metadata and retries survive reopen.
+      Numeric direction metadata is preserved. Text-index skipping and degraded
+      equivalent-name reuse remain separate compatibility gaps.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
@@ -836,9 +842,10 @@ requires an earlier dependency:
       IDs, field order, numeric aliases, and ID conflicts, operator-upsert CRUD
       metadata and zero-timestamp write boundaries,
       plus three non-unique nested-value index contracts,
-      required CI checks exactly 252 frozen executions and
-      rejects missing, duplicated, substituted, or skipped cases. The full
-      456-execution corpus remains separate open work.
+      and mixed IndexModel creation, required CI now checks all 456 frozen
+      executions in a separate real-endpoint job and rejects missing, duplicated,
+      substituted, skipped or failed cases. The broader TinyMongo inventory,
+      application suites and operational acceptance criteria remain open.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
       `$group` supports literal/field/computed keys, recursive structured BSON identity, and
       all eight planned accumulators across Rust, sync/async native Python, and
