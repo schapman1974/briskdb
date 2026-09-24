@@ -165,12 +165,17 @@ directions and names are preserved, and generated hashed names retain `_hashed`.
 The catalog reports only effective keys/options, never fictitious hashed or TTL
 support. Unique hashed/TTL combinations and those options on the built-in `_id`
 index are rejected before collection creation. Background unique builds still
-enforce uniqueness normally. Text indexes and degraded-equivalent-name reuse
-remain unsupported; differently named equivalent definitions still return 85.
+enforce uniqueness normally. Non-unique text declarations are accepted but the
+**entire index is skipped**, including any other keys/options in that declaration.
+No text index or placeholder is stored, and `$text` queries remain unsupported.
+Unique text declarations are rejected. A skipped declaration cannot replace an
+existing index of the same name or weaken its uniqueness. Degraded-equivalent-name
+reuse remains unsupported; differently named equivalent definitions still return 85.
 Native Rust/Python index-request semantics are unchanged.
 
 Successful commands with reduced behavior include `briskdbIndexWarnings`, an
-ordered array of `{name, reducedBehavior}` documents. PyMongo's `create_index()` /
+ordered array of `{name, reducedBehavior}` documents (plus `skipped: true` for
+text declarations). PyMongo's `create_index()` /
 `create_indexes()` helpers return names and discard these extra reply fields;
 inspect a raw command reply or use PyMongo command monitoring to see them:
 
@@ -185,10 +190,20 @@ assert result["briskdbIndexWarnings"] == [{
 }]
 ```
 
+For `{"key": {"body": "text"}}`, the warning is
+`{"name": "body_text", "skipped": true, "reducedBehavior": ["text: entire index is skipped; $text queries are not supported"]}`.
+PyMongo still returns the requested name even though no index is created; consult
+the warnings and catalog rather than treating that name as proof of index support.
+All-text batches retain the Ready index count and, on an absent collection,
+create only the empty collection/built-in ID index, matching the frozen TinyMongo
+memory/JSON behavior (its SQLite backends leave that namespace absent). Key/name
+and option-shape validation still runs eagerly. Skipped partial predicates are not
+compiled or applied, but sparse plus partial remains invalid.
+
 Malformed options, unsafe unique combinations and oversized warning replies fail
 before any mutation. Warnings are not durable index metadata; retries return them
 again. These compatibility options do not add a background worker, hashing,
-expiration, ordered index scans or distributed transactions.
+expiration, full-text search, ordered index scans or distributed transactions.
 
 Mongo `dropIndexes` and sync/async PyMongo `drop_index` / `drop_indexes` now use
 the shared engine's exclusive removal path. String selectors accept an exact

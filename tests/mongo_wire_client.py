@@ -1912,7 +1912,11 @@ def index_creation_smoke(uri):
             {"key": {"bad": 1}, "expireAfterSeconds": True},
             {"key": {"bad": 1}, "expireAfterSeconds": float("inf")},
             {"key": {"bad": 1}, "background": 1},
-            {"key": {"bad": "text"}},
+            {"key": {"bad": "text"}, "unique": True},
+            {"key": {"bad": "text"}, "sparse": True, "partialFilterExpression": {}},
+            {"key": {"body": "text", "tail": True}},
+            {"key": {"$body": "text"}},
+            {"key": {"body": "text"}, "weights": {"body": 1}},
             {"key": {"bad": 1}, "unique": 1},
             {"key": {"bad": 1}, "partialFilterExpression": {"bad": {"$unknown": 1}}},
             {"key": {"bad": 1}, "sparse": True, "partialFilterExpression": {"bad": 1}},
@@ -1995,6 +1999,83 @@ async def async_mixed_index_models_smoke(uri):
         assert (await collection.index_information())["token_hashed"] == {"key": [("token", 1)]}
 
 
+def skipped_text_warning(name):
+    return {"name": name, "skipped": True, "reducedBehavior": ["text: entire index is skipped; $text queries are not supported"]}
+
+
+def text_index_models_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_text_indexes
+        only_text = database.only_text
+        assert "only_text" not in database.list_collection_names()
+        assert only_text.create_index([("body", "text")]) == "body_text"
+        # Match the frozen memory/JSON reference's namespace creation. Its SQLite
+        # backends differ here; no secondary index or text-query support is added.
+        assert "only_text" in database.list_collection_names()
+        assert only_text.index_information() == {"_id_": {"key": [("_id", 1)]}}
+        for predicate in [{}, {"value": {"$unknown": 1}}]:
+            model = pymongo.IndexModel([("body", "text")], partialFilterExpression=predicate)
+            assert only_text.create_indexes([model]) == ["body_text"]
+            result = database.command("createIndexes", "only_text", indexes=[model.document])
+            assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (1, 1)
+            assert result["briskdbIndexWarnings"] == [skipped_text_warning("body_text")]
+        assert only_text.count_documents({}) == 0
+
+        collection = database.items
+        collection.insert_many([{"_id": 1, "email": "one", "body": "hello"}, {"_id": 2, "email": "two", "body": "world"}])
+        models = [
+            pymongo.IndexModel([("body", "text")], name="email_1"),
+            pymongo.IndexModel("email", unique=True),
+            pymongo.IndexModel([("tenant", -1), ("body", "text"), ("token", "hashed")], background=True, expireAfterSeconds=1),
+        ]
+        assert collection.create_indexes(models) == ["email_1", "email_1", "tenant_-1_body_text_token_hashed"]
+        expected = {"_id_": {"key": [("_id", 1)]}, "email_1": {"key": [("email", 1)], "unique": True}}
+        assert collection.index_information() == expected
+        for _ in range(2):
+            result = database.command("createIndexes", "items", indexes=[model.document for model in models])
+            assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (2, 2)
+            assert result["briskdbIndexWarnings"] == [skipped_text_warning("email_1"), skipped_text_warning("tenant_-1_body_text_token_hashed")]
+        for name in ["_id", "_id_", "_id_text"]:
+            result = database.command("createIndexes", "items", indexes=[{"key": {"_id": "text"}, "name": name, "unique": False, "expireAfterSeconds": 1}])
+            assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (2, 2)
+            assert result["briskdbIndexWarnings"] == [skipped_text_warning(name)]
+        assert collection.index_information() == expected
+        try:
+            collection.insert_one({"_id": 3, "email": "one"})
+        except DuplicateKeyError as error:
+            assert error.code == 11000
+        else:
+            raise AssertionError("same-name text skip weakened the existing unique index")
+        assert collection.count_documents({}) == 2
+        assert collection.find_one({"email": "one"})["body"] == "hello"
+        try:
+            collection.find_one({"$text": {"$search": "hello"}})
+        except OperationFailure as error:
+            assert error.code == 115
+        else:
+            raise AssertionError("text skipping must not advertise text-query support")
+
+
+async def async_text_index_models_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_text_indexes
+        collection = database.async_items
+        models = [pymongo.IndexModel([("body", "text")]), pymongo.IndexModel("value", unique=True)]
+        assert await collection.create_indexes(models) == ["body_text", "value_1"]
+        await collection.insert_one({"_id": 1, "value": 7, "body": "retained"})
+        result = await database.command("createIndexes", "async_items", indexes=[model.document for model in models])
+        assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (2, 2)
+        assert result["briskdbIndexWarnings"] == [skipped_text_warning("body_text")]
+        assert set(await collection.index_information()) == {"_id_", "value_1"}
+        try:
+            await collection.insert_one({"_id": 2, "value": 7})
+        except DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("async text skip weakened uniqueness")
+        assert (await collection.find_one({"value": 7}))["body"] == "retained"
+
+
 async def async_index_creation_smoke(uri):
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.wire_index_create.async_items
@@ -2049,6 +2130,19 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_text_indexes.only_text.index_information() == {"_id_": {"key": [("_id", 1)]}}
+        assert "only_text" in client.wire_text_indexes.list_collection_names()
+        assert set(client.wire_text_indexes.items.index_information()) == {"_id_", "email_1"}
+        assert client.wire_text_indexes.items.find_one({"email": "one"})["body"] == "hello"
+        assert set(client.wire_text_indexes.async_items.index_information()) == {"_id_", "value_1"}
+        assert client.wire_text_indexes.async_items.find_one({"value": 7})["body"] == "retained"
+        for collection, row in [(client.wire_text_indexes.items, {"_id": 999, "email": "one"}), (client.wire_text_indexes.async_items, {"_id": 999, "value": 7})]:
+            try:
+                collection.insert_one(row)
+            except DuplicateKeyError:
+                pass
+            else:
+                raise AssertionError("text-skip neighbor lost uniqueness after reopen")
         assert client.wire_index_models.items.index_information()["token_hashed"] == {"key": [("token", 1)]}
         assert client.wire_index_models.items.find_one({"token": "changed"})["created"] == datetime(2000, 1, 1)
         assert client.wire_index_models.async_items.find_one({"token": 1})["created"] == datetime(2000, 1, 1)
@@ -2520,6 +2614,8 @@ if __name__ == "__main__":
         asyncio.run(async_index_creation_smoke(sys.argv[1]))
         mixed_index_models_smoke(sys.argv[1])
         asyncio.run(async_mixed_index_models_smoke(sys.argv[1]))
+        text_index_models_smoke(sys.argv[1])
+        asyncio.run(async_text_index_models_smoke(sys.argv[1]))
         index_removal_smoke(sys.argv[1])
         asyncio.run(async_index_removal_smoke(sys.argv[1]))
         sync_smoke(sys.argv[1])

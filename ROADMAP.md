@@ -755,8 +755,12 @@ requires an earlier dependency:
       expiration, and synchronous background requests with explicit bounded
       `briskdbIndexWarnings` replies. Unique hashed/TTL and built-in ID degradation
       are rejected before mutation; effective metadata and retries survive reopen.
-      Numeric direction metadata is preserved. Text-index skipping and degraded
-      equivalent-name reuse remain separate compatibility gaps.
+      Numeric direction metadata is preserved. Non-unique text declarations now
+      skip the entire index with explicit `skipped: true` diagnostics; no phantom
+      metadata or full-text querying is added. Unique text and malformed late
+      models fail eagerly; existing same-name indexes keep their enforcement.
+      All-text batches match frozen memory/JSON namespace behavior, with retries
+      and reopen covered. Degraded equivalent-name reuse remains a separate gap.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

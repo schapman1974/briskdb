@@ -108,11 +108,16 @@ pub(super) fn prepare(
         let hashed = keys
             .iter()
             .any(|(_, value)| matches!(value, BsonValue::String(value) if value == "hashed"));
+        let text = keys
+            .iter()
+            .any(|(_, value)| matches!(value, BsonValue::String(value) if value == "text"));
         let ttl = document.get_first("expireAfterSeconds").is_some();
         let unique = document.get_first("unique") == Some(&BsonValue::Boolean(true));
         // A performance-only fallback must never weaken a uniqueness constraint,
         // including the implicit unique built-in ID index.
-        if (hashed || ttl) && (unique || (keys.len() == 1 && keys.get_first("_id").is_some())) {
+        if ((hashed || ttl || text) && unique)
+            || (!text && (hashed || ttl) && keys.len() == 1 && keys.get_first("_id").is_some())
+        {
             return Err(CommandError::unsupported());
         }
         if keys.len() == 1
@@ -131,7 +136,7 @@ pub(super) fn prepare(
             effective
                 .push(
                     field,
-                    if matches!(value, BsonValue::String(value) if value == "hashed") {
+                    if matches!(value, BsonValue::String(value) if value == "hashed" || value == "text") {
                         BsonValue::Int32(1)
                     } else {
                         value.clone()
@@ -142,7 +147,7 @@ pub(super) fn prepare(
         let mut index = DocumentIndexRequest::new(effective)?;
         if let Some(BsonValue::String(name)) = document.get_first("name") {
             index = index.with_name(name)?;
-        } else if hashed {
+        } else if hashed || text {
             index = index.with_name(requested_name(keys)?)?;
         }
         if let Some(BsonValue::Boolean(unique)) = document.get_first("unique") {
@@ -153,6 +158,10 @@ pub(super) fn prepare(
         }
         if let Some(BsonValue::Document(filter)) = document.get_first("partialFilterExpression") {
             index = index.with_partial_filter(DocumentFilter::new(filter.clone())?);
+        }
+        if text {
+            warnings.push(skipped_text_warning(&index, &mut check)?);
+            continue;
         }
         let mut reduced = Vec::new();
         if hashed {
@@ -183,6 +192,15 @@ pub(super) fn prepare(
         }
         indexes.push(index);
     }
+    if indexes.is_empty() {
+        // Keep the normal exclusive schema/control/corruption checks and exact
+        // Ready counts for an all-skipped batch. A built-in request is already
+        // a storage no-op: never allocate a secondary identity or fake metadata.
+        indexes.push(DocumentIndexRequest::new(fields([(
+            "_id",
+            BsonValue::Int32(1),
+        )]))?);
+    }
     let request =
         DocumentCreateIndexesRequest::new(namespace, indexes, DocumentWriteOptions::new())?;
     // Native execution repeats validation on its bounded worker. This first
@@ -205,6 +223,42 @@ pub(super) fn prepare(
     Ok(PreparedIndexes { request, warnings })
 }
 
+fn skipped_text_warning(
+    index: &DocumentIndexRequest,
+    check: &mut dyn FnMut() -> crate::core::EngineResult<()>,
+) -> Result<BsonValue> {
+    if index.sparse() && index.partial_filter().is_some() {
+        return Err(CommandError::unsupported());
+    }
+    let name = index
+        .name()
+        .expect("text declarations have requested names");
+    // Validate every path/direction and resource bound even though nothing is
+    // built. Only a single _id declaration may use the reserved built-in alias.
+    let validation_name = if index.keys().len() == 1
+        && index.keys().get_first("_id").is_some()
+        && matches!(name, "_id" | "_id_")
+    {
+        "_id_1"
+    } else {
+        name
+    };
+    crate::document::normalize_index_definition(index.keys(), Some(validation_name), check)?;
+    // TinyMongo does not compile membership predicates for skipped text models.
+    // No part of this compound declaration (including hashed/TTL/background
+    // options) takes effect, so do not emit diagnostics claiming a partial build.
+    Ok(BsonValue::Document(fields([
+        ("name", BsonValue::from(name)),
+        ("skipped", BsonValue::Boolean(true)),
+        (
+            "reducedBehavior",
+            BsonValue::Array(vec![BsonValue::from(
+                "text: entire index is skipped; $text queries are not supported",
+            )]),
+        ),
+    ])))
+}
+
 fn valid_ttl(value: &BsonValue) -> bool {
     match value {
         BsonValue::Int32(value) => *value >= 0,
@@ -219,6 +273,7 @@ fn requested_name(keys: &BsonDocument) -> Result<String> {
     for (field, direction) in keys.iter() {
         let suffix = match direction {
             BsonValue::String(value) if value == "hashed" => "_hashed",
+            BsonValue::String(value) if value == "text" => "_text",
             BsonValue::Int32(_)
             | BsonValue::Int64(_)
             | BsonValue::Double(_)
