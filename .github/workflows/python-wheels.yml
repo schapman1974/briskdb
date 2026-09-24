@@ -56,6 +56,12 @@ jobs:
       - name: Check Rust, extension, and build metadata parity
         run: python python/scripts/check_versions.py
 
+      - name: Install optional driver for the full source typing contract
+        # mongo.pyi subclasses the real typed driver. This build environment is
+        # separate from the clean sdist venv below, which still proves SQL-only
+        # import/query behavior before installing any BSON/PyMongo dependency.
+        run: python -m pip install pymongo==4.17.0
+
       - name: Type-check the public API at the minimum Python version
         env:
           MYPYPATH: python/python

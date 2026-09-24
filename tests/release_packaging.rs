@@ -119,6 +119,18 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
     }
 
     let workflow = include_str!("../.github/workflows/python-wheels.yml");
+    let typing_driver = workflow
+        .find("Install optional driver for the full source typing contract")
+        .expect("source typing requires the optional driver's real stubs");
+    let typing_check = workflow
+        .find("Type-check the public API at the minimum Python version")
+        .expect("source typing check must remain enabled");
+    let isolated_runtime = workflow
+        .find("python -m venv \"$RUNNER_TEMP/briskdb-sdist\"")
+        .expect("sdist runtime tests require a clean isolated venv");
+    assert!(typing_driver < typing_check && typing_check < isolated_runtime);
+    assert!(workflow.contains("assert importlib.util.find_spec(\"pymongo\") is None"));
+    assert!(!workflow.contains("--system-site-packages"));
     for required in [
         "manylinux_2_28_x86_64",
         "manylinux_2_28_aarch64",

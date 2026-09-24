@@ -14,6 +14,11 @@ that order when reproducing a release gate locally; installing test
 requirements first would hide a regression in the optional-dependency
 boundary.
 
+The source typing job installs pinned PyMongo in its build environment because
+the optional Mongo client stubs inherit PyMongo's real typed classes. The sdist
+runtime tests use a separate clean virtual environment without system site
+packages, so this does not weaken the SQL-only optional-dependency check.
+
 A `v<crate-version>` tag is publishable only when the root Rust crate,
 `briskdb-python` crate, Python metadata, wheel filenames, and runtime
 `briskdb.__version__` agree. The release workflow then:
