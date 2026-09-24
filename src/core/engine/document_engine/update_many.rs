@@ -1,11 +1,11 @@
 //! Bounded operator updates, committed one shard at a time.
 
 use super::*;
+use crate::storage::DocumentWriteTransaction;
 use crate::{
     document::{DocumentRequestId, DocumentUpdateResult, DocumentUpdater, DocumentWriteRollback},
     sqlite_error,
 };
-use rusqlite::{Transaction, TransactionBehavior};
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
@@ -73,9 +73,13 @@ impl Engine {
                     cancellation.clone(),
                     deadline,
                     move |storage, connection, cancellation, control| {
-                        let transaction =
-                            Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
-                                .map_err(sqlite_error::statement)?;
+                        let transaction = storage.begin_document_write(
+                            connection,
+                            collection_id,
+                            shard,
+                            cancellation,
+                            Some(control),
+                        )?;
                         let outcome = update_shard_matches(
                             storage,
                             &transaction,
@@ -128,7 +132,7 @@ impl Engine {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_shard_matches(
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     collection_id: DocumentCollectionId,
     shard: u16,
     mut key: Option<crate::document::CanonicalBsonKey>,

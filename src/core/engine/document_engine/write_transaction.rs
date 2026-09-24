@@ -1,11 +1,13 @@
 //! Per-input commit boundaries for inserts and exact-ID deletes.
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::Connection;
 
 use super::ensure_document_cpu_active;
 use crate::{
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, OperationControl},
+    document::DocumentCollectionId,
     sqlite_error,
+    storage::{DocumentWriteTransaction, Storage},
 };
 
 /// Rollback evidence is local to one transaction, never to an enclosing batch.
@@ -35,14 +37,17 @@ impl WriteTransactionError {
 }
 
 pub(super) fn write_transaction<T>(
+    storage: &Storage,
+    collection: DocumentCollectionId,
+    shard: u16,
     connection: &Connection,
     cancellation: &CancellationToken,
     control: &OperationControl,
-    write: impl FnOnce(&Transaction<'_>) -> EngineResult<T>,
+    write: impl FnOnce(&DocumentWriteTransaction<'_>) -> EngineResult<T>,
 ) -> Result<T, WriteTransactionError> {
     ensure_document_cpu_active(cancellation, control).map_err(WriteTransactionError::uncertain)?;
-    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
-        .map_err(sqlite_error::statement)
+    let transaction = storage
+        .begin_document_write(connection, collection, shard, cancellation, Some(control))
         .map_err(WriteTransactionError::uncertain)?;
     let result = write(&transaction).and_then(|value| {
         #[cfg(test)]
@@ -104,14 +109,60 @@ mod tests {
         },
         storage::Storage,
     };
-    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    use rusqlite::{
+        Transaction, TransactionBehavior,
+        hooks::{AuthAction, AuthContext, Authorization, TransactionOperation},
+    };
 
-    fn fixture() -> Connection {
+    struct Fixture {
+        connection: Connection,
+        storage: Storage,
+        collection: DocumentCollectionId,
+        _root: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = Connection;
+
+        fn deref(&self) -> &Connection {
+            &self.connection
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::open(root.path(), 2).unwrap();
+        let collection = storage
+            .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+            .unwrap()
+            .id();
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
+            .execute_batch("CREATE TEMP TABLE effects (id INTEGER PRIMARY KEY)")
             .unwrap();
-        connection
+        Fixture {
+            connection,
+            storage,
+            collection,
+            _root: root,
+        }
+    }
+
+    fn write_transaction<T>(
+        fixture: &Fixture,
+        cancellation: &CancellationToken,
+        control: &OperationControl,
+        write: impl FnOnce(&DocumentWriteTransaction<'_>) -> EngineResult<T>,
+    ) -> Result<T, WriteTransactionError> {
+        super::write_transaction(
+            &fixture.storage,
+            fixture.collection,
+            0,
+            fixture,
+            cancellation,
+            control,
+            write,
+        )
     }
 
     fn insert(connection: &Connection, id: i64) -> EngineResult<()> {

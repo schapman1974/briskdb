@@ -3,7 +3,8 @@
 mod document;
 #[cfg(feature = "documents")]
 pub(crate) use document::{
-    DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PreparedDocumentWrite,
+    DocumentStorageRecord, DocumentWriteTransaction, MAX_DOCUMENT_SHARD_SCAN_RECORDS,
+    PreparedDocumentWrite,
 };
 mod global_index;
 mod global_index_async;
@@ -87,6 +88,8 @@ struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     process_lease: process_lock::RootProcessLease,
     idempotency_stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
+    #[cfg(feature = "documents")]
+    document_write_stripes: Arc<[AtomicBool; process_lock::document_write::STRIPES]>,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
     #[cfg(feature = "documents")]
@@ -133,6 +136,8 @@ impl RootSchemaCoordination {
             gate: schema_gate::SchemaGate::new(),
             process_lease: process_lock::RootProcessLease::acquire(root)?,
             idempotency_stripes: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
+            #[cfg(feature = "documents")]
+            document_write_stripes: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
             #[cfg(feature = "documents")]

@@ -1,5 +1,8 @@
 //! Local-filesystem advisory locks shared by independent BriskDB processes.
 
+#[cfg(feature = "documents")]
+pub(super) mod document_write;
+
 use std::{
     fmt::Write,
     fs::{File, OpenOptions},
@@ -755,6 +758,63 @@ mod tests {
         drop(IdempotencyStripeGuard::try_acquire(temp.path(), digest, stripes).unwrap());
     }
 
+    #[cfg(feature = "documents")]
+    #[test]
+    fn document_write_fence_is_cross_process_and_released_after_exit_or_kill() {
+        use crate::document::DocumentCollectionId;
+        use document_write::{DocumentWriteFence, STRIPES};
+
+        for kill in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let ready = temp.path().join("ready");
+            let release = temp.path().join("release");
+            let mut child = spawn_holder(temp.path(), &ready, &release, "document-write");
+            wait_for_path(&ready);
+            let local: Arc<[AtomicBool; STRIPES]> =
+                Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+            for id in [1, 257] {
+                assert_eq!(
+                    DocumentWriteFence::try_acquire(
+                        temp.path(),
+                        DocumentCollectionId::from_validated(id),
+                        Arc::clone(&local),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    EngineErrorKind::Busy
+                );
+            }
+            drop(
+                DocumentWriteFence::try_acquire(
+                    temp.path(),
+                    DocumentCollectionId::from_validated(2),
+                    Arc::clone(&local),
+                )
+                .unwrap(),
+            );
+            if kill {
+                child.kill().unwrap();
+            } else {
+                fs::write(&release, b"release").unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.success(), !kill, "{output:?}");
+            drop(
+                DocumentWriteFence::try_acquire(
+                    temp.path(),
+                    DocumentCollectionId::from_validated(1),
+                    local,
+                )
+                .unwrap(),
+            );
+            assert!(
+                temp.path()
+                    .join(".briskdb-document-write-01.lock")
+                    .is_file()
+            );
+        }
+    }
+
     fn spawn_holder(root: &Path, ready: &Path, release: &Path, kind: &str) -> std::process::Child {
         Command::new(env::current_exe().unwrap())
             .arg("--exact")
@@ -804,7 +864,23 @@ mod tests {
         } else {
             None
         };
-        assert!(matches!(kind.as_str(), "lease" | "startup" | "idempotency"));
+        #[cfg(feature = "documents")]
+        let _document_write = if kind == "document-write" {
+            Some(
+                document_write::DocumentWriteFence::try_acquire(
+                    Path::new(&root),
+                    crate::document::DocumentCollectionId::from_validated(1),
+                    Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        assert!(
+            matches!(kind.as_str(), "lease" | "startup" | "idempotency")
+                || (cfg!(feature = "documents") && kind == "document-write")
+        );
         fs::write(ready, b"ready").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !release.exists() && Instant::now() < deadline {

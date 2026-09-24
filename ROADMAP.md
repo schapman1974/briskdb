@@ -730,6 +730,12 @@ requires an earlier dependency:
       change. Scan differentials, physical-selection proofs, exact record/entry
       rollback, cancellation/abort, sync/async PyMongo and restart checks retain
       the existing per-shard commit and recheck boundaries.
+      Secondary-uniqueness groundwork now routes every record write through a
+      root/collection/shard-bound transaction owning any cross-process writer
+      fence until SQLite cleanup. Bounded retained stripes, cancellation,
+      parent-task abort, process death and failed rollback are covered. Pending
+      unique and Ready non-unique indexes do not request fences; unique builds,
+      cross-shard duplicate validation and activation remain unfinished.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
