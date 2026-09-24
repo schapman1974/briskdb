@@ -277,6 +277,7 @@ async fn membership_selection_skips_unselected_bson_before_reads_and_writes() {
         DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
         doc([("a", list())]),
         15,
+        0,
     )
     .await;
 }
@@ -285,6 +286,7 @@ pub(super) async fn assert_physical_selection(
     definition: DocumentIndexRequest,
     query: BsonDocument,
     expected: usize,
+    excluded_id: i32,
 ) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 2).await.unwrap();
@@ -292,7 +294,7 @@ pub(super) async fn assert_physical_selection(
     let namespace = ns("membership_physical");
     seed(&engine, &session, &namespace, 35).await;
     build(&engine, &session, &namespace, definition).await;
-    let key = CanonicalBsonKey::encode(&BsonValue::Int32(0)).unwrap();
+    let key = CanonicalBsonKey::encode(&BsonValue::Int32(excluded_id)).unwrap();
     let mut restore = None;
     for shard in 0..2 {
         let connection =
@@ -367,6 +369,8 @@ async fn membership_selection_validates_the_chosen_multikey_entry_checksum() {
     assert_candidate_checksum(
         DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
         doc([("a", list())]),
+        5,
+        2,
     )
     .await;
 }
@@ -374,6 +378,8 @@ async fn membership_selection_validates_the_chosen_multikey_entry_checksum() {
 pub(super) async fn assert_candidate_checksum(
     definition: DocumentIndexRequest,
     query: BsonDocument,
+    selected_id: i32,
+    expected_entries: usize,
 ) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 2).await.unwrap();
@@ -381,7 +387,7 @@ pub(super) async fn assert_candidate_checksum(
     let namespace = ns("membership_checksum");
     seed(&engine, &session, &namespace, 35).await;
     build(&engine, &session, &namespace, definition).await;
-    let id = CanonicalBsonKey::encode(&BsonValue::Int32(5)).unwrap();
+    let id = CanonicalBsonKey::encode(&BsonValue::Int32(selected_id)).unwrap();
     let mut restore = None;
     for shard in 0..2 {
         let connection =
@@ -391,8 +397,8 @@ pub(super) async fn assert_candidate_checksum(
             .query_map([id.as_bytes()], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))).unwrap()
             .collect::<Result<Vec<_>, _>>().unwrap();
         if !entries.is_empty() {
-            assert_eq!(entries.len(), 2, "two distinct multikey entries");
-            assert_eq!(connection.execute("UPDATE briskdb_document_index_entries_v1 SET entry_checksum=zeroblob(32) WHERE id_key=?1", [id.as_bytes()]).unwrap(), 2);
+            assert_eq!(entries.len(), expected_entries, "selected entry count");
+            assert_eq!(connection.execute("UPDATE briskdb_document_index_entries_v1 SET entry_checksum=zeroblob(32) WHERE id_key=?1", [id.as_bytes()]).unwrap(), expected_entries);
             restore = Some((connection, entries));
         }
     }

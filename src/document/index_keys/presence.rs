@@ -17,7 +17,7 @@ impl DocumentIndexKeyGenerator {
         // when other indexed paths have no query constraint. Explicit null and
         // empty arrays are present; uncertain stored shapes retain BDIF entries.
         for path in &self.paths {
-            if matcher.requires_index_path_presence(path, &mut || budget.step())? {
+            if matcher.requires_index_path_existence(path, true, &mut || budget.step())? {
                 return Ok(true);
             }
         }

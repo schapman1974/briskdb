@@ -302,11 +302,12 @@ impl DocumentMatcher {
         Ok(None)
     }
 
-    /// Prove explicit field presence from a necessary positive clause only.
-    /// Alternatives and negations cannot grant sparse-index authority.
-    pub(crate) fn requires_index_path_presence(
+    /// Prove an explicit existence condition from a necessary clause only.
+    /// Logical alternatives and negations cannot grant index authority.
+    pub(crate) fn requires_index_path_existence(
         &self,
         requested: &[String],
+        expected: bool,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<bool> {
         for clause in &self.clauses {
@@ -317,7 +318,7 @@ impl DocumentMatcher {
                 } if path == requested => {
                     for predicate in predicates {
                         check()?;
-                        if matches!(predicate, Predicate::Exists(true)) {
+                        if matches!(predicate, Predicate::Exists(actual) if *actual == expected) {
                             return Ok(true);
                         }
                     }
@@ -327,7 +328,7 @@ impl DocumentMatcher {
                     children,
                 } => {
                     for child in children {
-                        if child.requires_index_path_presence(requested, check)? {
+                        if child.requires_index_path_existence(requested, expected, check)? {
                             return Ok(true);
                         }
                     }

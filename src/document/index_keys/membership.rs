@@ -35,6 +35,12 @@ impl DocumentIndexKeyGenerator {
                 matcher.membership_for_index_path(path, MAX_PROBE_KEYS, &mut || budget.step())?
             {
                 values
+            } else if matcher.requires_index_path_existence(path, false, &mut || budget.step())? {
+                // Missing fields have the ordinary null key. Explicit null is
+                // only a false-positive candidate, removed by the full matcher.
+                // Uncertain stored array paths retain their BDIF fallback key.
+                // Existing sparse all-null rejection below remains mandatory.
+                vec![&NULL]
             } else {
                 return Ok(None);
             };

@@ -1,6 +1,8 @@
 use super::*;
 use crate::document::{BsonBinary, BsonDecimal128, BsonObjectId, BsonRegex};
 
+mod absence;
+
 fn doc<const N: usize>(fields: [(&str, BsonValue); N]) -> BsonDocument {
     BsonDocument::from_entries(fields).unwrap()
 }

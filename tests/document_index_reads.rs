@@ -21,6 +21,8 @@ use briskdb::{
     },
 };
 
+#[path = "document_index_reads/absence.rs"]
+mod absence;
 #[path = "document_index_reads/membership.rs"]
 mod membership;
 #[path = "document_index_reads/presence.rs"]
@@ -109,6 +111,7 @@ async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen()
     }
     queries.extend(membership::queries());
     queries.extend(presence::queries());
+    queries.extend(absence::queries());
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
     let mut expected = Vec::new();
@@ -409,6 +412,7 @@ fn queries() -> Vec<BsonDocument> {
     ]);
     queries.extend(membership::queries());
     queries.extend(presence::queries());
+    queries.extend(absence::queries());
     queries
 }
 

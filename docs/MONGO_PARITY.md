@@ -715,7 +715,8 @@ including complete compound tuples and residual predicates under `$and`.
 Lists are limited to 128 scalar members, with at most 128 distinct candidate
 tuples and 1 MiB of encoded keys across the selected probe. Existing complete
 equality probes keep priority. Regex/array/object/unsupported members, empty or
-oversized lists, partial indexes and possible sparse all-null tuples fall back.
+oversized lists, partial indexes and possible sparse all-null tuples are not
+eligible for finite-key probing.
 Bound values and the existing non-unique fallback marker are checked through
 the full matcher. Multiple matching array entries are deduplicated before
 pagination, so reads and writes visit each logical record once. Independent
@@ -726,11 +727,20 @@ Necessary positive `$exists: true` conditions can also select all entries of a
 current sparse index after finite key probes have been considered. Direct and
 positive-conjunction predicates on any indexed path qualify, including compound
 sparse indexes. Explicit null, empty arrays and conservative non-unique fallback
-entries remain candidates; the full matcher removes false positives. Negative,
-alternative, partial-index and unproven presence shapes retain scans. Multikey
+entries remain candidates; the full matcher removes false positives. Logical
+negations, alternatives, partial-index and unproven presence shapes retain scans. Multikey
 rows are grouped before pagination, current entry bindings are checked, and
 field-removing mutations keep record/index changes in the same transaction.
 This is not range pushdown, an ordering promise, or new aggregation filtering.
+
+Necessary direct/positive-conjunction `$exists: false` clauses can provide null
+keys in complete finite probes. Explicit-null candidates are removed by the full
+matcher, and uncertain stored shapes retain fallback entries. A sparse all-null
+tuple remains unsafe; a necessarily nonnull companion path can make a compound
+sparse probe eligible. Singleton joins now preserve document-first streaming
+even when statistics underestimate large null-key groups. This bounds frontier
+sorting but can still walk nonmatching SQLite entries; it is not an index-only
+or index-order scan. Existing format, routing and aggregation accounting remain.
 
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.

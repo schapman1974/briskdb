@@ -1,5 +1,21 @@
 //! Bounded, naturally ordered index candidates for the shard merge frontier.
 
+pub(super) fn single() -> &'static str {
+    // Stale statistics can underestimate a large null/missing-key group. Keep
+    // the natural-order range outermost instead of sorting the complete group
+    // for each one-record frontier. Normal keys and BDIF are mutually exclusive
+    // record representations, so a singleton probe needs no extra grouping.
+    "SELECT d.natural_order, d.id_key, d.document_bson, d.document_checksum,
+            d.storage_format_version, e.entry_checksum, e.entry_format_version,
+            e.index_key
+     FROM briskdb_documents_v1 AS d
+     CROSS JOIN briskdb_document_index_entries_v1 AS e
+       ON e.collection_id = d.collection_id AND e.id_key = d.id_key
+     WHERE d.collection_id = ?1 AND d.natural_order > ?2
+       AND e.index_id = ?4 AND (e.index_key = ?5 OR e.index_key = ?6)
+     ORDER BY d.natural_order LIMIT ?3"
+}
+
 pub(super) fn membership(key_count: usize) -> String {
     // Only bounded placeholder numbers are generated, never BSON values. The
     // final parameter is the conservative fallback key.
@@ -41,6 +57,82 @@ mod tests {
 
     fn key(value: u8) -> Vec<u8> {
         vec![value; 13]
+    }
+
+    #[test]
+    fn single_key_frontiers_remain_streaming_after_statistics_become_stale() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::storage::document::ensure_schema(&mut connection).unwrap();
+        for hot in [false, true] {
+            let transaction = connection.transaction().unwrap();
+            for ordinal in if hot { 1_001..6_001_i64 } else { 1..1_001_i64 } {
+                let id = [vec![1], ordinal.to_be_bytes().to_vec()].concat();
+                let entry = if hot {
+                    key(0)
+                } else {
+                    [vec![1; 5], ordinal.to_be_bytes().to_vec()].concat()
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_documents_v1 VALUES (1,?1,?2,?3,?4,1)",
+                        params![id, ordinal, vec![0_u8; 5], vec![0_u8; 32]],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_index_entries_v1 VALUES (1,1,?1,?2,?3,1)",
+                        params![id, entry, vec![0_u8; 32]],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            if !hot {
+                connection.execute_batch("ANALYZE").unwrap();
+            }
+        }
+        // Statistics describe rare distinct keys, but later ordinary writes
+        // have created a large null/missing-key group. LIMIT 1 must not require
+        // materializing and sorting that complete group for every frontier.
+        for analyzed in [false, true] {
+            if analyzed {
+                connection.execute_batch("ANALYZE").unwrap();
+            }
+            let plan: Vec<String> = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", super::single()))
+                .unwrap()
+                .query_map(params![1, 0, 1, 1, key(0), key(255)], |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "analyzed={analyzed}: {plan:?}"
+            );
+            assert!(
+                plan.first().is_some_and(
+                    |step| step.starts_with("SEARCH d ") && step.contains("natural_order>?")
+                ),
+                "{plan:?}"
+            );
+            for after in [0, 1_001, 3_500, 6_000] {
+                for limit in [1, 3, 17] {
+                    let actual: Vec<i64> = connection
+                        .prepare(super::single())
+                        .unwrap()
+                        .query_map(params![1, after, limit, 1, key(0), key(255)], |row| {
+                            row.get(0)
+                        })
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    let expected: Vec<_> = (1_001..6_001)
+                        .filter(|value| *value > after)
+                        .take(limit as usize)
+                        .collect();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 
     #[test]
