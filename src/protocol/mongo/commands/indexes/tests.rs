@@ -108,6 +108,33 @@ fn compatibility_plans_keep_effective_keys_names_and_explicit_warnings() {
 }
 
 #[test]
+fn background_builtin_noops_use_the_canonical_name_without_secondary_name_rules() {
+    for name in [None, Some("_id_"), Some("_id_1"), Some("ignored_alias")] {
+        let mut options = vec![("background", BsonValue::Boolean(true))];
+        if let Some(name) = name {
+            options.push(("name", BsonValue::from(name)));
+        }
+        let prepared = plan(vec![model(
+            document([("_id", BsonValue::Int64(1))]),
+            options,
+        )])
+        .unwrap();
+        assert_eq!(
+            prepared.warnings,
+            vec![BsonValue::Document(document([
+                ("name", BsonValue::from("_id_")),
+                (
+                    "reducedBehavior",
+                    BsonValue::Array(vec![BsonValue::from(
+                        "background: builds run synchronously"
+                    )])
+                ),
+            ]))]
+        );
+    }
+}
+
+#[test]
 fn compatibility_never_degrades_unique_or_builtin_key_semantics() {
     for field in ["value", "_id"] {
         for hashed in [false, true] {

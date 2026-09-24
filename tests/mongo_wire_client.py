@@ -1966,6 +1966,10 @@ def mixed_index_models_smoke(uri):
         assert metadata["created_1"] == {"key": [("created", 1)]}
         assert metadata["email_1"] == {"key": [("email", 1)], "unique": True}
         assert metadata["descending"] == {"key": [("rank", -1)]}
+        builtin = database.command("createIndexes", "items", indexes=[{"key": {"_id": 1}, "name": "_id_", "background": True}])
+        assert (builtin["numIndexesBefore"], builtin["numIndexesAfter"]) == (5, 5)
+        assert builtin["briskdbIndexWarnings"] == [{"name": "_id_", "reducedBehavior": ["background: builds run synchronously"]}]
+        assert collection.index_information() == metadata
         assert collection.find_one({"token": {"nested": 1}})["_id"] == 1
         collection.update_one({"_id": 1}, {"$set": {"token": "changed"}})
         assert collection.find_one({"token": "changed"})["created"] == datetime(2000, 1, 1)

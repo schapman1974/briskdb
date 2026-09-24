@@ -165,12 +165,17 @@ pub(super) fn prepare(
             reduced.push(BsonValue::from("background: builds run synchronously"));
         }
         if !reduced.is_empty() {
-            // Validate/default the name with the same bounded native normalizer.
-            let (_, name) = crate::document::normalize_index_definition(
-                index.keys(),
-                index.name(),
-                &mut check,
-            )?;
+            // Built-in requests are validated/no-op'd by normalize_index_batch,
+            // which ignores the requested alias. Do not apply the secondary
+            // reserved-name rule to a legitimate explicit `_id_` request.
+            let name = if index.keys().len() == 1
+                && index.keys().get_first("_id") == Some(&BsonValue::Int32(1))
+            {
+                "_id_".to_owned()
+            } else {
+                crate::document::normalize_index_definition(index.keys(), index.name(), &mut check)?
+                    .1
+            };
             warnings.push(BsonValue::Document(fields([
                 ("name", BsonValue::String(name)),
                 ("reducedBehavior", BsonValue::Array(reduced)),
