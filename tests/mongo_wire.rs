@@ -15,6 +15,9 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
+#[path = "mongo_wire/metrics.rs"]
+mod metrics;
+
 async fn setup() -> (tempfile::TempDir, BriskDb, MongoServer) {
     let root = tempfile::tempdir().unwrap();
     let database = BriskDb::builder(root.path())
@@ -442,7 +445,23 @@ async fn finite_connection_cap_rejects_overflow() {
     }
     let mut overflow = TcpStream::connect(server.address()).await.unwrap();
     disconnected(&mut overflow).await;
+    let metrics = server.metrics();
+    assert_eq!(
+        (
+            metrics.accepted_connections,
+            metrics.admitted_connections,
+            metrics.rejected_connections,
+            metrics.active_connections
+        ),
+        (9, 8, 1, 8)
+    );
+    assert_eq!(metrics.peak_connections, 8);
     server.close().await.unwrap();
+    let metrics = server.metrics();
+    assert_eq!(
+        (metrics.active_connections, metrics.closed_connections),
+        (0, 8)
+    );
     database.close().await.unwrap();
 }
 
@@ -463,6 +482,7 @@ async fn assert_driver_restart(script: &'static str) {
     seed_index_metadata(&database).await;
     let output = run_driver(server.address(), "initial", script).await;
     server.close().await.unwrap();
+    metrics::assert_driver_metrics_drained(&server.metrics());
     database.close().await.unwrap();
     assert_driver(output);
     let database = BriskDb::builder(root.path())
@@ -476,6 +496,7 @@ async fn assert_driver_restart(script: &'static str) {
         .unwrap();
     let output = run_driver(server.address(), "reopened", script).await;
     server.close().await.unwrap();
+    metrics::assert_driver_metrics_drained(&server.metrics());
     database.close().await.unwrap();
     assert_driver(output);
 }
@@ -2210,6 +2231,22 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
             .get_first("ok"),
         Some(BsonValue::Double(1.0))
     ));
+    let metrics = server.metrics();
+    assert_eq!(metrics.response_limit_rejections, 3);
+    assert_eq!(metrics.errors_with_code(10334), Some(6));
+    assert_eq!(metrics.errors_with_code(43), Some(2));
+    assert_eq!(
+        metrics
+            .command(briskdb::protocol::mongo::MongoCommandKind::Find)
+            .failed,
+        1
+    );
+    assert_eq!(
+        metrics
+            .command(briskdb::protocol::mongo::MongoCommandKind::GetMore)
+            .failed,
+        4
+    );
     server.close().await.unwrap();
     database.close().await.unwrap();
 }

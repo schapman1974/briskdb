@@ -864,6 +864,16 @@ requires an earlier dependency:
       models fail eagerly; existing same-name indexes keep their enforcement.
       All-text batches match frozen memory/JSON namespace behavior, with retries
       and reopen covered. Degraded equivalent-name reuse remains a separate gap.
+    - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
+      can now inspect payload-free listener-local Mongo metrics: connection
+      admission/lifecycle/failures, fixed command/error-code counters, one-way
+      outcomes, write/response-limit errors and bounded latency histograms.
+      Drop guards drain live gauges on completion/abort; counters saturate and
+      snapshots remain available after close without retaining engine resources.
+      Native concurrency/unwind and real socket fixtures cover outcomes, cap
+      rejection, malformed frames, response limits and listener-local reset.
+      Cursor/row/shard telemetry, exporters/tracing, readiness and broader fault/
+      soak acceptance remain open; no listener policy or timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
