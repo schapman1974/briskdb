@@ -1,4 +1,5 @@
 use super::*;
+mod aggregation;
 use crate::{
     core::RequestContext,
     document::{

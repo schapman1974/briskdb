@@ -388,7 +388,8 @@ document/array IDs retain exact-value semantics. The complete matcher still
 checks candidates; this prunes shards without promising a multi-key index lookup.
 The restriction is shared by find/continuations, count, distinct and mutations.
 Empty/larger lists, regex members and unproven filter shapes scan every shard;
-aggregation does not yet push an initial match into this routing shortcut. The shared
+aggregation uses the same shard restriction for a safe first-stage match, while
+keeping its original matcher and cumulative accounting in the pipeline. The shared
 Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
 restarts. `skip` and `limit` apply once across the whole cursor, after the
@@ -1121,9 +1122,15 @@ API above remains an explicitly materialized alternative.
 Collection reads currently use controlled one-document source pages in global
 durable natural order, with a bounded shard frontier independent of caller
 output limits. All pipeline CPU work runs in admitted workers with cancellation
-and deadlines. This first integration uses scatter plans even for exact-ID
-matches; predicate/index pushdown and more efficient frontier reuse remain later
-optimizations. Repeated frontier probes can increase read work. No cross-shard
+and deadlines. A first-stage `$match` with a sole exact `_id`/`$eq` uses a point
+route; a safe literal `_id` list uses only its distinct owning shards. The entire
+pipeline is validated first and every original stage stays in place. List routes
+deliver unfiltered source rows from those shards into the original aggregation
+matcher, so unmatched inputs still consume its cumulative input/work budgets.
+No match is moved across a preceding transform, skip, limit, or other stage.
+Unproven shapes keep full-shard scans. General predicate/index pushdown and more
+efficient frontier reuse remain later optimizations. Repeated frontier probes
+can increase read work. No cross-shard
 snapshot is promised. Streaming batches can see concurrent changes; once a
 blocking stage has produced retained results, that buffered remainder is fixed.
 

@@ -32,9 +32,10 @@ pub(super) enum CursorSource {
     },
     Scatter(Option<Arc<DocumentMatcher>>),
     /// A proven nonempty subset of the at most 64 physical shards. The complete
-    /// matcher remains authoritative; the bitmap is only a routing restriction.
+    /// matcher remains authoritative, either here or in the aggregation runner;
+    /// the bitmap is only a routing restriction.
     ShardSubset {
-        matcher: Arc<DocumentMatcher>,
+        matcher: Option<Arc<DocumentMatcher>>,
         shards: u64,
     },
 }
@@ -55,8 +56,7 @@ impl CursorSource {
     pub(super) fn matcher(&self) -> Option<&Arc<DocumentMatcher>> {
         match self {
             Self::Point { .. } => None,
-            Self::Scatter(matcher) => matcher.as_ref(),
-            Self::ShardSubset { matcher, .. } => Some(matcher),
+            Self::Scatter(matcher) | Self::ShardSubset { matcher, .. } => matcher.as_ref(),
         }
     }
 
@@ -215,9 +215,11 @@ impl CursorState {
             )
             .saturating_add(match &self.source {
                 CursorSource::Point { id_key, .. } => id_key.as_bytes().len(),
-                CursorSource::Scatter(Some(matcher))
-                | CursorSource::ShardSubset { matcher, .. } => matcher.retained_bytes(),
-                CursorSource::Scatter(None) => 0,
+                CursorSource::Scatter(matcher) | CursorSource::ShardSubset { matcher, .. } => {
+                    matcher
+                        .as_ref()
+                        .map_or(0, |matcher| matcher.retained_bytes())
+                }
             })
     }
 }

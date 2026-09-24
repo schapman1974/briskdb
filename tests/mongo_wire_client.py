@@ -1067,6 +1067,25 @@ def id_in_routing_smoke(uri, reopened):
         rows = list(collection.find(query).sort("_id", 1).batch_size(1))
         assert [(row["_id"], row["changed"]) for row in rows] == [(9, 3), (13, 1), (18, 4), (22, 2)]
         assert collection.count_documents(query) == 4
+        assert collection.count_documents(query, skip=1, limit=2) == 2
+        assert collection.count_documents({"_id": {"$eq": Int64(9)}}) == 1
+        stages = [{"$match": query}, {"$sort": {"rank": -1}}, {"$skip": 1},
+                  {"$limit": 2}, {"$project": {"_id": 1}}]
+        assert list(collection.aggregate(stages, batchSize=1)) == [{"_id": 18}, {"_id": 13}]
+        page = client.id_in_sync.command("aggregate", "items", pipeline=stages,
+                                         cursor={"batchSize": 0})["cursor"]
+        assert page["firstBatch"] == [] and page["id"] != 0
+        paged = []
+        for _ in range(4):
+            page = client.id_in_sync.command("getMore", page["id"], collection="items",
+                                             batchSize=1)["cursor"]
+            paged.extend(page["nextBatch"])
+            if page["id"] == 0:
+                break
+        assert page["id"] == 0 and paged == [{"_id": 18}, {"_id": 13}]
+        # A transformed ID is not a physical owner. Only a leading match can route.
+        transformed = [{"$set": {"_id": 42}}, {"$match": {"_id": 42}}, {"$count": "n"}]
+        assert list(collection.aggregate(transformed)) == [{"n": 60}]
         assert collection.count_documents({}) == 60
         assert collection.find_one({"_id": 5}) == {"_id": 5, "rank": 5}
         assert list(collection.find({"_id": {"$in": []}})) == []
@@ -1089,6 +1108,12 @@ async def async_id_in_routing_smoke(uri, reopened):
         rows = await collection.find(query).sort("_id", 1).batch_size(1).to_list()
         assert [(row["_id"], row["changed"]) for row in rows] == [(8, 1), (12, 3), (18, 2)]
         assert await collection.count_documents(query) == 3
+        assert await collection.count_documents(query, skip=1, limit=1) == 1
+        assert await collection.count_documents({"_id": Int64(12)}) == 1
+        stages = [{"$match": query}, {"$sort": {"_id": -1}}, {"$skip": 1},
+                  {"$limit": 2}, {"$project": {"_id": 1}}]
+        cursor = await collection.aggregate(stages, batchSize=1)
+        assert await cursor.to_list() == [{"_id": 12}, {"_id": 8}]
         assert await collection.count_documents({}) == 31
 
 
