@@ -1591,6 +1591,9 @@ def count_checkpoint_smoke(uri):
             assert client.wire_count.command("count", "items", maxTimeMS=10000, **arguments)["n"] == expected
         assert client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
         assert client.unwritten_count.items.estimated_document_count() == 0
+        # Counts must leave the same records readable; paging also exercises
+        # the shared real-driver harness's cursor lifecycle/drain contract.
+        assert [row["_id"] for row in client.wire_count.items.find().batch_size(5)] == list(range(37))
 
 
 async def async_count_checkpoint_smoke(uri):
@@ -1601,6 +1604,7 @@ async def async_count_checkpoint_smoke(uri):
             assert reply["n"] == expected
         assert await client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
         assert await client.unwritten_count.items.estimated_document_count() == 0
+        assert [row["_id"] async for row in client.wire_count.items.find().batch_size(5)] == list(range(37))
 
 
 def aggregation_smoke(uri):
