@@ -1032,7 +1032,7 @@ fn failed_index_write_rolls_back_the_record_and_all_prior_index_entries() {
 }
 
 #[test]
-fn unsupported_unique_opaque_and_combined_budget_fail_before_intent() {
+fn duplicate_unique_opaque_and_combined_budget_fail_before_intent() {
     let temp = tempfile::tempdir().unwrap();
     let (storage, collection) = setup(temp.path(), 2);
     for (name, specification, unique) in [
@@ -1058,7 +1058,11 @@ fn unsupported_unique_opaque_and_combined_budget_fail_before_intent() {
             .unwrap();
         assert_eq!(
             build(&storage, name).unwrap_err().kind(),
-            EngineErrorKind::Unsupported
+            if unique {
+                EngineErrorKind::UniqueViolation
+            } else {
+                EngineErrorKind::Unsupported
+            }
         );
         drop(storage.enter_schema_operation().unwrap());
     }
@@ -1140,7 +1144,20 @@ fn index_operation_crash_child() {
         .parse()
         .unwrap();
     let storage = Storage::open(root, count).unwrap();
-    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP_BATCH").as_deref() == Ok("1") {
+    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_CREATE_UNIQUE").as_deref() == Ok("1") {
+        let migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .create_built_document_index_controlled(
+                &DocumentNamespace::new("app", "items").unwrap(),
+                "value",
+                &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                true,
+                migration,
+                OperationControl::new(None),
+            )
+            .unwrap();
+    } else if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP_BATCH").as_deref() == Ok("1") {
         drop_selected(&storage, None).unwrap();
     } else if std::env::var("BRISKDB_TEST_INDEX_OPERATION_BATCH").as_deref() == Ok("1") {
         create_batch(
@@ -1794,6 +1811,179 @@ fn every_build_commit_boundary_recovers_without_partial_activation() {
             drop(reopened);
             drop(Storage::open(temp.path(), count).unwrap());
         }
+    }
+}
+
+#[test]
+fn unique_build_and_drop_crashes_preserve_exact_enforcement_boundary() {
+    for dropping in [false, true] {
+        let count = 2;
+        let mut points: Vec<String> = if dropping {
+            [
+                "drop-before-intent:0",
+                "drop-after-intent:0",
+                "cleanup-before-completion:0",
+                "cleanup-after-completion:0",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        } else {
+            [
+                "before-intent:0",
+                "after-intent:0",
+                "before-activation:0",
+                "after-activation:0",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        };
+        for shard in 0..count {
+            let boundaries = if dropping {
+                [
+                    "cleanup-before-shard",
+                    "cleanup-after-shard",
+                    "before-cursor",
+                    "after-cursor",
+                ]
+            } else {
+                [
+                    "before-shard",
+                    "after-shard",
+                    "before-cursor",
+                    "after-cursor",
+                ]
+            };
+            for point in boundaries {
+                points.push(format!("{point}:{shard}"));
+            }
+        }
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), count).unwrap();
+            let collection = storage
+                .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+                .unwrap()
+                .id();
+            for id in 0..12 {
+                storage
+                    .insert_document(collection, &document(id, BsonValue::Int32(id)))
+                    .unwrap();
+            }
+            storage
+                .declare_document_index(
+                    collection,
+                    "value",
+                    &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                    true,
+                )
+                .unwrap();
+            if dropping {
+                build(&storage, "value").unwrap();
+            }
+            let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+            drop(storage);
+            crash_mode(temp.path(), count, &point, dropping);
+            let storage = Storage::open(temp.path(), count).unwrap();
+            let enforced = if dropping {
+                point == "drop-before-intent:0"
+            } else {
+                point == "after-activation:0"
+            };
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_documents_v1"),
+                records,
+                "{point}"
+            );
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_document_index_entries_v1")
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                if enforced { 12 } else { 0 },
+                "{point}"
+            );
+            let result =
+                storage.insert_document(collection, &document(100, BsonValue::Double(0.0)));
+            if enforced {
+                assert_eq!(
+                    result.unwrap_err().kind(),
+                    EngineErrorKind::UniqueViolation,
+                    "{point}"
+                );
+            } else {
+                result.unwrap();
+            }
+            drop(storage);
+            drop(Storage::open(temp.path(), count).unwrap());
+        }
+    }
+}
+
+#[test]
+fn combined_unique_creation_crashes_recover_metadata_and_enforcement_together() {
+    for point in [
+        "create-before-intent:0",
+        "create-after-intent:0",
+        "create-before-shard:0",
+        "create-after-shard:0",
+        "create-before-shard:1",
+        "create-after-shard:1",
+        "create-before-activation:0",
+        "create-after-activation:0",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::open(root.path(), 2).unwrap();
+        let collection = storage
+            .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+            .unwrap()
+            .id();
+        storage
+            .insert_document(collection, &document(1, BsonValue::Int32(7)))
+            .unwrap();
+        let records = snapshot(root.path(), 2, "briskdb_documents_v1");
+        drop(storage);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::document::enabled::index_operations::tests::index_operation_crash_child",
+                "--nocapture",
+            ])
+            .env("BRISKDB_TEST_INDEX_OPERATION_ROOT", root.path())
+            .env("BRISKDB_TEST_INDEX_OPERATION_SHARDS", "2")
+            .env("BRISKDB_TEST_INDEX_OPERATION_CREATE_UNIQUE", "1")
+            .env("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH", point)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(75), "{point}: {output:?}");
+        let storage = Storage::open(root.path(), 2).unwrap();
+        assert_eq!(snapshot(root.path(), 2, "briskdb_documents_v1"), records);
+        let catalog = storage.document_catalog().unwrap();
+        let target = catalog
+            .collection("app", "items")
+            .unwrap()
+            .indexes()
+            .iter()
+            .find(|index| index.name() == "value");
+        if point == "create-after-activation:0" {
+            assert!(target.unwrap().is_unique());
+            assert_eq!(target.unwrap().lifecycle(), DocumentIndexLifecycle::Ready);
+            assert_eq!(
+                storage
+                    .insert_document(collection, &document(2, BsonValue::Double(7.0)))
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::UniqueViolation
+            );
+        } else {
+            assert!(target.is_none());
+            storage
+                .insert_document(collection, &document(2, BsonValue::Double(7.0)))
+                .unwrap();
+        }
+        drop(storage);
+        drop(Storage::open(root.path(), 2).unwrap());
     }
 }
 

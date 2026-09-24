@@ -1563,7 +1563,7 @@ impl Engine {
                 &Storage,
                 &mut PooledConnection,
                 &CancellationToken,
-                &OperationControl,
+                &Arc<OperationControl>,
             ) -> EngineResult<T>
             + Send
             + 'static,

@@ -23,21 +23,21 @@ used, while idempotency stripes are retained after first use so unlink cannot
 create competing inodes. None may be replaced while a process is live. See the
 [multi-process contract](MULTIPROCESS.md).
 
-## Current format: version 19
+## Current format: version 20
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `19` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `20` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it and the unkeyed checksums
 described below.
 
-Version 19 has twenty-nine strict manifest tables and the partial unique
+Version 20 has twenty-nine strict manifest tables and the partial unique
 allocation-owner index. It retains the routing, authoritative
 logical and document catalogs, physical layout, application-schema migration,
 integrity, generated-ID activation, allocation-owner lifecycle, recoverable
@@ -55,6 +55,10 @@ existing BSON and index declarations/IDs are unchanged, with no index activation
 The v18-to-v19 step adds an empty checksummed index-operation journal, installs
 the version-19 fence and advances the semantic digest to version 11. The upgrade
 does not build any index; explicit non-unique builds can subsequently publish Ready.
+The v19-to-v20 step adds no tables or entry formats: it installs the version-20
+older-writer fence and advances the semantic digest to version 12. This permits
+unique build/abort intent and Ready secondary unique authority. Existing Pending
+declarations remain non-enforcing; no index is implicitly built by the upgrade.
 
 ```sql
 CREATE TABLE briskdb_manifest (
@@ -64,7 +68,7 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 19)
+        CHECK (requires_manifest_version >= 20)
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -666,7 +670,7 @@ CREATE TABLE briskdb_integrity (
 
 The manifest, metadata, routing, schema-catalog, shard-layout, and integrity
 tables each contain exactly one row, as does `briskdb_document_identities`.
-The version-19 downgrade-fence row is exactly `19`. The
+The version-20 downgrade-fence row is exactly `20`. The
 `briskdb_document_index_allocator` and `briskdb_document_index_storage` also
 contain exactly one row each.
 `briskdb_generated_table_ddl`, `briskdb_table_provisioning`,
@@ -1243,8 +1247,8 @@ restart as repair after any reported `DataCorruption`; whole-shard corruption
 drills and failure handling remain issue #68. Those storage failures retain
 their own error kinds and do not themselves justify rebaselining data.
 
-Manifest digest version 11 is a full 32-byte, unkeyed BLAKE3 digest. The stream
-begins with `briskdb.manifest.semantic-root.v11` plus its terminating NUL. It
+Manifest digest version 12 is a full 32-byte, unkeyed BLAKE3 digest. The stream
+begins with `briskdb.manifest.semantic-root.v12` plus its terminating NUL. It
 then encodes the length-prefixed name `application_id` and its tagged integer,
 followed by the length-prefixed name `user_version` and its tagged integer.
 These tables and columns follow in fixed order:
@@ -1294,7 +1298,7 @@ self-reference; its version, database state, and schema digest fields are
 covered. Frozen SQL definitions, STRICT flags, indexes, and foreign keys are
 validated separately rather than encoded as semantic rows.
 
-Every BriskDB-owned v19 manifest mutation recalculates the root after its row
+Every BriskDB-owned v20 manifest mutation recalculates the root after its row
 changes and before the same transaction commits. Progress acknowledgement,
 migration publication/finalization, provisioning intent/progress/finalization,
 generated-table bridge transitions, layout publication, owner/activation state
@@ -1304,7 +1308,10 @@ semantic values instead of the raw SQLite file makes the root stable across WAL
 checkpoints, page relocation, and `VACUUM`; it deliberately does not cover
 SQLite page bytes, rollback journals, WAL, or shared memory.
 
-Digest version 9 remains frozen solely to verify and migrate version-17
+Digest version 11 remains frozen solely to verify and migrate version-19
+manifests. It covers the same tables as version 12 but retains its v11 domain.
+Digest version 10 verifies version-18 manifests and omits the index-operation
+journal. Digest version 9 remains frozen solely to verify and migrate version-17
 manifests. Its `briskdb.manifest.semantic-root.v9` domain and stream omit the
 index-storage layout journal. Digest version 8 remains frozen solely to verify and migrate version-16
 manifests. Its `briskdb.manifest.semantic-root.v8` domain and stream omit the
@@ -1470,7 +1477,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 19 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 20 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -1751,12 +1758,22 @@ At each open, BriskDB validates the exact objects, columns, strict flags, frozen
 schema SQL, singleton rows, logical identifiers and limits, metadata codes,
 supported algorithm values, contiguous physical and bucket IDs, active
 lifecycle states, assignments, coverage, and foreign keys. A recognized
-version-19 manifest that violates any invariant is `DataCorruption` and is
+version-20 manifest that violates any invariant is `DataCorruption` and is
 rejected before shard connections are opened. The same locked transaction
 returns routing and logical rows as one coherent shared snapshot. Request
 routing performs no manifest query and cannot fall back to modulo after a failed
 validation; only successful migration finalization publishes a newer logical
 schema generation into the snapshot.
+
+## Previous version 19
+
+Version 19 has the same manifest objects and physical record/entry formats as
+version 20, but only authorizes non-unique Ready secondary indexes. Its semantic
+digest is version 11. The atomic v19-to-v20 migration replaces the exact metadata
+fence with `requires_manifest_version >= 20`, stamps version 20, and reseals the
+unchanged authoritative rows with digest version 12 and its new domain. Both
+failure sides roll back to exact v19; frozen v19 readers reject the upgraded root
+before writing. Unique activation must never be backported without this fence.
 
 ## Previous version 18
 
@@ -1777,8 +1794,9 @@ CREATE TABLE briskdb_document_index_operation (
 ```
 
 Kinds are Build (1), Drop cleanup (2), and Abort cleanup (3). A journal targets exactly one
-PendingBuild secondary index in an active collection. Build/Abort targets must
-be non-unique; Ready secondary unique indexes are invalid. The exact root shard
+PendingBuild secondary index in an active collection. Version 19 requires
+non-unique Build/Abort targets and rejects Ready secondary unique indexes.
+Version 20 permits both, with unchanged entry schema and journal kinds. The exact root shard
 count and progress are sealed; operations cannot overlap namespace provisioning,
 namespace deletion or an unfinished physical-layout upgrade.
 
@@ -1810,8 +1828,13 @@ reproduces the bounded complete key set and rejects missing, extra, stale,
 malformed or orphan entries without repair outside explicit journal ownership.
 Checksums detect damage, not malicious changes by a directory writer. Ready
 entries now serve conservative equality candidates with full BSON matching,
-using this existing format and checksum binding. Secondary uniqueness and broader
-index-backed query plans remain unimplemented.
+using this existing format and checksum binding. Version 20 enables secondary
+uniqueness with cross-process collection-writer fences, validated cross-shard
+key probes before record mutation, and disk-backed global key validation during
+offline builds/startup. Same-owner multikey repetitions are not duplicates.
+Record/entry changes commit together; whole-bulk post-image uniqueness and
+cross-shard atomic writes remain unimplemented. See the
+[engine enforcement boundary](DOCUMENT_ENGINE.md#equality-index-candidates).
 
 ## Previous version 17
 
@@ -2234,6 +2257,8 @@ returning:
    The v16-to-v17 step adds permanent index identities and semantic digest version 9.
    The v17-to-v18 step adds the physical index-layout journal and digest version 10.
    The v18-to-v19 step adds the document index-operation journal and digest version 11.
+   The v19-to-v20 step fences older writers before unique authority and reseals with
+   digest version 12, without adding tables or rewriting records/entries.
    Older formats therefore cannot be mistaken for checksummed,
    authoritative-catalog, allocator-authority, recoverable provisioning, or
    durable logical-to-physical DDL identity.
@@ -2487,7 +2512,7 @@ header value, format version, digest input, routing metadata, schema
 fingerprint, journal record, or recovery step. Listener settings are not
 persisted. Because engine open and its existing recovery precede listener
 binding, a later bind failure does not undo a migration or recovery transaction
-that already committed; a subsequent startup revalidates the same version-19
+that already committed; a subsequent startup revalidates the same version-20
 layout normally.
 
 Issue #52's separate data/admin HTTP routers and optional administration socket

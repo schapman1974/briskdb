@@ -160,6 +160,7 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 mod enabled {
     mod index_metadata;
     mod index_operations;
+    mod unique;
     mod write_transaction;
     use std::{
         collections::{HashMap, HashSet},
@@ -1790,6 +1791,7 @@ mod enabled {
             require_schema(connection)?;
             let indexes = self.active_document_indexes(collection_id)?;
             let entries = prepare_write_entries(indexes.as_deref(), prepared, cancellation)?;
+            connection.validate_unique_entries(&prepared.id_key, entries.as_ref())?;
             let natural_order = document_natural_order_to_sqlite(natural_order)?;
             let checksum = record_checksum(
                 collection_id,
@@ -1874,6 +1876,7 @@ mod enabled {
             let indexes = self.active_document_indexes(collection_id)?;
             validate_record_index_coverage(connection, indexes.as_deref(), &current, cancellation)?;
             let entries = prepare_write_entries(indexes.as_deref(), replacement, cancellation)?;
+            connection.validate_unique_entries(id_key, entries.as_ref())?;
             let natural_order = document_natural_order_to_sqlite(natural_order)?;
             let checksum = record_checksum(
                 collection_id,
@@ -2764,6 +2767,31 @@ mod enabled {
         indexes: &DocumentIndexPreparations,
     ) -> EngineResult<()> {
         manifest::current_integrity(manifest_connection, storage.shard_count())?;
+        // A cross-shard uniqueness snapshot must not combine an old owner on
+        // one shard with a new owner committed later on another shard. Hold
+        // every participating writer stripe in deterministic order throughout
+        // validation. Deduplicate collisions to avoid acquiring our own lock.
+        let mut fenced_collections = indexes
+            .collections
+            .iter()
+            .filter(|(_, indexes)| indexes.has_unique_secondary())
+            .map(|(collection, _)| *collection)
+            .collect::<Vec<_>>();
+        let stripe = |collection: &DocumentCollectionId| {
+            collection.get() % crate::storage::process_lock::document_write::STRIPES as u64
+        };
+        fenced_collections.sort_unstable_by_key(stripe);
+        fenced_collections.dedup_by_key(|collection| stripe(collection));
+        let cancellation = CancellationToken::new();
+        let _fences = fenced_collections
+            .iter()
+            .map(|collection| {
+                write_transaction::acquire_fence(storage, *collection, &cancellation, None)
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let unique_keys = (!fenced_collections.is_empty())
+            .then(|| unique::UniqueKeyScratch::new(None))
+            .transpose()?;
         let active_collections = catalog
             .collections()
             .iter()
@@ -2848,6 +2876,16 @@ mod enabled {
                     .get(&collection_id)
                     .map(|preparation| preparation.prepare(&document).map_err(stored_index_error))
                     .transpose()?;
+                if let (Some(unique_keys), Some(expected)) = (&unique_keys, &expected) {
+                    if unique_keys
+                        .add(expected, &id_key, &mut || Ok(()))?
+                        .is_some()
+                    {
+                        return Err(corrupt(
+                            "stored document unique index contains duplicate keys",
+                        ));
+                    }
+                }
                 super::index_storage::validate_record_entries(
                     &connection,
                     collection_id,
@@ -3267,11 +3305,6 @@ mod enabled {
                     || !specification.representation_eq(&expected_id))
             {
                 return Err(corrupt("built-in document _id index metadata is invalid"));
-            }
-            if !built_in && unique && lifecycle == DocumentIndexLifecycle::Ready {
-                return Err(corrupt(
-                    "unique document index is ready without global uniqueness authority",
-                ));
             }
             indexes.push(DocumentIndexMetadata::from_validated_parts(
                 DocumentIndexId::from_validated(positive_u64(

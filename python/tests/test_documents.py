@@ -60,7 +60,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                     session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": [1, 2], "active": True})
                     token = briskdb.CancellationToken()
                     token.cancel()
-                    for control, error in [({"max_result_bytes": 1}, briskdb.LimitExceededError), ({"cancellation": token}, briskdb.CancelledError), ({"unique": True}, briskdb.UnsupportedError)]:
+                    for control, error in [({"max_result_bytes": 1}, briskdb.LimitExceededError), ({"cancellation": token}, briskdb.CancelledError)]:
                         with self.assertRaises(error):
                             session.create_built_index(DATABASE, COLLECTION, {"value": 1}, **control)
                         self.assertEqual(len(session.list_indexes(DATABASE, COLLECTION)["indexes"]), 1)
@@ -137,8 +137,9 @@ class PythonDocumentApiTests(unittest.TestCase):
                     session.update_one(DATABASE, COLLECTION, {"_id": 1}, {"$set": {"value": [3, 4], "extra": True}})
                     session.delete_one(DATABASE, COLLECTION, {"_id": 2})
                     session.create_index(DATABASE, COLLECTION, {"value": 1}, name="unique", unique=True)
-                    with self.assertRaises(briskdb.UnsupportedError):
-                        session.build_index(DATABASE, COLLECTION, "unique")
+                    session.build_index(DATABASE, COLLECTION, "unique")
+                    with self.assertRaises(briskdb.UniqueViolationError):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": 2, "value": 3.0})
                     session.create_index(DATABASE, COLLECTION, {"value": 1}, name="to_drop")
                     session.build_index(DATABASE, COLLECTION, "to_drop")
                     with self.assertRaises(briskdb.LimitExceededError):
@@ -148,7 +149,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                 with database.session() as session:
                     indexes = {item["name"]: item for item in session.list_indexes(DATABASE, COLLECTION)["indexes"]}
                     self.assertEqual(indexes["value_1"]["lifecycle"], "ready")
-                    self.assertEqual(indexes["unique"]["lifecycle"], "pending_build")
+                    self.assertEqual(indexes["unique"]["lifecycle"], "ready")
                     self.assertEqual(session.count_documents(DATABASE, COLLECTION, {"value": 4})["count"], 1)
 
     def test_sparse_partial_declarations_validate_preserve_options_and_reopen(self) -> None:
@@ -1971,6 +1972,33 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_unique_build_mutations_reopen_and_drop(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": [1, 1.0]})
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 2, "value": 2})
+                    result = await session.create_built_index(DATABASE, COLLECTION, {"value": 1}, unique=True)
+                    self.assertEqual(result["lifecycle"], "ready")
+                    for operation in [
+                        lambda: session.insert_one(DATABASE, COLLECTION, {"_id": 3, "value": 1}),
+                        lambda: session.update_one(DATABASE, COLLECTION, {"_id": 2}, {"$set": {"value": 1}}),
+                        lambda: session.replace_one(DATABASE, COLLECTION, {"_id": 2}, {"value": 1}),
+                    ]:
+                        with self.assertRaises(briskdb.UniqueViolationError):
+                            await operation()
+                    self.assertEqual((await session.count_documents(DATABASE, COLLECTION, {"value": 2}))["count"], 1)
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    with self.assertRaises(briskdb.UniqueViolationError):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": 3, "value": 1})
+                    await session.delete_one(DATABASE, COLLECTION, {"_id": 1})
+                    await session.update_one(DATABASE, COLLECTION, {"_id": 2}, {"$set": {"value": 1}})
+                    await session.drop_index(DATABASE, COLLECTION, "value_1")
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 3, "value": 1})
+                    self.assertEqual((await session.count_documents(DATABASE, COLLECTION, {"value": 1}))["count"], 2)
+
     async def test_async_combined_index_creation_build_forwards_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

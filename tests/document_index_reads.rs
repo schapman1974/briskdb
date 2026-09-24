@@ -795,6 +795,101 @@ async fn indexed_multi_update_rolls_back_the_failing_shard_and_preserves_prior_c
     engine.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn unique_multi_update_rolls_back_records_and_entries_then_accepts_safe_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    let namespace = ns("unique_rollback");
+    seed(&engine, &session, &namespace, 35).await;
+    build(
+        &engine,
+        &session,
+        &namespace,
+        DocumentIndexRequest::new(doc([("rank", BsonValue::Int32(1))]))
+            .unwrap()
+            .with_unique(true),
+    )
+    .await;
+    let snapshot = || -> Vec<Vec<rusqlite::types::Value>> {
+        (0..2).flat_map(|shard| {
+            let connection = rusqlite::Connection::open(root.path().join(format!("shards/{shard:04}.sqlite"))).unwrap();
+            ["SELECT * FROM briskdb_documents_v1 ORDER BY collection_id, id_key",
+             "SELECT * FROM briskdb_document_index_entries_v1 ORDER BY collection_id, index_id, index_key, id_key"]
+                .into_iter().flat_map(|sql| {
+                    let mut statement = connection.prepare(sql).unwrap();
+                    let columns = statement.column_count();
+                    statement.query_map([], |row| (0..columns).map(|i| row.get(i)).collect()).unwrap()
+                        .collect::<Result<Vec<_>, _>>().unwrap()
+                }).collect::<Vec<_>>()
+        }).collect()
+    };
+    let first = rusqlite::Connection::open(root.path().join("shards/0000.sqlite")).unwrap();
+    assert!(
+        first
+            .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap()
+            >= 2
+    );
+    drop(first);
+    let before = snapshot();
+    let update = |operator, value| {
+        DocumentCommand::Update(DocumentUpdateRequest::new(
+            namespace.clone(),
+            DocumentFilter::new(doc([])).unwrap(),
+            DocumentUpdate::new(doc([(operator, obj([("rank", BsonValue::Int32(value))]))]))
+                .unwrap(),
+            DocumentMutationScope::Many,
+            DocumentWriteOptions::new(),
+        ))
+    };
+    let error = engine
+        .execute_document(
+            &session,
+            DocumentRequest::new(
+                DocumentRequestId::new([2; 16]).unwrap(),
+                RequestContext::new(),
+                update("$set", 9999),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
+    assert_eq!(
+        snapshot(),
+        before,
+        "failed shard must restore exact BSON and entry bytes"
+    );
+    call(&engine, &session, update("$inc", 100)).await;
+    assert_ne!(snapshot(), before);
+    let after = find(
+        &engine,
+        &session,
+        &namespace,
+        &doc([]),
+        DocumentReadOptions::new(),
+    )
+    .await;
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert_eq!(
+        find(
+            &engine,
+            &session,
+            &namespace,
+            &doc([]),
+            DocumentReadOptions::new()
+        )
+        .await,
+        after
+    );
+    engine.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_multi_update_cancellation_preserves_prior_commits_and_releases_admission() {
     for abort in [false, true] {

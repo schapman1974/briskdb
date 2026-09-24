@@ -1,6 +1,7 @@
 //! Per-input commit boundaries for inserts and exact-ID deletes.
 
 use rusqlite::Connection;
+use std::sync::Arc;
 
 use super::ensure_document_cpu_active;
 use crate::{
@@ -42,7 +43,7 @@ pub(super) fn write_transaction<T>(
     shard: u16,
     connection: &Connection,
     cancellation: &CancellationToken,
-    control: &OperationControl,
+    control: &Arc<OperationControl>,
     write: impl FnOnce(&DocumentWriteTransaction<'_>) -> EngineResult<T>,
 ) -> Result<T, WriteTransactionError> {
     ensure_document_cpu_active(cancellation, control).map_err(WriteTransactionError::uncertain)?;
@@ -151,7 +152,7 @@ mod tests {
     fn write_transaction<T>(
         fixture: &Fixture,
         cancellation: &CancellationToken,
-        control: &OperationControl,
+        control: &Arc<OperationControl>,
         write: impl FnOnce(&DocumentWriteTransaction<'_>) -> EngineResult<T>,
     ) -> Result<T, WriteTransactionError> {
         super::write_transaction(

@@ -1744,6 +1744,86 @@ async def async_indexed_mutation_smoke(uri):
         assert [row async for row in collection.find({})] == [{"_id": 3, "a": 8, "counter": 1}]
 
 
+def unique_index_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_unique
+        collection = database.items
+        collection.insert_many([{"_id": i, "value": i, "keep": True} for i in range(8)])
+        assert collection.create_index("value", unique=True) == "value_1"
+        assert collection.index_information()["value_1"]["unique"] is True
+        before = [BSON.encode(row) for row in collection.find({})]
+        for operation in [
+            lambda: collection.insert_one({"_id": 99, "value": 1.0}),
+            lambda: collection.update_one({"_id": 0}, {"$set": {"value": 1}}),
+            lambda: collection.replace_one({"_id": 0}, {"value": Int64(1)}),
+            lambda: collection.update_one({"_id": 99}, {"$set": {"value": 1}}, upsert=True),
+            lambda: collection.replace_one({"_id": 99}, {"value": 1}, upsert=True),
+            lambda: collection.find_one_and_update({"_id": 0}, {"$set": {"value": 1}}),
+            lambda: collection.find_one_and_replace({"_id": 0}, {"value": 1}),
+            lambda: collection.find_one_and_update({"_id": 99}, {"$set": {"value": 1}}, upsert=True),
+        ]:
+            try:
+                operation()
+            except (DuplicateKeyError, WriteError) as error:
+                assert error.code == 11000
+            else:
+                raise AssertionError("secondary unique conflict succeeded")
+            assert [BSON.encode(row) for row in collection.find({})] == before
+        # Keeping the same key is legal, and changing it releases the old key.
+        assert collection.update_one({"_id": 0}, {"$set": {"keep": False}}).modified_count == 1
+        assert collection.update_many({}, {"$inc": {"value": 100}}).modified_count == 8
+        assert collection.find_one_and_replace({"_id": 0}, {"value": 200},
+            return_document=pymongo.ReturnDocument.AFTER) == {"_id": 0, "value": 200}
+        assert collection.find_one_and_delete({"value": 101})["_id"] == 1
+        collection.insert_one({"_id": 1001, "value": 101})
+        # Ordered/unordered writeErrors retain original input indices.
+        for ordered in [True, False]:
+            batch = database[f"batch_{ordered}"]
+            batch.create_index("value", unique=True)
+            try:
+                batch.insert_many([{"_id": 1, "value": 7}, {"_id": 2, "value": 7.0},
+                                   {"_id": 3, "value": 8}], ordered=ordered)
+            except BulkWriteError as error:
+                assert error.details["nInserted"] == (1 if ordered else 2)
+                assert [(row["index"], row["code"]) for row in error.details["writeErrors"]] == [(1, 11000)]
+            else:
+                raise AssertionError("unique insert batch succeeded")
+        # A bad offline build does not activate, and another valid build works.
+        bad = database.bad_build
+        bad.insert_many([{"_id": 1, "value": 1}, {"_id": 2, "value": 1}])
+        try:
+            bad.create_index("value", unique=True)
+        except OperationFailure as error:
+            assert error.code == 11000
+        else:
+            raise AssertionError("duplicate offline build succeeded")
+        assert set(bad.index_information()) == {"_id_"}
+        bad.delete_one({"_id": 2})
+        bad.create_index("value", unique=True)
+
+
+async def async_unique_index_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_unique.async_items
+        await collection.create_index("value", unique=True, sparse=True)
+        await collection.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3, "value": [7, 7.0]}])
+        for operation in [
+            lambda: collection.insert_one({"_id": 4, "value": 7}),
+            lambda: collection.update_one({"_id": 1}, {"$set": {"value": [6, 7]}}),
+            lambda: collection.find_one_and_replace({"_id": 2}, {"value": 7}),
+        ]:
+            try:
+                await operation()
+            except (DuplicateKeyError, WriteError) as error:
+                assert error.code == 11000
+            else:
+                raise AssertionError("async unique conflict succeeded")
+        assert await collection.find_one({"_id": 1}) == {"_id": 1}
+        assert await collection.find_one({"_id": 2}) == {"_id": 2}
+        assert (await collection.delete_one({"_id": 3})).deleted_count == 1
+        assert (await collection.update_one({"_id": 1}, {"$set": {"value": 7}})).modified_count == 1
+
+
 def indexed_read_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.wire_index_reads.items
@@ -1816,7 +1896,7 @@ def index_creation_smoke(uri):
             ([{"key": {"value": 1}, "name": "another"}], 85),
             ([{"key": {"_id": 1}, "unique": False}], 197),
             ([{"key": {"_id": 1}, "unique": True}], 197),
-            ([{"key": {"new": 1}, "unique": True}], 115),
+            ([{"key": {"new": 1}, "unique": True}], 11000),
         ]:
             try:
                 database.command("createIndexes", "items", indexes=definitions)
@@ -1840,15 +1920,16 @@ def index_creation_smoke(uri):
                 raise AssertionError("invalid index batch was accepted")
             assert "absent" not in database.list_collection_names()
         # Runtime failure retains the completed prefix and leaves the root usable.
+        database.prefix.insert_many([{"_id": 1}, {"_id": 2}])
         try:
             database.command("createIndexes", "prefix", indexes=[
                 {"key": {"value": 1}, "name": "first"},
                 {"key": {"second": 1}, "unique": True},
             ])
         except OperationFailure as error:
-            assert error.code == 115
+            assert error.code == 11000
         else:
-            raise AssertionError("unsupported unique build succeeded")
+            raise AssertionError("duplicate unique build succeeded")
         assert set(database.prefix.index_information()) == {"_id_", "first"}
         collection.update_one({"_id": 1}, {"$set": {"active": True, "value": 100}})
         collection.delete_one({"_id": 2})
@@ -1910,6 +1991,16 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_unique.items.count_documents({}) == 8
+        assert client.wire_unique.items.index_information()["value_1"]["unique"] is True
+        assert client.wire_unique.async_items.find_one({"value": 7}) == {"_id": 1, "value": 7}
+        for collection, value in [(client.wire_unique.items, 101), (client.wire_unique.async_items, 7)]:
+            try:
+                collection.insert_one({"_id": 9999, "value": value})
+            except DuplicateKeyError as error:
+                assert error.code == 11000
+            else:
+                raise AssertionError("reopened unique index lost enforcement")
         assert list(client.wire_index_mutations.items.find({})) == [{"_id": 100, "a": 99, "counter": 11}]
         assert list(client.wire_index_mutations.async_items.find({})) == [{"_id": 3, "a": 8, "counter": 1}]
         assert client.wire_index_reads.items.count_documents({"a": 1}) == 9
@@ -2358,6 +2449,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "reopened":
         persisted_smoke(sys.argv[1])
     else:
+        unique_index_smoke(sys.argv[1])
+        asyncio.run(async_unique_index_smoke(sys.argv[1]))
         indexed_mutation_smoke(sys.argv[1])
         asyncio.run(async_indexed_mutation_smoke(sys.argv[1]))
         indexed_read_smoke(sys.argv[1])
