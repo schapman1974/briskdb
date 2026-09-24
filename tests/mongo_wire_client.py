@@ -1045,6 +1045,53 @@ async def async_compression_smoke(uri, reopened):
         assert "rank_lookup" in await collection.index_information()
 
 
+def id_in_routing_smoke(uri, reopened):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.id_in_sync.items
+        selected = [4, 9, 13, 18, 22, 27]
+        query = {"_id": {"$in": list(reversed(selected)) + [Int64(9), 9.0]}}
+        if not reopened:
+            collection.insert_many([{"_id": i, "rank": i} for i in range(64)])
+            assert [row["_id"] for row in collection.find(query).batch_size(2)] == selected
+            assert [row["_id"] for row in collection.find(query).sort("rank", -1).skip(1).limit(4).batch_size(2)] == [22, 18, 13, 9]
+            assert sorted(collection.distinct("_id", query)) == selected
+            assert collection.update_many(query, {"$set": {"changed": 1}}).modified_count == 6
+            assert collection.delete_one(query).deleted_count == 1
+            assert collection.find_one_and_delete(query, sort=[("_id", -1)])["_id"] == 27
+            assert collection.find_one_and_update(query, {"$set": {"changed": 2}},
+                                                 sort=[("_id", -1)], return_document=True)["_id"] == 22
+            assert collection.replace_one({"_id": {"$in": [13, 9]}}, {"rank": 9, "changed": 3}).modified_count == 1
+            assert collection.find_one_and_replace({"_id": {"$in": [13, 18]}}, {"rank": 18, "changed": 4},
+                                                  sort=[("_id", -1)], return_document=True)["_id"] == 18
+            assert collection.delete_many({"_id": {"$in": [50, Int64(51), 50.0]}}).deleted_count == 2
+        rows = list(collection.find(query).sort("_id", 1).batch_size(1))
+        assert [(row["_id"], row["changed"]) for row in rows] == [(9, 3), (13, 1), (18, 4), (22, 2)]
+        assert collection.count_documents(query) == 4
+        assert collection.count_documents({}) == 60
+        assert collection.find_one({"_id": 5}) == {"_id": 5, "rank": 5}
+        assert list(collection.find({"_id": {"$in": []}})) == []
+
+
+async def async_id_in_routing_smoke(uri, reopened):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000,
+                                       socketTimeoutMS=3000) as client:
+        collection = client.id_in_async.items
+        query = {"_id": {"$in": [18, 12, 8, 2, Int64(8), 8.0]}}
+        if not reopened:
+            await collection.insert_many([{"_id": i, "rank": i} for i in range(32)])
+            assert [row["_id"] async for row in collection.find(query).batch_size(1)] == [2, 8, 12, 18]
+            assert (await collection.update_many(query, {"$set": {"changed": 1}})).modified_count == 4
+            assert (await collection.delete_one(query)).deleted_count == 1
+            assert (await collection.find_one_and_update(query, {"$set": {"changed": 2}},
+                                                        sort=[("_id", -1)], return_document=True))["_id"] == 18
+            assert (await collection.replace_one({"_id": {"$in": [Int64(12), 12.0]}},
+                                                 {"rank": 12, "changed": 3})).modified_count == 1
+        rows = await collection.find(query).sort("_id", 1).batch_size(1).to_list()
+        assert [(row["_id"], row["changed"]) for row in rows] == [(8, 1), (12, 3), (18, 2)]
+        assert await collection.count_documents(query) == 3
+        assert await collection.count_documents({}) == 31
+
+
 def document_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
         collection = client.wire_data.items
@@ -2669,6 +2716,8 @@ if __name__ == "__main__":
     reopened = len(sys.argv) > 2 and sys.argv[2] == "reopened"
     compression_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_compression_smoke(sys.argv[1], reopened), timeout=20))
+    id_in_routing_smoke(sys.argv[1], reopened)
+    asyncio.run(asyncio.wait_for(async_id_in_routing_smoke(sys.argv[1], reopened), timeout=20))
     index_metadata_smoke(sys.argv[1])
     asyncio.run(async_index_metadata_smoke(sys.argv[1]))
     if reopened:

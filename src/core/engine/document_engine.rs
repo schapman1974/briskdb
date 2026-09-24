@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod aggregation;
 mod deletion;
 mod distinct;
+mod id_routing;
 mod index_metadata;
 mod metadata;
 mod single_mutation;
@@ -963,9 +964,11 @@ impl Engine {
                             u64::from(found),
                         )
                     }
-                    PreparedFilterRoute::Scatter(matcher) => {
+                    route @ (PreparedFilterRoute::Scatter(_)
+                    | PreparedFilterRoute::ShardSubset { .. }) => {
+                        let matcher = route.matcher().cloned();
                         let mut count = 0_u64;
-                        for shard in 0..self.shard_count() {
+                        for shard in route.shards(self.shard_count()) {
                             let matcher = matcher.clone();
                             let shard_count = self
                                 .run_document_shard(
@@ -1010,7 +1013,7 @@ impl Engine {
                                 )
                             })?;
                         }
-                        (scatter_plan(collection_id, self.shard_count())?, count)
+                        (route.plan(collection_id, self.shard_count())?, count)
                     }
                 };
                 let count = apply_count_options(count, &options);
@@ -1632,15 +1635,7 @@ impl Engine {
     }
 
     fn document_cursor_plan(&self, state: &CursorState) -> EngineResult<DocumentPlan> {
-        match &state.source {
-            PreparedFilterRoute::Point { id_key, shard } => {
-                DocumentPointPlan::new(state.collection_id, *shard, id_key.clone())
-                    .map(DocumentPlan::Point)
-            }
-            PreparedFilterRoute::Scatter(_) => {
-                scatter_plan(state.collection_id, self.shard_count())
-            }
-        }
+        state.source.plan(state.collection_id, self.shard_count())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1759,8 +1754,8 @@ impl Engine {
                 add_document_result_budget(&mut bytes, encoded_len, limits)?;
                 Ok((vec![document], false))
             }
-            PreparedFilterRoute::Scatter(matcher) => {
-                let matcher = matcher.clone();
+            PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. } => {
+                let matcher = state.source.matcher().cloned();
                 if state.sorter.is_some() {
                     return self
                         .scan_sorted_document_page(
@@ -1834,6 +1829,12 @@ impl Engine {
             Vec::with_capacity(usize::from(self.shard_count()));
         let mut retained_bytes = 0_u64;
         for shard in 0..self.shard_count() {
+            if !state.source.targets(shard) {
+                // Frontier positions remain physical shard IDs during the
+                // global natural-order merge and subsequent page continuation.
+                frontiers.push(None);
+                continue;
+            }
             let matcher = matcher.clone();
             let record = self
                 .run_document_shard(
@@ -2017,8 +2018,8 @@ fn cursor_page_base_bytes(state: &CursorState, shards: u16) -> u64 {
             PreparedFilterRoute::Point { id_key, .. } => {
                 DOCUMENT_RESULT_VALUE_BYTES + 10 + id_key.as_bytes().len() as u64
             }
-            PreparedFilterRoute::Scatter(_) => {
-                DOCUMENT_RESULT_VALUE_BYTES + 8 + u64::from(shards) * 2
+            PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. } => {
+                DOCUMENT_RESULT_VALUE_BYTES + 8 + state.source.shards(shards).count() as u64 * 2
             }
         }
 }
@@ -2227,7 +2228,14 @@ fn prepare_filter_route(
             let matcher = DocumentMatcher::compile_with_check(filter.document(), &mut || {
                 ensure_document_cpu_active(cancellation, control)
             })?;
-            Ok(PreparedFilterRoute::Scatter(Some(Arc::new(matcher))))
+            let matcher = Arc::new(matcher);
+            // Validate every query branch before deriving any routing shortcut.
+            if let Some(shards) =
+                id_routing::literal_in_shards(storage, filter, cancellation, control)?
+            {
+                return Ok(PreparedFilterRoute::ShardSubset { matcher, shards });
+            }
+            Ok(PreparedFilterRoute::Scatter(Some(matcher)))
         }
     }
 }
@@ -2254,6 +2262,7 @@ fn validate_point_record(
     Ok(())
 }
 
+#[cfg(test)]
 fn scatter_plan(
     collection_id: DocumentCollectionId,
     shard_count: u16,

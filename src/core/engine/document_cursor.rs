@@ -13,7 +13,8 @@ use crate::{
     document::{
         BsonDocument, CanonicalBsonKey, DocumentAggregationStream, DocumentCollectionId,
         DocumentCursorError, DocumentCursorId, DocumentDatabaseId, DocumentMatcher,
-        DocumentNamespace, DocumentProjector, DocumentSortKey, DocumentSorter,
+        DocumentNamespace, DocumentPlan, DocumentPointPlan, DocumentProjector, DocumentScatterPlan,
+        DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -30,6 +31,52 @@ pub(super) enum CursorSource {
         shard: u16,
     },
     Scatter(Option<Arc<DocumentMatcher>>),
+    /// A proven nonempty subset of the at most 64 physical shards. The complete
+    /// matcher remains authoritative; the bitmap is only a routing restriction.
+    ShardSubset {
+        matcher: Arc<DocumentMatcher>,
+        shards: u64,
+    },
+}
+
+impl CursorSource {
+    pub(super) fn targets(&self, shard: u16) -> bool {
+        match self {
+            Self::Point { shard: target, .. } => *target == shard,
+            Self::Scatter(_) => true,
+            Self::ShardSubset { shards, .. } => shards & (1_u64 << shard) != 0,
+        }
+    }
+
+    pub(super) fn shards(&self, shard_count: u16) -> impl Iterator<Item = u16> + '_ {
+        (0..shard_count).filter(|shard| self.targets(*shard))
+    }
+
+    pub(super) fn matcher(&self) -> Option<&Arc<DocumentMatcher>> {
+        match self {
+            Self::Point { .. } => None,
+            Self::Scatter(matcher) => matcher.as_ref(),
+            Self::ShardSubset { matcher, .. } => Some(matcher),
+        }
+    }
+
+    pub(super) fn plan(
+        &self,
+        collection_id: DocumentCollectionId,
+        shard_count: u16,
+    ) -> EngineResult<DocumentPlan> {
+        match self {
+            Self::Point { id_key, shard } => {
+                DocumentPointPlan::new(collection_id, *shard, id_key.clone())
+                    .map(DocumentPlan::Point)
+            }
+            Self::Scatter(_) | Self::ShardSubset { .. } => DocumentScatterPlan::new(
+                collection_id,
+                self.shards(shard_count).collect::<Vec<_>>(),
+            )
+            .map(DocumentPlan::Scatter),
+        }
+    }
 }
 
 pub(super) struct CursorState {
@@ -168,7 +215,8 @@ impl CursorState {
             )
             .saturating_add(match &self.source {
                 CursorSource::Point { id_key, .. } => id_key.as_bytes().len(),
-                CursorSource::Scatter(Some(matcher)) => matcher.retained_bytes(),
+                CursorSource::Scatter(Some(matcher))
+                | CursorSource::ShardSubset { matcher, .. } => matcher.retained_bytes(),
                 CursorSource::Scatter(None) => 0,
             })
     }

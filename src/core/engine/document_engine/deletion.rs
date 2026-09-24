@@ -41,14 +41,7 @@ impl Engine {
                         Arc::clone(&control),
                     )?;
                     let collection_id = require_collection(collection)?.id();
-                    let plan = match &route {
-                        PreparedFilterRoute::Point { id_key, shard } => DocumentPlan::Point(
-                            DocumentPointPlan::new(collection_id, *shard, id_key.clone())?,
-                        ),
-                        PreparedFilterRoute::Scatter(_) => {
-                            scatter_plan(collection_id, shard_count)?
-                        }
-                    };
+                    let plan = route.plan(collection_id, shard_count)?;
                     // The result has fixed size regardless of the eventual count.
                     // Reject delivery limits before admitting any writes.
                     enforce_execution_result_limits(
@@ -96,9 +89,12 @@ impl Engine {
                     .await?;
                 u64::from(deleted)
             }
-            PreparedFilterRoute::Scatter(matcher) if scope == DocumentMutationScope::Many => {
+            route @ (PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. })
+                if scope == DocumentMutationScope::Many =>
+            {
+                let matcher = route.matcher().cloned();
                 let mut count = 0u64;
-                for shard in 0..shard_count {
+                for shard in route.shards(shard_count) {
                     let matcher = matcher.clone();
                     let deleted = self
                         .run_document_shard_controlled(
@@ -152,11 +148,12 @@ impl Engine {
                 }
                 count
             }
-            PreparedFilterRoute::Scatter(matcher) => {
+            route @ (PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. }) => {
+                let matcher = route.matcher().cloned();
                 loop {
                     // Retain only one canonical identity, never a document per shard.
                     let mut earliest: Option<Candidate> = None;
-                    for shard in 0..shard_count {
+                    for shard in route.shards(shard_count) {
                         let matcher = matcher.clone();
                         let candidate = self
                             .run_document_shard_controlled(

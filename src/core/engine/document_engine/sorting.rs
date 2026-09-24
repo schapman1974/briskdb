@@ -139,7 +139,7 @@ impl Engine {
                 .saturating_add(1)
                 .min(MAX_WINDOW_KEYS) as usize;
             let mut window = Window::new(capacity, MAX_WINDOW_BYTES);
-            for shard in 0..self.shard_count() {
+            for shard in state.source.shards(self.shard_count()) {
                 let sorter = sorter.clone();
                 let matcher = matcher.clone();
                 let after = state.sort_after.clone();

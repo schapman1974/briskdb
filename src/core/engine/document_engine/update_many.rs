@@ -36,14 +36,7 @@ impl Engine {
                             Arc::clone(&control),
                         )?)?
                         .id();
-                    let plan = match &route {
-                        PreparedFilterRoute::Point { id_key, shard } => DocumentPlan::Point(
-                            DocumentPointPlan::new(collection_id, *shard, id_key.clone())?,
-                        ),
-                        PreparedFilterRoute::Scatter(_) => {
-                            scatter_plan(collection_id, shard_count)?
-                        }
-                    };
+                    let plan = route.plan(collection_id, shard_count)?;
                     // Counts occupy fixed-width fields. Preflight the final delivery
                     // shape before the first shard can commit anything.
                     enforce_execution_result_limits_with_check(
@@ -56,9 +49,11 @@ impl Engine {
                 },
             )
             .await?;
-        let (shards, key, matcher) = match route {
-            PreparedFilterRoute::Point { id_key, shard } => (shard..shard + 1, Some(id_key), None),
-            PreparedFilterRoute::Scatter(matcher) => (0..shard_count, None, matcher),
+        let shards = route.shards(shard_count).collect::<Vec<_>>();
+        let matcher = route.matcher().cloned();
+        let key = match route {
+            PreparedFilterRoute::Point { id_key, .. } => Some(id_key),
+            PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. } => None,
         };
         let mut totals = (0u64, 0u64);
         for shard in shards {
