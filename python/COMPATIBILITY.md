@@ -37,7 +37,7 @@ particular interpreter's host SQLite supports extension loading.
 ## Optional BSON dependency
 
 SQL-only applications need no BSON package. The wheel does not declare a
-runtime dependency on `bson` or PyMongo, and importing BriskDB, opening a
+mandatory runtime dependency on `bson` or PyMongo, and importing BriskDB, opening a
 database, and executing SQL do not import either package. Calling a document
 method without the optional package raises `UnsupportedError` with code
 `unsupported` before the command can mutate storage; the same database remains
@@ -47,6 +47,12 @@ Applications using `documents=True` should install PyMongo, which supplies the
 supported `bson` package. The unrelated package named `bson` on PyPI is not a
 supported substitute. The compatibility and release suites pin PyMongo 4.17.0
 and test its BSON classes on every supported wheel target.
+
+`briskdb[pymongo]` installs that exact optional driver for `patch()`, `MongoClient`
+and `AsyncMongoClient`. Importing BriskDB (including SQL wildcard exports) and
+constructing an unentered patch do not load PyMongo. Explicit Mongo client
+imports and entering a patch do. Managed clients currently reject other PyMongo
+versions rather than advertising an untested lifecycle compatibility range.
 
 ## Version parity
 

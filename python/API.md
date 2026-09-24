@@ -34,6 +34,31 @@ management. The `AsyncDatabase`, `AsyncSession`, `AsyncTransaction`, and
 `await`/`async with`. Cancelling a task propagates a native
 `CancellationToken` into the exact Rust request.
 
+## PyMongo-compatible local clients and patching
+
+- `patch(folder=None, backend="sqlite", *, shards=None) -> MongoPatch`
+- `MongoClient(host=None, port=None, document_class=None, tz_aware=None,
+  connect=None, type_registry=None, *, folder=None, shards=None, **driver_options)`
+- `AsyncMongoClient(...)` has equivalent construction arguments and awaited close.
+
+These subclass the optional pinned real PyMongo clients; collection/query behavior
+still uses the shared Rust engine. Direct clients default to `BRISKDB_HOME` or
+`./briskdb-data`; `client.briskdb_path` reports the root. Patch scopes without a
+folder use isolated temporary SQLite roots. Creation defaults to four shards;
+reopen detects the existing layout. Same-process managed owners of one canonical
+persistent path share an engine until the last owner closes it.
+
+`MongoPatch` supports synchronous context/decorator and asynchronous context
+protocols. Async clients require async scopes. Only PyMongo's top-level client
+constructors change, with LIFO restoration and rejection of cross-thread/task
+overlap. Captured patch constructors cannot create clients after scope exit.
+Async startup/cleanup is cancellation-drained and off-thread; synchronous
+entry/exit blocks during lifecycle work. A private Mongo-only loopback listener
+opens no HTTP/admin ports and shares native database shutdown ownership.
+Original remote connection/authentication settings are not used; no new Mongo
+semantics or TinyMongo storage backends are implied. See
+[examples and substitution boundaries](README.md#patch-pymongo-for-local-testing).
+
 ## Native document commands
 
 The Python wheel contains BriskDB's document engine, but each database handle

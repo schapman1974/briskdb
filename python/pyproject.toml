@@ -31,6 +31,9 @@ classifiers = [
 Repository = "https://github.com/schapman1974/briskdb"
 Issues = "https://github.com/schapman1974/briskdb/issues"
 
+[project.optional-dependencies]
+pymongo = ["pymongo==4.17.0"]
+
 [tool.maturin]
 manifest-path = "Cargo.toml"
 python-source = "python"

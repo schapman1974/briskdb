@@ -359,6 +359,48 @@ the server leaves the database running; closing the database drains its servers.
 Mongo remains loopback-only even alongside TLS/SCRAM PostgreSQL or authenticated
 SQLite remote. Their credentials do not secure the Mongo port.
 
+### Use existing PyMongo code with the BriskDB wheel
+
+The wheel built from this checkout supports a TinyMongo-style patch scope:
+
+```bash
+python -m pip install './python[pymongo]'
+```
+
+```python
+import briskdb
+import pymongo
+
+with briskdb.patch(folder="./briskdb-test-data", shards=4):
+    # Import application modules that capture MongoClient inside this scope.
+    with pymongo.MongoClient("mongodb://ignored.example.com") as client:
+        client.app.users.update_one(
+            {"_id": 123}, {"$set": {"name": "Ada"}}, upsert=True
+        )
+        print(client.app.users.find_one({"_id": 123}))
+```
+
+`patch()` without a folder uses isolated **temporary SQLite files**, deleted
+on exit; an explicit folder persists. PyMongo's constructors are restored and
+scope-created clients are closed even if application code raises. Use
+`async with briskdb.patch(...)` with `pymongo.AsyncMongoClient`.
+Direct use needs no global patch:
+
+```python
+from briskdb import MongoClient
+
+with MongoClient(folder="./briskdb-test-data") as client:
+    print(list(client.app.users.find({"name": "Ada"})))
+```
+
+These are real PyMongo 4.17 clients using the wheel's Rust engine and one private
+loopback Mongo socket—**no separate daemon or HTTP/admin listeners**. Supplied
+Mongo hosts, credentials, TLS and topology settings are not used remotely.
+Existing clients and aliases imported before patch entry are unchanged, so patch
+**before importing your application**. This adds integration convenience, not
+new Mongo queries or TinyMongo's alternative storage backends. See
+[patching and async examples](python/README.md#patch-pymongo-for-local-testing).
+
 ### Query registered SQL tables over HTTP
 
 Registered tables can also be queried over HTTP:

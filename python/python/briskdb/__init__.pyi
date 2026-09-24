@@ -40,6 +40,16 @@ from ._briskdb import (
     open as open,
 )
 from .remote import RemoteAttachment as RemoteAttachment, attach_remote as attach_remote
+from .patching import MongoPatch as MongoPatch, patch as patch
+from .mongo import (
+    MongoClient as MongoClient,
+    AsyncMongoClient as AsyncMongoClient,
+    ASCENDING as ASCENDING,
+    DESCENDING as DESCENDING,
+    ReturnDocument as ReturnDocument,
+    IndexModel as IndexModel,
+    errors as errors,
+)
 from .api import (
     AsyncCursor as AsyncCursor,
     AsyncDatabase as AsyncDatabase,

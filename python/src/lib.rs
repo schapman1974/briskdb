@@ -1,6 +1,7 @@
 mod bson;
 mod document_api;
 mod error;
+mod mongo_client;
 mod remote_sqlite;
 mod value;
 
@@ -104,6 +105,7 @@ impl Drop for ServerShared {
 struct DatabaseShared {
     database: Mutex<Option<BriskDb>>,
     servers: Mutex<Vec<Weak<ServerShared>>>,
+    mongo_servers: Mutex<Vec<Weak<mongo_client::MongoShared>>>,
     runtime: Arc<RuntimeOwner>,
     root: PathBuf,
     config: Config,
@@ -121,6 +123,11 @@ impl DatabaseShared {
 
 impl Drop for DatabaseShared {
     fn drop(&mut self) {
+        if let Ok(servers) = self.mongo_servers.get_mut() {
+            for server in servers.iter().filter_map(Weak::upgrade) {
+                let _ = server.begin_close();
+            }
+        }
         if let Ok(servers) = self.servers.get_mut() {
             for server in servers.iter().filter_map(Weak::upgrade) {
                 let _ = server.begin_close();
@@ -725,6 +732,7 @@ impl Database {
                 shared: Arc::new(DatabaseShared {
                     database: Mutex::new(Some(database)),
                     servers: Mutex::new(Vec::new()),
+                    mongo_servers: Mutex::new(Vec::new()),
                     runtime,
                     root,
                     config,
@@ -1054,10 +1062,14 @@ impl Database {
         })
     }
 
+    fn _serve_mongo(&self, py: Python<'_>) -> PyResult<mongo_client::MongoListener> {
+        mongo_client::start(&self.shared, py)
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let shared = Arc::clone(&self.shared);
         let report = run_native(py, move || {
-            let (database, servers) = {
+            let (database, servers, mongo_servers) = {
                 let mut database_slot = shared.database.lock()?;
                 let Some(database) = database_slot.take() else {
                     return Ok(None);
@@ -1068,9 +1080,20 @@ impl Database {
                     .filter_map(Weak::upgrade)
                     .collect::<Vec<_>>();
                 registry.clear();
-                (database, servers)
+                let mut mongo_registry = shared.mongo_servers.lock()?;
+                let mongo_servers = mongo_registry
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>();
+                mongo_registry.clear();
+                (database, servers, mongo_servers)
             };
             let mut listener_failure = None;
+            for server in mongo_servers {
+                if let Err(error) = server.close_native() {
+                    listener_failure.get_or_insert(error);
+                }
+            }
             for server in servers {
                 if let Err(error) = server.close_native() {
                     listener_failure.get_or_insert(error);
@@ -3025,6 +3048,7 @@ fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Cursor>()?;
     module.add_class::<Database>()?;
     module.add_class::<Server>()?;
+    module.add_class::<mongo_client::MongoListener>()?;
     module.add_class::<Session>()?;
     module.add_class::<Transaction>()?;
     module.add_function(wrap_pyfunction!(open_database, module)?)?;

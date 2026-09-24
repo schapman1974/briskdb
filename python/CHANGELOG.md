@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added TinyMongo-style `patch()` and real-PyMongo-backed local
+  `MongoClient`/`AsyncMongoClient`, with an optional pinned `pymongo` extra.
+  Scopes own temporary SQLite storage or a persistent folder, restore client
+  constructors on exit, and drain clients/listener/engine on cleanup. Async
+  clients require async scopes. A private Mongo-only loopback listener opens no
+  HTTP/admin ports. Remote credentials are not forwarded; pre-existing clients
+  and aliases remain unchanged. This adds integration convenience, not new
+  Mongo semantics or TinyMongo storage-backend emulation.
 - Added opt-in `mongo=` to synchronous/async `Database.serve()` and
   `Server.mongo_address`. The shared Mongo listener requires `documents=True`,
   remains loopback-only, and can coexist with PostgreSQL or SQLite remote.

@@ -52,8 +52,23 @@ from .api import (
     open_async,
 )
 from .remote import RemoteAttachment, attach_remote
+from .patching import MongoPatch, patch
+
+ASCENDING = 1
+DESCENDING = -1
+
+
+def __getattr__(name):
+    if name in {"MongoClient", "AsyncMongoClient", "ReturnDocument", "IndexModel", "errors"}:
+        from . import mongo
+        return getattr(mongo, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
+    "MongoPatch",
+    "patch",
+    "ASCENDING",
+    "DESCENDING",
     "RemoteAttachment",
     "attach_remote",
     "BriskDBError",

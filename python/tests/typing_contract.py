@@ -5,6 +5,20 @@ import sqlite3
 import briskdb
 
 
+def patched_client_contract(path: str) -> None:
+    with briskdb.patch(folder=path, shards=4) as Client:
+        with Client() as client:
+            print(client.app.items.find_one({"_id": 1}))
+    with briskdb.MongoClient(folder=path) as client:
+        print(client.app.items.find().sort("score", briskdb.DESCENDING).to_list())
+
+
+async def async_patched_client_contract(path: str) -> None:
+    async with briskdb.patch(folder=path):
+        async with briskdb.AsyncMongoClient(folder=path) as client:
+            print(await client.app.items.count_documents({}))
+
+
 def remote_contract(database: briskdb.Database, token: str) -> None:
     server: briskdb.Server = database.serve(
         admin=None, sqlite_remote_token=token, sqlite_remote_tables=["notes"],
