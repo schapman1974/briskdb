@@ -353,19 +353,18 @@ There is no pagination option or retained cursor. Request budgets apply to uniqu
 output values rather than unrelated input payloads; exceeding a bound fails the
 whole command. See the [distinct contract and limits](../docs/DOCUMENT_ENGINE.md#distinct-values).
 
-Operator updates/findAndModify, upserts, and native bulk-write helpers remain
-unsupported. There is no Python collection
-object or Python-hosted MongoDB network listener in this slice. The separate
-opt-in Rust Mongo listener also exposes batch inserts/deletes, retained finds
+Native sessions do not provide a PyMongo-style collection object. The opt-in
+Mongo listener, hosted through Rust or Python `db.serve(mongo=...)`, exposes
+batch inserts/deletes, retained finds
 and aggregation, `estimated_document_count()`, and aggregation-backed
 `count_documents()` through PyMongo. These share the native document engine.
 
 ## Attached listeners
 
-- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None) -> Server`; pass `admin=None` to disable administration
+- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, mongo=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None, sqlite_remote_token=None, sqlite_remote_tables=None, sqlite_remote_routing_key=None) -> Server`; pass `admin=None` to disable administration
 - `await async_db.serve(...) -> AsyncServer`
 - `Server.data_address` reports the data address and `Server.http_address`
-  remains its compatibility alias. `.admin_address` and `.postgres_address`
+  remains its compatibility alias. `.admin_address`, `.postgres_address`, and `.mongo_address`
   report optional bound addresses.
 - `Server.close()` is idempotent; server context exit closes only listeners.
 - Database close first drains every attached server, then stops the engine.
@@ -379,6 +378,16 @@ permit a non-loopback PostgreSQL address. This is single-identity
 authentication, not roles or authorization. The PostgreSQL endpoint supports
 BriskDB's documented bounded SQL subset. See the repository's
 [HTTP listener contract](../docs/HTTP_LISTENERS.md).
+
+`mongo="127.0.0.1:0"` enables the shared Mongo subset and reports the OS-assigned
+port through `mongo_address`. It requires opening with `documents=True`; it
+never enables documents implicitly. Mongo accepts only numeric loopback socket
+addresses, is unauthenticated, and remains loopback-only alongside secured
+PostgreSQL or SQLite remote. Fixed-port collisions and failed binds reject startup
+without stopping the borrowed database or retaining any newly bound sockets.
+Mongo uses the same attached-server ownership, close/drain and database-close
+registry as the other listeners. Its BSON collections are separate from SQL
+tables. No Mongo socket or Python client dependency is enabled by default.
 
 ## Results and errors
 

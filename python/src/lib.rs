@@ -869,6 +869,7 @@ impl Database {
         http = "127.0.0.1:0",
         admin = "127.0.0.1:0",
         postgres = None,
+        mongo = None,
         postgres_tls_cert = None,
         postgres_tls_key = None,
         postgres_user = "briskdb",
@@ -885,6 +886,7 @@ impl Database {
         http: &str,
         admin: Option<&str>,
         postgres: Option<&str>,
+        mongo: Option<&str>,
         postgres_tls_cert: Option<PathBuf>,
         postgres_tls_key: Option<PathBuf>,
         postgres_user: &str,
@@ -934,6 +936,12 @@ impl Database {
         let postgres_listen = postgres
             .map(|address| parse_listener_address(address, "PostgreSQL"))
             .transpose()?;
+        let mongo_listen = mongo
+            .map(|address| parse_listener_address(address, "Mongo"))
+            .transpose()?;
+        if let Some(address) = mongo_listen {
+            validate_python_listener_address(address, "Mongo")?;
+        }
         validate_python_listener_address(http_listen, "HTTP")?;
         if let Some(address) = admin_listen {
             validate_python_listener_address(address, "admin HTTP")?;
@@ -975,33 +983,63 @@ impl Database {
                 admin_listen,
                 postgres_listen,
             };
-            let attached = match (remote, postgres_security) {
-                (Some(remote), _) => {
-                    shared
-                        .runtime
-                        .runtime
-                        .block_on(AttachedServer::start_sqlite_remote(
+            let attached =
+                match (remote, postgres_security, mongo_listen) {
+                    (Some(remote), _, Some(address)) => shared.runtime.runtime.block_on(
+                        AttachedServer::start_sqlite_remote_with_mongo(
                             &database,
                             listener_config,
                             remote,
-                        ))
-                }
-                (None, Some(security)) => {
-                    shared
+                            address,
+                        ),
+                    ),
+                    (Some(remote), _, None) => {
+                        shared
+                            .runtime
+                            .runtime
+                            .block_on(AttachedServer::start_sqlite_remote(
+                                &database,
+                                listener_config,
+                                remote,
+                            ))
+                    }
+                    (None, Some(security), Some(address)) => {
+                        shared
+                            .runtime
+                            .runtime
+                            .block_on(AttachedServer::start_secure_with_mongo(
+                                &database,
+                                listener_config,
+                                security,
+                                address,
+                            ))
+                    }
+                    (None, Some(security), None) => {
+                        shared
+                            .runtime
+                            .runtime
+                            .block_on(AttachedServer::start_secure(
+                                &database,
+                                listener_config,
+                                security,
+                            ))
+                    }
+                    (None, None, Some(address)) => {
+                        shared
+                            .runtime
+                            .runtime
+                            .block_on(AttachedServer::start_with_mongo(
+                                &database,
+                                listener_config,
+                                address,
+                            ))
+                    }
+                    (None, None, None) => shared
                         .runtime
                         .runtime
-                        .block_on(AttachedServer::start_secure(
-                            &database,
-                            listener_config,
-                            security,
-                        ))
+                        .block_on(AttachedServer::start(&database, listener_config)),
                 }
-                (None, None) => shared
-                    .runtime
-                    .runtime
-                    .block_on(AttachedServer::start(&database, listener_config)),
-            }
-            .map_err(listener_error)?;
+                .map_err(listener_error)?;
             let server = Arc::new(ServerShared {
                 addresses: attached.addresses(),
                 server: Mutex::new(Some(attached)),
@@ -1109,6 +1147,14 @@ impl Server {
     }
 
     #[getter]
+    fn mongo_address(&self) -> Option<String> {
+        self.shared
+            .addresses
+            .mongo()
+            .map(|address| address.to_string())
+    }
+
+    #[getter]
     fn closed(&self) -> PyResult<bool> {
         self.shared.is_closed().map_err(PyErr::from)
     }
@@ -1123,10 +1169,11 @@ impl Server {
 
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "Server(http_address={:?}, admin_address={:?}, postgres_address={:?}, closed={})",
+            "Server(http_address={:?}, admin_address={:?}, postgres_address={:?}, mongo_address={:?}, closed={})",
             self.http_address(),
             self.admin_address(),
             self.postgres_address(),
+            self.mongo_address(),
             self.closed()?
         ))
     }

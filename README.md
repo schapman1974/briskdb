@@ -337,6 +337,28 @@ for supported operations, limits, and the Rust attached-server API.
 To opt into bounded zlib transport, add `compressors="zlib"` to `MongoClient`
 or `AsyncMongoClient`; default connections remain uncompressed.
 
+The Python package built from this checkout can host the same listener, without
+a separate daemon. Install `./python` and `pymongo`, then:
+
+```python
+import briskdb
+from pymongo import MongoClient
+
+with briskdb.open("./briskdb-data", shards=4, documents=True) as db:
+    with db.serve(mongo="127.0.0.1:0") as server:
+        with MongoClient(f"mongodb://{server.mongo_address}") as client:
+            client.demo.users.update_one(
+                {"_id": 123}, {"$set": {"name": "Ada"}}, upsert=True
+            )
+            print(client.demo.users.find_one({"_id": 123}))
+```
+
+`mongo=None` is the default; `documents=True` must be set when opening the
+database. `await db.serve(mongo=...)` also works with `AsyncDatabase`. Closing
+the server leaves the database running; closing the database drains its servers.
+Mongo remains loopback-only even alongside TLS/SCRAM PostgreSQL or authenticated
+SQLite remote. Their credentials do not secure the Mongo port.
+
 ### Query registered SQL tables over HTTP
 
 Registered tables can also be queried over HTTP:

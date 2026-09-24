@@ -77,6 +77,12 @@ server first. Remote PostgreSQL uses the same TLS
 certificate/key/user/password-file keyword arguments as the synchronous
 `Database.serve()` method.
 
+An explicitly document-enabled database also accepts
+`await database.serve(mongo="127.0.0.1:0")`; `server.mongo_address` reports the
+actual socket for `pymongo.AsyncMongoClient`. This defaults to `None`, remains
+unauthenticated/loopback-only even alongside secured PostgreSQL or SQLite remote,
+and shares native BSON collections and the same close/drain lifecycle.
+
 Native document methods have the same sync/async pairing. Enable the document
 engine on open and install PyMongo for its `bson` value classes:
 

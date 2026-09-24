@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added opt-in `mongo=` to synchronous/async `Database.serve()` and
+  `Server.mongo_address`. The shared Mongo listener requires `documents=True`,
+  remains loopback-only, and can coexist with PostgreSQL or SQLite remote.
+  No Mongo socket is enabled by default; PyMongo remains an optional client.
 - Added synchronous/async `list_database_names` with typed name results, shared
   name filters and logical combinations, catalog-only discovery and normal
   request controls. Full disk statistics and statistics-based filters remain

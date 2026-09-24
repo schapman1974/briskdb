@@ -310,6 +310,7 @@ class Database:
         http: str = "127.0.0.1:0",
         admin: Optional[str] = "127.0.0.1:0",
         postgres: Optional[str] = None,
+        mongo: Optional[str] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
@@ -331,6 +332,8 @@ class Server:
     def admin_address(self) -> Optional[str]: ...
     @property
     def postgres_address(self) -> Optional[str]: ...
+    @property
+    def mongo_address(self) -> Optional[str]: ...
     @property
     def closed(self) -> bool: ...
     def close(self) -> ServerCloseReport: ...

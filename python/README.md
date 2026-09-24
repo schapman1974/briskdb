@@ -231,6 +231,29 @@ Closing a server leaves the database usable; closing the database first closes
 all of its attached servers. The asyncio API provides `await db.serve()` and
 an `AsyncServer` context manager with the same lifecycle.
 
+For PyMongo clients, the same wheel includes an optional Mongo listener:
+
+```python
+from pymongo import MongoClient
+
+with briskdb.open("./data", documents=True) as db:
+    with db.serve(mongo="127.0.0.1:0") as server:
+        with MongoClient(f"mongodb://{server.mongo_address}") as client:
+            client.app.notes.update_one(
+                {"_id": 123}, {"$set": {"body": "hello"}}, upsert=True
+            )
+            print(client.app.notes.find_one({"_id": 123}))
+```
+
+This uses the same BSON collections as native document sessions, not SQL tables.
+Mongo is disabled by default (`mongo=None`), requires `documents=True`, and is
+unauthenticated/loopback-only. Neither PostgreSQL credentials nor SQLite remote
+tokens authenticate Mongo. Do not publicly proxy this port. `AsyncDatabase.serve`
+accepts the same option and `AsyncServer.mongo_address` reports its bound address.
+PyMongo is still optional for importing BriskDB and for SQL-only applications.
+See the [Mongo compatibility contract](../docs/MONGO_PARITY.md) for the supported
+subset and limits; this is not a full MongoDB server.
+
 Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.
