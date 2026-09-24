@@ -1,9 +1,10 @@
-# BriskDB 0.1.0-alpha.7 — Unreleased
+# BriskDB 0.1.0-alpha.7 — 2026-09-24
 
-The Rust crate and Python wheel now identify this source/test build as
-`0.1.0-alpha.7` / `0.1.0a7`. This version bump does not publish a GitHub release
-or PyPI package. Use the current checkout or an explicitly supplied alpha.7
-wheel; the public alpha.6 artifacts do not contain all features described here.
+Rust crate version: `0.1.0-alpha.7`; Python distribution version: `0.1.0a7`.
+The tagged release publishes verified macOS/Linux ARM64 and x86-64 wheels and
+a source distribution. Install the optional pinned PyMongo companion with
+`python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0a7'`.
+The older alpha.6 artifacts do not contain all features described here.
 
 Highlights since alpha.6:
 
@@ -23,8 +24,9 @@ Highlights since alpha.6:
 Existing PostgreSQL TLS/SCRAM, HTTP, embedded SQL/Rust/Python, and same-host
 storage boundaries remain. SQL tables and BSON collections are separate data
 models. General cross-shard transactions, production hardening, full protocol
-parity, and MySQL support are not implied. Final remote/release gates remain
-required before publishing; local development validation is not a release gate.
+parity, and MySQL support are not implied. Cross-platform artifact tests and
+native dependency audits are required before publishing; local development
+validation is not a release gate.
 
 PostgreSQL still requires TLS and SCRAM-SHA-256 for remote access and supports
 bounded simple and parameterized text/binary extended queries, with

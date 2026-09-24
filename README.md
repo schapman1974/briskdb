@@ -36,9 +36,9 @@ tables through a local or remote server, using the same Python wheel.
 > [boundaries are explicit](#honest-alpha-boundaries), and measured results are
 > published even when they are not flattering.
 
-Current source/test version: **0.1.0-alpha.7** (Python: `0.1.0a7`), not yet
-published to PyPI. New PyMongo patching and remote `sqlite3` examples require
-this checkout or a supplied current testing wheel, not the older alpha.6 release.
+Version: **0.1.0-alpha.7** (Python: `0.1.0a7`). PyMongo patching and remote
+`sqlite3` require alpha.7 or this checkout, not the older alpha.6 release.
+See [PyPI](https://pypi.org/project/briskdb/0.1.0a7/) for release artifacts.
 
 ## Why developers might care
 
@@ -95,12 +95,14 @@ server. `briskdb.attach_remote()` exposes them as SQLite virtual tables in the
 `remote` schema; it does not replace Python's `sqlite3` driver or copy the
 server's database files. SQLite runs joins, filters, and aggregates locally.
 
-This addon is a **read-only preview on `main`**, not yet published to PyPI.
-From a checkout of this repository, install it with Python 3.9+ and Rust 1.85+:
+This addon is a **read-only alpha preview** included in the alpha.7 wheel:
 
 ```bash
-python -m pip install ./python
+python -m pip install --only-binary=:all: 'briskdb==0.1.0a7'
 ```
+
+To build a checkout instead, use `python -m pip install ./python` with
+Python 3.9+ and Rust 1.85+.
 
 Your Python interpreter must have SQLite 3.31+ with extension-loading support.
 Some macOS Python builds disable it; extension-enabled Homebrew Python 3.14 is
@@ -239,7 +241,7 @@ experimental and opt-in; the exact contract lives in
 | Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, unique indexes and safe equality candidates, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), whole-bulk post-image semantics and broader query planning remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
-| Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb) on `main`; authenticated table access, parameters and local joins; not yet published to PyPI |
+| Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb) in alpha.7; authenticated table access, parameters and local joins |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Where BriskDB fits
@@ -365,12 +367,15 @@ SQLite remote. Their credentials do not secure the Mongo port.
 
 ### Use existing PyMongo code with the BriskDB wheel
 
-The wheel built from this checkout supports TinyMongo-style usage without a
-separate database process. Install from the repository root:
+The alpha.7 wheel supports TinyMongo-style usage without a separate database
+process. Install the wheel and its optional pinned PyMongo companion:
 
 ```bash
-python -m pip install './python[pymongo]'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0a7'
 ```
+
+For a source build, run `python -m pip install './python[pymongo]'` from the
+repository root with Rust 1.85+ installed.
 
 Patch existing PyMongo code for an isolated test:
 

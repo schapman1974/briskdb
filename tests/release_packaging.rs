@@ -59,7 +59,7 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
         "Mongo remains unauthenticated and loopback-only",
         "read-only SQLite virtual-table addon",
         "`briskdb.patch()`",
-        "does not publish a GitHub release or PyPI package",
+        "Cross-platform artifact tests and native dependency audits are required before publishing",
         "complete data-directory copy",
         "There is no stable pre-1.0 on-disk compatibility promise",
         "manifest version 21",

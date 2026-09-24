@@ -1,9 +1,9 @@
 # Python changelog
 
-## 0.1.0-alpha.7 — Unreleased
+## 0.1.0-alpha.7 — 2026-09-24
 
-Python distribution version: `0.1.0a7`. This source/test build is not yet a
-published PyPI release; install the checkout or an explicitly supplied wheel.
+Python distribution version: `0.1.0a7`. Install the optional pinned PyMongo
+companion with `python -m pip install 'briskdb[pymongo]==0.1.0a7'`.
 
 - Added the read-only `attach_remote()` SQLite virtual-table addon for standard
   Python `sqlite3`, with explicit server allowlists and bearer-token access.

@@ -41,10 +41,12 @@ db.close()
 
 ## Patch PyMongo for local testing
 
-The wheel from this checkout includes `briskdb.patch()`, a TinyMongo-style
+The alpha.7 wheel includes `briskdb.patch()`, a TinyMongo-style
 context manager/decorator. Install its optional pinned driver companion:
 
 ```bash
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0a7'
+# Or build a repository checkout with Rust 1.85+:
 python -m pip install './python[pymongo]'
 # For a supplied test wheel (replacing any same-version older build):
 python -m pip install --force-reinstall './briskdb-...whl[pymongo]'
