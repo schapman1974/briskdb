@@ -5,6 +5,10 @@ pub(super) fn assert_driver_metrics_drained(snapshot: &MongoMetricsSnapshot) {
     assert!(snapshot.accepted_connections > 0 && snapshot.admitted_connections > 0);
     assert_eq!(snapshot.active_connections, 0);
     assert_eq!(snapshot.closed_connections, snapshot.admitted_connections);
+    assert!(snapshot.cursors.registered > 0);
+    assert_eq!(snapshot.cursors.active, 0);
+    assert_eq!(snapshot.cursors.registered, snapshot.cursors.closed);
+    assert!(snapshot.cursors.peak <= 32);
     for kind in [MongoCommandKind::Hello, MongoCommandKind::Find] {
         assert!(
             snapshot.command(kind).completed > 0,
@@ -184,5 +188,96 @@ async fn listener_metrics_separate_malformed_truncated_and_clean_shutdown_connec
         snapshot.error_codes().map(|(_, count)| count).sum::<u64>(),
         0
     );
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cursor_metrics_follow_handoff_kill_exhaustion_and_shutdown() {
+    let (_root, database, mut server) = setup().await;
+    let mut first = TcpStream::connect(server.address()).await.unwrap();
+    for id in 1..=3 {
+        send_command(
+            &mut first,
+            &insert_command("metrics", doc([("_id", BsonValue::Int32(id))])),
+        )
+        .await;
+    }
+    let id = live_cursor_id(&send_command(&mut first, &cursor_find("metrics", 0)).await);
+    assert!(id > 0);
+    assert_eq!(
+        (
+            server.metrics().cursors.registered,
+            server.metrics().cursors.active
+        ),
+        (1, 1)
+    );
+    let mut second = TcpStream::connect(server.address()).await.unwrap();
+    assert_eq!(
+        live_cursor_id(&send_command(&mut second, &cursor_more("metrics", id, 1)).await),
+        id
+    );
+    first.shutdown().await.unwrap();
+    disconnected(&mut first).await;
+    send_command(&mut second, &command("ping")).await;
+    assert_eq!(
+        (
+            server.metrics().cursors.registered,
+            server.metrics().cursors.active
+        ),
+        (1, 1)
+    );
+    let killed = send_command(
+        &mut second,
+        &doc([
+            ("killCursors", BsonValue::from("metrics")),
+            ("cursors", BsonValue::Array(vec![BsonValue::Int64(id)])),
+            ("$db", BsonValue::from("wire")),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        killed.get_first("cursorsKilled"),
+        Some(&BsonValue::Array(vec![BsonValue::Int64(id)]))
+    );
+    assert_eq!(
+        (
+            server.metrics().cursors.closed,
+            server.metrics().cursors.active
+        ),
+        (1, 0)
+    );
+    let id = live_cursor_id(&send_command(&mut second, &cursor_find("metrics", 0)).await);
+    assert!(id > 0);
+    assert_eq!(
+        live_cursor_id(&send_command(&mut second, &cursor_more("metrics", id, 10)).await),
+        0
+    );
+    assert_eq!(
+        (
+            server.metrics().cursors.closed,
+            server.metrics().cursors.active
+        ),
+        (2, 0)
+    );
+    assert!(live_cursor_id(&send_command(&mut second, &cursor_find("metrics", 0)).await) > 0);
+    assert_eq!(
+        (
+            server.metrics().cursors.registered,
+            server.metrics().cursors.active
+        ),
+        (3, 1)
+    );
+    server.close().await.unwrap();
+    let cursors = server.metrics().cursors;
+    assert_eq!(
+        (
+            cursors.registered,
+            cursors.closed,
+            cursors.active,
+            cursors.peak
+        ),
+        (3, 3, 0, 1)
+    );
+    assert_eq!((cursors.idle_expired, cursors.limit_rejections), (0, 0));
     database.close().await.unwrap();
 }

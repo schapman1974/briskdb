@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::super::metrics;
 use super::{CommandError, Result};
 use crate::{
     core::Session,
@@ -25,12 +26,20 @@ struct Entry {
     touched: Instant,
     remaining: Option<Duration>,
     in_use: bool,
+    metrics: metrics::CursorGuard,
 }
 
 #[derive(Default)]
-pub(super) struct WireCursors(Mutex<BTreeMap<DocumentCursorId, Entry>>);
+pub(super) struct WireCursors(
+    Mutex<BTreeMap<DocumentCursorId, Entry>>,
+    Arc<metrics::Metrics>,
+);
 
 impl WireCursors {
+    pub(super) fn new(metrics: Arc<metrics::Metrics>) -> Self {
+        Self(Mutex::new(BTreeMap::new()), metrics)
+    }
+
     pub fn register(
         &self,
         id: DocumentCursorId,
@@ -48,6 +57,7 @@ impl WireCursors {
                 .count()
                 >= MAX_CONNECTION_CURSORS
         {
+            self.1.cursor_rejected();
             return Err(CommandError::new(
                 10334,
                 "BSONObjectTooLarge",
@@ -63,6 +73,7 @@ impl WireCursors {
                 touched: Instant::now(),
                 remaining,
                 in_use: false,
+                metrics: self.1.register_cursor(),
             },
         );
         Ok(())
@@ -88,6 +99,7 @@ impl WireCursors {
                 .count()
                 >= MAX_CONNECTION_CURSORS
         {
+            self.1.cursor_rejected();
             return Err(CommandError::new(
                 10334,
                 "BSONObjectTooLarge",
@@ -162,7 +174,13 @@ impl WireCursors {
 }
 
 fn prune(entries: &mut BTreeMap<DocumentCursorId, Entry>) {
-    entries.retain(|_, entry| entry.in_use || entry.touched.elapsed() < IDLE_TIMEOUT);
+    entries.retain(|_, entry| {
+        let keep = entry.in_use || entry.touched.elapsed() < IDLE_TIMEOUT;
+        if !keep {
+            entry.metrics.expired();
+        }
+        keep
+    });
 }
 
 pub(super) struct WireCursorLease {
@@ -255,6 +273,21 @@ mod tests {
         }
     }
 
+    fn assert_counts(metrics: &metrics::Metrics, expected: (u64, u64, u64, u64, u64, u64)) {
+        let cursors = metrics.snapshot().cursors;
+        assert_eq!(
+            (
+                cursors.registered,
+                cursors.closed,
+                cursors.active,
+                cursors.peak,
+                cursors.idle_expired,
+                cursors.limit_rejections
+            ),
+            expected
+        );
+    }
+
     #[test]
     fn cumulative_budget_busy_and_abandoned_leases_are_bounded() {
         let registry = Arc::new(WireCursors::default());
@@ -281,6 +314,7 @@ mod tests {
             .complete(Duration::ZERO, false)
             .unwrap();
         assert!(registry.0.lock().unwrap().is_empty());
+        assert_counts(&registry.1, (3, 3, 0, 1, 0, 0));
     }
 
     #[test]
@@ -313,6 +347,7 @@ mod tests {
         assert!(registry.0.lock().unwrap().contains_key(&id));
         registry.discard(id);
         assert_eq!(lease.complete(Duration::ZERO, true).unwrap_err().code, 43);
+        assert_counts(&registry.1, (3, 3, 0, 1, 1, 0));
     }
 
     #[test]
@@ -335,5 +370,50 @@ mod tests {
             .complete(Duration::ZERO, true)
             .unwrap();
         assert_eq!(registry.0.lock().unwrap().get(&id).unwrap().connection, 10);
+        assert_counts(&registry.1, (9, 1, 8, 9, 0, 1));
+        let metrics = Arc::clone(&registry.1);
+        drop(registry);
+        assert_counts(&metrics, (9, 9, 0, 9, 0, 1));
+    }
+
+    #[test]
+    fn capacity_rejections_do_not_register_and_registry_drop_drains_all_cursors() {
+        for owners in [1, 4] {
+            let metrics = Arc::new(metrics::Metrics::default());
+            let registry = WireCursors::new(Arc::clone(&metrics));
+            let total = owners * 8;
+            for value in 1..=total {
+                register(&registry, value, (value - 1) / 8, None);
+            }
+            let rejected = registry.register(
+                DocumentCursorId::new(total + 1).unwrap(),
+                namespace(),
+                Arc::new(Session::new(1, PreparedStatementLimits::default())),
+                if owners == 1 { 0 } else { 4 },
+                None,
+            );
+            assert_eq!(rejected.unwrap_err().code, 10334);
+            assert_counts(&metrics, (total, 0, total, total, 0, 1));
+            drop(registry);
+            assert_counts(&metrics, (total, total, 0, total, 0, 1));
+        }
+    }
+
+    #[test]
+    fn explicit_take_closes_once_without_retaining_session_or_registry() {
+        let metrics = Arc::new(metrics::Metrics::default());
+        let registry = Arc::new(WireCursors::new(Arc::clone(&metrics)));
+        let id = register(&registry, 1, 10, None);
+        let session = registry.take(id, &namespace()).unwrap();
+        let weak_session = Arc::downgrade(&session);
+        assert_counts(&metrics, (1, 1, 0, 1, 0, 0));
+        assert!(registry.take(id, &namespace()).is_none());
+        registry.discard(id);
+        drop(session);
+        let weak_registry = Arc::downgrade(&registry);
+        drop(registry);
+        assert!(weak_session.upgrade().is_none());
+        assert!(weak_registry.upgrade().is_none());
+        assert_counts(&metrics, (1, 1, 0, 1, 0, 0));
     }
 }

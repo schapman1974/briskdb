@@ -868,11 +868,13 @@ requires an earlier dependency:
       can now inspect payload-free listener-local Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way
       outcomes, write/response-limit errors and bounded latency histograms.
+      Wire cursor metrics track registration, active/peak/closed entries, idle
+      expiry and capacity rejection without double-counting batches or handoffs.
       Drop guards drain live gauges on completion/abort; counters saturate and
       snapshots remain available after close without retaining engine resources.
       Native concurrency/unwind and real socket fixtures cover outcomes, cap
       rejection, malformed frames, response limits and listener-local reset.
-      Cursor/row/shard telemetry, exporters/tracing, readiness and broader fault/
+      Row/shard telemetry, exporters/tracing, readiness and broader fault/
       soak acceptance remain open; no listener policy or timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

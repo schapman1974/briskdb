@@ -479,6 +479,13 @@ counter, write-error occurrences and response-size rejections. Command counters
 separate started, in-flight, completed, failed, aborted and deliberately suppressed
 one-way responses. Unknown command names share `Other`; namespaces, query values,
 identities and diagnostic text never become labels or retained metric data.
+The `cursors` group exposes registered, active, peak and closed wire cursors,
+idle-pruned entries and connection/registry capacity rejections (including failed
+handoffs). Retained batches and socket handoffs do not re-register a cursor.
+Every registry removal counts as closed: exhaustion, explicit kill, errors,
+idle expiry, owning-socket disconnect and listener shutdown. Idle expiry does
+not include execution-budget exhaustion (already reported as command code 50).
+These are listener wire-registry counts, not all embedded engine cursors.
 
 ```rust,ignore
 use briskdb::protocol::mongo::MongoCommandKind;
@@ -500,7 +507,7 @@ commands, from complete frame through reply construction; socket framing and
 delivery are excluded. Live snapshots sample atomics separately; accounting
 identities are meaningful after drain, not during concurrent updates. Totals
 saturate, gauges are admission-bounded, close retains final counters, and a new
-listener starts at zero. This is not a Prometheus endpoint, cursor/row/shard
+listener starts at zero. This is not a Prometheus endpoint, row/shard
 telemetry, correlated tracing, or completion of the broader #187 hardening gate.
 
 Projection uses the shared engine transform after filtering; projected fields

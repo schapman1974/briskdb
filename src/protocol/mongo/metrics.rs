@@ -170,6 +170,22 @@ pub struct MongoTransportFailures {
     pub io: u64,
 }
 
+/// Listener wire-cursor registry counters, not all native engine cursors.
+/// Handoff and retained getMore batches do not register another cursor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MongoCursorMetrics {
+    pub registered: u64,
+    pub active: u64,
+    pub peak: u64,
+    /// All removed entries: exhaustion, kill, error, expiry, disconnect or close.
+    pub closed: u64,
+    /// Entries removed by idle pruning; execution-budget errors are separate.
+    pub idle_expired: u64,
+    /// Registry/connection capacity rejections, including a receiving handoff.
+    pub limit_rejections: u64,
+}
+
 /// Listener-local cumulative counters. Concurrent fields are sampled separately,
 /// not as a globally atomic snapshot; compare accounting identities after drain.
 /// Totals saturate instead of wrapping. Live gauges are bounded by admission.
@@ -185,6 +201,7 @@ pub struct MongoMetricsSnapshot {
     pub accept_failures: u64,
     pub connection_task_failures: u64,
     pub transport_failures: MongoTransportFailures,
+    pub cursors: MongoCursorMetrics,
     pub write_errors: u64,
     pub response_limit_rejections: u64,
     commands: [MongoCommandMetrics; COMMANDS],
@@ -227,6 +244,16 @@ struct CommandCounters {
 }
 
 #[derive(Default)]
+struct CursorCounters {
+    registered: AtomicU64,
+    active: AtomicU64,
+    peak: AtomicU64,
+    closed: AtomicU64,
+    expired: AtomicU64,
+    rejected: AtomicU64,
+}
+
+#[derive(Default)]
 pub(super) struct Metrics {
     accepted: AtomicU64,
     admitted: AtomicU64,
@@ -239,6 +266,7 @@ pub(super) struct Metrics {
     transport: [AtomicU64; 4],
     write_errors: AtomicU64,
     response_limits: AtomicU64,
+    cursors: CursorCounters,
     commands: [CommandCounters; COMMANDS],
     error_codes: [AtomicU64; 31],
     other_codes: AtomicU64,
@@ -278,6 +306,14 @@ impl Metrics {
                 io: get(&self.transport[3]),
             },
             write_errors: get(&self.write_errors),
+            cursors: MongoCursorMetrics {
+                registered: get(&self.cursors.registered),
+                active: get(&self.cursors.active),
+                peak: get(&self.cursors.peak),
+                closed: get(&self.cursors.closed),
+                idle_expired: get(&self.cursors.expired),
+                limit_rejections: get(&self.cursors.rejected),
+            },
             response_limit_rejections: get(&self.response_limits),
             commands: std::array::from_fn(|i| {
                 let c = &self.commands[i];
@@ -313,6 +349,15 @@ impl Metrics {
     }
     pub(super) fn response_rejected(&self) {
         add(&self.response_limits, 1);
+    }
+    pub(super) fn register_cursor(self: &Arc<Self>) -> CursorGuard {
+        add(&self.cursors.registered, 1);
+        let active = self.cursors.active.fetch_add(1, Ordering::Relaxed) + 1;
+        self.cursors.peak.fetch_max(active, Ordering::Relaxed);
+        CursorGuard(Arc::clone(self))
+    }
+    pub(super) fn cursor_rejected(&self) {
+        add(&self.cursors.rejected, 1);
     }
     pub(super) fn connection_error(&self, kind: io::ErrorKind) {
         let i = match kind {
@@ -362,6 +407,20 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::Relaxed);
         add(&self.0.closed, 1);
+    }
+}
+
+/// Exactly one guard per registered entry, never cloned into a cursor lease.
+pub(super) struct CursorGuard(Arc<Metrics>);
+impl CursorGuard {
+    pub(super) fn expired(&self) {
+        add(&self.0.cursors.expired, 1);
+    }
+}
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        self.0.cursors.active.fetch_sub(1, Ordering::Relaxed);
+        add(&self.0.cursors.closed, 1);
     }
 }
 

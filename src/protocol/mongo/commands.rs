@@ -11,7 +11,7 @@ mod indexes;
 
 use tokio::sync::Mutex;
 
-use super::{Request, wire};
+use super::{Request, metrics, wire};
 use crate::{
     BriskDb, CancellationToken, DocumentSupport,
     core::{EngineError, EngineErrorKind, RequestContext, ResultLimits, Session},
@@ -1178,11 +1178,11 @@ pub(super) struct Executor {
 }
 
 impl Executor {
-    pub(super) fn new(database: BriskDb) -> Self {
+    pub(super) fn new(database: BriskDb, metrics: Arc<metrics::Metrics>) -> Self {
         Self {
             database,
             creation: Mutex::new(()),
-            cursors: Arc::new(cursors::WireCursors::default()),
+            cursors: Arc::new(cursors::WireCursors::new(metrics)),
         }
     }
 
