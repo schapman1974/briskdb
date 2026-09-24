@@ -177,8 +177,9 @@ mod enabled {
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
             DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
-            DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexProbe, DocumentMatcher,
-            DocumentNamespace, DocumentPlacement, PreparedDocumentIndexEntries, encode_document,
+            DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexProbe,
+            DocumentIndexSelection, DocumentMatcher, DocumentNamespace, DocumentPlacement,
+            PreparedDocumentIndexEntries, encode_document,
         },
         sqlite_error,
     };
@@ -2173,10 +2174,14 @@ mod enabled {
             let sqlite_limit =
                 i64::try_from(limit).expect("bounded document scan limit fits SQLite");
             require_schema(connection)?;
-            let membership_sql = probe
-                .filter(|probe| probe.keys().len() > 1)
-                .map(|probe| candidate_sql::membership(probe.keys().len()));
-            let sql = if let Some(sql) = membership_sql.as_deref() {
+            let grouped_sql = match probe.map(DocumentIndexProbe::selection) {
+                Some(DocumentIndexSelection::Keys(keys)) if keys.len() > 1 => {
+                    Some(candidate_sql::membership(keys.len()))
+                }
+                Some(DocumentIndexSelection::SparseEntries) => Some(candidate_sql::sparse()),
+                _ => None,
+            };
+            let sql = if let Some(sql) = grouped_sql.as_deref() {
                 sql
             } else if probe.is_some() {
                 // Keep natural-order pagination and let SQLite choose join
@@ -2201,8 +2206,14 @@ mod enabled {
             let mut statement = connection.prepare(sql).map_err(|error| {
                 shard_read_error(error, "failed to prepare stored BSON document scan")
             })?;
-            let mut rows = match probe {
-                Some(probe) if probe.keys().len() > 1 => {
+            let mut rows = match probe.map(|probe| (probe, probe.selection())) {
+                Some((probe, DocumentIndexSelection::SparseEntries)) => statement.query(params![
+                    to_sqlite_id(collection_id)?,
+                    after_natural_order,
+                    sqlite_limit,
+                    probe.index_id().get() as i64,
+                ]),
+                Some((probe, DocumentIndexSelection::Keys(keys))) if keys.len() > 1 => {
                     use rusqlite::types::{ToSqlOutput, ValueRef};
                     // Borrow the existing encoded keys; do not make another
                     // per-shard copy of a potentially large membership list.
@@ -2213,19 +2224,19 @@ mod enabled {
                         ValueRef::Integer(probe.index_id().get() as i64),
                     ]
                     .into_iter()
-                    .chain(probe.keys().iter().map(|key| ValueRef::Blob(key)))
+                    .chain(keys.iter().map(|key| ValueRef::Blob(key)))
                     .chain(std::iter::once(ValueRef::Blob(
                         crate::document::NON_UNIQUE_FALLBACK_KEY,
                     )))
                     .map(ToSqlOutput::Borrowed);
                     statement.query(rusqlite::params_from_iter(values))
                 }
-                Some(probe) => statement.query(params![
+                Some((probe, DocumentIndexSelection::Keys(keys))) => statement.query(params![
                     to_sqlite_id(collection_id)?,
                     after_natural_order,
                     sqlite_limit,
                     probe.index_id().get() as i64,
-                    &probe.keys()[0],
+                    &keys[0],
                     crate::document::NON_UNIQUE_FALLBACK_KEY,
                 ]),
                 None => statement.query(params![

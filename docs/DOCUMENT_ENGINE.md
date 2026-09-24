@@ -282,6 +282,18 @@ the natural-order range and streams grouping without an all-candidate temporary
 sort, including after SQLite statistics are collected. Aggregation still receives its
 original unfiltered source rows; membership probes do not bypass its accounting.
 
+After equality and finite membership candidates, a necessary positive
+`$exists: true` clause can select all entries of a non-partial sparse Ready index.
+Direct fields and positive `$and` clauses qualify; alternatives, negations and
+`$exists: false` alone do not. For a compound sparse index, one qualifying indexed
+path suffices because sparse membership requires any indexed field to exist.
+Explicit null and empty arrays are present, not missing. Non-unique fallback
+entries remain included, and the full matcher removes other compound-path or
+residual matches. The same document-first, grouped natural-order pagination and
+checksum validation apply, without retaining all keys or index rows in memory.
+No sparse authority is retained across cursor requests, and mutations maintain
+entry membership transactionally when fields are removed.
+
 Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
 9,541 eligible matching candidates) without false negatives, plus native and
 real-driver scan differentials, residual filters, paging, index churn, write

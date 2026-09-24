@@ -72,7 +72,7 @@ pub use index_keys::{
     DocumentIndexPreparation, MAX_DOCUMENT_INDEX_KEY_BYTES, MAX_DOCUMENT_PREPARED_INDEXES,
     PreparedDocumentIndexEntries, PreparedDocumentIndexKeys,
 };
-pub(crate) use index_keys::{DocumentIndexProbe, NON_UNIQUE_FALLBACK_KEY};
+pub(crate) use index_keys::{DocumentIndexProbe, DocumentIndexSelection, NON_UNIQUE_FALLBACK_KEY};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
 pub use matcher::{DocumentMatcher, DocumentQueryError};
 pub use options::{

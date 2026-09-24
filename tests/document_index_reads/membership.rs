@@ -58,7 +58,6 @@ pub(super) fn queries() -> Vec<BsonDocument> {
 
 fn mutation(namespace: DocumentNamespace, mode: u8) -> DocumentCommand {
     let upsert = mode >= 8;
-    let mode = if upsert { mode - 8 } else { mode };
     let filter = DocumentFilter::new(if upsert {
         doc([
             (
@@ -71,6 +70,16 @@ fn mutation(namespace: DocumentNamespace, mode: u8) -> DocumentCommand {
         doc([("a", list())])
     })
     .unwrap();
+    mutation_with_filter(namespace, mode, filter)
+}
+
+pub(super) fn mutation_with_filter(
+    namespace: DocumentNamespace,
+    mode: u8,
+    filter: DocumentFilter,
+) -> DocumentCommand {
+    let upsert = mode >= 8;
+    let mode = if upsert { mode - 8 } else { mode };
     let write = DocumentWriteOptions::new().with_upsert(upsert);
     let read = DocumentReadOptions::new()
         .with_sort(DocumentSort::new(doc([("rank", BsonValue::Int32(-1))])).unwrap())
@@ -264,18 +273,25 @@ async fn membership_cursor_reselects_current_index_authority_between_pages() {
 
 #[tokio::test]
 async fn membership_selection_skips_unselected_bson_before_reads_and_writes() {
+    assert_physical_selection(
+        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+        doc([("a", list())]),
+        15,
+    )
+    .await;
+}
+
+pub(super) async fn assert_physical_selection(
+    definition: DocumentIndexRequest,
+    query: BsonDocument,
+    expected: usize,
+) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 2).await.unwrap();
     let session = engine.session();
     let namespace = ns("membership_physical");
     seed(&engine, &session, &namespace, 35).await;
-    build(
-        &engine,
-        &session,
-        &namespace,
-        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
-    )
-    .await;
+    build(&engine, &session, &namespace, definition).await;
     let key = CanonicalBsonKey::encode(&BsonValue::Int32(0)).unwrap();
     let mut restore = None;
     for shard in 0..2 {
@@ -299,16 +315,25 @@ async fn membership_selection_skips_unselected_bson_before_reads_and_writes() {
         &engine,
         &session,
         &namespace,
-        &doc([("a", list())]),
+        &query,
         DocumentReadOptions::new().with_batch_size(2).unwrap(),
     )
     .await;
-    assert_eq!(found.len(), 15);
-    let result = call(&engine, &session, mutation(namespace.clone(), 1)).await;
+    assert_eq!(found.len(), expected);
+    let result = call(
+        &engine,
+        &session,
+        mutation_with_filter(
+            namespace.clone(),
+            1,
+            DocumentFilter::new(query.clone()).unwrap(),
+        ),
+    )
+    .await;
     let DocumentResult::Update(result) = result.result() else {
         panic!("update");
     };
-    assert_eq!(result.modified_count(), 15);
+    assert_eq!(result.modified_count(), expected as u64);
     let (connection, checksum) = restore.unwrap();
     assert_eq!(
         connection
@@ -327,30 +352,35 @@ async fn membership_selection_skips_unselected_bson_before_reads_and_writes() {
             &engine,
             &engine.session(),
             &namespace,
-            &doc([("a", list())]),
+            &query,
             DocumentReadOptions::new()
         )
         .await
         .len(),
-        15
+        expected
     );
     engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn membership_selection_validates_the_chosen_multikey_entry_checksum() {
+    assert_candidate_checksum(
+        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+        doc([("a", list())]),
+    )
+    .await;
+}
+
+pub(super) async fn assert_candidate_checksum(
+    definition: DocumentIndexRequest,
+    query: BsonDocument,
+) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 2).await.unwrap();
     let session = engine.session();
     let namespace = ns("membership_checksum");
     seed(&engine, &session, &namespace, 35).await;
-    build(
-        &engine,
-        &session,
-        &namespace,
-        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
-    )
-    .await;
+    build(&engine, &session, &namespace, definition).await;
     let id = CanonicalBsonKey::encode(&BsonValue::Int32(5)).unwrap();
     let mut restore = None;
     for shard in 0..2 {
@@ -374,7 +404,7 @@ async fn membership_selection_validates_the_chosen_multikey_entry_checksum() {
                 RequestContext::new(),
                 DocumentCommand::Find(DocumentFindRequest::new(
                     namespace.clone(),
-                    DocumentFilter::new(doc([("a", list())])).unwrap(),
+                    DocumentFilter::new(query).unwrap(),
                     DocumentReadOptions::new(),
                 )),
             ),

@@ -23,6 +23,8 @@ use briskdb::{
 
 #[path = "document_index_reads/membership.rs"]
 mod membership;
+#[path = "document_index_reads/presence.rs"]
+mod presence;
 
 fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
     BsonDocument::from_entries(entries).unwrap()
@@ -106,15 +108,36 @@ async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen()
         )]));
     }
     queries.extend(membership::queries());
+    queries.extend(presence::queries());
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
     let mut expected = Vec::new();
-    for (name, keys) in [
-        ("fallback_value", doc([("v", BsonValue::Int32(1))])),
-        ("fallback_path", doc([("v.score", BsonValue::Int32(1))])),
+    for (name, keys, sparse) in [
+        ("fallback_value", doc([("v", BsonValue::Int32(1))]), false),
+        (
+            "fallback_path",
+            doc([("v.score", BsonValue::Int32(1))]),
+            false,
+        ),
         (
             "fallback_compound",
             doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(1))]),
+            false,
+        ),
+        (
+            "fallback_sparse_value",
+            doc([("v", BsonValue::Int32(1))]),
+            true,
+        ),
+        (
+            "fallback_sparse_path",
+            doc([("v.score", BsonValue::Int32(1))]),
+            true,
+        ),
+        (
+            "fallback_sparse_compound",
+            doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(1))]),
+            true,
         ),
     ] {
         let namespace = ns(name);
@@ -158,7 +181,7 @@ async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen()
             &engine,
             &session,
             &namespace,
-            DocumentIndexRequest::new(keys).unwrap(),
+            DocumentIndexRequest::new(keys).unwrap().with_sparse(sparse),
         )
         .await;
         for (query, scan) in queries.iter().zip(&scans) {
@@ -385,6 +408,7 @@ fn queries() -> Vec<BsonDocument> {
         doc([("a", BsonValue::Int32(999))]),
     ]);
     queries.extend(membership::queries());
+    queries.extend(presence::queries());
     queries
 }
 

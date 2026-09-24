@@ -12,6 +12,13 @@ fn keys() -> BsonDocument {
     doc([("v", BsonValue::Int32(1))])
 }
 
+fn probe_keys(probe: &DocumentIndexProbe) -> &[Vec<u8>] {
+    let DocumentIndexSelection::Keys(keys) = probe.selection() else {
+        panic!("expected a finite key probe");
+    };
+    keys
+}
+
 fn secondary(id: u64, specification: BsonDocument) -> DocumentIndexMetadata {
     DocumentIndexMetadata::from_validated_parts(
         DocumentIndexId::from_validated(id),
@@ -109,7 +116,7 @@ fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_prefe
         .unwrap()
         .unwrap();
     assert_eq!(probe.index_id().get(), 2);
-    assert_eq!(probe.keys().len(), 2);
+    assert_eq!(probe_keys(&probe).len(), 2);
     let expected = [1, 2].map(|value| {
         preparation
             .prepare(&doc([("v", BsonValue::Int32(value))]))
@@ -118,7 +125,7 @@ fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_prefe
             .keys()[0]
             .clone()
     });
-    assert_eq!(probe.keys(), expected);
+    assert_eq!(probe_keys(&probe), expected);
     let matcher =
         DocumentMatcher::compile(&doc([("v", list), ("other", BsonValue::Int32(3))])).unwrap();
     let probe = preparation
@@ -130,7 +137,44 @@ fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_prefe
         3,
         "an existing exact-equality index still wins"
     );
-    assert_eq!(probe.keys().len(), 1);
+    assert_eq!(probe_keys(&probe).len(), 1);
+}
+
+#[test]
+fn sparse_presence_is_explicit_and_loses_to_later_finite_key_probes() {
+    let metadata = collection([
+        membership(2, true, None),
+        secondary(3, doc([("other", BsonValue::Int32(1))])),
+    ]);
+    let preparation = DocumentIndexPreparation::compile(&metadata).unwrap();
+    let mut query = doc([(
+        "v",
+        BsonValue::Document(doc([("$exists", BsonValue::Boolean(true))])),
+    )]);
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 2);
+    assert!(matches!(
+        probe.selection(),
+        DocumentIndexSelection::SparseEntries
+    ));
+    query
+        .push(
+            "other",
+            BsonValue::Document(doc([(
+                "$in",
+                BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(2)]),
+            )])),
+        )
+        .unwrap();
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 3);
+    assert_eq!(probe_keys(&probe).len(), 2);
 }
 
 #[test]

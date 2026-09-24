@@ -14,13 +14,14 @@ use crate::core::{EngineError, EngineErrorKind, EngineResult};
 mod codec;
 mod membership;
 mod preparation;
+mod presence;
 mod probe;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
 pub use preparation::{
     DocumentIndexPreparation, MAX_DOCUMENT_PREPARED_INDEXES, PreparedDocumentIndexEntries,
     PreparedDocumentIndexKeys,
 };
-pub(crate) use preparation::{DocumentIndexProbe, NON_UNIQUE_FALLBACK_KEY};
+pub(crate) use preparation::{DocumentIndexProbe, DocumentIndexSelection, NON_UNIQUE_FALLBACK_KEY};
 
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_NODES: usize = 4096;

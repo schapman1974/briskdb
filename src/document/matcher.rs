@@ -302,6 +302,43 @@ impl DocumentMatcher {
         Ok(None)
     }
 
+    /// Prove explicit field presence from a necessary positive clause only.
+    /// Alternatives and negations cannot grant sparse-index authority.
+    pub(crate) fn requires_index_path_presence(
+        &self,
+        requested: &[String],
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<bool> {
+        for clause in &self.clauses {
+            check()?;
+            match clause {
+                Clause::Field {
+                    path, predicates, ..
+                } if path == requested => {
+                    for predicate in predicates {
+                        check()?;
+                        if matches!(predicate, Predicate::Exists(true)) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Clause::Logical {
+                    kind: Logical::And,
+                    children,
+                } => {
+                    for child in children {
+                        if child.requires_index_path_presence(requested, check)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        check()?;
+        Ok(false)
+    }
+
     /// Match caller-supplied BSON after structural size/depth validation.
     pub fn matches(&self, document: &BsonDocument) -> EngineResult<bool> {
         encode_document(document)
