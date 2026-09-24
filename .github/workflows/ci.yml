@@ -224,6 +224,61 @@ jobs:
           cargo test --locked --no-default-features --features mongo --test mongo_wire
           real_pymongo_sync_async_discovery -- --ignored --exact
 
+  mongo-odm:
+    name: Mongo real Beanie and MongoEngine applications
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned ODM Python environment
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.5"
+
+      - name: Check out locked application fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: schapman1974/tinymongo
+          ref: 53cbf44e98b8caa036163725d195fd29592e1cc0
+          path: target/tinymongo-source
+          persist-credentials: false
+
+      - name: Install test-only ODM dependencies and verify source
+        run: |
+          python -m pip install -r tests/mongo_odm_requirements.txt
+          python -m pip install --no-build-isolation --no-deps ./target/tinymongo-source
+          python scripts/mongo_parity.py verify-source --source-root target/tinymongo-source
+          python -m unittest discover -s tests -p 'test_mongo_odm_harness.py' -v
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Restore ODM endpoint build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-odm-1.85
+
+      - name: Require unchanged real ODM application bodies and restart
+        env:
+          BRISKDB_MONGO_ODM_PYTHON: python
+          BRISKDB_MONGO_ODM_REPORT_DIR: target/mongo-odm
+        run: >-
+          cargo +1.85.0 test --locked --no-default-features --features mongo
+          --test mongo_odm -- --ignored --nocapture
+
+      - name: Upload real ODM application results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-real-odm-results
+          path: target/mongo-odm/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
     runs-on: ubuntu-24.04

@@ -509,6 +509,15 @@ requires an earlier dependency:
       change streams, or compression are advertised. Required CI smoke exercises
       real PyMongo 4.17.0 sync/async discovery, pooling, reconnect, and explicit
       unsupported-command errors (#184).
+    - [ ] [#181](https://github.com/schapman1974/briskdb/issues/181) — actual
+      Beanie 2.1.0 and MongoEngine 0.29.3 CRUD application bodies now run unchanged
+      from the locked TinyMongo source against stock PyMongo 4.17.0 and a real
+      four-shard listener. Only connection construction changes. Source hashes,
+      exact executed-case checks, pinned dependencies, process deadlines and
+      before/after-restart runs gate CI separately from the frozen command corpus.
+      Persisted data and ODM-created index metadata are checked on reopen.
+      This covers the two baseline ODM fixtures, not broader application/ODM
+      feature matrices or user-supplied large applications.
     - [ ] Initial wire data slice for [#173](https://github.com/schapman1974/briskdb/issues/173),
       [#172](https://github.com/schapman1974/briskdb/issues/172), and
       [#180](https://github.com/schapman1974/briskdb/issues/180): single-document
