@@ -131,7 +131,7 @@ temporary files RAM. Use fresh BriskDB roots, not TinyMongo database files, and
 spawned processes with newly constructed handles, never inherited clients after
 `fork()`. PyMongo remains optional for SQL-only use and unentered patch objects.
 
-After installing a test wheel, run `python python/examples/pymongo_patch.py`
+After installing a test wheel, run `python python/examples/mongo/patch.py`
 from the repository (or copy that script elsewhere). It exercises sync queries,
 unique indexes, updates, async access and persisted reopen without a daemon.
 

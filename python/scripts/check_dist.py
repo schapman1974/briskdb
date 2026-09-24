@@ -54,7 +54,7 @@ SDIST_FILES = {
     "examples/asyncio.py",
     "examples/serverless_handler.py",
     "examples/sync.py",
-    "examples/pymongo_patch.py",
+    "examples/mongo/patch.py",
     "pyproject.toml",
 }
 

@@ -305,6 +305,14 @@ assert not _mongo_runtime._stores
             with self.assertRaises(briskdb.FailedPreconditionError):
                 database._serve_mongo()
 
+    def test_documented_example_runs_without_import_shadowing(self):
+        example = Path(__file__).resolve().parents[1] / "examples" / "mongo" / "patch.py"
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run([sys.executable, str(example)], cwd=folder,
+                                    capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("persistence passed", result.stdout)
+
 
 class AsyncPatchingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
