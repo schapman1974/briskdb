@@ -479,6 +479,12 @@ async fn real_pymongo_index_candidates() {
     assert_driver_restart("/tests/mongo_index_candidates_client.py").await;
 }
 
+#[tokio::test]
+#[ignore = "focused local count checks; also included in the full real-driver gate"]
+async fn real_pymongo_counts() {
+    assert_driver_restart("/tests/mongo_count_client.py").await;
+}
+
 async fn assert_driver_restart(script: &'static str) {
     let (root, database, mut server) = setup().await;
     server.set_read_metrics_enabled(true);

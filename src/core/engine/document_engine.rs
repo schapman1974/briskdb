@@ -978,54 +978,15 @@ impl Engine {
                     }
                     route @ (PreparedFilterRoute::Scatter(_)
                     | PreparedFilterRoute::ShardSubset { .. }) => {
-                        let matcher = route.matcher().cloned();
-                        let mut count = 0_u64;
-                        for shard in route.shards(self.shard_count()) {
-                            let matcher = matcher.clone();
-                            let shard_count = self
-                                .run_document_shard(
-                                    shard,
-                                    owner,
-                                    cancellation.clone(),
-                                    deadline,
-                                    move |storage, connection, cancellation| {
-                                        if let Some(matcher) = matcher {
-                                            let mut after = None;
-                                            let mut count = 0_u64;
-                                            while let Some(record) = next_matching_document(
-                                                storage,
-                                                connection,
-                                                collection_id,
-                                                shard,
-                                                after,
-                                                Some(&matcher),
-                                                cancellation,
-                                                deadline,
-                                                None,
-                                            )? {
-                                                after = Some(record.natural_order());
-                                                count = count.checked_add(1).ok_or_else(|| {
-                                                    limit_exceeded("document count overflowed")
-                                                })?;
-                                            }
-                                            return Ok(count);
-                                        }
-                                        storage.count_document_shard_on_connection(
-                                            connection,
-                                            collection_id,
-                                            shard,
-                                            cancellation,
-                                        )
-                                    },
-                                )
-                                .await?;
-                            count = count.checked_add(shard_count).ok_or_else(|| {
-                                EngineError::new(
-                                    EngineErrorKind::LimitExceeded,
-                                    "document count exceeded the supported range",
-                                )
-                            })?;
-                        }
+                        let count = self
+                            .count_document_shards(
+                                owner,
+                                collection_id,
+                                &route,
+                                cancellation,
+                                deadline,
+                            )
+                            .await?;
                         (route.plan(collection_id, self.shard_count())?, count)
                     }
                 };

@@ -512,10 +512,16 @@ work. In-flight decoding is separately bounded by eight records and the existing
 BSON allocation limits. Point reads still use one shard directly. Refilling the
 selected frontier and sorted key-window scans remain sequential.
 
+Native `Count` uses the same eight-child coordinator for independent shard
+counts, including owner-pruned `_id` sets. An empty filter uses each shard's
+storage count; filtered counts retain the existing full matcher/candidate path.
+Only one checked scalar per shard is retained, and global skip/limit applies
+once after summation. Exact-ID counts still read their one owner directly.
+
 Child failure, task panic, caller cancellation, deadline or engine shutdown stops
-new frontier admission and drains every started child before returning one error,
-without publishing a partial page. Peer cancellation uses a local token and never
-cancels the caller's potentially shared request/listener token. The owning engine
+new read admission and drains every started child before returning one error,
+without publishing a partial page or count. Peer cancellation uses a local token
+and never cancels the caller's potentially shared request/listener token. The owning engine
 operation retains its schema/session/lifecycle guards while children drain, even
 when the calling task is abandoned. This adds concurrency, not cross-shard or
 cross-batch snapshot isolation.
