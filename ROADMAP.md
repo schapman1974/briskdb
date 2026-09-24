@@ -545,7 +545,10 @@ requires an earlier dependency:
       budgets and shard-local commit semantics remain authoritative. Pool-counter
       tests prove actual physical-shard access, numeric aliases/BSON IDs and
       restart behavior. Empty/oversized/regex lists and unproven filter shapes
-      keep scans; aggregation match pushdown and broader routing vectors remain.
+      keep scans. Aggregation now also routes a safe leading exact-ID/list match,
+      including PyMongo `count_documents()`, while retaining the complete pipeline
+      and its input/work accounting. Matches after transforms/skip/limit do not
+      establish routes. Broader predicate planning and routing vectors remain.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
       single-shard worker grouping. Missing IDs receive ObjectIds; explicit

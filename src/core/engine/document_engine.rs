@@ -2233,7 +2233,10 @@ fn prepare_filter_route(
             if let Some(shards) =
                 id_routing::literal_in_shards(storage, filter, cancellation, control)?
             {
-                return Ok(PreparedFilterRoute::ShardSubset { matcher, shards });
+                return Ok(PreparedFilterRoute::ShardSubset {
+                    matcher: Some(matcher),
+                    shards,
+                });
             }
             Ok(PreparedFilterRoute::Scatter(Some(matcher)))
         }

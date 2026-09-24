@@ -23,7 +23,7 @@ impl Engine {
         }
         let storage = self.inner.database.storage.clone();
         let lookup = namespace.clone();
-        let (collection_id, runner) = self
+        let (collection_id, source, runner) = self
             .run_document_storage_task(
                 cancellation.clone(),
                 deadline,
@@ -32,20 +32,29 @@ impl Engine {
                         ensure_document_cpu_active(cancellation, &control)
                     })?
                     .into_stream();
+                    // Compile every stage first. The original leading match
+                    // stays in the runner; only physical shard selection moves
+                    // into the source, never filtering ahead of its work budget.
+                    let source = id_routing::leading_match_source(
+                        &storage,
+                        &pipeline,
+                        cancellation,
+                        &control,
+                    )?;
                     let collection = storage.document_collection_controlled(
                         lookup.database(),
                         lookup.collection(),
                         Arc::clone(&control),
                     )?;
                     ensure_document_cpu_active(cancellation, &control)?;
-                    Ok((require_collection(collection)?.id(), runner))
+                    Ok((require_collection(collection)?.id(), source, runner))
                 },
             )
             .await?;
         let mut state = CursorState {
             namespace: namespace.clone(),
             collection_id,
-            source: PreparedFilterRoute::Scatter(None),
+            source,
             projection: None,
             sorter: None,
             sort_after: None,

@@ -2,11 +2,49 @@
 //! semantics remain in the existing shared execution paths.
 
 use super::*;
+use crate::document::DocumentPipeline;
 
 const MAX_ROUTED_IDS: usize = 1024;
 
 #[cfg(test)]
 mod tests;
+
+/// Called only after the entire pipeline has compiled successfully. Keep every
+/// stage (including the first match) in its original place. Unfiltered source
+/// rows from the selected shards still pass through the runner's cumulative
+/// input/work limits before matching; there is no prefilter or duplicate matcher.
+pub(super) fn leading_match_source(
+    storage: &Storage,
+    pipeline: &DocumentPipeline,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+) -> EngineResult<PreparedFilterRoute> {
+    ensure_document_cpu_active(cancellation, control)?;
+    let Some(first) = pipeline.stages().first().filter(|stage| stage.len() == 1) else {
+        return Ok(PreparedFilterRoute::Scatter(None));
+    };
+    let Some(BsonValue::Document(predicate)) = first.get_first("$match") else {
+        return Ok(PreparedFilterRoute::Scatter(None));
+    };
+    let filter = DocumentFilter::new(predicate.clone())?;
+    match classify_filter(&filter, cancellation, control)? {
+        FilterRoute::Point(id) => {
+            let (id_key, shard) = storage.prepare_document_id(&id)?;
+            ensure_document_cpu_active(cancellation, control)?;
+            Ok(PreparedFilterRoute::Point { id_key, shard })
+        }
+        FilterRoute::Filtered(filter) => Ok(
+            match literal_in_shards(storage, filter, cancellation, control)? {
+                Some(shards) => PreparedFilterRoute::ShardSubset {
+                    matcher: None,
+                    shards,
+                },
+                None => PreparedFilterRoute::Scatter(None),
+            },
+        ),
+        FilterRoute::Scatter => Ok(PreparedFilterRoute::Scatter(None)),
+    }
+}
 
 /// Called only after the complete filter has compiled successfully. Restrict
 /// only a sole `_id: {$in: [literal, ...]}`; never reinterpret a regex, logical
