@@ -183,11 +183,16 @@ async fn combined_index_creation_preflights_controls_and_reports_exclusive_ready
         EngineErrorKind::InvalidArgument
     );
     create_collection(&engine, &session, 2).await;
+    // A unique build is supported, but must reject duplicate data before
+    // publishing its declaration or changing the existing catalog.
     insert(
         &engine,
         &session,
         3,
-        vec![document(BsonValue::Int32(1), "same")],
+        vec![
+            document(BsonValue::Int32(1), "same"),
+            document(BsonValue::Int32(100), "same"),
+        ],
     )
     .await;
     declare_pending_index(&engine, &session, "pending").await;
@@ -234,7 +239,7 @@ async fn combined_index_creation_preflights_controls_and_reports_exclusive_ready
             .await
             .unwrap_err()
             .kind(),
-        EngineErrorKind::Unsupported
+        EngineErrorKind::UniqueViolation
     );
     assert_eq!(pending_indexes(&engine, &session).await, original);
     for (seed, before, after) in [(6, 1, 2), (7, 2, 2)] {
