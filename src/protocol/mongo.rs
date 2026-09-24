@@ -1,9 +1,11 @@
 //! Opt-in Mongo transport and initial document command adapter.
 //!
 //! This codec validates message boundaries, not BSON or command semantics.
-//! Compression is deliberately unsupported until it can be negotiated safely.
+//! The standalone public codec is uncompressed; listeners separately negotiate
+//! bounded zlib transport without changing this envelope API.
 
 mod commands;
+mod compression;
 mod listener;
 mod wire;
 

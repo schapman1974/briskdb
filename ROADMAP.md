@@ -505,13 +505,17 @@ requires an earlier dependency:
       lifecycle, with passive all-listener binding, fail-closed startup,
       actual bound Mongo addresses, signal drain, and restart coverage. Existing
       config struct shapes and disabled defaults remain unchanged. Negotiated
-      compression and expanded resource/fuzz gates
+      zlib now has bounded compressed/expanded envelopes, strict stream and
+      original CRC validation, malformed/bomb/property tests, compressed replies
+      with safe plain fallback, and real sync/async PyMongo restart coverage.
+      Broader codec coverage and expanded resource/fuzz gates
       remain; this is not a completed Mongo compatibility milestone.
     - [ ] [#170](https://github.com/schapman1974/briskdb/issues/170) and
       [#169](https://github.com/schapman1974/briskdb/issues/169) — standalone
       hello/isMaster, ping, buildInfo, correlated replies, and initial strict
       option validation implemented. No sessions, retryable writes, replication,
-      change streams, or compression are advertised. Required CI smoke exercises
+      or change streams are advertised; compression offers negotiate only zlib.
+      Required CI smoke exercises
       real PyMongo 4.17.0 sync/async discovery, pooling, reconnect, and explicit
       unsupported-command errors (#184).
     - [ ] [#181](https://github.com/schapman1974/briskdb/issues/181) — actual

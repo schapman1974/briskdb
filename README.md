@@ -334,6 +334,8 @@ SQL tables and BSON collections remain separate data models. Ctrl-C/SIGTERM
 drains all enabled listeners and closes the database. See the
 [Mongo compatibility contract](docs/MONGO_PARITY.md#current-wire-checkpoint)
 for supported operations, limits, and the Rust attached-server API.
+To opt into bounded zlib transport, add `compressors="zlib"` to `MongoClient`
+or `AsyncMongoClient`; default connections remain uncompressed.
 
 ### Query registered SQL tables over HTTP
 

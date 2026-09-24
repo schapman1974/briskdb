@@ -94,6 +94,29 @@ listeners; an unexpected Mongo exit stops the common server and reports failure.
 Mongo has no authentication/TLS boundary yet: keep it local, including when
 PostgreSQL uses TLS/SCRAM. Do not publicly proxy the Mongo listener.
 
+Zlib transport is negotiated only when a valid hello/isMaster offers `zlib`.
+For example, pass `compressors="zlib"` to `MongoClient` / `AsyncMongoClient`,
+or append `&compressors=zlib` to the README's connection URI. Ordinary clients
+remain uncompressed. Snappy, zstd and the testing-only noop codec are not
+negotiated. Successful negotiation is local to that connection; failed or
+unsupported offers cannot enable compressed requests on it or another socket.
+
+Both the compressed wire packet and the expanded original message retain the
+1 MiB hard ceiling. A zlib handshake advertises 1 MiB minus 1 KiB, reserving
+space for wrapper/stored-block overhead when drivers size batches before
+compression (including PyMongo's `zlibCompressionLevel=0`). The 512 KiB BSON,
+decoded-heap, batch, connection and frame-read limits are unchanged. Inflation
+checks the declared size before allocation, uses a fixed-size output buffer,
+and requires one complete zlib stream with exact consumed/produced lengths.
+Truncation, bad checksums, trailing streams/data, nested/unsupported opcodes,
+unnegotiated codecs and size mismatches close only the offending connection.
+Original OP_MSG CRC-32C checks still cover the reconstructed original header.
+Handshake/authentication commands cannot be compressed. Replies use zlib when
+it reduces a compressed request's response size, otherwise remain plain.
+Compression runs in the same bounded, joined blocking-parser slots as BSON.
+Raw framing, malformed/bomb cases and real sync/async PyMongo CRUD/cursor/index
+and restart tests cover the transport separately from the frozen semantic corpus.
+
 Rust hosts using `listeners,mongo` can call
 `server::AttachedServer::start_with_mongo(&database, listener_config, address)`
 and obtain the actual address with `server.addresses().mongo()`. This requires
@@ -661,8 +684,9 @@ rollback and cancellation preserve earlier commits without claiming atomicity
 across shards. Physical-selection tests, scan differentials and sync/async driver
 coverage verify the write path independently of read acceleration.
 
-Sessions, retryable writes, replication, change streams, and compression are
-not advertised. This is not full TinyMongo or MongoDB compatibility. Required
+Sessions, retryable writes, replication and change streams are not advertised.
+Zlib is advertised only in response to a valid matching compression offer.
+This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,
 driver batch splitting, cursor paging/closing, pooled-socket handoff, concurrent
 reads/writes, byte-bounded batches, reconnection, resource limits, and

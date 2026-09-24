@@ -1,7 +1,9 @@
 """Required real-wire discovery and point operations, not a Mongo parity claim."""
 
 import asyncio
+import struct
 import sys
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -972,10 +974,75 @@ def sync_smoke(uri):
     # A new client proves reconnect after a pool is closed.
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.admin.command("ping")["ok"] == 1
-    # Offering compression must not cause the driver to compress when the server
-    # negotiates none. zlib is available without optional codec dependencies.
+    # Stock PyMongo negotiates zlib and compresses eligible requests. No driver
+    # methods or replies are patched; zlib needs no optional Python package.
     with pymongo.MongoClient(uri, compressors="zlib", serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        assert client.admin.command("hello", compression=["zlib"])["compression"] == ["zlib"]
         assert client.admin.command("ping")["ok"] == 1
+
+
+def compression_smoke(uri, reopened):
+    with pymongo.MongoClient(uri, compressors="zlib", zlibCompressionLevel=0,
+                            serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.compressed_sync.items
+        assert client.admin.command("hello", compression=["zlib"])["compression"] == ["zlib"]
+        # A later hello without an offer must not disable the pooled connection.
+        check_hello(client.admin.command("hello"))
+        if not reopened:
+            collection.insert_many([
+                {"_id": i, "rank": Int64(i), "payload": "compress-me" * 512}
+                for i in range(30)
+            ])
+            assert collection.create_index("rank", name="rank_lookup") == "rank_lookup"
+            assert collection.update_one({"_id": 0}, {"$set": {"changed": True}}).modified_count == 1
+            assert collection.delete_one({"_id": 29}).deleted_count == 1
+        rows = list(collection.find({}).sort("rank", 1).batch_size(3))
+        assert [row["_id"] for row in rows] == list(range(29))
+        assert rows[0]["changed"] is True and isinstance(rows[0]["rank"], Int64)
+        assert all(row["payload"] == "compress-me" * 512 for row in rows)
+        assert "rank_lookup" in collection.index_information()
+        boundary = client.compressed_sync.boundaries
+        if not reopened:
+            # A legal pre-compression batch can exceed the hard wire ceiling
+            # with level-zero stored blocks. The advertised headroom must make
+            # stock PyMongo split it; neither its encoder nor replies are patched.
+            command = {"insert": "boundaries", "ordered": True, "$db": "compressed_sync"}
+            overhead = 4 + 1 + len(BSON.encode(command)) + 1 + 4 + len(b"documents\0")
+            empty = len(BSON.encode({"_id": 0, "payload": Binary(b"")}))
+            available = 1024 * 1024 - 16 - overhead - 3 * empty - 16
+            lengths = [available // 3, available // 3, available - 2 * (available // 3)]
+            documents = [{"_id": i, "payload": Binary(b"x" * length)} for i, length in enumerate(lengths)]
+            sequence = b"documents\0" + b"".join(BSON.encode(row) for row in documents)
+            body = b"\0" * 5 + BSON.encode(command) + b"\1" + struct.pack("<i", len(sequence) + 4) + sequence
+            assert len(body) + 16 < 1024 * 1024
+            assert len(zlib.compress(body, level=0)) + 25 > 1024 * 1024
+            assert len(boundary.insert_many(documents).inserted_ids) == 3
+        assert boundary.count_documents({}) == 3
+        assert len(boundary.find_one({"_id": 0})["payload"]) > 340_000
+    for level in [-1, 9]:
+        with pymongo.MongoClient(uri, compressors="zlib", zlibCompressionLevel=level,
+                                serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+            assert client.compressed_sync.items.find_one({"_id": 0})["changed"] is True
+
+
+async def async_compression_smoke(uri, reopened):
+    async with pymongo.AsyncMongoClient(uri, compressors="zlib", serverSelectionTimeoutMS=3000,
+                                       socketTimeoutMS=3000) as client:
+        collection = client.compressed_async.items
+        assert (await client.admin.command("hello", compression=["zlib"]))["compression"] == ["zlib"]
+        if not reopened:
+            await collection.insert_many([
+                {"_id": i, "rank": i, "payload": "async-compress" * 512}
+                for i in range(18)
+            ])
+            assert await collection.create_index("rank", name="rank_lookup") == "rank_lookup"
+            assert (await collection.update_one({"_id": 0}, {"$set": {"changed": True}})).modified_count == 1
+            assert (await collection.delete_one({"_id": 17})).deleted_count == 1
+        rows = await collection.find({}).sort("rank", 1).batch_size(2).to_list()
+        assert [row["_id"] for row in rows] == list(range(17))
+        assert rows[0]["changed"] is True
+        assert all(row["payload"] == "async-compress" * 512 for row in rows)
+        assert "rank_lookup" in await collection.index_information()
 
 
 def document_smoke(uri):
@@ -2599,9 +2666,12 @@ async def async_smoke(uri):
 
 if __name__ == "__main__":
     assert pymongo.version == "4.17.0", "use the pinned real-driver version"
+    reopened = len(sys.argv) > 2 and sys.argv[2] == "reopened"
+    compression_smoke(sys.argv[1], reopened)
+    asyncio.run(asyncio.wait_for(async_compression_smoke(sys.argv[1], reopened), timeout=20))
     index_metadata_smoke(sys.argv[1])
     asyncio.run(async_index_metadata_smoke(sys.argv[1]))
-    if len(sys.argv) > 2 and sys.argv[2] == "reopened":
+    if reopened:
         persisted_smoke(sys.argv[1])
     else:
         unique_index_smoke(sys.argv[1])

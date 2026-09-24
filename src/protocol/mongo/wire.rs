@@ -333,6 +333,56 @@ mod tests {
     }
 
     #[test]
+    fn compressed_messages_validate_crc_against_the_original_header() {
+        use super::super::compression::{TransportCodec, encode_reply};
+        use tokio_util::codec::Decoder;
+
+        let mut body = body();
+        body.push("padding", BsonValue::from("x".repeat(4096)))
+            .unwrap();
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(1);
+        payload.put_u8(0);
+        payload.extend_from_slice(&encode_document(&body).unwrap());
+        payload.put_u32_le(0);
+        let mut original = message(1);
+        original.payload = payload.clone().freeze();
+        let end = payload.len();
+        let crc = checksum(&original, &payload[..end - 4]);
+        payload[end - 4..].copy_from_slice(&crc.to_le_bytes());
+        original.payload = payload.freeze();
+        let packet = encode_reply(original.clone(), true).unwrap();
+        for tampered in [false, true] {
+            let mut source = packet.clone();
+            if tampered {
+                source[4] ^= 1;
+            }
+            let mut codec = TransportCodec::new().unwrap();
+            codec.enable_zlib();
+            let frame = codec
+                .decode(&mut source)
+                .unwrap()
+                .unwrap()
+                .into_frame()
+                .unwrap();
+            assert_eq!(decode_request(frame).is_ok(), !tampered);
+        }
+        let mut bad = BytesMut::from(original.payload.as_ref());
+        bad[end - 1] ^= 1;
+        original.payload = bad.freeze();
+        let mut source = encode_reply(original, true).unwrap();
+        let mut codec = TransportCodec::new().unwrap();
+        codec.enable_zlib();
+        let frame = codec
+            .decode(&mut source)
+            .unwrap()
+            .unwrap()
+            .into_frame()
+            .unwrap();
+        assert!(decode_request(frame).is_err());
+    }
+
+    #[test]
     fn flags_required_optional_and_one_way() {
         assert!(decode_request(message(4)).is_err());
         assert!(!decode_request(message(1 << 30)).unwrap().more_to_come);
