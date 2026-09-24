@@ -244,15 +244,15 @@ jobs:
         with:
           repository: schapman1974/tinymongo
           ref: 53cbf44e98b8caa036163725d195fd29592e1cc0
-          path: target/tinymongo-source
+          # Authoritative fixtures are not build artifacts. A partial Rust cache
+          # restore may clean target/ when the dependency key changes.
+          path: .ci/tinymongo-odm-source
           persist-credentials: false
 
-      - name: Install test-only ODM dependencies and verify source
+      - name: Install test-only ODM dependencies
         run: |
           python -m pip install -r tests/mongo_odm_requirements.txt
-          python -m pip install --no-build-isolation --no-deps ./target/tinymongo-source
-          python scripts/mongo_parity.py verify-source --source-root target/tinymongo-source
-          python -m unittest discover -s tests -p 'test_mongo_odm_harness.py' -v
+          python -m pip install --no-build-isolation --no-deps ./.ci/tinymongo-odm-source
 
       - name: Install Rust 1.85
         run: rustup toolchain install 1.85.0 --profile minimal
@@ -262,9 +262,15 @@ jobs:
         with:
           shared-key: mongo-odm-1.85
 
+      - name: Verify locked fixtures after cache restoration
+        run: |
+          python scripts/mongo_parity.py verify-source --source-root .ci/tinymongo-odm-source
+          python -m unittest discover -s tests -p 'test_mongo_odm_harness.py' -v
+
       - name: Require unchanged real ODM application bodies and restart
         env:
           BRISKDB_MONGO_ODM_PYTHON: python
+          BRISKDB_MONGO_ODM_SOURCE_ROOT: .ci/tinymongo-odm-source
           BRISKDB_MONGO_ODM_REPORT_DIR: target/mongo-odm
         run: >-
           cargo +1.85.0 test --locked --no-default-features --features mongo
