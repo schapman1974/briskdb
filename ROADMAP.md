@@ -745,6 +745,12 @@ requires an earlier dependency:
       Bulk writes still commit per input/shard and can reject transient collisions
       even when the eventual image is unique. Sharded TinyMongo whole-post-image
       parity and crash-safe cross-shard bulk coordination remain #183; #174 stays open.
+      Non-unique physical indexes now accept nested/object/array and other valid
+      BSON values via checksummed, record-bound fallback candidates. Candidate
+      scans include these records before the complete matcher; unique indexes
+      retain strict key semantics. Atomic maintenance, corruption checks, build/drop
+      recovery and manifest-v21/digest-v13 downgrade fencing preserve restart safety.
+      The pure key oracle remains unchanged. Mixed IndexModel options remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
@@ -829,7 +835,8 @@ requires an earlier dependency:
       Decimal representation/no-op contracts, plus replacement-upsert equality
       IDs, field order, numeric aliases, and ID conflicts, operator-upsert CRUD
       metadata and zero-timestamp write boundaries,
-      required CI checks exactly 246 frozen executions and
+      plus three non-unique nested-value index contracts,
+      required CI checks exactly 252 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

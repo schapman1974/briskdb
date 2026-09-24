@@ -784,12 +784,15 @@ impl Storage {
                             let expected = current
                                 .get(&collection.id())
                                 .map(|index| {
-                                    index.prepare_with_check(record.document(), &mut || {
-                                        ensure_control_active(
-                                            &control,
-                                            "while validating existing document indexes",
-                                        )
-                                    })
+                                    index.prepare_for_storage_with_check(
+                                        record.document(),
+                                        &mut || {
+                                            ensure_control_active(
+                                                &control,
+                                                "while validating existing document indexes",
+                                            )
+                                        },
+                                    )
                                 })
                                 .transpose()
                                 .map_err(stored_index_error)?;
@@ -807,13 +810,15 @@ impl Storage {
                                     )
                                 },
                             )?;
-                            let entries =
-                                prepared.prepare_with_check(record.document(), &mut || {
+                            let entries = prepared.prepare_for_storage_with_check(
+                                record.document(),
+                                &mut || {
                                     ensure_control_active(
                                         &control,
                                         "while validating future document index entries",
                                     )
-                                })?;
+                                },
+                            )?;
                             if let Some(unique_keys) = &unique_keys {
                                 if let Some(conflict) = unique_keys.add(
                                     &entries,
@@ -930,13 +935,15 @@ impl Storage {
                             )
                         },
                         |record| {
-                            let entries =
-                                prepared.prepare_with_check(record.document(), &mut || {
+                            let entries = prepared.prepare_for_storage_with_check(
+                                record.document(),
+                                &mut || {
                                     ensure_control_active(
                                         &control,
                                         "while generating document index build entries",
                                     )
-                                })?;
+                                },
+                            )?;
                             super::super::index_storage::insert_selected_entries(
                                 &transaction,
                                 collection.id(),

@@ -76,6 +76,193 @@ fn frames(result: &PreparedDocumentIndexEntries) -> Vec<(u64, bool, Vec<Vec<u8>>
         .collect()
 }
 
+fn storage_preparation(unique: bool, fields: BsonDocument) -> DocumentIndexPreparation {
+    let index = DocumentIndexMetadata::from_validated_parts(
+        DocumentIndexId::from_validated(2),
+        "fallback-test".into(),
+        fields,
+        unique,
+        false,
+        DocumentIndexLifecycle::Ready,
+    );
+    DocumentIndexPreparation::compile(&collection([index])).unwrap()
+}
+
+#[test]
+fn nonunique_storage_fallback_is_separate_from_strict_and_unique_keys() {
+    let ordinary = storage_preparation(false, keys());
+    let unique = storage_preparation(true, keys());
+    for value in [
+        BsonValue::Document(doc([("x", BsonValue::Int32(2))])),
+        BsonValue::Array(vec![BsonValue::Array(vec![BsonValue::Int32(1)])]),
+        BsonValue::Double(f64::NAN),
+        BsonValue::Double(f64::INFINITY),
+    ] {
+        let input = doc([("v", value)]);
+        assert_eq!(
+            ordinary.prepare(&input).unwrap_err().kind(),
+            EngineErrorKind::Unsupported
+        );
+        assert_eq!(
+            unique
+                .prepare_for_storage_with_check(&input, &mut || Ok(()))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+        let prepared = ordinary
+            .prepare_for_storage_with_check(&input, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            frames(&prepared),
+            vec![(2, false, vec![NON_UNIQUE_FALLBACK_KEY.to_vec()])]
+        );
+        assert!(DocumentIndexKey::from_bytes(NON_UNIQUE_FALLBACK_KEY).is_err());
+    }
+    let scalar = doc([("v", BsonValue::Int32(3))]);
+    assert_eq!(
+        frames(&ordinary.prepare(&scalar).unwrap()),
+        frames(
+            &ordinary
+                .prepare_for_storage_with_check(&scalar, &mut || Ok(()))
+                .unwrap()
+        )
+    );
+}
+
+#[test]
+fn storage_fallback_covers_intermediate_and_parallel_arrays_without_partial_keys() {
+    for (fields, input) in [
+        (
+            doc([("v.x", BsonValue::Int32(1))]),
+            doc([(
+                "v",
+                BsonValue::Array(vec![BsonValue::Document(doc([("x", BsonValue::Int32(2))]))]),
+            )]),
+        ),
+        (
+            doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(1))]),
+            doc([
+                ("a", BsonValue::Array(vec![BsonValue::Int32(1)])),
+                ("b", BsonValue::Array(vec![BsonValue::Int32(2)])),
+            ]),
+        ),
+        (
+            keys(),
+            doc([(
+                "v",
+                BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Document(doc([]))]),
+            )]),
+        ),
+    ] {
+        let preparation = storage_preparation(false, fields);
+        let prepared = preparation
+            .prepare_for_storage_with_check(&input, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            frames(&prepared),
+            vec![(2, false, vec![NON_UNIQUE_FALLBACK_KEY.to_vec()])]
+        );
+    }
+}
+
+#[test]
+fn storage_fallback_keeps_known_membership_exclusions_and_uncertain_sparse_paths() {
+    for (sparse, partial, fields, input, fallback) in [
+        (
+            false,
+            Some(doc([("active", BsonValue::Boolean(true))])),
+            keys(),
+            doc([("v", BsonValue::Document(doc([])))]),
+            false,
+        ),
+        (
+            false,
+            Some(doc([("active", BsonValue::Boolean(true))])),
+            keys(),
+            doc([
+                ("v", BsonValue::Document(doc([]))),
+                ("active", BsonValue::Boolean(true)),
+            ]),
+            true,
+        ),
+        (true, None, keys(), doc([]), false),
+        (
+            true,
+            None,
+            doc([("v.x", BsonValue::Int32(1))]),
+            doc([("v", BsonValue::Array(vec![BsonValue::Document(doc([]))]))]),
+            true,
+        ),
+    ] {
+        let specification = doc([
+            ("v", BsonValue::Int32(2)),
+            ("name", BsonValue::from("membership")),
+            ("key", BsonValue::Document(fields)),
+            ("unique", BsonValue::Boolean(false)),
+            ("sparse", BsonValue::Boolean(sparse)),
+            (
+                "partialFilterExpression",
+                partial.map(BsonValue::Document).unwrap_or(BsonValue::Null),
+            ),
+        ]);
+        let index = DocumentIndexMetadata::from_validated_parts(
+            DocumentIndexId::from_validated(2),
+            "membership".into(),
+            specification,
+            false,
+            false,
+            DocumentIndexLifecycle::Ready,
+        );
+        let preparation = DocumentIndexPreparation::compile(&collection([index])).unwrap();
+        let prepared = preparation
+            .prepare_for_storage_with_check(&input, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            frames(&prepared),
+            vec![(
+                2,
+                false,
+                if fallback {
+                    vec![NON_UNIQUE_FALLBACK_KEY.to_vec()]
+                } else {
+                    vec![]
+                }
+            )]
+        );
+    }
+}
+
+#[test]
+fn storage_fallback_does_not_swallow_control_errors_or_key_limits() {
+    let preparation = storage_preparation(false, keys());
+    let input = doc([("v", BsonValue::Document(doc([])))]);
+    for kind in [
+        EngineErrorKind::Cancelled,
+        EngineErrorKind::DataCorruption,
+        EngineErrorKind::Unsupported,
+        EngineErrorKind::LimitExceeded,
+    ] {
+        let error = preparation
+            .prepare_for_storage_with_check(&input, &mut || {
+                Err(EngineError::new(kind, "injected control error"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), kind);
+    }
+    let too_many = doc([(
+        "v",
+        BsonValue::Array((0..=16_384).map(BsonValue::Int32).collect()),
+    )]);
+    assert_eq!(
+        preparation
+            .prepare_for_storage_with_check(&too_many, &mut || Ok(()))
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::LimitExceeded
+    );
+}
+
 #[test]
 fn storage_selection_never_interprets_or_enforces_unselected_pending_definitions() {
     let ready = DocumentIndexMetadata::from_validated_parts(

@@ -93,6 +93,9 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_stores_id_first",
             "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids",
             "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_rejects_conflicting_filter_and_replacement_ids",
+            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_indexed_ranges_feed_every_filter_consumer",
+            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_dotted_query_paths_traverse_document_arrays_not_raw_nested_arrays",
+            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_tuple_equality_keeps_array_matches_visible_after_indexing",
         ])
         .args([
             "--mongo-contract-target=briskdb",
@@ -140,6 +143,8 @@ individual.update('tests.contracts.test_query_operator_contract::' + name for na
     'test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic',
     'test_every_filtering_crud_entrypoint_rejects_invalid_not_operands',
     'test_every_filtering_crud_entrypoint_rejects_operator_typos',
+    'test_dotted_query_paths_traverse_document_arrays_not_raw_nested_arrays',
+    'test_tuple_equality_keeps_array_matches_visible_after_indexing',
 ])
 individual.update('tests.contracts.test_update_operator_contract::' + name for name in [
     'test_min_and_max_follow_bson_order_and_report_noops',
@@ -160,6 +165,7 @@ individual.update('tests.contracts.test_bson_comparison_contract::' + name for n
     'test_tm036_pull_reuses_unbounded_min_max_key_ranges',
     'test_pull_reuses_recursive_bson_range_comparison',
     'test_pull_document_ranges_share_missing_and_array_path_semantics',
+    'test_indexed_ranges_feed_every_filter_consumer',
 ])
 individual.update('tests.contracts.test_decimal128_contract::' + name for name in [
     'test_decimal128_inc_promotes_the_result',
@@ -181,11 +187,11 @@ expected = {(case['id'], api) for case in corpus['cases']
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 246, ('locked suite coverage changed', len(expected), len(executions))
+assert len(expected) == len(executions) == 252, ('locked suite coverage changed', len(expected), len(executions))
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 246 exact frozen candidate executions, with no skips.')
+print('Verified all 252 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

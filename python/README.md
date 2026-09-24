@@ -146,7 +146,10 @@ Secondary declarations start `pending_build`. `session.build_index(database,
 collection, name)` explicitly builds a declared index and marks it Ready after
 every shard commits; later document writes maintain its entries transactionally.
 It requires sole-process ownership; interrupted builds require reopening for
-cleanup and retry. Ready indexes provide conservative scalar-equality candidates;
+cleanup and retry. Non-unique indexes accept nested objects, arrays and other
+valid BSON values, retaining conservative candidates when an equality key cannot
+be generated. Unique indexes retain the stricter supported key subset.
+Ready indexes provide conservative scalar-equality candidates;
 unsupported shapes still scan. `unique=True` indexes validate existing records
 before activation and enforce canonical keys across shards on every write,
 raising `UniqueViolationError` on conflicts. Use `create_built_index(..., unique=True)`

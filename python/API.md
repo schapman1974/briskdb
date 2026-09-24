@@ -248,6 +248,9 @@ durable intent. Publication happens only after all shards commit. Interruption
 after intent requires closing/reopening the root; recovery removes the unfinished
 build's derived entries and leaves its declaration pending for an explicit retry.
 Ready entries are maintained with inserts, replacements, updates and deletes.
+Non-unique indexes accept nested objects, arrays and other valid BSON values;
+values outside the equality-key subset remain conservative candidates checked
+by the full matcher. Unique indexes retain the stricter supported key subset.
 Ready indexes provide conservative scalar-equality candidates with full matcher
 rechecks; unsupported shapes still scan. `unique=True` builds reject duplicate
 existing data before intent with `UniqueViolationError`. Once Ready, they enforce

@@ -1,6 +1,9 @@
 //! Collection-wide preparation, not a physical index or catalog-freshness proof.
 
-use super::{Budget, DocumentIndexKeyGenerator, MAX_WORK_BYTES, allocation, fmt, limit};
+use super::{
+    Budget, DocumentIndexKeyGenerator, MAX_WORK_BYTES, UnsupportedIndexedValue, allocation, fmt,
+    limit,
+};
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
@@ -8,10 +11,16 @@ use crate::{
         DocumentIndexId, DocumentIndexMetadata, DocumentMatcher, encode_document, memory,
     },
 };
+use std::error::Error;
 
 /// Maximum secondary declarations in one preparation; the built-in `_id_`
 /// index is handled by record storage and does not count toward this limit.
 pub const MAX_DOCUMENT_PREPARED_INDEXES: usize = 64;
+
+/// Storage-only candidate marker, deliberately outside the BDIK tuple space.
+/// Manifest v21 fences older readers/writers before this representation appears.
+/// It is record-checksummed like a normal entry, never a unique equality key.
+pub(crate) const NON_UNIQUE_FALLBACK_KEY: &[u8] = b"BDIF\0\0\0\x01\0\0\0\x01\0";
 
 /// Compiled secondary-index definitions from one collection metadata snapshot.
 ///
@@ -209,6 +218,28 @@ impl DocumentIndexPreparation {
         document: &BsonDocument,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<PreparedDocumentIndexEntries> {
+        self.prepare_inner(document, false, check)
+    }
+
+    /// A non-unique index is an optimization, not a restriction on valid BSON
+    /// values. An unrepresentable value contributes one conservative candidate
+    /// marker instead of a partial key set. Sparse membership that cannot be
+    /// determined by strict path extraction is also conservatively included;
+    /// the complete matcher remains authoritative. Unique indexes stay strict.
+    pub(crate) fn prepare_for_storage_with_check(
+        &self,
+        document: &BsonDocument,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<PreparedDocumentIndexEntries> {
+        self.prepare_inner(document, true, check)
+    }
+
+    fn prepare_inner(
+        &self,
+        document: &BsonDocument,
+        allow_fallback: bool,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<PreparedDocumentIndexEntries> {
         let mut budget = Budget::new(check);
         budget.step()?;
         budget.charge(self.retained_bytes)?;
@@ -229,9 +260,40 @@ impl DocumentIndexPreparation {
             .map_err(allocation)?;
         for index in &self.indexes {
             budget.step()?;
-            let tuples = index
+            let tuples = match index
                 .generator
-                .keys_validated_with_budget(document, &mut budget)?;
+                .keys_validated_with_budget(document, &mut budget)
+            {
+                Ok(tuples) => tuples,
+                Err(error)
+                    if allow_fallback
+                        && !index.unique
+                        && error.source().is_some_and(|source| {
+                            source.downcast_ref::<UnsupportedIndexedValue>().is_some()
+                        }) =>
+                {
+                    // Do not reset work charged before the unsupported value.
+                    // In particular, cancellation and allocation/key budgets
+                    // cannot be converted into a successful fallback.
+                    budget.step()?;
+                    budget.keys(1)?;
+                    budget.charge(32 + NON_UNIQUE_FALLBACK_KEY.len())?;
+                    let mut key = Vec::new();
+                    key.try_reserve_exact(NON_UNIQUE_FALLBACK_KEY.len())
+                        .map_err(allocation)?;
+                    key.extend_from_slice(NON_UNIQUE_FALLBACK_KEY);
+                    let mut keys = Vec::new();
+                    keys.try_reserve_exact(1).map_err(allocation)?;
+                    keys.push(key);
+                    indexes.push(PreparedDocumentIndexKeys {
+                        index_id: index.id,
+                        unique: false,
+                        keys,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             budget.charge(tuples.len() * 32)?;
             let mut keys = Vec::new();
             keys.try_reserve_exact(tuples.len()).map_err(allocation)?;

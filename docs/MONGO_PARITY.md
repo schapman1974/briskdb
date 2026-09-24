@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 246 exact sync/async executions in the frozen
+Required CI separately runs 252 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -36,6 +36,8 @@ plus missing-counter and CRUD increment metadata cases and two Decimal128
 increment promotion/representation contracts, plus replacement-upsert equality
 IDs (four parameter cases), ID-first order, numeric ID aliases, and ID conflicts,
 operator-upsert equality fields/CRUD metadata, and zero-timestamp write boundaries,
+plus non-unique indexed object ranges, dotted document-array paths and nested-array
+equality (including their shared read/mutation consumers),
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -524,8 +526,12 @@ reference tokens and the frozen generator remain unchanged. Independent tests co
 eager validation, input immutability and interruption without partial results.
 This pure helper is not physical index activation, wire support or uniqueness enforcement.
 The frozen helper subset rejects intermediate/parallel arrays, object/nested-array
-keys, ObjectId/date keys and nonfinite numeric keys; broader MongoDB index values
-remain open. Native Rust and sync/async Python declarations now accept sparse or
+keys, ObjectId/date keys and nonfinite numeric keys. Unique storage still uses
+that strict subset. Non-unique storage now retains such records as checksummed
+fallback candidates, preserving complete matcher results through reads, writes,
+builds and restart. The three previously failing nested-value frozen cases are
+included in the expanded required candidate gate; mixed IndexModel options and
+the full parity release gate remain open. Native Rust and sync/async Python declarations now accept sparse or
 partial options after shared eager validation. The complete retained envelope is
 bounded; exact filter BSON, IDs and membership options survive restart. Existing
 flat declarations remain byte-compatible, and unknown legacy envelopes remain

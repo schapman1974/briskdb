@@ -461,7 +461,9 @@ more valuable than a star. Start with the
   shards for every record write; duplicates fail with code 11000. Builds require
   sole-process ownership. Complete
   supported equality tuples use Ready index candidates with full BSON matching;
-  partial indexes, sparse all-null queries and unsupported shapes retain scans.
+  non-unique indexes accept nested/object/array and other valid BSON values,
+  retaining conservative candidates when a value has no ordinary equality key.
+  Partial indexes, sparse all-null queries and unsupported shapes retain scans.
   PyMongo `drop_index` / `drop_indexes` remove secondary indexes
   without deleting documents; `_id_` remains protected. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.
