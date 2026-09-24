@@ -380,15 +380,22 @@ prevent stale find/aggregate cursors from reading a recreated namespace; their
 next admitted continuation fails and releases state (or idle expiry cleans it).
 
 An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
-`DocumentPlan::Point` with one collection and one physical shard. A sole
-`{_id: {$in: [literal, ...]}}` with 1–1024 values produces a deterministic
+`DocumentPlan::Point` with one collection and one physical shard. A safe
+`{_id: {$in: [literal, ...]}}` produces a deterministic
 `DocumentPlan::Scatter` over only the distinct owning shards. It uses storage's
 versioned canonical BSON encoding, so numeric aliases share ownership and
 document/array IDs retain exact-value semantics. The complete matcher still
 checks candidates; this prunes shards without promising a multi-key index lookup.
 The restriction is shared by find/continuations, count, distinct and mutations.
-Empty/larger lists, regex members and unproven filter shapes scan every shard;
-aggregation uses the same shard restriction for a safe first-stage match, while
+Compound filters and positive `$and` clauses intersect proven exact-ID/list owner
+sets; `$or` unions them only when every branch has a proven ID restriction.
+These remain matcher-backed scans even with one owner: other conditions still
+govern reads, writes and upserts. Canonical-ID work is capped at 1024 values across
+the entire filter. Empty/oversized lists, regex members, negations, dotted IDs
+and unproven branches provide no restriction. Without another necessary bound,
+these scan every shard; empty owner intersections also use the ordinary scan
+and matcher rather than introducing an empty-source plan.
+Aggregation uses the same shard restriction for a safe first-stage match, while
 keeping its original matcher and cumulative accounting in the pipeline. The shared
 Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
@@ -1123,8 +1130,9 @@ Collection reads currently use controlled one-document source pages in global
 durable natural order, with a bounded shard frontier independent of caller
 output limits. All pipeline CPU work runs in admitted workers with cancellation
 and deadlines. A first-stage `$match` with a sole exact `_id`/`$eq` uses a point
-route; a safe literal `_id` list uses only its distinct owning shards. The entire
-pipeline is validated first and every original stage stays in place. List routes
+route; proven compound, positive-AND, bounded-OR and literal-list ID constraints
+use only their selected owning shards. The entire
+pipeline is validated first and every original stage stays in place. Subset routes
 deliver unfiltered source rows from those shards into the original aggregation
 matcher, so unmatched inputs still consume its cumulative input/work budgets.
 No match is moved across a preceding transform, skip, limit, or other stage.
