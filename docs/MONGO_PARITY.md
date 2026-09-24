@@ -471,6 +471,38 @@ bounded to 15 seconds. Exhaustion returns ID zero; stale or wrong-namespace IDs
 return code 43. Simultaneous use returns code 237. No SQLite lease is held between
 batches, and no cross-batch snapshot is promised under concurrent writes.
 
+Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
+network administration endpoint. The listener-local snapshot includes accepted,
+admitted/rejected, active/closed/peak connections, fatal transport/accept/task
+failures, 22 fixed command families, 31 fixed error codes plus an unknown-code
+counter, write-error occurrences and response-size rejections. Command counters
+separate started, in-flight, completed, failed, aborted and deliberately suppressed
+one-way responses. Unknown command names share `Other`; namespaces, query values,
+identities and diagnostic text never become labels or retained metric data.
+
+```rust,ignore
+use briskdb::protocol::mongo::MongoCommandKind;
+
+let snapshot = mongo.metrics();
+let finds = snapshot.command(MongoCommandKind::Find);
+println!("active={} find_completed={} find_failed={}",
+    snapshot.active_connections, finds.completed, finds.failed);
+```
+
+Per-command admission occurs after frame decoding and request preparation return;
+malformed frames/parser failures are transport failures, not invented command
+outcomes. Completion means an encoded reply or suppressed one-way outcome, not
+successful delivery, successful writes, or global atomicity. Failed counts include
+top-level and embedded write/write-concern errors; code counters count individual
+error occurrences in final outcomes. Eight disjoint latency buckets (exported
+microsecond bounds) plus cumulative/max time include completed and aborted
+commands, from complete frame through reply construction; socket framing and
+delivery are excluded. Live snapshots sample atomics separately; accounting
+identities are meaningful after drain, not during concurrent updates. Totals
+saturate, gauges are admission-bounded, close retains final counters, and a new
+listener starts at zero. This is not a Prometheus endpoint, cursor/row/shard
+telemetry, correlated tracing, or completion of the broader #187 hardening gate.
+
 Projection uses the shared engine transform after filtering; projected fields
 retain BSON types and stored field order. The same projection persists across
 getMore batches. Path collisions, mixed modes, and unsupported operators fail

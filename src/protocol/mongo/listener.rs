@@ -1,6 +1,11 @@
 //! Host-owned, loopback-only Mongo listener over the shared document engine.
 
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::BytesMut;
 use tokio::{
@@ -11,7 +16,7 @@ use tokio::{
 };
 use tokio_util::codec::Decoder;
 
-use super::{Request, commands, compression, decode_request, invalid, wire};
+use super::{Request, commands, compression, decode_request, invalid, metrics, wire};
 use crate::{
     BriskDb, CancellationToken, EngineState,
     document::{BsonDocument, BsonValue},
@@ -29,6 +34,7 @@ pub struct MongoServer {
     address: SocketAddr,
     shutdown: CancellationToken,
     task: Option<JoinHandle<io::Result<()>>>,
+    metrics: Arc<metrics::Metrics>,
 }
 
 impl MongoServer {
@@ -57,16 +63,24 @@ impl MongoServer {
             return Err(invalid("Mongo listener requires a running engine"));
         }
         let token = shutdown.clone();
-        let task = tokio::spawn(run(listener, database.clone(), token));
+        let metrics = Arc::new(metrics::Metrics::default());
+        let task = tokio::spawn(run(listener, database.clone(), token, Arc::clone(&metrics)));
         Ok(Self {
             address,
             shutdown,
             task: Some(task),
+            metrics,
         })
     }
 
     pub const fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Fixed-cardinality, payload-free cumulative counters for this listener.
+    /// Available after close; reading them retains no engine, session or cursor.
+    pub fn metrics(&self) -> super::MongoMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub fn begin_close(&self) {
@@ -101,6 +115,7 @@ async fn run(
     listener: TcpListener,
     database: BriskDb,
     shutdown: CancellationToken,
+    metrics: Arc<metrics::Metrics>,
 ) -> io::Result<()> {
     let executor = Arc::new(commands::Executor::new(database.clone()));
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -115,27 +130,39 @@ async fn run(
                 executor.prune_cursors();
                 if database.engine().state() != EngineState::Running { break; }
             }
-            _ = connections.join_next(), if !connections.is_empty() => {},
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if matches!(joined, Some(Err(_))) { metrics.task_failed(); }
+            },
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(connection) => connection,
-                    Err(error) => { outcome = Err(error); break; }
+                    Err(error) => { metrics.accept_failed(); outcome = Err(error); break; }
                 };
-                let Ok(permit) = slots.clone().try_acquire_owned() else { drop(stream); continue; };
+                metrics.accepted();
+                let Ok(permit) = slots.clone().try_acquire_owned() else { metrics.rejected(); drop(stream); continue; };
                 let token = shutdown.clone();
                 let executor = Arc::clone(&executor);
+                let metrics = Arc::clone(&metrics);
+                let admission = metrics.admit();
                 connections.spawn(async move {
                     // This slot remains held while the blocking parser is awaited,
                     // including during shutdown; malformed clients cannot grow the queue.
                     let _permit = permit;
-                    let _ = connection(stream, token, executor).await;
+                    let _admission = admission;
+                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics)).await {
+                        metrics.connection_error(error.kind());
+                    }
                 });
             }
         }
     }
     shutdown.cancel();
     drop(listener);
-    while connections.join_next().await.is_some() {}
+    while let Some(joined) = connections.join_next().await {
+        if joined.is_err() {
+            metrics.task_failed();
+        }
+    }
     outcome
 }
 
@@ -143,6 +170,7 @@ async fn connection(
     mut stream: TcpStream,
     shutdown: CancellationToken,
     executor: Arc<commands::Executor>,
+    metrics: Arc<metrics::Metrics>,
 ) -> io::Result<()> {
     let session = executor.session();
     let _cursors = executor.connection_cursors(session.id().get());
@@ -181,6 +209,7 @@ async fn connection(
             source.extend_from_slice(&chunk[..read]);
         };
         response_id = response_id.wrapping_add(1);
+        let started = Instant::now();
         let compressed = frame.is_compressed();
         let (request, prepared) = tokio::task::spawn_blocking(move || {
             let request = decode_request(frame.into_frame()?)?;
@@ -192,6 +221,10 @@ async fn connection(
         })
         .await
         .map_err(|_| io::Error::other("Mongo parser task failed"))??;
+        let observed = metrics.command(
+            request.body.iter().next().map_or("", |(name, _)| name),
+            started,
+        );
         let body = match prepared {
             Some(Ok(prepared)) => {
                 executor
@@ -205,19 +238,27 @@ async fn connection(
             codec.enable_zlib();
         }
         let cursor_id = commands::reply_cursor_id(&body);
-        let (result, rejected) = tokio::task::spawn_blocking(move || {
-            if request.more_to_come {
-                return Ok((None, true));
-            }
-            let (body, rejected) = match commands::validate_response(&body) {
-                Ok(()) => (body, false),
-                Err(error) => (error.document(), true),
-            };
-            let reply = wire::reply(&request, &body, response_id)?;
-            compression::encode_reply(reply, compressed).map(|reply| (Some(reply), rejected))
-        })
-        .await
-        .map_err(|_| io::Error::other("Mongo parser task failed"))??;
+        let metrics = Arc::clone(&metrics);
+        let (result, rejected) =
+            tokio::task::spawn_blocking(move || -> io::Result<(Option<BytesMut>, bool)> {
+                if request.more_to_come {
+                    observed.complete(&body, true);
+                    return Ok((None, true));
+                }
+                let (body, rejected) = match commands::validate_response(&body) {
+                    Ok(()) => (body, false),
+                    Err(error) => {
+                        metrics.response_rejected();
+                        (error.document(), true)
+                    }
+                };
+                let reply = wire::reply(&request, &body, response_id)?;
+                let reply = compression::encode_reply(reply, compressed)?;
+                observed.complete(&body, false);
+                Ok((Some(reply), rejected))
+            })
+            .await
+            .map_err(|_| io::Error::other("Mongo parser task failed"))??;
         if rejected {
             if let Some(id) = cursor_id {
                 executor.discard_cursor(id);

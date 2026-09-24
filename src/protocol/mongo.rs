@@ -7,9 +7,14 @@
 mod commands;
 mod compression;
 mod listener;
+mod metrics;
 mod wire;
 
 pub use listener::MongoServer;
+pub use metrics::{
+    MONGO_LATENCY_UPPER_BOUNDS_MICROS, MongoCommandKind, MongoCommandMetrics, MongoMetricsSnapshot,
+    MongoTransportFailures,
+};
 pub use wire::{DocumentSequence, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request};
 
 use std::io;
