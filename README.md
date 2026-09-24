@@ -303,6 +303,40 @@ That local development form is unauthenticated and therefore loopback-only.
 The [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md) shows the four settings
 for TLS plus SCRAM-SHA-256; secure mode is required for any remote bind.
 
+### Use PyMongo with the opt-in Mongo listener
+
+Build from source with the non-default `mongo` feature, then explicitly enable
+the listener. This is a growing MongoDB subset, not full MongoDB compatibility:
+
+```bash
+cargo run --locked --features mongo --bin briskdb -- \
+  --data-dir ./briskdb-data --shards 4 --mongo-listen 127.0.0.1:27017
+```
+
+In another terminal, after installing `pymongo`:
+
+```python
+from pymongo import MongoClient
+
+with MongoClient("mongodb://127.0.0.1:27017/?directConnection=true") as client:
+    client.demo.users.update_one(
+        {"_id": 123}, {"$set": {"name": "Ada"}}, upsert=True
+    )
+    print(client.demo.users.find_one({"_id": 123}))
+```
+
+`BRISKDB_MONGO_LISTEN` is the environment equivalent; `--mongo-listen disabled`
+overrides it. Mongo is disabled by default, including in Mongo-enabled builds.
+Builds without the feature reject activation before opening database files.
+The listener is **unauthenticated and loopback-only**; do not expose it through
+a public proxy. HTTP/PostgreSQL and Mongo share the engine and lifecycle, but
+SQL tables and BSON collections remain separate data models. Ctrl-C/SIGTERM
+drains all enabled listeners and closes the database. See the
+[Mongo compatibility contract](docs/MONGO_PARITY.md#current-wire-checkpoint)
+for supported operations, limits, and the Rust attached-server API.
+
+### Query registered SQL tables over HTTP
+
 Registered tables can also be queried over HTTP:
 
 ```bash

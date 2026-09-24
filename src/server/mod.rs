@@ -1,5 +1,8 @@
 //! Server process assembly and listener lifecycle.
 
+#[cfg(feature = "mongo")]
+mod mongo;
+
 use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 #[cfg(feature = "server")]
@@ -54,6 +57,8 @@ pub struct ListenerAddresses {
     http: SocketAddr,
     admin: Option<SocketAddr>,
     postgres: Option<SocketAddr>,
+    #[cfg(feature = "mongo")]
+    mongo: Option<SocketAddr>,
 }
 
 impl ListenerAddresses {
@@ -74,6 +79,11 @@ impl ListenerAddresses {
     pub const fn postgres(self) -> Option<SocketAddr> {
         self.postgres
     }
+
+    #[cfg(feature = "mongo")]
+    pub const fn mongo(self) -> Option<SocketAddr> {
+        self.mongo
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +91,8 @@ struct BoundListeners {
     http: tokio::net::TcpListener,
     admin: Option<tokio::net::TcpListener>,
     postgres: Option<tokio::net::TcpListener>,
+    #[cfg(feature = "mongo")]
+    mongo: Option<(tokio::net::TcpListener, BriskDb)>,
 }
 
 impl BoundListeners {
@@ -108,6 +120,8 @@ impl BoundListeners {
             http,
             admin,
             postgres,
+            #[cfg(feature = "mongo")]
+            mongo: None,
         })
     }
 
@@ -129,6 +143,13 @@ impl BoundListeners {
                 .map(tokio::net::TcpListener::local_addr)
                 .transpose()
                 .context("failed to read the bound PostgreSQL listener address")?,
+            #[cfg(feature = "mongo")]
+            mongo: self
+                .mongo
+                .as_ref()
+                .map(|(listener, _)| listener.local_addr())
+                .transpose()
+                .context("failed to read the bound Mongo listener address")?,
         })
     }
 
@@ -138,8 +159,47 @@ impl BoundListeners {
             http,
             admin: None,
             postgres: None,
+            #[cfg(feature = "mongo")]
+            mongo: None,
         }
     }
+}
+
+fn validate_optional_mongo(
+    config: &ListenerConfig,
+    address: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    if let Some(address) = address {
+        #[cfg(feature = "mongo")]
+        mongo::validate_address(config, address)?;
+        #[cfg(not(feature = "mongo"))]
+        {
+            let _ = (config, address);
+            anyhow::bail!("Mongo listener requires the `mongo` Cargo feature");
+        }
+    }
+    Ok(())
+}
+
+async fn bind_configured_listeners(
+    config: &ListenerConfig,
+    database: &BriskDb,
+    mongo_address: Option<SocketAddr>,
+) -> anyhow::Result<BoundListeners> {
+    validate_optional_mongo(config, mongo_address)?;
+    #[cfg(feature = "mongo")]
+    if let Some(address) = mongo_address {
+        mongo::validate_database(database)?;
+        let mut listeners = BoundListeners::bind(config).await?;
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .with_context(|| format!("failed to bind Mongo listener {address}"))?;
+        listeners.mongo = Some((listener, database.clone()));
+        return Ok(listeners);
+    }
+    #[cfg(not(feature = "mongo"))]
+    let _ = database;
+    BoundListeners::bind(config).await
 }
 
 #[cfg(feature = "server")]
@@ -154,29 +214,67 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`EngineOptions::default`].
 #[cfg(feature = "server")]
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
+    run_configured(config, options, None).await
+}
+
+/// Opt into loopback Mongo alongside the normal process-owned listeners.
+/// Existing configuration structs and default entry points remain unchanged.
+#[cfg(all(feature = "server", feature = "mongo"))]
+pub async fn run_with_mongo(
+    config: Config,
+    options: EngineOptions,
+    address: SocketAddr,
+) -> anyhow::Result<()> {
+    run_configured(config, options, Some(address)).await
+}
+
+#[cfg(feature = "server")]
+async fn run_configured(
+    config: Config,
+    options: EngineOptions,
+    mongo_listen: Option<SocketAddr>,
+) -> anyhow::Result<()> {
     let listener_config = ListenerConfig {
         http_listen: config.listen,
         admin_listen: config.admin_listen,
         postgres_listen: config.postgres_listen,
     };
     validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
+    validate_optional_mongo(&listener_config, mongo_listen)?;
     let postgres_security = config
         .postgres_security
         .as_ref()
         .map(postgres::SecurityConfig::load)
         .transpose()
         .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-    let database = BriskDb::builder(&config.data_dir)
+    let builder = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
-        .with_engine_options(options)
-        .open()
-        .await?;
-    let listeners = match BoundListeners::bind(&listener_config).await {
+        .with_engine_options(options);
+    #[cfg(feature = "mongo")]
+    let builder = builder.with_document_support(if mongo_listen.is_some() {
+        crate::DocumentSupport::Enabled
+    } else {
+        crate::DocumentSupport::Disabled
+    });
+    let database = builder.open().await?;
+    let listeners = match bind_configured_listeners(&listener_config, &database, mongo_listen).await
+    {
         Ok(listeners) => listeners,
         Err(error) => {
             database.begin_close();
             if let Err(shutdown_error) = database.close().await {
                 warn!(error = %shutdown_error, "failed to clean up after listener startup error");
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "mongo")]
+    let mongo_listen = match listeners.addresses() {
+        Ok(addresses) => addresses.mongo(),
+        Err(error) => {
+            database.begin_close();
+            if let Err(shutdown_error) = database.close().await {
+                warn!(error = %shutdown_error, "failed to clean up after listener address error");
             }
             return Err(error);
         }
@@ -208,6 +306,7 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         listen = %config.listen,
         admin_listen = ?config.admin_listen,
         postgres_listen = ?config.postgres_listen,
+        mongo_listen = ?mongo_listen,
         postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),
@@ -298,7 +397,18 @@ pub struct AttachedServer {
 impl AttachedServer {
     /// Bind and start listeners against the exact engine behind `database`.
     pub async fn start(database: &BriskDb, config: ListenerConfig) -> anyhow::Result<Self> {
-        Self::start_with_security(database, config, None, None).await
+        Self::start_with_security(database, config, None, None, None).await
+    }
+
+    /// Attach loopback Mongo to the same explicitly document-enabled database.
+    /// Closing this server joins every listener but leaves the borrowed engine running.
+    #[cfg(feature = "mongo")]
+    pub async fn start_with_mongo(
+        database: &BriskDb,
+        config: ListenerConfig,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_security(database, config, None, None, Some(address)).await
     }
 
     /// Bind listeners with TLS and SCRAM enabled for PostgreSQL.
@@ -311,7 +421,7 @@ impl AttachedServer {
         let security = security
             .load()
             .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-        Self::start_with_security(database, config, Some(security), None).await
+        Self::start_with_security(database, config, Some(security), None, None).await
     }
 
     /// Start a dedicated authenticated SQLite remote data plane instead of
@@ -324,7 +434,7 @@ impl AttachedServer {
     ) -> anyhow::Result<Self> {
         let router = crate::protocol::sqlite_remote::router(database.engine().clone(), remote)
             .map_err(anyhow::Error::msg)?;
-        Self::start_with_security(database, config, None, Some(router)).await
+        Self::start_with_security(database, config, None, Some(router), None).await
     }
 
     async fn start_with_security(
@@ -332,9 +442,10 @@ impl AttachedServer {
         config: ListenerConfig,
         security: Option<postgres::LoadedSecurity>,
         data_router: Option<axum::Router>,
+        mongo_address: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
         validate_listener_addresses(&config, security.is_some())?;
-        let listeners = BoundListeners::bind(&config).await?;
+        let listeners = bind_configured_listeners(&config, database, mongo_address).await?;
         let addresses = listeners.addresses()?;
         let engine = database.engine().clone();
         let (shutdown, shutdown_rx) = oneshot::channel();
@@ -382,10 +493,12 @@ impl AttachedServer {
     pub async fn close(&mut self) -> anyhow::Result<bool> {
         let already_closed = self.task.is_none();
         self.begin_close();
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Ok(already_closed);
         };
-        task.await.context("attached listener task failed")??;
+        let result = task.await;
+        self.task.take();
+        result.context("attached listener task failed")??;
         Ok(already_closed)
     }
 }
@@ -469,6 +582,74 @@ enum EngineShutdown {
 }
 
 async fn serve_listeners_with_shutdown_mode<F>(
+    listeners: BoundListeners,
+    engine: Engine,
+    signal: F,
+    accepted: Option<Arc<Notify>>,
+    engine_shutdown: EngineShutdown,
+    postgres_security: Option<postgres::LoadedSecurity>,
+    data_router: Option<axum::Router>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    #[cfg(feature = "mongo")]
+    let mut listeners = listeners;
+    #[cfg(feature = "mongo")]
+    if let Some((listener, database)) = listeners.mongo.take() {
+        let shutdown = crate::CancellationToken::new();
+        // A listener cancels its own token even on failure. Keep the request
+        // marker separate so an unexpected Mongo exit cannot look intentional.
+        let requested = crate::CancellationToken::new();
+        let mongo = match crate::protocol::mongo::MongoServer::from_bound(
+            &database,
+            listener,
+            shutdown.clone(),
+        ) {
+            Ok(mongo) => mongo,
+            Err(error) => {
+                if engine_shutdown == EngineShutdown::Owned {
+                    engine.begin_shutdown();
+                    engine.shutdown().await?;
+                }
+                return Err(error).context("failed to start bound Mongo listener");
+            }
+        };
+        let (stop, stopped) = oneshot::channel();
+        let token = shutdown.clone();
+        let request_marker = requested.clone();
+        let signal = async move {
+            tokio::select! {
+                _ = signal => {},
+                _ = stopped => {},
+            }
+            request_marker.cancel();
+            token.cancel();
+        };
+        let primary = serve_listeners_with_shutdown_plain(
+            listeners,
+            engine.clone(),
+            signal,
+            accepted,
+            engine_shutdown,
+            postgres_security,
+            data_router,
+        );
+        return mongo::coordinate(mongo, primary, stop, requested, engine).await;
+    }
+    serve_listeners_with_shutdown_plain(
+        listeners,
+        engine,
+        signal,
+        accepted,
+        engine_shutdown,
+        postgres_security,
+        data_router,
+    )
+    .await
+}
+
+async fn serve_listeners_with_shutdown_plain<F>(
     listeners: BoundListeners,
     engine: Engine,
     signal: F,
@@ -1592,6 +1773,8 @@ mod tests {
                     http,
                     admin: Some(admin),
                     postgres: Some(postgres),
+                    #[cfg(feature = "mongo")]
+                    mongo: None,
                 },
                 engine,
                 async move {
@@ -1640,6 +1823,8 @@ mod tests {
                 http,
                 admin: None,
                 postgres: Some(postgres),
+                #[cfg(feature = "mongo")]
+                mongo: None,
             },
             engine,
             async move {
@@ -1702,6 +1887,8 @@ mod tests {
                 http,
                 admin: None,
                 postgres: Some(postgres),
+                #[cfg(feature = "mongo")]
+                mongo: None,
             },
             engine,
             async move {
@@ -1758,6 +1945,8 @@ mod tests {
                     http,
                     admin: Some(admin),
                     postgres: Some(postgres),
+                    #[cfg(feature = "mongo")]
+                    mongo: None,
                 },
                 engine,
                 async {},
@@ -1848,6 +2037,8 @@ mod tests {
                 http: listener,
                 admin: None,
                 postgres: Some(postgres),
+                #[cfg(feature = "mongo")]
+                mongo: None,
             },
             engine,
             std::future::pending(),

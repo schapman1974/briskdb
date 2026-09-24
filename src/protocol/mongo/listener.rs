@@ -42,8 +42,22 @@ impl MongoServer {
             return Err(invalid("Mongo listener requires a running engine"));
         }
         let listener = TcpListener::bind(address).await?;
+        Self::from_bound(database, listener, CancellationToken::new())
+    }
+
+    /// Start only after the owning server has bound every configured listener.
+    pub(crate) fn from_bound(
+        database: &BriskDb,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> io::Result<Self> {
         let address = listener.local_addr()?;
-        let shutdown = CancellationToken::new();
+        if !address.ip().is_loopback() {
+            return Err(invalid("Mongo listener requires loopback"));
+        }
+        if database.engine().state() != EngineState::Running {
+            return Err(invalid("Mongo listener requires a running engine"));
+        }
         let token = shutdown.clone();
         let task = tokio::spawn(run(listener, database.clone(), token));
         Ok(Self {
@@ -64,9 +78,16 @@ impl MongoServer {
     /// Close sockets and join bounded connection/parser work. Safe to call twice.
     pub async fn close(&mut self) -> io::Result<()> {
         self.begin_close();
-        if let Some(task) = self.task.take() {
-            task.await
-                .map_err(|_| io::Error::other("Mongo listener task failed"))??;
+        self.wait().await
+    }
+
+    /// Cancellation-safe observation: a losing select must retain the task so
+    /// close can still join it instead of accidentally detaching parser work.
+    pub(crate) async fn wait(&mut self) -> io::Result<()> {
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task.take();
+            result.map_err(|_| io::Error::other("Mongo listener task failed"))??;
         }
         Ok(())
     }
