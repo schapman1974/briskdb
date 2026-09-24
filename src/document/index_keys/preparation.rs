@@ -204,7 +204,7 @@ impl DocumentIndexPreparation {
             budget.step()?;
             if let Some(key) = index
                 .generator
-                .equality_key_with_budget(matcher, &mut budget)?
+                .storage_equality_key_with_budget(matcher, &mut budget)?
             {
                 let bytes = key.encoded_len_with_check(&mut || budget.step())?;
                 budget.charge(bytes)?;

@@ -770,15 +770,15 @@ requires an earlier dependency:
       tuples from direct/positive-conjunctive filters, with authoritative matching
       after bound SQLite probes. Natural paging, checksummed entry/record binding,
       write maintenance and index churn across cursor requests are covered.
-      Partial indexes, sparse all-null tuples and unsupported/incomplete shapes
+      Unproven partial indexes, sparse all-null tuples and unsupported/incomplete shapes
       fall back to scans. Source-locked comparisons cover 201,349 matcher
-      evaluations with no excluded true matches. Broader predicates and measured
-      execution diagnostics remain open under #174/#178.
+      evaluations with no excluded true matches. Broader predicates and final
+      planner acceptance remain open under #174/#178.
       Necessary positive `$in` lists now derive bounded complete compound tuples:
       at most 128 scalar members per list, 128 distinct tuples and 1 MiB of encoded
       keys per probe. Existing equality probes keep priority. Bound SQL candidates
       include non-unique fallback records and deduplicate multikey matches before
-      pagination; the full matcher still governs each read/mutation. Partial,
+      pagination; the full matcher still governs each read/mutation. Unproven partial,
       regex/unsupported, empty/oversized and possible sparse all-null probes retain
       scans. Native scan differentials, typed candidate proofs, physical selection,
       checksum, index churn and restart checks cover the extension.
@@ -799,6 +799,14 @@ requires an earlier dependency:
       canonical deduplication and full matching retain conservative behavior;
       uncertain branches keep scans. Necessary finite probes remain preferred
       across indexes, followed by logical probes and sparse-presence scans.
+      Partial Ready indexes now supply finite candidates when bounded positive
+      AND/OR proofs establish every required scalar equality or explicit presence
+      fact. Exact representation avoids unproven numeric-alias implications;
+      ranges, type/list implications and negations still scan. Shared work limits,
+      current Ready authority and full matching remain mandatory. Native read
+      counters, scan differentials, churn/membership-changing mutations and
+      sync/async PyMongo restart fixtures cover the private planner extension;
+      frozen public equality inference and index formats remain unchanged.
       Native Rust and sync/async Python reads now offer opt-in, payload-free
       access-path diagnostics: candidate proof/index identity/key count or a
       conservative scan reason, freshly selected on each cursor page. Default

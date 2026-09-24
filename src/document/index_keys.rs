@@ -397,6 +397,10 @@ impl super::matcher::MatchControl for Budget<'_> {
     fn allocation(&mut self, bytes: usize) -> EngineResult<()> {
         self.charge(bytes)
     }
+
+    fn comparison_bytes(&mut self, bytes: usize) -> EngineResult<()> {
+        self.charge(bytes)
+    }
 }
 
 impl<'a> Budget<'a> {

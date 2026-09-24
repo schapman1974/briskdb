@@ -443,6 +443,17 @@ Manifest version 21 fences older writers/readers before these durable markers ca
 appear. Inserts, updates, replacements, deletes, builds and restart validation
 share the same storage preparation; existing `BDIK` keys are not rewritten.
 
+The private Ready-index planner can use partial indexes for equality and bounded
+finite/logical candidates when a query proves the membership filter. Proofs use
+identical-representation scalar equality or explicit positive existence facts,
+composed through positive AND/OR without query expansion. Every query alternative
+must establish the required fact; unproven numeric aliases, ranges, type/list
+implications and negations keep scans. Proof work shares existing index budgets
+and cancellation checks. Candidates still include applicable fallback records,
+run the full matcher and require current schema-admitted Ready authority on each
+request. This does not change the public `equality_key` helper, durable formats,
+the frozen oracle, or the prohibition on combining sparse and partial options.
+
 Generation validates input BSON and has independent per-call limits: 16,384 keys,
 8 MiB conservative charge per scalar/scope, 64 MiB cumulative work/retention charge,
 and one million traversal/work steps. Duplicate values still consume work. Shared

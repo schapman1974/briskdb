@@ -32,8 +32,7 @@ impl DocumentIndexKeyGenerator {
         budget: &mut Budget<'_>,
         alternatives: bool,
     ) -> EngineResult<Option<Vec<DocumentIndexKey>>> {
-        budget.step()?;
-        if self.partial.is_some() {
+        if !self.proves_partial_membership(matcher, budget)? {
             return Ok(None);
         }
         budget.charge(128 + self.paths.len() * 32)?;

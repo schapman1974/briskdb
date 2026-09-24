@@ -15,6 +15,7 @@ if __name__ == "__main__":
         (wire.sparse_presence_smoke, wire.async_sparse_presence_smoke),
         (wire.absence_index_smoke, wire.async_absence_index_smoke),
         (wire.logical_index_smoke, wire.async_logical_index_smoke),
+        (wire.partial_index_smoke, wire.async_partial_index_smoke),
     ]:
         sync(uri, reopened)
         asyncio.run(asyncio.wait_for(asynchronous(uri, reopened), timeout=20))

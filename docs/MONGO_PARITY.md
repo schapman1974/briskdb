@@ -742,18 +742,18 @@ warning/degradation behavior and the full frozen index suites remain open.
 Ready-index equality reads now have 1,087 additional source-locked probe groups:
 201,349 matcher evaluations and 9,541 eligible matching candidates without false
 negatives. Direct/positive-conjunctive complete scalar tuples use bound BDIK
-probes, preserve natural paging and still run the full matcher. Partial indexes,
+probes, preserve natural paging and still run the full matcher. Unproven partial indexes,
 sparse all-null tuples and unsupported/incomplete shapes scan. Native/real-driver
 tests compare filters, sorting, count/distinct, index drop/recreation between
 batches, write maintenance and reopened results. This does not close #174 or
-#178: bulk-policy decisions, broader candidate forms and plan diagnostics remain open.
+#178: bulk-policy decisions, broader candidate forms and final acceptance remain open.
 
 Ready-index candidates also support necessary positive literal `$in` lists,
 including complete compound tuples and residual predicates under `$and`.
 Lists are limited to 128 scalar members, with at most 128 distinct candidate
 tuples and 1 MiB of encoded keys across the selected probe. Existing complete
 equality probes keep priority. Regex/array/object/unsupported members, empty or
-oversized lists, partial indexes and possible sparse all-null tuples are not
+oversized lists, unproven partial indexes and possible sparse all-null tuples are not
 eligible for finite-key probing.
 Bound values and the existing non-unique fallback marker are checked through
 the full matcher. Multiple matching array entries are deduplicated before
@@ -787,11 +787,23 @@ than intersecting values that may match different array elements. A single
 borrowed-value buffer caps each path at 128 raw operand occurrences, including
 duplicates and failed attempts; existing tuple/byte budgets still apply. Compound
 unions may admit cross-branch combinations, which the full matcher removes.
-Unbounded/unsupported branches, partial indexes and possible sparse all-null
+Unbounded/unsupported branches, unproven partial indexes and possible sparse all-null
 tuples remain conservative. Necessary finite probes keep priority across indexes,
 then logical probes, then sparse-presence scans. Native and real-driver fixtures
 cover overlapping multikey matches, residuals, mutation/upsert, churn, corruption
 and restart without changing the frozen public equality-probe oracle.
+
+Ready partial indexes can now supply equality, finite-membership/absence and
+logical candidate keys when the query proves the index's membership filter.
+The bounded proof accepts identical-representation scalar equalities and explicit
+`$exists: true` facts, composing positive AND/OR without expanding the query.
+Every query alternative must prove each required fact; a partial-filter OR needs
+one sufficient branch. Numeric-alias, range, type, membership-list and negation
+implications remain deliberately unproven and scan. The full matcher, fallback
+records, work/cancellation limits and fresh Ready authority remain mandatory.
+The public single-equality helper and frozen corpus are unchanged. Native
+scan/read-counter differentials and sync/async PyMongo restart fixtures verify
+selection, index churn and membership-changing writes; this is not range support.
 
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.
