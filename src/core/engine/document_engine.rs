@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod aggregation;
 mod deletion;
 mod distinct;
+mod fanout;
 mod id_routing;
 mod index_metadata;
 mod metadata;
@@ -1882,56 +1883,19 @@ impl Engine {
     ) -> EngineResult<(Vec<BsonDocument>, bool)> {
         enforce_empty_result_limit(limits)?;
         let collection_id = state.collection_id;
-        let start_after = state.after;
         let frontier_limit = limits
             .max_bytes()
             .max(u64::try_from(BSON_MAX_DECODED_BYTES).unwrap_or(u64::MAX));
-        let mut frontiers: Vec<Option<DocumentStorageRecord>> =
-            Vec::with_capacity(usize::from(self.shard_count()));
-        let mut retained_bytes = 0_u64;
-        for shard in 0..self.shard_count() {
-            if !state.source.targets(shard) {
-                // Frontier positions remain physical shard IDs during the
-                // global natural-order merge and subsequent page continuation.
-                frontiers.push(None);
-                continue;
-            }
-            let matcher = matcher.clone();
-            let stats = state.read_stats.clone();
-            let record = self
-                .run_document_shard(
-                    shard,
-                    owner,
-                    cancellation.clone(),
-                    deadline,
-                    move |storage, connection, cancellation| {
-                        next_matching_document(
-                            storage,
-                            connection,
-                            collection_id,
-                            shard,
-                            start_after,
-                            matcher.as_deref(),
-                            cancellation,
-                            deadline,
-                            stats.as_deref(),
-                        )
-                    },
-                )
-                .await?;
-            if let Some(record) = &record {
-                validate_point_record(record, collection_id, shard, record.id_key())?;
-                retained_bytes = retained_bytes
-                    .checked_add(u64::try_from(record.encoded_len()).unwrap_or(u64::MAX))
-                    .ok_or_else(result_size_overflow)?;
-                if retained_bytes > frontier_limit {
-                    return Err(limit_exceeded(
-                        "document scatter merge frontier exceeds its bounded memory limit",
-                    ));
-                }
-            }
-            frontiers.push(record);
-        }
+        let (mut frontiers, mut retained_bytes) = self
+            .initial_document_frontiers(
+                owner,
+                state,
+                cancellation.clone(),
+                deadline,
+                matcher.clone(),
+                frontier_limit,
+            )
+            .await?;
 
         let mut heap = BinaryHeap::new();
         for (shard, record) in frontiers.iter().enumerate() {

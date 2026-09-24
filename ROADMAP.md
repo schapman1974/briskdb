@@ -864,6 +864,16 @@ requires an earlier dependency:
       models fail eagerly; existing same-name indexes keep their enforcement.
       All-text batches match frozen memory/JSON namespace behavior, with retries
       and reopen covered. Degraded equivalent-name reuse remains a separate gap.
+    - [ ] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
+      source pages now load their initial frontiers from at most eight target
+      shards concurrently, sharing pool/worker admission and a checked aggregate
+      frontier byte budget. Physical shard positions and the existing natural-order
+      merge preserve global pagination across empty/uneven and owner-pruned shards.
+      Errors, panics and cancellation stop admission and drain children before
+      operation guards release; peer cancellation never poisons caller/listener
+      tokens. Point reads remain direct; frontier refill and sorted-window work
+      remain sequential. Wider parallel sorted execution and fault/skew acceptance
+      remain open; no partial-page or new snapshot guarantee is introduced.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can now inspect payload-free listener-local Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way
