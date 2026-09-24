@@ -27,6 +27,165 @@ fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocu
 fn obj(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonValue {
     BsonValue::Document(doc(entries))
 }
+
+#[tokio::test]
+async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let records = vec![
+        doc([
+            ("_id", BsonValue::Int32(1)),
+            ("v", obj([("score", BsonValue::Int32(2))])),
+        ]),
+        doc([
+            ("_id", BsonValue::Int32(2)),
+            ("v", obj([("score", BsonValue::Int32(0))])),
+        ]),
+        doc([
+            ("_id", BsonValue::Int32(3)),
+            (
+                "v",
+                BsonValue::Array(vec![obj([("score", BsonValue::Int32(3))])]),
+            ),
+        ]),
+        doc([("_id", BsonValue::Int32(4)), ("v", BsonValue::Int32(1))]),
+        doc([("_id", BsonValue::Int32(5)), ("v", BsonValue::Null)]),
+        doc([
+            ("_id", BsonValue::Int32(6)),
+            (
+                "v",
+                BsonValue::Array(vec![BsonValue::Array(vec![
+                    BsonValue::Int32(1),
+                    BsonValue::Int32(2),
+                ])]),
+            ),
+        ]),
+        doc([
+            ("_id", BsonValue::Int32(7)),
+            (
+                "v",
+                BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(2)]),
+            ),
+        ]),
+        doc([("_id", BsonValue::Int32(8)), ("v", BsonValue::Double(1.0))]),
+        doc([
+            ("_id", BsonValue::Int32(9)),
+            ("v", BsonValue::Boolean(true)),
+        ]),
+        doc([
+            ("_id", BsonValue::Int32(10)),
+            ("a", BsonValue::Array(vec![BsonValue::Int32(1)])),
+            ("b", BsonValue::Array(vec![BsonValue::Int32(2)])),
+        ]),
+        doc([("_id", BsonValue::Int32(11))]),
+    ];
+    let queries = vec![
+        doc([]),
+        doc([("v", BsonValue::Int32(1))]),
+        doc([("v", BsonValue::Boolean(true))]),
+        doc([("v", BsonValue::Null)]),
+        doc([("v", obj([("$gt", obj([("score", BsonValue::Int32(1))]))]))]),
+        doc([("v", obj([("$eq", obj([("score", BsonValue::Int32(2))]))]))]),
+        doc([(
+            "v",
+            BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(2)]),
+        )]),
+        doc([("v.score", BsonValue::Int32(2))]),
+        doc([("v.score", obj([("$exists", BsonValue::Boolean(false))]))]),
+        doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(2))]),
+    ];
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    let mut expected = Vec::new();
+    for (name, keys) in [
+        ("fallback_value", doc([("v", BsonValue::Int32(1))])),
+        ("fallback_path", doc([("v.score", BsonValue::Int32(1))])),
+        (
+            "fallback_compound",
+            doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(1))]),
+        ),
+    ] {
+        let namespace = ns(name);
+        call(
+            &engine,
+            &session,
+            DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                namespace.clone(),
+                DocumentCollectionOptions::empty(),
+                DocumentWriteOptions::new(),
+            )),
+        )
+        .await;
+        call(
+            &engine,
+            &session,
+            DocumentCommand::Insert(
+                DocumentInsertRequest::new(
+                    namespace.clone(),
+                    records.clone(),
+                    DocumentWriteOptions::new(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+        let mut scans = Vec::new();
+        for query in &queries {
+            scans.push(
+                find(
+                    &engine,
+                    &session,
+                    &namespace,
+                    query,
+                    DocumentReadOptions::new().with_batch_size(1).unwrap(),
+                )
+                .await,
+            );
+        }
+        build(
+            &engine,
+            &session,
+            &namespace,
+            DocumentIndexRequest::new(keys).unwrap(),
+        )
+        .await;
+        for (query, scan) in queries.iter().zip(&scans) {
+            assert_eq!(
+                &find(
+                    &engine,
+                    &session,
+                    &namespace,
+                    query,
+                    DocumentReadOptions::new().with_batch_size(1).unwrap()
+                )
+                .await,
+                scan,
+                "query changed after non-unique build: {query:?}"
+            );
+        }
+        expected.push((namespace, scans));
+    }
+    drop(session);
+    engine.shutdown().await.unwrap();
+    let reopened = Engine::open(root.path(), 4).await.unwrap();
+    let session = reopened.session();
+    for (namespace, scans) in expected {
+        for (query, scan) in queries.iter().zip(scans) {
+            assert_eq!(
+                find(
+                    &reopened,
+                    &session,
+                    &namespace,
+                    query,
+                    DocumentReadOptions::new().with_batch_size(1).unwrap()
+                )
+                .await,
+                scan,
+                "query changed after reopen: {query:?}"
+            );
+        }
+    }
+    reopened.shutdown().await.unwrap();
+}
 fn ns(name: &str) -> DocumentNamespace {
     DocumentNamespace::new("index_reads", name).unwrap()
 }

@@ -454,7 +454,7 @@ mod enabled {
     ) -> EngineResult<Option<PreparedDocumentIndexEntries>> {
         preparation
             .map(|preparation| {
-                preparation.prepare_with_check(document, &mut || {
+                preparation.prepare_for_storage_with_check(document, &mut || {
                     ensure_document_operation_not_cancelled(
                         cancellation,
                         "while preparing document index entries",
@@ -2177,12 +2177,13 @@ mod enabled {
                 // order. Forcing an index-first join would repeatedly sort
                 // large equality groups for each one-record merge frontier.
                 "SELECT d.natural_order, d.id_key, d.document_bson, d.document_checksum,
-                        d.storage_format_version, e.entry_checksum, e.entry_format_version
+                        d.storage_format_version, e.entry_checksum, e.entry_format_version,
+                        e.index_key
                  FROM briskdb_documents_v1 AS d
                  JOIN briskdb_document_index_entries_v1 AS e
                    ON e.collection_id = d.collection_id AND e.id_key = d.id_key
                  WHERE d.collection_id = ?1 AND d.natural_order > ?2
-                   AND e.index_id = ?4 AND e.index_key = ?5
+                   AND e.index_id = ?4 AND (e.index_key = ?5 OR e.index_key = ?6)
                  ORDER BY d.natural_order LIMIT ?3"
             } else {
                 "SELECT natural_order, id_key, document_bson, document_checksum,
@@ -2201,6 +2202,7 @@ mod enabled {
                     sqlite_limit,
                     probe.index_id().get() as i64,
                     probe.key(),
+                    crate::document::NON_UNIQUE_FALLBACK_KEY,
                 ]),
                 None => statement.query(params![
                     to_sqlite_id(collection_id)?,
@@ -2257,12 +2259,18 @@ mod enabled {
                     let version = row.get::<_, i64>(6).map_err(|error| {
                         shard_read_error(error, "invalid document index entry version")
                     })?;
+                    let index_key = row
+                        .get_ref(7)
+                        .and_then(|value| value.as_blob().map_err(Into::into))
+                        .map_err(|error| {
+                            shard_read_error(error, "invalid document index candidate key")
+                        })?;
                     super::index_storage::validate_probe_entry(
                         collection_id,
                         probe.index_id(),
                         shard,
                         record.id_key.as_bytes(),
-                        probe.key(),
+                        index_key,
                         &record.checksum,
                         stored,
                         version,
@@ -2874,7 +2882,11 @@ mod enabled {
                 )?;
                 let expected = indexes
                     .get(&collection_id)
-                    .map(|preparation| preparation.prepare(&document).map_err(stored_index_error))
+                    .map(|preparation| {
+                        preparation
+                            .prepare_for_storage_with_check(&document, &mut || Ok(()))
+                            .map_err(stored_index_error)
+                    })
                     .transpose()?;
                 if let (Some(unique_keys), Some(expected)) = (&unique_keys, &expected) {
                     if unique_keys

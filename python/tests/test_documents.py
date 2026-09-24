@@ -52,6 +52,54 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_nonunique_nested_candidates_follow_mutations_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    documents = [
+                        {"_id": 1, "v": {"score": 2}},
+                        {"_id": 2, "v": [{"score": 3}]},
+                        {"_id": 3, "v": 1},
+                        {"_id": 4, "v": [1, 2]},
+                        {"_id": 5, "v": [[1, 2]]},
+                        {"_id": 6, "v": ObjectId("64b000000000000000000006")},
+                        {"_id": 7, "v": datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)},
+                    ]
+                    for collection in ("scan", "indexed"):
+                        session.create_collection(DATABASE, collection)
+                        for document in documents:
+                            session.insert_one(DATABASE, collection, document)
+                    session.create_built_index(DATABASE, "indexed", {"v": 1})
+                    session.create_built_index(DATABASE, "indexed", {"v.score": 1})
+                    session.create_built_index(DATABASE, "indexed", {"v": 1}, name="sparse", sparse=True)
+                    session.create_built_index(DATABASE, "indexed", {"v": 1}, name="partial", partial_filter={"active": True})
+                    operations = [
+                        ("update_many", ({"v.score": 2}, {"$set": {"v": 1}})),
+                        ("update_one", ({"v": 1}, {"$set": {"v": {"score": 2}, "active": True}})),
+                        ("replace_one", ({"v.score": 3}, {"v": [1, {"score": 2}]})),
+                        ("find_one_and_update", ({"v.score": 2}, {"$set": {"v": 2}})),
+                        ("find_one_and_replace", ({"v": 2}, {"v": {"score": 4}})),
+                        ("delete_many", ({"v.score": {"$exists": True}},)),
+                    ]
+                    for operation, args in operations:
+                        method = getattr(session, operation)
+                        expected = method(DATABASE, "scan", *args)
+                        actual = method(DATABASE, "indexed", *args)
+                        for key in ("matched_count", "modified_count", "deleted_count", "document"):
+                            if key in expected:
+                                self.assertEqual(actual[key], expected[key], (operation, key))
+                        self.assertEqual(
+                            bson_bytes({"rows": session.find(DATABASE, "indexed")["documents"]}),
+                            bson_bytes({"rows": session.find(DATABASE, "scan")["documents"]}),
+                            operation,
+                        )
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(
+                        bson_bytes({"rows": session.find(DATABASE, "indexed")["documents"]}),
+                        bson_bytes({"rows": session.find(DATABASE, "scan")["documents"]}),
+                    )
+
     def test_combined_index_creation_build_counts_options_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1972,6 +2020,29 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_nonunique_nested_candidates_upsert_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "v": [{"score": 2}]})
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 2, "v": 2})
+                    await session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                    await session.create_built_index(DATABASE, COLLECTION, {"v.score": 1})
+                    self.assertEqual((await session.count_documents(DATABASE, COLLECTION, {"v.score": 2}))["count"], 1)
+                    changed = await session.update_many(DATABASE, COLLECTION, {"v.score": 2}, {"$set": {"v": 2}})
+                    self.assertEqual(changed["modified_count"], 1)
+                    changed = await session.update_many(DATABASE, COLLECTION, {"v": 2}, {"$set": {"v": {"score": 3}}})
+                    self.assertEqual(changed["modified_count"], 2)
+                    upserted = await session.update_one(DATABASE, COLLECTION, {"_id": 3, "v.score": 7}, {"$set": {"tag": "new"}}, upsert=True)
+                    self.assertEqual(upserted["upserted_id"], 3)
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertEqual((await session.count_documents(DATABASE, COLLECTION, {"v.score": 3}))["count"], 2)
+                    self.assertEqual((await session.find(DATABASE, COLLECTION, {"v.score": 7}))["documents"][0]["tag"], "new")
+                    removed = await session.delete_many(DATABASE, COLLECTION, {"v.score": 3})
+                    self.assertEqual(removed["deleted_count"], 2)
+
     async def test_async_unique_build_mutations_reopen_and_drop(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

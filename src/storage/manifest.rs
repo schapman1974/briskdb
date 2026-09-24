@@ -53,7 +53,8 @@ const V17_SCHEMA_VERSION: u32 = 17;
 const V18_SCHEMA_VERSION: u32 = 18;
 const V19_SCHEMA_VERSION: u32 = 19;
 const V20_SCHEMA_VERSION: u32 = 20;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V20_SCHEMA_VERSION;
+const V21_SCHEMA_VERSION: u32 = 21;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V21_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const DOCUMENT_CATALOG_VERSION: u32 = 1;
@@ -101,6 +102,7 @@ const V9_MANIFEST_DIGEST_VERSION: u32 = 9;
 const V10_MANIFEST_DIGEST_VERSION: u32 = 10;
 const V11_MANIFEST_DIGEST_VERSION: u32 = 11;
 const V12_MANIFEST_DIGEST_VERSION: u32 = 12;
+const V13_MANIFEST_DIGEST_VERSION: u32 = 13;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
@@ -114,6 +116,7 @@ const V9_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v9\0";
 const V10_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v10\0";
 const V11_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v11\0";
 const V12_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v12\0";
+const V13_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v13\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 const GENERATED_TABLE_DDL_DIGEST_DOMAIN: &[u8] = b"briskdb.generated-table-ddl.v1\0";
 
@@ -296,6 +299,10 @@ const V19_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V20_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 20)
+) STRICT";
+const V21_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 21)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1503,6 +1510,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v19_to_v20,
         validate: validate_v20,
     },
+    Migration {
+        from: V20_SCHEMA_VERSION,
+        to: V21_SCHEMA_VERSION,
+        name: "document_nonunique_index_fallback_candidates",
+        apply: migrate_v20_to_v21,
+        validate: validate_v21,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -1516,8 +1530,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v20_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v20,
+    initialize_current: create_v21_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v21,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -3459,7 +3473,7 @@ pub(super) fn downgrade_v19_manifest_to_v18_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
-    if read_identity(connection)?.1 == i64::from(V20_SCHEMA_VERSION) {
+    if read_identity(connection)?.1 >= i64::from(V20_SCHEMA_VERSION) {
         downgrade_v20_manifest_to_v19_for_test(connection, shard_count)?;
     }
     connection
@@ -3491,6 +3505,9 @@ fn downgrade_v20_manifest_to_v19_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
+    if read_identity(connection)?.1 == i64::from(V21_SCHEMA_VERSION) {
+        downgrade_v21_manifest_to_v20_for_test(connection, shard_count)?;
+    }
     connection
         .execute_batch("DROP TABLE briskdb_metadata")
         .map_err(sqlite_error::storage)?;
@@ -3512,6 +3529,35 @@ fn downgrade_v20_manifest_to_v19_for_test(
     set_identity(connection, V19_SCHEMA_VERSION)?;
     refresh_manifest_digest(connection)?;
     validate_v19(connection, shard_count, &schema_objects(connection)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn downgrade_v21_manifest_to_v20_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch("DROP TABLE briskdb_metadata")
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V20_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata VALUES (?1)",
+            [V20_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V12_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V20_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v20(connection, shard_count, &schema_objects(connection)?)?;
     Ok(())
 }
 
@@ -5512,6 +5558,11 @@ fn create_v20_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v19_to_v20(transaction, shard_count)
 }
 
+fn create_v21_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v20_schema(transaction, shard_count)?;
+    migrate_v20_to_v21(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5667,6 +5718,7 @@ fn migrate_interrupted_legacy_to_v19(
     create_v19_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v20(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5675,6 +5727,16 @@ fn migrate_interrupted_legacy_to_v20(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v20_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v21(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v21_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -6384,6 +6446,31 @@ fn migrate_v19_to_v20(transaction: &Transaction<'_>, _shard_count: u16) -> Engin
         .execute(
             "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
             [V12_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn migrate_v20_to_v21(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    // Older writers cannot maintain BDIF fallback entries, and older startup
+    // validation would misclassify otherwise valid nested BSON as corruption.
+    // Reject them at the manifest boundary before any storage access/writes.
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V21_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata VALUES (?1)",
+            [V21_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V13_MANIFEST_DIGEST_VERSION],
         )
         .map_err(sqlite_error::storage)?;
     Ok(())
@@ -7819,6 +7906,35 @@ fn validate_v19(
         EngineError::new(
             EngineErrorKind::Internal,
             "document index authority validation omitted the logical catalog",
+        )
+    })?;
+    let indexes = validate_global_indexes(connection, &catalog)?;
+    snapshot.logical_catalog = Some(catalog.with_global_indexes(indexes));
+    validate_document_catalog(connection, snapshot.shard_count)?;
+    Ok(snapshot)
+}
+
+fn validate_v21(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_v12_features(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V21_SCHEMA_VERSION,
+            downgrade_fence_sql: V21_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v19_objects(),
+            expected_manifest_digest_version: V13_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    let catalog = snapshot.logical_catalog.take().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "document fallback validation omitted the logical catalog",
         )
     })?;
     let indexes = validate_global_indexes(connection, &catalog)?;
@@ -9588,7 +9704,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V12_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V13_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -10032,7 +10148,8 @@ fn manifest_semantic_digest_for_version(
         | V9_MANIFEST_DIGEST_VERSION
         | V10_MANIFEST_DIGEST_VERSION
         | V11_MANIFEST_DIGEST_VERSION
-        | V12_MANIFEST_DIGEST_VERSION => {
+        | V12_MANIFEST_DIGEST_VERSION
+        | V13_MANIFEST_DIGEST_VERSION => {
             let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 16);
             for query in V1_MANIFEST_DIGEST_QUERIES {
                 queries.push(query);
@@ -10070,7 +10187,9 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (
-                if digest_version == V12_MANIFEST_DIGEST_VERSION {
+                if digest_version == V13_MANIFEST_DIGEST_VERSION {
+                    V13_MANIFEST_DIGEST_DOMAIN
+                } else if digest_version == V12_MANIFEST_DIGEST_VERSION {
                     V12_MANIFEST_DIGEST_DOMAIN
                 } else if digest_version == V11_MANIFEST_DIGEST_VERSION {
                     V11_MANIFEST_DIGEST_DOMAIN
@@ -10233,7 +10352,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V17_SCHEMA_VERSION
                 | V18_SCHEMA_VERSION
                 | V19_SCHEMA_VERSION
-                | V20_SCHEMA_VERSION)
+                | V20_SCHEMA_VERSION
+                | V21_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -10297,7 +10417,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V12_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V13_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -12476,6 +12596,70 @@ mod tests {
         initialize_interrupted_legacy: migrate_interrupted_legacy_to_v19,
     };
 
+    const V20_PLAN: MigrationPlan<'static> = MigrationPlan {
+        current_version: V20_SCHEMA_VERSION,
+        migrations: MIGRATIONS,
+        initialize_current: create_v20_schema,
+        initialize_interrupted_legacy: migrate_interrupted_legacy_to_v20,
+    };
+
+    #[test]
+    fn v21_nonunique_fallback_upgrade_is_atomic_and_fences_v20_readers() {
+        for (phase, inject_panic) in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ]
+        .into_iter()
+        .flat_map(|phase| [false, true].map(|panic| (phase, panic)))
+        {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            insert_active_document_catalog(&connection);
+            downgrade_v21_manifest_to_v20_for_test(&connection, 4).unwrap();
+            let before = stored_manifest_digest(&connection);
+            let objects_before = schema_objects(&connection).unwrap();
+            let attempt = catch_unwind(AssertUnwindSafe(|| {
+                load_or_create_with_hook(&mut connection, 4, |point| {
+                    if point.from == V20_SCHEMA_VERSION && point.phase == phase {
+                        if inject_panic {
+                            panic!("injected non-unique fallback upgrade panic");
+                        }
+                        return Err(EngineError::new(
+                            EngineErrorKind::Internal,
+                            "injected fallback upgrade error",
+                        ));
+                    }
+                    Ok(())
+                })
+            }));
+            if inject_panic {
+                assert!(attempt.is_err());
+            } else {
+                assert_eq!(
+                    attempt.unwrap().unwrap_err().kind(),
+                    EngineErrorKind::Internal
+                );
+            }
+            assert_eq!(identity(&connection).1, 20);
+            assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+            assert_eq!(stored_manifest_digest(&connection), before);
+            inspect_with_plan(&connection, 4, V20_PLAN).unwrap();
+            load_or_create_manifest(&mut connection, 4).unwrap();
+            assert_eq!(identity(&connection).1, 21);
+            let after = stored_manifest_digest(&connection);
+            assert_ne!(before, after);
+            assert_eq!(
+                inspect_with_plan(&connection, 4, V20_PLAN)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            assert_eq!(stored_manifest_digest(&connection), after);
+            downgrade_v21_manifest_to_v20_for_test(&connection, 4).unwrap();
+            assert_eq!(stored_manifest_digest(&connection), before);
+        }
+    }
+
     #[test]
     fn v20_unique_authority_upgrade_is_atomic_and_fences_v19_readers() {
         for (phase, inject_panic) in [
@@ -12516,7 +12700,7 @@ mod tests {
             assert_eq!(stored_manifest_digest(&connection), before);
             inspect_with_plan(&connection, 4, V19_PLAN).unwrap();
             load_or_create_manifest(&mut connection, 4).unwrap();
-            assert_eq!(identity(&connection).1, 20);
+            assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
             let after = stored_manifest_digest(&connection);
             assert_ne!(after, before);
             assert_eq!(
@@ -13609,7 +13793,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V12_MANIFEST_DIGEST_VERSION)
+            i64::from(V13_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -13736,6 +13920,7 @@ mod tests {
                 (17, 18),
                 (18, 19),
                 (19, 20),
+                (20, 21),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -13815,7 +14000,7 @@ mod tests {
                             |row| row.get::<_, i64>(0),
                         )
                         .unwrap(),
-                    i64::from(V12_MANIFEST_DIGEST_VERSION)
+                    i64::from(V13_MANIFEST_DIGEST_VERSION)
                 );
                 assert_eq!(
                     connection
@@ -14399,7 +14584,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V12_MANIFEST_DIGEST_VERSION)
+            i64::from(V13_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -15538,7 +15723,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in [
-            ("manifest_digest_version", 13),
+            ("manifest_digest_version", 14),
             ("schema_digest_version", 2),
         ] {
             let mut unsupported = Connection::open_in_memory().unwrap();
@@ -17503,7 +17688,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 21",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 22",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -18264,7 +18449,7 @@ mod tests {
                     .unwrap(),
                 (
                     i64::from(CURRENT_SCHEMA_VERSION),
-                    i64::from(V12_MANIFEST_DIGEST_VERSION)
+                    i64::from(V13_MANIFEST_DIGEST_VERSION)
                 )
             );
             for table in [
@@ -18343,7 +18528,7 @@ mod tests {
                     .unwrap(),
                 (
                     i64::from(CURRENT_SCHEMA_VERSION),
-                    i64::from(V12_MANIFEST_DIGEST_VERSION)
+                    i64::from(V13_MANIFEST_DIGEST_VERSION)
                 )
             );
             assert_eq!(

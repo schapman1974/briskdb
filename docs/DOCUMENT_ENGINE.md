@@ -340,6 +340,22 @@ indexing; the built-in ID authority is separate. Code-with-scope keeps recursive
 ordered BSON identity. Finite numeric aliases share canonical keys while booleans,
 strings, binary subtypes, and code remain distinct. No options are silently degraded.
 
+Non-unique physical indexes do not impose that strict value subset on documents.
+Storage preparation uses a record-bound `BDIF` fallback marker for values outside
+the equality-token subset, including intermediate/nested/parallel arrays,
+objects, ObjectId/date values and nonfinite numbers. A record contributes either
+its complete ordinary key set or one fallback marker per affected index, never
+a partial key set. Equality candidates include these fallback records in natural
+order and validate their entry/record checksums before the full BSON matcher.
+This may scan more candidates but cannot discard a possible match. Partial
+nonmembers stay excluded; uncertain sparse path membership is conservatively
+included. Unique indexes still reject unsupported values. Cancellation, malformed
+definitions, corruption and resource limits never become successful fallbacks.
+The pure public key/preparation helpers remain strict and source-oracle compatible.
+Manifest version 21 fences older writers/readers before these durable markers can
+appear. Inserts, updates, replacements, deletes, builds and restart validation
+share the same storage preparation; existing `BDIK` keys are not rewritten.
+
 Generation validates input BSON and has independent per-call limits: 16,384 keys,
 8 MiB conservative charge per scalar/scope, 64 MiB cumulative work/retention charge,
 and one million traversal/work steps. Duplicate values still consume work. Shared

@@ -15,11 +15,11 @@ mod codec;
 mod preparation;
 mod probe;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
-pub(crate) use preparation::DocumentIndexProbe;
 pub use preparation::{
     DocumentIndexPreparation, MAX_DOCUMENT_PREPARED_INDEXES, PreparedDocumentIndexEntries,
     PreparedDocumentIndexKeys,
 };
+pub(crate) use preparation::{DocumentIndexProbe, NON_UNIQUE_FALLBACK_KEY};
 
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_NODES: usize = 4096;
@@ -177,7 +177,7 @@ impl DocumentIndexKeyGenerator {
             return Ok(Vec::new());
         }
         if arrays > 1 {
-            return Err(unsupported());
+            return Err(unsupported_value());
         }
         let mut components = Vec::new();
         let mut key_count: usize = 1;
@@ -255,7 +255,7 @@ fn nested_value<'a>(
         }
         match found {
             Some(BsonValue::Document(next)) => current = next,
-            Some(BsonValue::Array(_)) => return Err(unsupported()),
+            Some(BsonValue::Array(_)) => return Err(unsupported_value()),
             _ => return Ok(None),
         }
     }
@@ -280,7 +280,7 @@ fn component_keys(
     for value in values {
         budget.step()?;
         if !supported_scalar(value) {
-            return Err(unsupported());
+            return Err(unsupported_value());
         }
         // Includes nested code scopes. Preflight bounded work before encoding
         // and hashing; duplicates also consume work rather than evading quotas.
@@ -436,6 +436,28 @@ fn unsupported() -> EngineError {
     EngineError::new(
         EngineErrorKind::Unsupported,
         "unsupported document index key or membership expression",
+    )
+}
+
+/// A value outside the strict equality-token subset, not a malformed definition
+/// or a resource/control error. Only non-unique storage preparation may turn
+/// this particular cause into a conservative candidate marker.
+#[derive(Debug)]
+struct UnsupportedIndexedValue;
+
+impl fmt::Display for UnsupportedIndexedValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("document value requires a non-unique index fallback")
+    }
+}
+
+impl std::error::Error for UnsupportedIndexedValue {}
+
+fn unsupported_value() -> EngineError {
+    EngineError::from_source(
+        EngineErrorKind::Unsupported,
+        "unsupported document index key value",
+        UnsupportedIndexedValue,
     )
 }
 

@@ -341,7 +341,7 @@ fn combined_creation_publishes_entries_counts_and_shared_cache_without_record_re
 }
 
 #[test]
-fn combined_creation_preflight_failures_leave_catalog_allocator_and_entries_unchanged() {
+fn combined_creation_key_limit_failures_leave_catalog_allocator_and_entries_unchanged() {
     let temp = tempfile::tempdir().unwrap();
     let (storage, collection) = setup(temp.path(), 2);
     storage
@@ -349,7 +349,7 @@ fn combined_creation_preflight_failures_leave_catalog_allocator_and_entries_unch
             collection,
             &document(
                 50,
-                BsonValue::ObjectId(crate::document::BsonObjectId::from_bytes([7; 12])),
+                BsonValue::Array((0..=16_384).map(BsonValue::Int32).collect()),
             ),
         )
         .unwrap();
@@ -357,7 +357,7 @@ fn combined_creation_preflight_failures_leave_catalog_allocator_and_entries_unch
     let high = high_water(temp.path());
     assert_eq!(
         create_built(&storage, "new", "value").unwrap_err().kind(),
-        EngineErrorKind::Unsupported
+        EngineErrorKind::LimitExceeded
     );
     assert_eq!(storage.document_catalog().unwrap(), catalog);
     assert_eq!(high_water(temp.path()), high);
@@ -433,7 +433,7 @@ fn built_drop_preserves_records_surviving_entries_and_allocator_without_stale_ca
         snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
         surviving
     );
-    // The removed index no longer rejects values outside its supported key subset.
+    // Only the surviving index receives entries, including for wider BSON values.
     peer.insert_document(
         collection,
         &document(50, BsonValue::ObjectId(BsonObjectId::from_bytes([7; 12]))),
@@ -983,11 +983,20 @@ fn compound_sparse_and_partial_membership_build_and_write_together() {
 
 #[test]
 fn failed_index_write_rolls_back_the_record_and_all_prior_index_entries() {
+    for value in [
+        BsonValue::Int32(7),
+        BsonValue::Document(BsonDocument::new()),
+    ] {
+        assert_failed_index_write_rolls_back(value);
+    }
+}
+
+fn assert_failed_index_write_rolls_back(value: BsonValue) {
     let temp = tempfile::tempdir().unwrap();
     let (storage, collection) = setup(temp.path(), 2);
     build(&storage, "value").unwrap();
     let prepared = storage
-        .prepare_document_write(&document(40, BsonValue::Int32(7)))
+        .prepare_document_write(&document(40, value))
         .unwrap();
     let cancellation = CancellationToken::new();
     let order = storage
@@ -1109,7 +1118,13 @@ fn ready_coverage_corruption_is_rejected_without_repair() {
         "PRAGMA foreign_keys=OFF; DELETE FROM briskdb_documents_v1",
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let (storage, _) = setup(temp.path(), 2);
+        let (storage, collection) = setup(temp.path(), 2);
+        storage
+            .insert_document(
+                collection,
+                &document(50, BsonValue::Document(BsonDocument::new())),
+            )
+            .unwrap();
         build(&storage, "value").unwrap();
         for shard in 0..2 {
             storage
@@ -1132,6 +1147,109 @@ fn ready_coverage_corruption_is_rejected_without_repair() {
             entries
         );
     }
+}
+
+#[test]
+fn nonunique_fallback_candidate_checksum_is_checked_before_matching() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    storage
+        .insert_document(
+            collection,
+            &document(50, BsonValue::Document(BsonDocument::new())),
+        )
+        .unwrap();
+    build(&storage, "value").unwrap();
+    let matcher = DocumentMatcher::compile(
+        &BsonDocument::from_entries([("value", BsonValue::Int32(999))]).unwrap(),
+    )
+    .unwrap();
+    let admission = storage.enter_schema_operation().unwrap();
+    let probe = storage
+        .document_equality_probe(collection, &matcher, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    let id = crate::document::CanonicalBsonKey::encode(&BsonValue::Int32(50)).unwrap();
+    let shard = storage.shard_for_key(id.as_bytes());
+    let connection = storage.open_unconfigured_shard(shard).unwrap();
+    let token = CancellationToken::new();
+    let candidates = storage
+        .scan_document_candidates_on_connection(
+            &connection,
+            collection,
+            shard,
+            None,
+            100,
+            Some(&probe),
+            &token,
+        )
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id_key(), &id);
+    assert!(!matcher.matches(candidates[0].document()).unwrap());
+    assert_eq!(connection.execute("UPDATE briskdb_document_index_entries_v1 SET entry_checksum = zeroblob(32) WHERE index_key = ?1", [crate::document::NON_UNIQUE_FALLBACK_KEY]).unwrap(), 1);
+    assert_eq!(
+        storage
+            .scan_document_candidates_on_connection(
+                &connection,
+                collection,
+                shard,
+                None,
+                100,
+                Some(&probe),
+                &token
+            )
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DataCorruption
+    );
+    drop(connection);
+    drop(admission);
+    drop(storage);
+    assert_eq!(
+        Storage::open(temp.path(), 2).err().unwrap().kind(),
+        EngineErrorKind::DataCorruption
+    );
+}
+
+#[test]
+fn unique_build_cannot_use_nonunique_fallback_or_leave_a_partial_declaration() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    let collection = storage
+        .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+        .unwrap();
+    storage
+        .insert_document(
+            collection.id(),
+            &document(50, BsonValue::Document(BsonDocument::new())),
+        )
+        .unwrap();
+    let before = storage.document_catalog().unwrap();
+    let high = high_water(temp.path());
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let error = storage
+        .create_built_document_index_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            "value",
+            &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+            true,
+            migration,
+            OperationControl::new(None),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+    assert_eq!(storage.document_catalog().unwrap(), before);
+    assert_eq!(high_water(temp.path()), high);
+    assert!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .all(Vec::is_empty)
+    );
+    assert_eq!(create_built(&storage, "value", "value").unwrap(), (1, 2));
+    drop(storage);
+    drop(Storage::open(temp.path(), 2).unwrap());
 }
 
 #[test]
@@ -1384,6 +1502,12 @@ fn every_built_drop_boundary_recovers_without_rewriting_surviving_authority() {
         for point in points {
             let temp = tempfile::tempdir().unwrap();
             let (storage, collection) = setup(temp.path(), count);
+            storage
+                .insert_document(
+                    collection,
+                    &document(50, BsonValue::Document(BsonDocument::new())),
+                )
+                .unwrap();
             let removed = build(&storage, "value").unwrap();
             let keep = storage
                 .declare_document_index(
@@ -1773,7 +1897,13 @@ fn every_build_commit_boundary_recovers_without_partial_activation() {
         }
         for point in points {
             let temp = tempfile::tempdir().unwrap();
-            let (storage, _) = setup(temp.path(), count);
+            let (storage, collection) = setup(temp.path(), count);
+            storage
+                .insert_document(
+                    collection,
+                    &document(50, BsonValue::Document(BsonDocument::new())),
+                )
+                .unwrap();
             drop(storage);
             let records = snapshot(temp.path(), count, "briskdb_documents_v1");
             crash(temp.path(), count, &point);
@@ -1805,7 +1935,7 @@ fn every_build_commit_boundary_recovers_without_partial_activation() {
                     .iter()
                     .map(Vec::len)
                     .sum::<usize>(),
-                if activated { 24 } else { 0 }
+                if activated { 25 } else { 0 }
             );
             build(&reopened, "value").unwrap();
             drop(reopened);

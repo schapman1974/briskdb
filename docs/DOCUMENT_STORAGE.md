@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 20 retains that separation. A SQL table can
+catalog, and the current format 21 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -30,7 +30,7 @@ compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
 All eight document catalog tables and the index-storage layout and operation journals participate
-in semantic manifest digest version 12. Every supported mutation uses an immediate SQLite transaction,
+in semantic manifest digest version 13. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -139,8 +139,8 @@ discard only the journal-owned derived entries and retain the PendingBuild
 declaration; it never activates a partial build. An interrupted admitted build
 leaves schema operations fenced until the root is reopened for recovery.
 
-Each entry checksum binds collection, index, shard, canonical record ID, BDIK
-frame and the exact current record checksum. Inserts, replacements (including
+Each entry checksum binds collection, index, shard, canonical record ID, key
+bytes and the exact current record checksum. Inserts, replacements (including
 unindexed-field changes), and deletes maintain entries in the document's own
 transaction. A schema-fenced root-shared compiled cache selects only Ready
 indexes; opaque or unique pending declarations remain non-enforcing. Startup
@@ -150,6 +150,15 @@ older writers. Unique builds reject existing cross-shard duplicates before inten
 record writes hold a cross-process collection stripe through commit/rollback and
 validate conflicting canonical keys on every shard. Startup validates global
 ownership using private disk-backed scratch under the same writer fences.
+Version 21 permits non-unique `BDIF` candidate markers for values outside the
+strict equality-token subset. The marker bytes are
+`42 44 49 46 00 00 00 01 00 00 00 01 00`, distinct from every `BDIK` tuple.
+An affected record/index has exactly one marker instead of ordinary keys.
+Equality candidate reads include marker owners and verify the actual marker's
+checksum before applying the complete matcher. Markers are never unique keys;
+unique preparation remains strict. The existing entry format/version/checksum
+envelope is unchanged. The version-21 manifest fence prevents older binaries
+from omitting candidates or misclassifying valid nested records as corruption.
 Record/entry formats remain unchanged. Whole-bulk post-image parity and broader
 planner use remain work under #174/#183. Native/wire batch creation and removal retain one admission
 guard across entries; completed entries survive a later failure, and only an
@@ -173,7 +182,7 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 18 and validate its physical schema, but
+understand current manifest format 21 and validate its physical schema, but
 refuse to open a root containing collections or a pending deletion.
 
 Every built-in and declared index also has a durable root-wide `DocumentIndexId`.
