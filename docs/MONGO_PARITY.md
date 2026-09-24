@@ -471,6 +471,14 @@ bounded to 15 seconds. Exhaustion returns ID zero; stale or wrong-namespace IDs
 return code 43. Simultaneous use returns code 237. No SQLite lease is held between
 batches, and no cross-batch snapshot is promised under concurrent writes.
 
+Natural-order reads load initial source frontiers from at most eight targeted
+shards concurrently, including find/getMore and distinct/aggregate source pages.
+Global ordering, pagination, owner pruning and the shared frontier byte bound
+remain authoritative. Failures cancel only local peer work, then drain started
+children before returning one error; a query failure cannot cancel a shared
+listener shutdown token. Point reads remain direct; frontier refills and sorted
+key-window scans remain sequential. See the [engine read boundaries](DOCUMENT_ENGINE.md).
+
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task

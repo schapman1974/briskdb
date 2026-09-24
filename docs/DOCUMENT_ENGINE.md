@@ -503,6 +503,23 @@ merge; `batch_size` bounds each returned page. An initial batch size of zero
 opens a cursor without reading documents. Continuations require a positive
 batch size and cannot change the original skip or limit.
 
+Initial natural-order merge frontiers now load across at most eight target shards
+concurrently, under the existing connection/worker admission limits. Completed
+frontiers retain physical shard positions before the same natural-order merge;
+empty shards and pruned-owner subsets do not alter output order. A shared checked
+byte budget charges each record before publishing its frontier or admitting more
+work. In-flight decoding is separately bounded by eight records and the existing
+BSON allocation limits. Point reads still use one shard directly. Refilling the
+selected frontier and sorted key-window scans remain sequential.
+
+Child failure, task panic, caller cancellation, deadline or engine shutdown stops
+new frontier admission and drains every started child before returning one error,
+without publishing a partial page. Peer cancellation uses a local token and never
+cancels the caller's potentially shared request/listener token. The owning engine
+operation retains its schema/session/lifecycle guards while children drain, even
+when the calling task is abandoned. This adds concurrency, not cross-shard or
+cross-batch snapshot isolation.
+
 ### Field updates and single-record write boundaries
 
 `Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
