@@ -573,6 +573,11 @@ impl Engine {
 }
 
 fn require_single_mutation_read_options(options: &DocumentReadOptions) -> EngineResult<()> {
+    if options.plan_diagnostics() {
+        return Err(unsupported(
+            "access-path diagnostics are not available for find-and-modify",
+        ));
+    }
     if options.skip() != 0
         || options.limit().is_some()
         || options.batch_size() != DEFAULT_DOCUMENT_BATCH_SIZE

@@ -57,7 +57,9 @@ impl Engine {
             remaining: None,
             batch_byte_limit: None,
         };
-        let plan = self.document_cursor_plan(&state)?;
+        let plan = self
+            .document_cursor_plan(&state, &options, cancellation.clone(), deadline)
+            .await?;
         let mut budget = DocumentResultBudget::new(limits);
         budget.add_plan(&plan)?;
         budget.add_bytes(0)?;

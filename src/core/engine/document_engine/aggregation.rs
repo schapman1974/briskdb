@@ -69,7 +69,9 @@ impl Engine {
                 source_exhausted: false,
             }),
         };
-        let plan = self.document_cursor_plan(&state)?;
+        let plan = self
+            .document_cursor_plan(&state, &options, cancellation.clone(), deadline)
+            .await?;
         let (documents, has_more) = self
             .read_document_page(owner, &mut state, cancellation, deadline, &options, limits)
             .await?;
@@ -101,7 +103,7 @@ impl Engine {
         limits: ResultLimits,
     ) -> EngineResult<(Vec<BsonDocument>, bool)> {
         enforce_empty_result_limit(limits)?;
-        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count());
+        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count(), options);
         if state
             .batch_byte_limit
             .is_some_and(|limit| result_bytes > limit)

@@ -80,7 +80,10 @@ pub use options::{
     DocumentReadOptions, DocumentSort, DocumentUpdate, DocumentWriteOptions,
     MAX_DOCUMENT_BATCH_SIZE, MAX_DOCUMENT_REQUEST_BYTES,
 };
-pub use plan::{DocumentPlan, DocumentPointPlan, DocumentScatterPlan};
+pub use plan::{
+    DocumentCandidateKind, DocumentPlan, DocumentPointPlan, DocumentReadAccess, DocumentScanReason,
+    DocumentScatterPlan,
+};
 pub use projection::DocumentProjector;
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,

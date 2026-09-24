@@ -56,6 +56,7 @@ use crate::{
 const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
+const DOCUMENT_READ_ACCESS_BYTES: u64 = 32;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
 const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
@@ -744,7 +745,9 @@ impl Engine {
                     remaining: options.limit(),
                     batch_byte_limit: options.batch_byte_limit(),
                 };
-                let plan = self.document_cursor_plan(&state)?;
+                let plan = self
+                    .document_cursor_plan(&state, &options, cancellation.clone(), deadline)
+                    .await?;
                 let (documents, has_more) = self
                     .read_document_page(
                         owner,
@@ -867,7 +870,9 @@ impl Engine {
                             state.batch_byte_limit =
                                 Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
                         }
-                        let plan = self.document_cursor_plan(&state)?;
+                        let plan = self
+                            .document_cursor_plan(&state, &options, cancellation.clone(), deadline)
+                            .await?;
                         let (documents, has_more) = self
                             .read_document_page(
                                 owner,
@@ -1634,8 +1639,50 @@ impl Engine {
         result
     }
 
-    fn document_cursor_plan(&self, state: &CursorState) -> EngineResult<DocumentPlan> {
-        state.source.plan(state.collection_id, self.shard_count())
+    async fn document_cursor_plan(
+        &self,
+        state: &CursorState,
+        options: &DocumentReadOptions,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> EngineResult<DocumentPlan> {
+        let plan = state.source.plan(state.collection_id, self.shard_count())?;
+        if !options.plan_diagnostics() {
+            return Ok(plan);
+        }
+        // Point plans already describe a canonical-ID lookup. Inserts and
+        // other commands without read diagnostics keep their existing plans.
+        let DocumentPlan::Scatter(plan) = plan else {
+            return Ok(plan);
+        };
+        let storage = self.inner.database.storage.clone();
+        let source = state.source.clone();
+        let collection = state.collection_id;
+        let aggregation = state.aggregation.is_some();
+        self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
+            use crate::document::{DocumentReadAccess, DocumentScanReason};
+            let mut check = || ensure_document_cpu_active(cancellation, &control);
+            check()?;
+            // The request still owns schema admission. This uses the same
+            // Ready cache and bounded selector as its actual reads, but keeps
+            // only payload-free diagnostics, never retained probe authority.
+            let access = if aggregation {
+                DocumentReadAccess::Scan {
+                    reason: DocumentScanReason::AggregationInput,
+                }
+            } else if let Some(matcher) = source.matcher() {
+                storage
+                    .document_candidate_selection(collection, matcher, &mut check)?
+                    .1
+            } else {
+                DocumentReadAccess::Scan {
+                    reason: DocumentScanReason::Unfiltered,
+                }
+            };
+            check()?;
+            Ok(DocumentPlan::Scatter(plan.with_read_access(access)))
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1670,7 +1717,7 @@ impl Engine {
         enforce_empty_result_limit(limits)?;
         if state
             .batch_byte_limit
-            .is_some_and(|limit| cursor_page_base_bytes(state, self.shard_count()) > limit)
+            .is_some_and(|limit| cursor_page_base_bytes(state, self.shard_count(), options) > limit)
         {
             return Err(limit_exceeded(
                 "cursor envelope cannot fit the batch byte limit",
@@ -1739,7 +1786,7 @@ impl Engine {
                         deadline,
                     )
                     .await?;
-                let mut bytes = cursor_page_base_bytes(state, self.shard_count());
+                let mut bytes = cursor_page_base_bytes(state, self.shard_count(), options);
                 if state.batch_byte_limit.is_some_and(|limit| {
                     bytes
                         + DOCUMENT_RESULT_ROW_BYTES
@@ -1878,7 +1925,7 @@ impl Engine {
         }
 
         let mut documents = Vec::new();
-        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count());
+        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count(), options);
         let requested = state
             .remaining
             .unwrap_or(u64::MAX)
@@ -2012,14 +2059,21 @@ fn cursor_envelope_bytes(namespace: &DocumentNamespace) -> u64 {
         + namespace.collection().len() as u64
 }
 
-fn cursor_page_base_bytes(state: &CursorState, shards: u16) -> u64 {
+fn cursor_page_base_bytes(state: &CursorState, shards: u16, options: &DocumentReadOptions) -> u64 {
     cursor_envelope_bytes(&state.namespace)
         + match &state.source {
             PreparedFilterRoute::Point { id_key, .. } => {
                 DOCUMENT_RESULT_VALUE_BYTES + 10 + id_key.as_bytes().len() as u64
             }
             PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. } => {
-                DOCUMENT_RESULT_VALUE_BYTES + 8 + state.source.shards(shards).count() as u64 * 2
+                DOCUMENT_RESULT_VALUE_BYTES
+                    + 8
+                    + state.source.shards(shards).count() as u64 * 2
+                    + if options.plan_diagnostics() {
+                        DOCUMENT_READ_ACCESS_BYTES
+                    } else {
+                        0
+                    }
             }
         }
 }
@@ -2133,6 +2187,11 @@ fn require_delete_options(options: DocumentWriteOptions) -> EngineResult<()> {
 }
 
 fn require_count_options(options: &DocumentReadOptions) -> EngineResult<()> {
+    if options.plan_diagnostics() {
+        return Err(unsupported(
+            "access-path diagnostics are not available for count",
+        ));
+    }
     require_catalog_read_options(options)
 }
 
@@ -2559,6 +2618,11 @@ impl DocumentResultBudget {
                 self.add_bytes(u64::try_from(plan.id_key().as_bytes().len()).unwrap_or(u64::MAX))
             }
             DocumentPlan::Scatter(plan) => {
+                if plan.read_access().is_some() {
+                    // Fixed-size enum/index identity/count metadata, no BSON or
+                    // index names. Default plans retain their previous budget.
+                    self.add_bytes(DOCUMENT_READ_ACCESS_BYTES)?;
+                }
                 self.add_bytes(DOCUMENT_RESULT_VALUE_BYTES + 8)?;
                 self.add_bytes(
                     u64::try_from(plan.shards().len())

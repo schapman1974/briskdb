@@ -7,8 +7,9 @@ use super::{
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
-        BsonDocument, BsonErrorContext, DocumentCollectionId, DocumentCollectionMetadata,
-        DocumentIndexId, DocumentIndexMetadata, DocumentMatcher, encode_document, memory,
+        BsonDocument, BsonErrorContext, DocumentCandidateKind, DocumentCollectionId,
+        DocumentCollectionMetadata, DocumentIndexId, DocumentIndexMetadata, DocumentMatcher,
+        DocumentReadAccess, encode_document, memory,
     },
 };
 use std::error::Error;
@@ -52,6 +53,7 @@ pub(crate) struct DocumentIndexProbe {
     collection_id: DocumentCollectionId,
     index_id: DocumentIndexId,
     selection: DocumentIndexSelection,
+    kind: DocumentCandidateKind,
 }
 
 pub(crate) enum DocumentIndexSelection {
@@ -68,6 +70,17 @@ impl DocumentIndexProbe {
     }
     pub(crate) fn selection(&self) -> &DocumentIndexSelection {
         &self.selection
+    }
+
+    pub(crate) fn read_access(&self) -> DocumentReadAccess {
+        DocumentReadAccess::IndexCandidates {
+            index_id: self.index_id,
+            kind: self.kind,
+            key_count: match &self.selection {
+                DocumentIndexSelection::Keys(keys) => keys.len(),
+                DocumentIndexSelection::SparseEntries => 0,
+            },
+        }
     }
 }
 
@@ -198,6 +211,7 @@ impl DocumentIndexPreparation {
                 return Ok(Some(DocumentIndexProbe {
                     collection_id: self.collection_id,
                     index_id: index.id,
+                    kind: DocumentCandidateKind::Equality,
                     selection: DocumentIndexSelection::Keys(vec![
                         key.to_bytes_with_check(&mut || budget.step())?,
                     ]),
@@ -234,6 +248,11 @@ impl DocumentIndexPreparation {
                     collection_id: self.collection_id,
                     index_id: index.id,
                     selection: DocumentIndexSelection::Keys(encoded),
+                    kind: if alternatives {
+                        DocumentCandidateKind::LogicalFinite
+                    } else {
+                        DocumentCandidateKind::NecessaryFinite
+                    },
                 }));
             }
         }
@@ -249,6 +268,7 @@ impl DocumentIndexPreparation {
                     collection_id: self.collection_id,
                     index_id: index.id,
                     selection: DocumentIndexSelection::SparseEntries,
+                    kind: DocumentCandidateKind::SparsePresence,
                 }));
             }
         }

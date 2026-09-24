@@ -4,9 +4,48 @@ use std::fmt;
 
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
-use super::{CanonicalBsonKey, DocumentCollectionId};
+use super::{CanonicalBsonKey, DocumentCollectionId, DocumentIndexId};
 
 const MAX_DOCUMENT_SHARDS: usize = 64;
+
+/// The bounded proof selected for a secondary-index candidate read. These are
+/// candidate supersets, never index-only reads or replacements for matching.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentCandidateKind {
+    Equality,
+    NecessaryFinite,
+    LogicalFinite,
+    SparsePresence,
+}
+
+/// Why this source uses natural-order scanning instead of a secondary probe.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentScanReason {
+    Unfiltered,
+    NoReadyIndex,
+    NoSafeProbe,
+    ProbeWorkLimit,
+    /// Aggregation retains every routed source row for pipeline accounting.
+    AggregationInput,
+}
+
+/// Payload-free access-path diagnostics, selected under current schema admission.
+/// This describes a plan, not measured SQLite rows, physical I/O or shard visits.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentReadAccess {
+    Scan {
+        reason: DocumentScanReason,
+    },
+    IndexCandidates {
+        index_id: DocumentIndexId,
+        kind: DocumentCandidateKind,
+        /// Zero for a sparse-entry scan; otherwise the finite probe-key count.
+        key_count: usize,
+    },
+}
 
 /// A single-shard document plan proven from a canonical BSON identity.
 #[derive(Clone, PartialEq, Eq)]
@@ -70,6 +109,7 @@ impl fmt::Debug for DocumentPointPlan {
 pub struct DocumentScatterPlan {
     collection_id: DocumentCollectionId,
     shards: Box<[u16]>,
+    read_access: Option<DocumentReadAccess>,
 }
 
 impl DocumentScatterPlan {
@@ -104,6 +144,7 @@ impl DocumentScatterPlan {
         Ok(Self {
             collection_id,
             shards: shards.into_boxed_slice(),
+            read_access: None,
         })
     }
 
@@ -115,6 +156,19 @@ impl DocumentScatterPlan {
         &self.shards
     }
 
+    /// Optional read-access diagnostics. Absence is not a claim of full scanning;
+    /// ordinary plans and commands without diagnostics retain their old shape.
+    pub const fn read_access(&self) -> Option<DocumentReadAccess> {
+        self.read_access
+    }
+
+    pub(crate) fn with_read_access(mut self, access: DocumentReadAccess) -> Self {
+        self.read_access = Some(access);
+        self
+    }
+
+    /// Extract routing fields; inspect `read_access()` first to retain optional
+    /// diagnostics separately.
     pub fn into_parts(self) -> (DocumentCollectionId, Vec<u16>) {
         (self.collection_id, self.shards.into_vec())
     }
@@ -168,6 +222,16 @@ mod tests {
     fn scatter_plan_sorts_and_rejects_invalid_targets() {
         let plan = DocumentScatterPlan::new(collection_id(), vec![3, 0, 2]).unwrap();
         assert_eq!(plan.shards(), &[0, 2, 3]);
+        assert!(plan.read_access().is_none());
+        let access = DocumentReadAccess::IndexCandidates {
+            index_id: DocumentIndexId::from_validated(9),
+            kind: DocumentCandidateKind::NecessaryFinite,
+            key_count: 2,
+        };
+        let diagnostic = plan.with_read_access(access);
+        assert_eq!(diagnostic.read_access(), Some(access));
+        assert_eq!(diagnostic.into_parts(), (collection_id(), vec![0, 2, 3]));
+        assert!(std::mem::size_of::<DocumentReadAccess>() <= 32);
         assert!(DocumentScatterPlan::new(collection_id(), Vec::new()).is_err());
         assert!(DocumentScatterPlan::new(collection_id(), vec![1, 1]).is_err());
         assert!(DocumentScatterPlan::new(collection_id(), vec![64]).is_err());

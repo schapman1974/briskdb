@@ -32,7 +32,20 @@ class WriteResult(TypedDict):
     rows_affected: int
     generated_key: Optional[GeneratedKey]
 
-class DocumentPlan(TypedDict):
+class DocumentScanAccess(TypedDict):
+    kind: Literal["scan"]
+    reason: Literal["unfiltered", "no_ready_index", "no_safe_probe", "probe_work_limit", "aggregation_input"]
+
+class DocumentIndexAccess(TypedDict):
+    kind: Literal["index_candidates"]
+    candidate_kind: Literal["equality", "necessary_finite", "logical_finite", "sparse_presence"]
+    index_id: int
+    key_count: int
+
+class DocumentPlanDiagnostics(TypedDict, total=False):
+    read_access: Union[DocumentScanAccess, DocumentIndexAccess]
+
+class DocumentPlan(DocumentPlanDiagnostics):
     kind: DocumentPlanKind
     collection_id: int
     shards: List[int]
@@ -536,6 +549,7 @@ class Session:
         skip: int = 0,
         limit: Optional[int] = None,
         batch_size: int = 101,
+        plan_diagnostics: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -549,6 +563,7 @@ class Session:
         pipeline: List[BsonDocument],
         *,
         batch_size: int = 101,
+        plan_diagnostics: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -562,6 +577,7 @@ class Session:
         cursor_id: int,
         *,
         batch_size: int = 101,
+        plan_diagnostics: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -587,6 +603,7 @@ class Session:
         field: str,
         filter: Optional[BsonDocument] = None,
         *,
+        plan_diagnostics: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
