@@ -12,6 +12,8 @@ pub(crate) struct DocumentWriteTransaction<'c> {
     collection: DocumentCollectionId,
     shard: u16,
     fence: Option<DocumentWriteFence>,
+    control: Option<Arc<OperationControl>>,
+    cancellation: CancellationToken,
 }
 
 impl std::fmt::Debug for DocumentWriteTransaction<'_> {
@@ -33,7 +35,7 @@ impl Storage {
         collection: DocumentCollectionId,
         shard: u16,
         cancellation: &CancellationToken,
-        control: Option<&OperationControl>,
+        control: Option<&Arc<OperationControl>>,
     ) -> EngineResult<DocumentWriteTransaction<'c>> {
         let fenced = self
             .active_document_indexes(collection)?
@@ -58,11 +60,11 @@ impl<'c> DocumentWriteTransaction<'c> {
         collection: DocumentCollectionId,
         shard: u16,
         cancellation: &CancellationToken,
-        control: Option<&OperationControl>,
+        control: Option<&Arc<OperationControl>>,
         fenced: bool,
     ) -> EngineResult<Self> {
         let check = || {
-            if let Some(reason) = control.and_then(OperationControl::reason) {
+            if let Some(reason) = control.and_then(|control| control.reason()) {
                 return Err(reason.error());
             }
             ensure_document_operation_not_cancelled(cancellation, "before document write admission")
@@ -75,26 +77,12 @@ impl<'c> DocumentWriteTransaction<'c> {
             ));
         }
         let fence = if fenced {
-            let started = Instant::now();
-            loop {
-                check()?;
-                match DocumentWriteFence::try_acquire(
-                    &storage.root,
-                    collection,
-                    Arc::clone(&storage.schema_coordination.document_write_stripes),
-                ) {
-                    Ok(fence) => break Some(fence),
-                    Err(error)
-                        if error.kind() == EngineErrorKind::Busy
-                            && started.elapsed() < CONNECTION_BUSY_TIMEOUT =>
-                    {
-                        // Blocking worker only. No shard transaction or foreign
-                        // pool lease is held while waiting for the collection.
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            Some(acquire_fence(
+                storage,
+                collection,
+                cancellation,
+                control.map(Arc::as_ref),
+            )?)
         } else {
             None
         };
@@ -108,6 +96,8 @@ impl<'c> DocumentWriteTransaction<'c> {
             collection,
             shard,
             fence,
+            control: control.cloned(),
+            cancellation: cancellation.clone(),
         })
     }
 
@@ -132,6 +122,53 @@ impl<'c> DocumentWriteTransaction<'c> {
         require_write_transaction(self)
     }
 
+    pub(super) fn validate_unique_entries(
+        &self,
+        owner: &CanonicalBsonKey,
+        entries: Option<&PreparedDocumentIndexEntries>,
+    ) -> EngineResult<()> {
+        let Some(entries) =
+            entries.filter(|entries| entries.indexes().iter().any(|index| index.is_unique()))
+        else {
+            return Ok(());
+        };
+        if self.fence.is_none() || entries.collection_id() != self.collection {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "document unique-key validation requires its admitted collection fence",
+            ));
+        }
+        self.require_scope(&self.storage, self.collection, self.shard)?;
+        let mut check = || unique::check_active(self.control.as_deref(), &self.cancellation);
+        for shard in 0..self.storage.shard_count() {
+            check()?;
+            let peer;
+            let connection = if shard == self.shard {
+                self.connection
+            } else {
+                peer = unique::open_peer(
+                    &self.storage,
+                    shard,
+                    self.control.clone(),
+                    self.cancellation.clone(),
+                )?;
+                &peer
+            };
+            let result = unique::validate_on_shard(
+                &self.storage,
+                connection,
+                self.collection,
+                shard,
+                self.shard,
+                owner,
+                entries,
+                &mut check,
+            );
+            unique::normalize(result, self.control.as_deref(), &self.cancellation)?;
+        }
+        check()
+    }
+
     pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
         self.transaction.take().expect("live transaction").commit()
     }
@@ -141,6 +178,34 @@ impl<'c> DocumentWriteTransaction<'c> {
             .take()
             .expect("live transaction")
             .rollback()
+    }
+}
+
+pub(super) fn acquire_fence(
+    storage: &Storage,
+    collection: DocumentCollectionId,
+    cancellation: &CancellationToken,
+    control: Option<&OperationControl>,
+) -> EngineResult<DocumentWriteFence> {
+    let started = Instant::now();
+    loop {
+        unique::check_active(control, cancellation)?;
+        match DocumentWriteFence::try_acquire(
+            &storage.root,
+            collection,
+            Arc::clone(&storage.schema_coordination.document_write_stripes),
+        ) {
+            Ok(fence) => return Ok(fence),
+            Err(error)
+                if error.kind() == EngineErrorKind::Busy
+                    && started.elapsed() < CONNECTION_BUSY_TIMEOUT =>
+            {
+                // Blocking worker only. No shard transaction or foreign pool
+                // lease is held while waiting for the collection.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -484,8 +549,8 @@ mod tests {
         assert!(transaction.fence.is_none());
         drop(claim(&storage, collection).unwrap());
         transaction.rollback().unwrap();
-        // Test-only cache injection exercises prospective Ready authority.
-        // Persistent unique activation remains unsupported in this milestone.
+        // Test-only cache injection isolates the Ready authority decision from
+        // the separately tested build/activation lifecycle.
         let catalog = storage.document_catalog().unwrap();
         storage
             .publish_document_indexes(

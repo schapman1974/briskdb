@@ -229,7 +229,7 @@ Collection metadata contains `id`, `database_id`, `database`, `name`,
 `namespace`, exact BSON `options`, placement `code`/`version`, and index
 metadata. Each index contains `name`, exact ordered `keys`, `unique`,
 `built_in`, and `lifecycle`. New secondary declarations start `pending_build`;
-explicit non-unique builds become `ready`. The built-in `_id_` is always ready.
+explicit builds become `ready`. The built-in `_id_` is always ready.
 
 Both sync and async `create_index` accept `sparse=True` or a `partial_filter`
 mapping, but not both. The shared index validator checks the supported predicate
@@ -237,10 +237,10 @@ subset eagerly, including branches that would otherwise short-circuit. Empty
 filters and unsupported operators (such as `$ne`) raise `UnsupportedError`.
 Keys, name and filter together have a 1 MiB stored-specification limit. This is a
 declaration only: it does not scan existing records, accelerate queries, or enforce
-uniqueness yet. Redeclaring an identical built index preserves `lifecycle="ready"`.
+uniqueness. Redeclaring an identical built index preserves `lifecycle="ready"`.
 
 Sync and async `build_index(database, collection, name, ...)` build a declared
-non-unique index and return its name with `lifecycle="ready"`. They accept the
+index and return its name with `lifecycle="ready"`. They accept the
 usual request ID, timeout, cancellation and result limits. Builds require no
 other process to hold the database open and exclusively pause schema admission.
 All current records and the combined index-key budget are validated before
@@ -248,8 +248,14 @@ durable intent. Publication happens only after all shards commit. Interruption
 after intent requires closing/reopening the root; recovery removes the unfinished
 build's derived entries and leaves its declaration pending for an explicit retry.
 Ready entries are maintained with inserts, replacements, updates and deletes.
-Queries still scan; this does not accelerate them or enforce secondary uniqueness.
-`unique=True` builds raise `UnsupportedError` until global uniqueness is implemented.
+Ready indexes provide conservative scalar-equality candidates with full matcher
+rechecks; unsupported shapes still scan. `unique=True` builds reject duplicate
+existing data before intent with `UniqueViolationError`. Once Ready, they enforce
+cross-shard canonical key ownership on inserts, updates, replacements and upserts,
+including sparse/partial and multikey membership. Deletion releases keys; dropping
+the index removes enforcement. Reopening preserves both metadata and enforcement.
+Bulk writes remain per-input/per-shard, not globally atomic; transient conflicts
+can fail even when an eventual bulk post-image would be unique (#183).
 
 ```python
 session.create_index("app", "events", {"kind": 1}, name="by_kind")
@@ -262,7 +268,7 @@ sparse/partial options and request controls as `create_index`. The collection
 must already exist. It returns `kind="index_built"`, `lifecycle="ready"`, and
 Ready-index counts before/after (including `_id_`, excluding Pending declarations)
 observed under the same exclusive admission. A matching Ready retry leaves both
-counts equal. Unique secondary builds remain unsupported.
+counts equal. Pass `unique=True` to activate a unique secondary constraint.
 
 ```python
 result = session.create_built_index("app", "events", {"kind": 1}, name="by_kind")
@@ -285,7 +291,7 @@ same way; unknown legacy envelopes retain their previous opaque `keys` value and
 are not silently interpreted. Ordinary and built-in result shapes are unchanged.
 
 `drop_index` is available on both sync and async sessions. It removes one pending
-declaration or built non-unique index by exact, case-sensitive name and returns `kind="acknowledged"`,
+declaration or built index by exact, case-sensitive name and returns `kind="acknowledged"`,
 `acknowledged=True`, and a null plan. It never removes documents or the built-in
 ID index. `_id`/`_id_` raise `InvalidArgumentError`; missing indexes raise
 `FailedPreconditionError`, including a repeated drop. Field aliases, key-pattern

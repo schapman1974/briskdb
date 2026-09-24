@@ -1,4 +1,4 @@
-//! Offline non-unique build/drop authority. A build is published only after
+//! Offline build/drop authority. A build is published only after
 //! every shard commits; restart discards an unpublished build, never activates it.
 
 use super::*;
@@ -453,7 +453,7 @@ impl Storage {
                     .map_err(sqlite_error::storage)?;
                 require_ready_manifest(&transaction, self.shard_count())?;
                 let changed = transaction.execute("UPDATE briskdb_document_indexes SET lifecycle_state = 2
-                    WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND is_unique = 0 AND lifecycle_state = 1",
+                    WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND lifecycle_state = 1",
                     params![to_sqlite_id(collection.id())?, name]).map_err(sqlite_error::storage)?;
                 if changed != 1 {
                     return Err(corrupt("document index drop lost its Ready declaration"));
@@ -673,12 +673,6 @@ impl Storage {
                         }
                     }
                 }
-                if unique {
-                    return Err(EngineError::new(
-                        EngineErrorKind::Unsupported,
-                        "physical unique document indexes require global uniqueness authority",
-                    ));
-                }
                 if let Some(existing) = existing.filter(|_| !strict_compatibility) {
                     let canonical_keys = !specification.is_empty()
                         && specification
@@ -750,12 +744,6 @@ impl Storage {
             if target.is_built_in() {
                 return Err(DocumentIndexError::Protected.into_engine_error());
             }
-            if target.is_unique() {
-                return Err(EngineError::new(
-                    EngineErrorKind::Unsupported,
-                    "physical unique document indexes require global uniqueness authority",
-                ));
-            }
             let current = compile_ready_indexes(&catalog, &mut || {
                 ensure_control_active(&control, "while preparing document index authority")
             })?;
@@ -769,6 +757,10 @@ impl Storage {
             let prepared = future
                 .get(&collection.id())
                 .ok_or_else(|| corrupt("document index build omitted its collection"))?;
+            let unique_keys = prepared
+                .has_unique_secondary()
+                .then(|| unique::UniqueKeyScratch::new(Some(Arc::clone(&control))))
+                .transpose()?;
             // Validate all current entries and the combined future write budget
             // before accepting durable intent. Data cannot change under this guard.
             for shard in 0..self.shard_count() {
@@ -815,12 +807,38 @@ impl Storage {
                                     )
                                 },
                             )?;
-                            prepared.prepare_with_check(record.document(), &mut || {
-                                ensure_control_active(
-                                    &control,
-                                    "while validating future document index entries",
-                                )
-                            })?;
+                            let entries =
+                                prepared.prepare_with_check(record.document(), &mut || {
+                                    ensure_control_active(
+                                        &control,
+                                        "while validating future document index entries",
+                                    )
+                                })?;
+                            if let Some(unique_keys) = &unique_keys {
+                                if let Some(conflict) = unique_keys.add(
+                                    &entries,
+                                    record.id_key.as_bytes(),
+                                    &mut || {
+                                        ensure_control_active(
+                                            &control,
+                                            "while validating unique index build keys",
+                                        )
+                                    },
+                                )? {
+                                    return Err(
+                                        if conflict == target.id()
+                                            && target.lifecycle()
+                                                == DocumentIndexLifecycle::PendingBuild
+                                        {
+                                            unique::duplicate()
+                                        } else {
+                                            corrupt(
+                                                "stored document unique index contains duplicate keys",
+                                            )
+                                        },
+                                    );
+                                }
+                            }
                             Ok(())
                         },
                     )
@@ -852,8 +870,8 @@ impl Storage {
                     transaction.execute(
                         "INSERT INTO briskdb_document_indexes
                          (collection_id, index_name, spec_bson, is_unique, is_builtin, index_format_version, lifecycle_state)
-                         VALUES (?1, ?2, ?3, 0, 0, 1, 2)",
-                        params![to_sqlite_id(collection.id())?, name, bytes],
+                         VALUES (?1, ?2, ?3, ?4, 0, 1, 2)",
+                        params![to_sqlite_id(collection.id())?, name, bytes, target.is_unique()],
                     ).map_err(sqlite_error::storage)?;
                     allocate_index_identity(&transaction, to_sqlite_id(collection.id())?, name)?;
                     let actual: i64 = transaction.query_row(
@@ -977,7 +995,7 @@ impl Storage {
                     AND index_id = ?1 AND operation_id = ?2 AND operation_kind = ?3 AND next_shard = ?4",
                     params![target.id().get() as i64, journal.operation, journal.kind, journal.next]).map_err(sqlite_error::storage)?;
                     let activated = transaction.execute("UPDATE briskdb_document_indexes SET lifecycle_state = 1
-                    WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND is_unique = 0 AND lifecycle_state = 2",
+                    WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND lifecycle_state = 2",
                     params![to_sqlite_id(collection.id())?, name]).map_err(sqlite_error::storage)?;
                     if removed != 1 || activated != 1 {
                         return Err(corrupt(

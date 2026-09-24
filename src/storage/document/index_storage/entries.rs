@@ -128,12 +128,6 @@ pub(in crate::storage::document) fn insert_selected_entries(
             "document index build preparation omitted its target",
         ));
     }
-    if prepared.indexes().iter().any(|index| index.is_unique()) {
-        return Err(EngineError::new(
-            EngineErrorKind::Unsupported,
-            "physical unique document indexes require global uniqueness authority",
-        ));
-    }
     let mut statement = transaction
         .prepare_cached(
             "INSERT INTO briskdb_document_index_entries_v1

@@ -232,7 +232,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, non-unique indexes with safe equality candidates, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), uniqueness and broader query planning remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, unique indexes and safe equality candidates, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), whole-bulk post-image semantics and broader query planning remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb) on `main`; authenticated table access, parameters and local joins; not yet published to PyPI |
@@ -454,15 +454,19 @@ more valuable than a star. Start with the
 - Python document commands support bounded BSON queries, basic aggregation,
   metadata/cursors, filtered deletes, replacements, and field/array updates.
   Replacement, update-one/many, and find-and-modify upserts are supported; other update operators,
-  native Python bulk-write helpers, secondary uniqueness and broader index-backed plans
-  remain planned. Explicit non-unique `build_index` now builds maintained entries;
+  native Python bulk-write helpers and broader index-backed plans
+  remain planned. Explicit `build_index` builds maintained entries;
   PyMongo `create_index` / `create_indexes` also build ordinary, compound, sparse
-  and partial non-unique indexes. Builds require sole-process ownership. Complete
+  and partial indexes, including `unique=True`. Unique keys are enforced across
+  shards for every record write; duplicates fail with code 11000. Builds require
+  sole-process ownership. Complete
   supported equality tuples use Ready index candidates with full BSON matching;
   partial indexes, sparse all-null queries and unsupported shapes retain scans.
   PyMongo `drop_index` / `drop_indexes` remove secondary indexes
   without deleting documents; `_id_` remains protected. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.
+  Bulk updates may reject temporary key collisions even when their eventual
+  post-image would be unique; that TinyMongo parity work remains open.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
   checks on Linux/macOS x86-64 and ARM64.

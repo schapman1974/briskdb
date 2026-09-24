@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 19 retains that separation. A SQL table can
+catalog, and the current format 20 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -30,7 +30,7 @@ compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
 All eight document catalog tables and the index-storage layout and operation journals participate
-in semantic manifest digest version 11. Every supported mutation uses an immediate SQLite transaction,
+in semantic manifest digest version 12. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -89,7 +89,7 @@ The fixed table and exact canonical-ID key provide safe `_id` candidate
 filtering. Complete supported scalar equality tuples can also use Ready secondary
 entries; BSON matching remains authoritative and verifies every candidate.
 SQLite candidates may never exclude a true Mongo match. Secondary declarations start `PendingBuild`;
-an explicit non-unique build can publish maintained physical entries as `Ready`.
+an explicit build can publish maintained physical entries as `Ready`.
 Partial indexes, incomplete/unsupported equality shapes and sparse all-null
 tuples retain scans. Probes are request-local under schema admission, never
 cursor-retained authority. The [engine contract](DOCUMENT_ENGINE.md#equality-index-candidates)
@@ -145,8 +145,13 @@ unindexed-field changes), and deletes maintain entries in the document's own
 transaction. A schema-fenced root-shared compiled cache selects only Ready
 indexes; opaque or unique pending declarations remain non-enforcing. Startup
 rejects missing, extra, stale or orphan entries without repair unless an explicit
-journal owns their cleanup. Global uniqueness and broader planner use remain work under
-#174. Native/wire batch creation and removal retain one admission
+journal owns their cleanup. Version 20 permits Ready unique indexes and fences
+older writers. Unique builds reject existing cross-shard duplicates before intent;
+record writes hold a cross-process collection stripe through commit/rollback and
+validate conflicting canonical keys on every shard. Startup validates global
+ownership using private disk-backed scratch under the same writer fences.
+Record/entry formats remain unchanged. Whole-bulk post-image parity and broader
+planner use remain work under #174/#183. Native/wire batch creation and removal retain one admission
 guard across entries; completed entries survive a later failure, and only an
 unfinished entry's journal fences the root until reopen. Built-index drops use journal-owned cleanup
 without removing records; namespace deletion can remove both indexes and records.

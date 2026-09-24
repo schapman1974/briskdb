@@ -706,7 +706,7 @@ requires an earlier dependency:
       prefixes survive runtime failures; unfinished new entries are removed on
       reopen without changing earlier indexes or records. Real-driver restart,
       raw malformed-batch, source-locked metadata and crash-boundary tests cover
-      this path. Unique enforcement, broader planner acceleration and
+      this path. Whole-bulk unique post-image parity, broader planner acceleration and
       broader IndexModel warning/degradation compatibility remain open.
       Native `DropIndexes` now powers Mongo/PyMongo named, unambiguous legacy-field
       and wildcard removal under one sole-process/exclusive admission. It resolves
@@ -723,7 +723,7 @@ requires an earlier dependency:
       Partial indexes, sparse all-null tuples and unsupported/incomplete shapes
       fall back to scans. Source-locked comparisons cover 201,349 matcher
       evaluations with no excluded true matches. Broader predicates, planner
-      diagnostics and secondary uniqueness remain open under #174/#178.
+      diagnostics remain open under #174/#178.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys
@@ -734,8 +734,17 @@ requires an earlier dependency:
       root/collection/shard-bound transaction owning any cross-process writer
       fence until SQLite cleanup. Bounded retained stripes, cancellation,
       parent-task abort, process death and failed rollback are covered. Pending
-      unique and Ready non-unique indexes do not request fences; unique builds,
-      cross-shard duplicate validation and activation remain unfinished.
+      unique and Ready non-unique indexes do not request fences.
+      Version 20 now fences older writers and enables unique builds/activation,
+      cross-shard duplicate validation for all record mutations and upserts,
+      and global ownership checks on reopen. Ordinary/compound/multikey/sparse/
+      partial keys share the canonical generator. Build duplicates fail before
+      intent; runtime duplicates return 11000. Disk-backed private scratch bounds
+      build/startup key memory; writer stripes span record/entry commit or rollback.
+      Removal releases enforcement through the existing recoverable lifecycle.
+      Bulk writes still commit per input/shard and can reject transient collisions
+      even when the eventual image is unique. Sharded TinyMongo whole-post-image
+      parity and crash-safe cross-shard bulk coordination remain #183; #174 stays open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

@@ -1,5 +1,5 @@
 //! Downgrade-fenced physical entry schema and restartable empty-table upgrade.
-//! Ready non-unique authority is managed by the separate operation journal.
+//! Ready secondary authority is managed by the separate operation journal.
 
 use rusqlite::Connection;
 

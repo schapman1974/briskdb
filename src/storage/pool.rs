@@ -1290,7 +1290,7 @@ pub(super) fn run_dedicated_connection_controlled<T>(
     }
 }
 
-fn has_generic_sqlite_failure(error: &EngineError) -> bool {
+pub(super) fn has_generic_sqlite_failure(error: &EngineError) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(cause) = source {
         if let Some(rusqlite::Error::SqliteFailure(code, _)) = cause.downcast_ref() {

@@ -290,7 +290,7 @@ pub(super) fn open_existing_read_only(
 /// validation to the caller. The controlled virtual-table bootstrap path uses
 /// this split so it can install cancellation hooks before validation touches
 /// SQLite schema state that may be locked by another process.
-#[cfg(feature = "experimental-vtab")]
+#[cfg(any(feature = "experimental-vtab", feature = "documents"))]
 pub(super) fn open_required_file_read_only(path: &Path) -> EngineResult<Connection> {
     validate_existing_file(path)?;
     open_existing_read_only_connection(path)
@@ -298,7 +298,7 @@ pub(super) fn open_required_file_read_only(path: &Path) -> EngineResult<Connecti
 
 /// Validate an already-open read-only shard without replacing its busy handler
 /// or progress hook.
-#[cfg(feature = "experimental-vtab")]
+#[cfg(any(feature = "experimental-vtab", feature = "documents"))]
 pub(super) fn validate_open_read_only_connection(
     connection: &Connection,
     path: &Path,
@@ -2876,7 +2876,7 @@ fn open_existing_connection(path: &Path) -> EngineResult<Connection> {
     Ok(connection)
 }
 
-#[cfg(feature = "experimental-vtab")]
+#[cfg(any(feature = "experimental-vtab", feature = "documents"))]
 fn open_existing_read_only_connection(path: &Path) -> EngineResult<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -2988,7 +2988,7 @@ fn require_writable(connection: &Connection) -> EngineResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "experimental-vtab")]
+#[cfg(any(feature = "experimental-vtab", feature = "documents"))]
 fn require_read_only(connection: &Connection) -> EngineResult<()> {
     if connection
         .is_readonly(MAIN_DB)

@@ -405,6 +405,26 @@ async fn index_batch_counts_conflicts_completed_prefix_and_reopen() {
         assert_eq!(index_code(&error), code);
     }
     // Runtime failures retain the completed prefix, without fencing a clean root.
+    engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::Insert(
+                    DocumentInsertRequest::new(
+                        namespace(),
+                        vec![
+                            BsonDocument::from_entries([("_id", BsonValue::Int32(9001))]).unwrap(),
+                            BsonDocument::from_entries([("_id", BsonValue::Int32(9002))]).unwrap(),
+                        ],
+                        DocumentWriteOptions::new(),
+                    )
+                    .unwrap(),
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
     let error = engine
         .execute_document(
             &session,
@@ -415,7 +435,7 @@ async fn index_batch_counts_conflicts_completed_prefix_and_reopen() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+    assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
     let result = engine
         .execute_document(
             &session,

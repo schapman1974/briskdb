@@ -64,10 +64,10 @@ The current engine executes:
 | `ListCollectionMetadata` | Filters and pages BSON collection metadata through the shared cursor registry; `name_only` restricts both output and filtering to name/type |
 | `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
 | `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
-| `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
-| `CreateBuiltIndex` | Creates and builds one non-unique index on an existing collection; returns `IndexBuilt { name, before, after }` with Ready counts under the same exclusive admission |
+| `BuildIndex` | Explicitly builds a declared index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication |
+| `CreateBuiltIndex` | Creates and builds one index on an existing collection; returns `IndexBuilt { name, before, after }` with Ready counts under the same exclusive admission |
 | `CreateIndexes` | Eagerly validates up to 1,000 definitions, then creates them in order under one exclusive admission; logical-definition conflicts, built-in ID no-ops, and `IndexesBuilt { before, after }` counts |
-| `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
+| `DropIndex` | Removes an exact pending declaration or recoverably removes a built index and its derived entries; never removes BSON records |
 | `DropIndexes` | Removes an exact name, an unambiguous single-field alias, or every secondary definition under one exclusive admission; returns Ready `before` / `after` counts and protects the built-in ID index |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `ListIndexMetadata` | Pages BSON metadata for built indexes only, built-in first then by name; shares cursor controls and excludes pending declarations |
@@ -135,7 +135,7 @@ membership validator or authority: consumers must compile it before execution.
 
 New secondary declarations start `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Declarations do not
-scan or validate existing records. Explicit non-unique builds and transactional
+scan or validate existing records. Explicit builds and transactional
 maintenance and wire creation/discovery/removal are implemented separately below,
 along with conservative equality candidates. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
@@ -153,7 +153,7 @@ high-water mark is retained, so recreating the name gets a new index ID.
 Result-budget and request-control failures before commit leave the declaration
 unchanged. A successful commit returns `Acknowledged(true)` without a later
 cancellation check turning that committed removal into an apparent failure.
-Crash tests cover both sides of commit. Built non-unique indexes instead require
+Crash tests cover both sides of commit. Built indexes instead require
 sole-process ownership and exclusive schema admission: intent atomically changes
 the target to PendingBuild and installs the existing version-19 Drop journal.
 Cleanup removes only that globally unique index ID from each shard, then deletes
@@ -206,14 +206,16 @@ index lifecycles, or establish catalog freshness. A compiled snapshot may be
 stale after a drop; physical callers must fence metadata and maintain entries
 atomically with the document. Ordinary writes still ignore non-enforcing pending
 declarations. `DocumentCommand::BuildIndex(DocumentBuildIndexRequest)` now builds
-one declared non-unique index offline under exclusive schema admission and
+one declared index offline under exclusive schema admission and
 sole-process ownership. It returns `DocumentResult::IndexReady(name)` after all
 shards commit and the checksummed manifest publishes Ready. Repeated builds and
 matching declarations preserve that Ready lifecycle. Ready entries are maintained
 transactionally by every record write and verified on reopen. Interrupted builds
 require reopening; startup discards the unpublished derived entries, leaving the
 declaration pending. Shared preparation bounds apply across all Ready indexes,
-not independently per index. Unique builds currently return Unsupported.
+not independently per index. Unique builds validate every prospective key
+across all shards before durable intent; duplicate data returns `UniqueViolation`
+(Mongo code 11000), without activating the constraint.
 `CreateBuiltIndex(DocumentCreateIndexRequest)` combines normalization, declaration
 and build under that admission. Preflight failures leave no new declaration or
 allocated identity. Matching Ready retries are idempotent; matching Pending
@@ -221,7 +223,7 @@ declarations keep their original identity and abort behavior. For a new index,
 the declaration and v19 DROP cleanup obligation commit together, with the cleanup
 cursor held at zero until final activation cancels the obligation. Reopening an
 interrupted operation removes both the new declaration and its derived entries,
-without reusing its committed identity. No format version changes. `before` and
+without reusing its committed identity. `before` and
 `after` count Ready indexes (including `_id_`, excluding unrelated Pending
 declarations); result limits are checked before durable intent.
 `CreateIndexes(DocumentCreateIndexesRequest)` adds bounded ordered batches and
@@ -237,14 +239,14 @@ Pending declarations participate in conflict checks and matching ones are built.
 The ascending built-in ID request is a no-op with actual Ready counts; descending
 ID creation is unsupported. The older singleton declaration/build APIs retain
 their existing permissive naming behavior.
-Cross-shard uniqueness, broader planner candidates and selector compatibility
-remain open under #174. Ready-index discovery is
+Broader planner candidates, whole-bulk post-image uniqueness and selector compatibility
+remain open under #174/#183. Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 ### Equality index candidates
 
 Find (including sorted/paged reads), filtered count/distinct and mutation
-selection can use a current Ready non-unique index when every indexed
+selection can use a current Ready index when every indexed
 path has a necessary supported scalar equality. Direct equality, `$eq` and
 positive `$and` clauses are recognized; the entire BSON matcher still verifies
 each candidate. Compound paths and scalar membership in final arrays reuse the
@@ -287,12 +289,13 @@ that boundary and release admission after worker cleanup. This adds no unique
 constraint, global snapshot or cross-shard atomicity guarantee.
 
 Every record mutation now requires a root/collection/shard-bound
-`DocumentWriteTransaction`, including imports and upsert rechecks. As a
-prerequisite for secondary uniqueness, it can own a bounded collection-writer
+`DocumentWriteTransaction`, including imports and upsert rechecks. With a Ready
+unique secondary index, it owns a bounded collection-writer
 stripe acquired before `BEGIN IMMEDIATE`. Only the schema-admitted Ready index
-cache may request that fence: today's non-unique indexes and pending unique
-declarations do not acquire it. Unique activation and duplicate checks remain
-unsupported; this is transaction-lifetime infrastructure, not a new constraint.
+cache may request that fence: non-unique indexes and pending unique
+declarations do not acquire it. Insert and replacement post-images probe all
+shards for conflicting canonical keys before any record mutation. Foreign-shard
+probes use dedicated validated read-only connections, not nested pool leases.
 The blocking worker retains the fence until SQLite commits or rolls back, even
 if its async parent is abandoned. Unproven rollback degrades the root and retains
 the fence and degraded root lease until process exit. Cross-process stripes use
@@ -300,6 +303,25 @@ at most 256 retained, owner-only lock files in a separate document-write namespa
 only serialize unrelated collections. Contention is cancellable and bounded by
 the existing storage busy timeout. Record/index formats and shard-local commit
 boundaries are unchanged.
+
+Manifest version 20 fences older writers before unique activation. The existing
+entry format covers ordinary, compound, one-level multikey, sparse and partial
+unique indexes. Repeated keys within one record do not conflict; BSON numeric
+aliases collide, booleans remain distinct, missing and null share a key, and
+empty arrays have their own key. Same-owner replacements are legal; deletes
+release ownership in the same transaction as record/entry removal. Dropping the
+index removes enforcement through the existing recoverable lifecycle.
+Offline builds and startup use a private disk-backed SQLite key set with a
+bounded cache, not an unbounded collection-wide in-memory map. Startup holds
+the relevant writer stripes in deterministic order while checking global keys;
+duplicate stored owners are corruption, not an automatic repair opportunity.
+
+This is **per-record/per-shard enforcement**, not globally atomic bulk updates.
+Earlier shard/input commits can survive a later conflict. A multi-update whose
+eventual post-image is unique can still fail if an intermediate key belongs to
+another record (for example, shifting unique values `[1, 2]` to `[2, 3]`). The
+locked TinyMongo backends disagree here; sharded whole-post-image parity and a
+crash-safe cross-shard coordinator remain issue #183.
 
 `DocumentIndexKeyGenerator` generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
@@ -561,9 +583,10 @@ commit. `DocumentReplaceRequest::with_max_document_bytes` lets wire adapters
 enforce their smaller advertised BSON limit, including a retained ID larger
 than the incoming replacement. Validation failure rolls back the local
 transaction. Successful commits are not reclassified by late cancellation.
-Pending secondary declarations remain non-enforcing. Ready non-unique indexes
+Pending secondary declarations remain non-enforcing. Ready indexes
 validate the post-image against the combined index-key bounds and replace their
-entries in the same record transaction. Secondary uniqueness remains unfinished.
+entries in the same record transaction. Ready unique indexes additionally check
+cross-shard ownership under the collection-writer fence described above.
 
 `Replace` with `DocumentWriteOptions::with_upsert(true)` first follows the normal
 replacement path. On no match, it inserts a normalized replacement: an explicit
@@ -1103,7 +1126,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 Other update operators,
 additional aggregation expressions/group-key forms,
-database statistics, unique secondary-index builds and
+database statistics, whole-bulk unique post-image semantics and
 broader index-backed query plans
 remain later roadmap work. Collection and Ready-index metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`

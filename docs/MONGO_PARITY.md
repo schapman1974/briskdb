@@ -150,7 +150,7 @@ Native Rust `ListIndexMetadata` and Python `list_index_metadata` share this path
 the older native `ListIndexes` / `list_indexes` still include pending metadata.
 
 Mongo `createIndexes` and sync/async PyMongo `create_index` / `create_indexes`
-now build non-unique ordinary, compound, sparse and partial indexes through native
+now build ordinary, compound, sparse and partial indexes, including unique indexes, through native
 `CreateIndexes`. Batches are limited to 1,000 entries and existing BSON/request
 budgets. Every shape is validated before implicit collection creation; builds then
 run in order under one exclusive schema/sole-process admission. A runtime failure
@@ -159,9 +159,16 @@ Pending declarations. Matching retries keep identities and metadata; same-name
 definition conflicts return 86, equivalent definitions with another name return
 85, and explicit uniqueness options on ascending `_id` return 197. Valid ascending
 `_id` requests are no-ops even when PyMongo supplies its default `_id_1` name.
-New unique secondary builds return 115; unknown options (including TTL, background,
+Duplicate unique builds/writes return 11000; unknown options (including TTL, background,
 collation and commit quorum), descending `_id` creation and document sequences are
-not supported. These builds maintain entries but do not accelerate reads yet.
+not supported. Ready indexes also provide conservative equality candidates.
+Ready unique indexes enforce cross-shard ownership for inserts, replacements,
+updates and upserts. Missing/null, numeric aliases, multikey deduplication and
+sparse/partial membership use the shared canonical key generator. Enforcement
+survives reopening and ends with recoverable index removal. Bulk writes retain
+the existing per-input/per-shard commit boundary: they are not globally atomic,
+and an otherwise unique final bulk image can fail on a transient collision.
+Whole-post-image sharded TinyMongo parity remains #183.
 
 Mongo `dropIndexes` and sync/async PyMongo `drop_index` / `drop_indexes` now use
 the shared engine's exclusive removal path. String selectors accept an exact
@@ -196,8 +203,9 @@ specifications and IDs are preserved. This is storage groundwork, not index
 activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
-are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, broader planner use and selector compatibility remain
+are discarded on reopen without changing BSON or declaration IDs. Version 20
+adds the older-writer fence for secondary uniqueness using the same entry format
+and lifecycle. Broader planner use, whole-bulk post-image parity and selector compatibility remain
 open under #174. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
@@ -499,7 +507,7 @@ Required CI compares 64 valid ascending integer-key definitions with the unchang
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
 not itself physical index support: secondary declarations still enforce no uniqueness.
-Ready non-unique indexes separately support conservative equality candidates.
+Ready indexes separately support conservative equality candidates.
 Required CI also compares
 six build/drop/recreation discovery states and the reopened result with the
 source-locked TinyMongo client, including built-in/name order and exact options.
@@ -525,12 +533,12 @@ opaque/readable. These options are metadata-only until physical activation;
 native declaration validation does not scan records; wire removal uses the separate
 exclusive lifecycle described above.
 The separate native `CreateBuiltIndex` / sync/async `create_built_index` helper
-now combines declaration and physical non-unique build on an existing collection,
+now combines declaration and physical build on an existing collection,
 with exclusive before/after Ready counts. Preflight rejects unsupported data and
 combined budgets without publishing metadata. Restart removes newly created
 unfinished declarations and entries, but preserves preexisting Pending ones.
-It reuses the v19 cleanup journal and does not change the frozen contract or
-claim secondary uniqueness. Equality candidates use the separately validated
+It reuses the v19 cleanup journal and does not change the frozen contract.
+Version 20 additionally permits unique builds. Equality candidates use the separately validated
 Ready-cache read path. Native batch and wire creation
 now reuse that lifecycle, with completed-prefix recovery tests at every new-entry
 commit boundary on two- and four-shard roots. TinyMongo's broader IndexModel
@@ -543,7 +551,7 @@ probes, preserve natural paging and still run the full matcher. Partial indexes,
 sparse all-null tuples and unsupported/incomplete shapes scan. Native/real-driver
 tests compare filters, sorting, count/distinct, index drop/recreation between
 batches, write maintenance and reopened results. This does not close #174 or
-#178: uniqueness, broader candidate forms and plan diagnostics remain open.
+#178: whole-bulk post-image parity, broader candidate forms and plan diagnostics remain open.
 
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.
