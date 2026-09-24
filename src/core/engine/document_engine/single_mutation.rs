@@ -403,14 +403,7 @@ impl Engine {
                             Arc::clone(&control),
                         )?)?
                         .id();
-                    let plan = match &route {
-                        PreparedFilterRoute::Point { id_key, shard } => DocumentPlan::Point(
-                            DocumentPointPlan::new(collection_id, *shard, id_key.clone())?,
-                        ),
-                        PreparedFilterRoute::Scatter(_) => {
-                            scatter_plan(collection_id, shard_count)?
-                        }
-                    };
+                    let plan = route.plan(collection_id, shard_count)?;
                     enforce_execution_result_limits_with_check(
                         &DocumentExecution::new(request_id, Some(plan.clone()), no_match),
                         limits,
@@ -470,10 +463,11 @@ impl Engine {
                 )
                 .await
             }
-            PreparedFilterRoute::Scatter(matcher) => {
+            route @ (PreparedFilterRoute::Scatter(_) | PreparedFilterRoute::ShardSubset { .. }) => {
+                let matcher = route.matcher().cloned();
                 loop {
                     let mut best = None;
-                    for shard in 0..shard_count {
+                    for shard in route.shards(shard_count) {
                         let matcher = matcher.clone();
                         let sorter = sorter.clone();
                         // Comparing potentially large BSON sort keys stays on

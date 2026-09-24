@@ -380,8 +380,15 @@ prevent stale find/aggregate cursors from reading a recreated namespace; their
 next admitted continuation fails and releases state (or idle expiry cleans it).
 
 An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
-`DocumentPlan::Point` with one collection and one physical shard. Other filters
-produce a deterministic `DocumentPlan::Scatter` over every shard. The shared
+`DocumentPlan::Point` with one collection and one physical shard. A sole
+`{_id: {$in: [literal, ...]}}` with 1–1024 values produces a deterministic
+`DocumentPlan::Scatter` over only the distinct owning shards. It uses storage's
+versioned canonical BSON encoding, so numeric aliases share ownership and
+document/array IDs retain exact-value semantics. The complete matcher still
+checks candidates; this prunes shards without promising a multi-key index lookup.
+The restriction is shared by find/continuations, count, distinct and mutations.
+Empty/larger lists, regex members and unproven filter shapes scan every shard;
+aggregation does not yet push an initial match into this routing shortcut. The shared
 Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
 restarts. `skip` and `limit` apply once across the whole cursor, after the
@@ -810,7 +817,7 @@ again against the shared cursor retention quota; an over-quota continuation
 fails and releases its cursor.
 
 Until sorted indexes are available, each bounded window rescans matching
-documents on all shards. A window retains at most 1024 keys and a conservative
+documents on the routed shards. A window retains at most 1024 keys and a conservative
 64-MiB heap charge (plus the current bounded input/key while considering it),
 then fetches only selected documents. Large skips can span several windows;
 memory-bound or window-bound pages may be shorter than the requested batch.
