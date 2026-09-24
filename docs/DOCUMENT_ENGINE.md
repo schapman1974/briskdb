@@ -247,15 +247,17 @@ implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 Find (including sorted/paged reads), filtered count/distinct and mutation
 selection can use a current Ready index when every indexed
-path has a necessary supported scalar equality or bounded literal `$in` list.
+path has a necessary supported scalar equality, bounded literal `$in` list, or
+explicit field-absence condition.
 Direct equality, `$eq` and positive `$and` clauses are recognized; the entire BSON matcher still verifies
 each candidate. Compound paths and scalar membership in final arrays reuse the
 same canonical BDIK keys as transactional write maintenance. Missing/null and
 numeric cohorts keep their BSON semantics; booleans remain distinct from numbers.
 
 Partial indexes are not selected. Sparse all-null tuples, incomplete compound
-equalities, array/object operands, ObjectId/date/nonfinite operands and queries
-with only alternatives, negations or ranges fall back to scans. Membership lists
+constraints, array/object operands and ObjectId/date/nonfinite operands are not
+eligible for finite-key probing. Alternatives, logical negations and ranges alone
+cannot establish a finite witness. Membership lists
 must be nonempty and contain at most 128 supported scalar literals each, with
 at most 128 distinct compound tuples and 1 MiB of encoded keys in total. Regex
 members and unsafe/oversized lists fall back. Numeric aliases are deduplicated;
@@ -293,6 +295,21 @@ residual matches. The same document-first, grouped natural-order pagination and
 checksum validation apply, without retaining all keys or index rows in memory.
 No sparse authority is retained across cursor requests, and mutations maintain
 entry membership transactionally when fields are removed.
+
+Necessary direct/positive-conjunction `$exists: false` clauses contribute the
+ordinary null key to a complete finite tuple. Missing and explicit null share
+that physical key; the full matcher excludes explicit null. Compound equality
+or membership constraints can complete the tuple. Possible sparse all-null
+tuples still cannot exclude entirely absent records and remain ineligible;
+another necessarily nonnull component can establish sparse compound membership.
+Uncertain stored paths retain non-unique fallback entries. Public single-equality
+inference remains unchanged.
+
+Singleton candidates also pin the document-first join, preventing stale SQLite
+statistics from sorting an entire large equality/null-key group for each one-row
+frontier. These joins prioritize bounded pagination memory: SQLite can still walk
+nonmatching document/index entries even though BSON decoding skips noncandidates.
+They are not index-order scans or an index-only read promise.
 
 Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
 9,541 eligible matching candidates) without false negatives, plus native and

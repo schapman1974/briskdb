@@ -38,6 +38,14 @@ pub(super) fn queries() -> Vec<BsonDocument> {
 
 #[tokio::test]
 async fn sparse_presence_mutations_and_upserts_match_scans_and_survive_reopen() {
+    assert_mutations_and_upserts(index(), exists("a", true), 30).await;
+}
+
+pub(super) async fn assert_mutations_and_upserts(
+    definition: DocumentIndexRequest,
+    query: BsonDocument,
+    matched: u64,
+) {
     for mode in 0..13 {
         let root = tempfile::tempdir().unwrap();
         let engine = Engine::open(root.path(), 4).await.unwrap();
@@ -45,8 +53,8 @@ async fn sparse_presence_mutations_and_upserts_match_scans_and_survive_reopen() 
         for name in ["scan", "indexed"] {
             seed(&engine, &session, &ns(name), 35).await;
         }
-        build(&engine, &session, &ns("indexed"), index()).await;
-        let mut query = exists("a", true);
+        build(&engine, &session, &ns("indexed"), definition.clone()).await;
+        let mut query = query.clone();
         if mode >= 8 {
             query.push("_id", BsonValue::Int32(1234)).unwrap();
         }
@@ -72,13 +80,16 @@ async fn sparse_presence_mutations_and_upserts_match_scans_and_survive_reopen() 
             let DocumentResult::Update(result) = &actual else {
                 panic!("update");
             };
-            assert_eq!((result.matched_count(), result.modified_count()), (30, 30));
+            assert_eq!(
+                (result.matched_count(), result.modified_count()),
+                (matched, matched)
+            );
         }
         if mode == 6 {
             let DocumentResult::Delete(result) = &actual else {
                 panic!("delete");
             };
-            assert_eq!(result.deleted_count(), 30);
+            assert_eq!(result.deleted_count(), matched);
         }
         engine.shutdown().await.unwrap();
         let engine = Engine::open(root.path(), 4).await.unwrap();
@@ -108,12 +119,26 @@ async fn sparse_presence_mutations_and_upserts_match_scans_and_survive_reopen() 
 
 #[tokio::test]
 async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_index() {
+    assert_churn_and_membership_change(
+        index(),
+        exists("a", true),
+        30,
+        doc([("$unset", obj([("a", BsonValue::Int32(1))]))]),
+    )
+    .await;
+}
+
+pub(super) async fn assert_churn_and_membership_change(
+    definition: DocumentIndexRequest,
+    query: BsonDocument,
+    matched: usize,
+    update: BsonDocument,
+) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
     let namespace = ns("presence_churn");
     seed(&engine, &session, &namespace, 35).await;
-    let query = exists("a", true);
     let expected = find(
         &engine,
         &session,
@@ -122,8 +147,8 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
         DocumentReadOptions::new(),
     )
     .await;
-    assert_eq!(expected.len(), 30);
-    build(&engine, &session, &namespace, index()).await;
+    assert_eq!(expected.len(), matched);
+    build(&engine, &session, &namespace, definition.clone()).await;
     let (mut cursor, mut documents) = page(
         call(
             &engine,
@@ -141,7 +166,7 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
         if pages % 2 == 0 {
             drop_index(&engine, &session, &namespace).await;
         } else {
-            build(&engine, &session, &namespace, index()).await;
+            build(&engine, &session, &namespace, definition.clone()).await;
         }
         let next = page(
             call(
@@ -168,7 +193,7 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
         expected
     );
     if pages % 2 == 1 {
-        build(&engine, &session, &namespace, index()).await;
+        build(&engine, &session, &namespace, definition).await;
     }
     let result = call(
         &engine,
@@ -176,7 +201,7 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
         DocumentCommand::Update(DocumentUpdateRequest::new(
             namespace.clone(),
             DocumentFilter::new(query.clone()).unwrap(),
-            DocumentUpdate::new(doc([("$unset", obj([("a", BsonValue::Int32(1))]))])).unwrap(),
+            DocumentUpdate::new(update).unwrap(),
             DocumentMutationScope::Many,
             DocumentWriteOptions::new(),
         )),
@@ -185,7 +210,10 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
     let DocumentResult::Update(result) = result.result() else {
         panic!("update");
     };
-    assert_eq!((result.matched_count(), result.modified_count()), (30, 30));
+    assert_eq!(
+        (result.matched_count(), result.modified_count()),
+        (matched as u64, matched as u64)
+    );
     assert!(
         find(
             &engine,
@@ -215,17 +243,21 @@ async fn sparse_presence_reselects_indexes_between_pages_and_updates_out_of_the_
 
 #[tokio::test]
 async fn sparse_presence_skips_absent_bson_before_reads_and_writes() {
-    membership::assert_physical_selection(index(), exists("a", true), 30).await;
+    membership::assert_physical_selection(index(), exists("a", true), 30, 0).await;
 }
 
 #[tokio::test]
 async fn sparse_presence_validates_selected_entry_checksums() {
-    membership::assert_candidate_checksum(index(), exists("a", true)).await;
+    membership::assert_candidate_checksum(index(), exists("a", true), 5, 2).await;
 }
 
 #[tokio::test]
 #[ignore = "manual same-root sparse presence benchmark; timing is not a CI assertion"]
 async fn sparse_presence_candidate_benchmark() {
+    benchmark(true).await;
+}
+
+pub(super) async fn benchmark(present: bool) {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
@@ -246,10 +278,12 @@ async fn sparse_presence_candidate_benchmark() {
                 ("_id", BsonValue::Int32(id)),
                 ("payload", BsonValue::from("x".repeat(4096))),
             ]);
-            if id % 20 == 0 {
+            if (id % 20 == 0) == present {
                 row.push(
                     "a",
-                    if id % 40 == 0 {
+                    if !present && id % 100 != 1 {
+                        BsonValue::Int32(1)
+                    } else if present && id % 40 == 0 {
                         BsonValue::Array(vec![])
                     } else {
                         BsonValue::Null
@@ -271,10 +305,13 @@ async fn sparse_presence_candidate_benchmark() {
     .await;
     for indexed in [false, true] {
         if indexed {
-            build(&engine, &session, &namespace, index()).await;
+            let definition = DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))]))
+                .unwrap()
+                .with_sparse(present);
+            build(&engine, &session, &namespace, definition).await;
         }
         for residual_miss in [false, true] {
-            let mut query = exists("a", true);
+            let mut query = exists("a", present);
             if residual_miss {
                 query.push("unmatched", BsonValue::Int32(1)).unwrap();
             }
@@ -314,7 +351,7 @@ async fn sparse_presence_candidate_benchmark() {
                     }
                 }
                 println!(
-                    "presence benchmark indexed={indexed} write={write} residual_miss={residual_miss} documents=1000 present=50 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
+                    "existence benchmark present={present} indexed={indexed} write={write} residual_miss={residual_miss} documents=1000 matched=50 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
                     started.elapsed().as_micros()
                 );
             }

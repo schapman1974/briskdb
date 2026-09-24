@@ -780,8 +780,13 @@ requires an earlier dependency:
       sparse entries after finite key probes. Any indexed path can prove compound
       sparse membership; null/empty arrays and non-unique fallback entries stay
       included. Grouped natural-order candidates retain full-matcher checks,
-      checksum validation and per-request authority. Negative/alternative and
+      checksum validation and per-request authority. Logical-negation/alternative and
       unproven presence shapes keep scans; no format or aggregate-source change.
+      Necessary `$exists: false` clauses now contribute ordinary null keys to
+      complete finite probes, with explicit null removed by the full matcher.
+      Existing compound/sparse/null safety and fallback markers remain in force.
+      Singleton candidates preserve document-first streaming even with stale
+      statistics and large null-key groups; no all-candidate sort is required.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

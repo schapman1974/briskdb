@@ -2184,18 +2184,9 @@ mod enabled {
             let sql = if let Some(sql) = grouped_sql.as_deref() {
                 sql
             } else if probe.is_some() {
-                // Keep natural-order pagination and let SQLite choose join
-                // order. Forcing an index-first join would repeatedly sort
-                // large equality groups for each one-record merge frontier.
-                "SELECT d.natural_order, d.id_key, d.document_bson, d.document_checksum,
-                        d.storage_format_version, e.entry_checksum, e.entry_format_version,
-                        e.index_key
-                 FROM briskdb_documents_v1 AS d
-                 JOIN briskdb_document_index_entries_v1 AS e
-                   ON e.collection_id = d.collection_id AND e.id_key = d.id_key
-                 WHERE d.collection_id = ?1 AND d.natural_order > ?2
-                   AND e.index_id = ?4 AND (e.index_key = ?5 OR e.index_key = ?6)
-                 ORDER BY d.natural_order LIMIT ?3"
+                // Preserve streaming natural-order frontiers even when stale
+                // statistics underestimate a large equality/null-key group.
+                candidate_sql::single()
             } else {
                 "SELECT natural_order, id_key, document_bson, document_checksum,
                         storage_format_version
