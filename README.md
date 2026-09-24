@@ -361,36 +361,55 @@ SQLite remote. Their credentials do not secure the Mongo port.
 
 ### Use existing PyMongo code with the BriskDB wheel
 
-The wheel built from this checkout supports a TinyMongo-style patch scope:
+The wheel built from this checkout supports TinyMongo-style usage without a
+separate database process. Install from the repository root:
 
 ```bash
 python -m pip install './python[pymongo]'
 ```
 
+Patch existing PyMongo code for an isolated test:
+
 ```python
 import briskdb
 import pymongo
 
-with briskdb.patch(folder="./briskdb-test-data", shards=4):
+with briskdb.patch():
     # Import application modules that capture MongoClient inside this scope.
-    with pymongo.MongoClient("mongodb://ignored.example.com") as client:
-        client.app.users.update_one(
-            {"_id": 123}, {"$set": {"name": "Ada"}}, upsert=True
-        )
-        print(client.app.users.find_one({"_id": 123}))
+    client = pymongo.MongoClient("mongodb://ignored.example.com")
+    client.app.users.insert_one({"_id": 1, "name": "Ada"})
+    print(client.app.users.find_one({"_id": 1}))
 ```
 
 `patch()` without a folder uses isolated **temporary SQLite files**, deleted
-on exit; an explicit folder persists. PyMongo's constructors are restored and
-scope-created clients are closed even if application code raises. Use
-`async with briskdb.patch(...)` with `pymongo.AsyncMongoClient`.
-Direct use needs no global patch:
+on exit. Use `briskdb.patch(folder="./test-data")` to keep data between runs.
+PyMongo's constructors are restored and scope-created clients are closed even
+if application code raises.
+
+Use a persistent client directly, without patching PyMongo:
 
 ```python
 from briskdb import MongoClient
 
-with MongoClient(folder="./briskdb-test-data") as client:
+with MongoClient(folder="./app-data") as client:
+    client.app.users.update_one({"_id": 1}, {"$set": {"name": "Ada"}}, upsert=True)
     print(list(client.app.users.find({"name": "Ada"})))
+```
+
+Patch async PyMongo code with an async scope:
+
+```python
+import asyncio
+import briskdb
+import pymongo
+
+async def main():
+    async with briskdb.patch():
+        client = pymongo.AsyncMongoClient()
+        await client.app.users.insert_one({"_id": 1, "name": "Ada"})
+        print(await client.app.users.find_one({"_id": 1}))
+
+asyncio.run(main())
 ```
 
 These are real PyMongo 4.17 clients using the wheel's Rust engine and one private
