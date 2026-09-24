@@ -141,6 +141,62 @@ fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_prefe
 }
 
 #[test]
+fn logical_probes_keep_necessary_key_priority_and_precede_sparse_scans() {
+    let alternatives = BsonValue::Array(vec![
+        BsonValue::Document(doc([("other", BsonValue::Int32(1))])),
+        BsonValue::Document(doc([("other", BsonValue::Int32(2))])),
+    ]);
+    let metadata = collection([
+        secondary(2, doc([("other", BsonValue::Int32(1))])),
+        secondary(3, keys()),
+    ]);
+    let preparation = DocumentIndexPreparation::compile(&metadata).unwrap();
+    let mut query = doc([("$or", alternatives.clone())]);
+    query
+        .push(
+            "v",
+            BsonValue::Document(doc([(
+                "$in",
+                BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(4)]),
+            )])),
+        )
+        .unwrap();
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        probe.index_id().get(),
+        3,
+        "necessary membership wins even on a later index"
+    );
+    assert_eq!(probe_keys(&probe).len(), 2);
+
+    let preparation = DocumentIndexPreparation::compile(&collection([
+        membership(2, true, None),
+        secondary(3, doc([("other", BsonValue::Int32(1))])),
+    ]))
+    .unwrap();
+    let query = doc([
+        ("$or", alternatives),
+        (
+            "v",
+            BsonValue::Document(doc([("$exists", BsonValue::Boolean(true))])),
+        ),
+    ]);
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        probe.index_id().get(),
+        3,
+        "finite logical keys precede a sparse entry scan"
+    );
+    assert_eq!(probe_keys(&probe).len(), 2);
+}
+
+#[test]
 fn sparse_presence_is_explicit_and_loses_to_later_finite_key_probes() {
     let metadata = collection([
         membership(2, true, None),

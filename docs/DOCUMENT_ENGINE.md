@@ -256,8 +256,8 @@ numeric cohorts keep their BSON semantics; booleans remain distinct from numbers
 
 Partial indexes are not selected. Sparse all-null tuples, incomplete compound
 constraints, array/object operands and ObjectId/date/nonfinite operands are not
-eligible for finite-key probing. Alternatives, logical negations and ranges alone
-cannot establish a finite witness. Membership lists
+eligible for finite-key probing. Logical negations and ranges alone cannot
+establish a finite witness. Membership lists
 must be nonempty and contain at most 128 supported scalar literals each, with
 at most 128 distinct compound tuples and 1 MiB of encoded keys in total. Regex
 members and unsafe/oversized lists fall back. Numeric aliases are deduplicated;
@@ -304,6 +304,20 @@ tuples still cannot exclude entirely absent records and remain ineligible;
 another necessarily nonnull component can establish sparse compound membership.
 Uncertain stored paths retain non-unique fallback entries. Public single-equality
 inference remains unchanged.
+
+After necessary equality/membership/absence probes, bounded positive `$or`
+combinations can supply finite keys before sparse-presence scans. For each index
+path, every OR branch must provide a supported equality, literal membership or
+absence witness; a conjunction can choose any one necessary witness. AND values
+are never intersected, because different array elements can satisfy different
+clauses. Nested combinations use one borrowed-value buffer per path, capped at
+128 raw operand occurrences across attempted branches (duplicates included;
+failed branches do not refund work). Compound paths form conservative Cartesian
+supersets; full matching removes cross-branch and null false positives. Existing
+128-tuple/1-MiB limits, sparse all-null rejection, partial-index exclusion,
+fallback entries and request controls apply. An unbounded OR branch, regex
+membership or unsupported value cannot silently disappear from the union.
+Public single-equality inference and aggregate source accounting are unchanged.
 
 Singleton candidates also pin the document-first join, preventing stale SQLite
 statistics from sorting an entire large equality/null-key group for each one-row

@@ -787,6 +787,12 @@ requires an earlier dependency:
       Existing compound/sparse/null safety and fallback markers remain in force.
       Singleton candidates preserve document-first streaming even with stale
       statistics and large null-key groups; no all-candidate sort is required.
+      Bounded positive OR combinations now union per-path necessary witnesses
+      only when every alternative is covered. Conjunctions never intersect
+      array-valued matches. A 128-operand work cap, existing tuple/byte bounds,
+      canonical deduplication and full matching retain conservative behavior;
+      uncertain branches keep scans. Necessary finite probes remain preferred
+      across indexes, followed by logical probes and sparse-presence scans.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

@@ -449,9 +449,19 @@ async fn finite_connection_cap_rejects_overflow() {
 #[tokio::test]
 #[ignore = "requires pinned PyMongo; CI runs this explicitly with BRISKDB_MONGO_WIRE_PYTHON"]
 async fn real_pymongo_sync_async_discovery() {
+    assert_driver_restart("/tests/mongo_wire_client.py").await;
+}
+
+#[tokio::test]
+#[ignore = "focused local index-candidate checks; also included in the full real-driver gate"]
+async fn real_pymongo_index_candidates() {
+    assert_driver_restart("/tests/mongo_index_candidates_client.py").await;
+}
+
+async fn assert_driver_restart(script: &'static str) {
     let (root, database, mut server) = setup().await;
     seed_index_metadata(&database).await;
-    let output = run_driver(server.address(), "initial").await;
+    let output = run_driver(server.address(), "initial", script).await;
     server.close().await.unwrap();
     database.close().await.unwrap();
     assert_driver(output);
@@ -464,7 +474,7 @@ async fn real_pymongo_sync_async_discovery() {
     let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
-    let output = run_driver(server.address(), "reopened").await;
+    let output = run_driver(server.address(), "reopened", script).await;
     server.close().await.unwrap();
     database.close().await.unwrap();
     assert_driver(output);
@@ -625,15 +635,16 @@ async fn wire_index_metadata_lists_only_ready_definitions_and_validates_options(
     database.close().await.unwrap();
 }
 
-async fn run_driver(address: std::net::SocketAddr, phase: &'static str) -> std::process::Output {
+async fn run_driver(
+    address: std::net::SocketAddr,
+    phase: &'static str,
+    script: &'static str,
+) -> std::process::Output {
     let python = std::env::var("BRISKDB_MONGO_WIRE_PYTHON").unwrap_or_else(|_| "python3".into());
     let uri = format!("mongodb://{address}/");
     tokio::task::spawn_blocking(move || {
         Command::new(python)
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/mongo_wire_client.py"
-            ))
+            .arg(format!("{}{script}", env!("CARGO_MANIFEST_DIR")))
             .arg(uri)
             .arg(phase)
             .output()
