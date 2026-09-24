@@ -1,6 +1,7 @@
 use briskdb::document::{
-    BsonValue, DocumentCollectionMetadata, DocumentExecution, DocumentIndexLifecycle,
-    DocumentIndexMetadata, DocumentPlan, DocumentRequestId, DocumentResult,
+    BsonValue, DocumentCandidateKind, DocumentCollectionMetadata, DocumentExecution,
+    DocumentIndexLifecycle, DocumentIndexMetadata, DocumentPlan, DocumentReadAccess,
+    DocumentRequestId, DocumentResult, DocumentScanReason,
 };
 use pyo3::{
     prelude::*,
@@ -236,12 +237,52 @@ fn plan_to_python(py: Python<'_>, plan: &DocumentPlan) -> PyResult<Py<PyAny>> {
             output.set_item("kind", "scatter")?;
             output.set_item("collection_id", scatter.collection_id().get())?;
             output.set_item("shards", scatter.shards().to_vec())?;
+            if let Some(access) = scatter.read_access() {
+                output.set_item("read_access", read_access_to_python(py, access)?)?;
+            }
         }
         _ => {
             return Err(crate::error::unsupported(
                 "this document plan is unknown to the current Python API",
             ));
         }
+    }
+    Ok(output.into_any().unbind())
+}
+
+fn read_access_to_python(py: Python<'_>, access: DocumentReadAccess) -> PyResult<Py<PyAny>> {
+    let output = PyDict::new(py);
+    match access {
+        DocumentReadAccess::Scan { reason } => {
+            let reason = match reason {
+                DocumentScanReason::Unfiltered => "unfiltered",
+                DocumentScanReason::NoReadyIndex => "no_ready_index",
+                DocumentScanReason::NoSafeProbe => "no_safe_probe",
+                DocumentScanReason::ProbeWorkLimit => "probe_work_limit",
+                DocumentScanReason::AggregationInput => "aggregation_input",
+                _ => return Err(crate::error::unsupported("unknown document scan reason")),
+            };
+            output.set_item("kind", "scan")?;
+            output.set_item("reason", reason)?;
+        }
+        DocumentReadAccess::IndexCandidates {
+            index_id,
+            kind,
+            key_count,
+        } => {
+            let candidate_kind = match kind {
+                DocumentCandidateKind::Equality => "equality",
+                DocumentCandidateKind::NecessaryFinite => "necessary_finite",
+                DocumentCandidateKind::LogicalFinite => "logical_finite",
+                DocumentCandidateKind::SparsePresence => "sparse_presence",
+                _ => return Err(crate::error::unsupported("unknown document candidate kind")),
+            };
+            output.set_item("kind", "index_candidates")?;
+            output.set_item("candidate_kind", candidate_kind)?;
+            output.set_item("index_id", index_id.get())?;
+            output.set_item("key_count", key_count)?;
+        }
+        _ => return Err(crate::error::unsupported("unknown document read access")),
     }
     Ok(output.into_any().unbind())
 }

@@ -319,6 +319,23 @@ fallback entries and request controls apply. An unbounded OR branch, regex
 membership or unsupported value cannot silently disappear from the union.
 Public single-equality inference and aggregate source accounting are unchanged.
 
+Native find, get-more, distinct and aggregation can opt into payload-free
+read-plan diagnostics with `DocumentReadOptions::with_plan_diagnostics(true)`
+(Python: `plan_diagnostics=True`). `DocumentScatterPlan::read_access()` then
+reports `DocumentReadAccess::IndexCandidates` with a numeric index identity,
+proof kind and finite key count, or `Scan` with an unfiltered/no-ready-index/
+no-safe-probe/probe-work-limit/aggregation-input reason. The selector is shared
+with actual reads and runs under that request's schema admission, cancellation
+and deadline. It retains no probe authority between cursor pages. Defaults and
+exact-ID point plans are unchanged; each continuation opts in separately.
+The fixed 32-byte diagnostic charge participates in result limits and page
+packing, including sorted/aggregate pages. No BSON keys, filters or index names
+are exposed. These are planned access paths, not measured row/shard visits,
+SQLite I/O or index-only reads. Aggregation preserves its routed source scan
+and pipeline work accounting. Counts and find-and-modify reject this native
+option; catalog commands have no data access path. MongoDB `explain` and actual
+execution counters remain separate work under #178.
+
 Singleton candidates also pin the document-first join, preventing stale SQLite
 statistics from sorting an entire large equality/null-key group for each one-row
 frontier. These joins prioritize bounded pagination memory: SQLite can still walk

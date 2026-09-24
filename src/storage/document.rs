@@ -179,7 +179,7 @@ mod enabled {
             DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
             DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexProbe,
             DocumentIndexSelection, DocumentMatcher, DocumentNamespace, DocumentPlacement,
-            PreparedDocumentIndexEntries, encode_document,
+            DocumentReadAccess, DocumentScanReason, PreparedDocumentIndexEntries, encode_document,
         },
         sqlite_error,
     };
@@ -433,18 +433,56 @@ mod enabled {
             matcher: &DocumentMatcher,
             check: &mut dyn FnMut() -> EngineResult<()>,
         ) -> EngineResult<Option<DocumentIndexProbe>> {
+            self.document_candidate_selection(collection, matcher, check)
+                .map(|(probe, _)| probe)
+        }
+
+        pub(crate) fn document_candidate_selection(
+            &self,
+            collection: DocumentCollectionId,
+            matcher: &DocumentMatcher,
+            check: &mut dyn FnMut() -> EngineResult<()>,
+        ) -> EngineResult<(Option<DocumentIndexProbe>, DocumentReadAccess)> {
             check()?;
             let Some(indexes) = self.active_document_indexes(collection)? else {
-                return Ok(None);
+                return Ok((
+                    None,
+                    DocumentReadAccess::Scan {
+                        reason: DocumentScanReason::NoReadyIndex,
+                    },
+                ));
             };
+            if indexes.is_empty() {
+                return Ok((
+                    None,
+                    DocumentReadAccess::Scan {
+                        reason: DocumentScanReason::NoReadyIndex,
+                    },
+                ));
+            }
             match indexes.equality_probe_with_check(matcher, check) {
                 // Optional optimization work has its own shared bound. Running
                 // out of that budget must not reject an otherwise valid scan.
                 Err(error) if error.kind() == EngineErrorKind::LimitExceeded => {
                     check()?;
-                    Ok(None)
+                    Ok((
+                        None,
+                        DocumentReadAccess::Scan {
+                            reason: DocumentScanReason::ProbeWorkLimit,
+                        },
+                    ))
                 }
-                result => result,
+                Ok(Some(probe)) => {
+                    let access = probe.read_access();
+                    Ok((Some(probe), access))
+                }
+                Ok(None) => Ok((
+                    None,
+                    DocumentReadAccess::Scan {
+                        reason: DocumentScanReason::NoSafeProbe,
+                    },
+                )),
+                Err(error) => Err(error),
             }
         }
     }

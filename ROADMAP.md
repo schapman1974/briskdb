@@ -766,8 +766,8 @@ requires an earlier dependency:
       write maintenance and index churn across cursor requests are covered.
       Partial indexes, sparse all-null tuples and unsupported/incomplete shapes
       fall back to scans. Source-locked comparisons cover 201,349 matcher
-      evaluations with no excluded true matches. Broader predicates, planner
-      diagnostics remain open under #174/#178.
+      evaluations with no excluded true matches. Broader predicates and measured
+      execution diagnostics remain open under #174/#178.
       Necessary positive `$in` lists now derive bounded complete compound tuples:
       at most 128 scalar members per list, 128 distinct tuples and 1 MiB of encoded
       keys per probe. Existing equality probes keep priority. Bound SQL candidates
@@ -793,6 +793,12 @@ requires an earlier dependency:
       canonical deduplication and full matching retain conservative behavior;
       uncertain branches keep scans. Necessary finite probes remain preferred
       across indexes, followed by logical probes and sparse-presence scans.
+      Native Rust and sync/async Python reads now offer opt-in, payload-free
+      access-path diagnostics: candidate proof/index identity/key count or a
+      conservative scan reason, freshly selected on each cursor page. Default
+      responses and point plans are unchanged; sorted/aggregate page budgets
+      include the metadata. Planned shard owners are not measured visits;
+      MongoDB explain, physical counters and broader benchmarks remain open.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

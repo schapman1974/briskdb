@@ -52,6 +52,59 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_opt_in_plan_diagnostics_and_cursor_index_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for identity in range(6):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": 1})
+                    query = {"v": 1}
+                    ordinary = session.find(DATABASE, COLLECTION, query)
+                    self.assertNotIn("read_access", ordinary["plan"])
+                    result = session.find(DATABASE, COLLECTION, query, plan_diagnostics=True)
+                    self.assertEqual(result["documents"], ordinary["documents"])
+                    self.assertEqual(result["plan"]["read_access"], {"kind": "scan", "reason": "no_ready_index"})
+                    session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                    first = session.find(DATABASE, COLLECTION, query, batch_size=1, plan_diagnostics=True)
+                    original_access = first["plan"]["read_access"]
+                    self.assertEqual(set(original_access), {"kind", "candidate_kind", "key_count", "index_id"})
+                    self.assertEqual((original_access["kind"], original_access["candidate_kind"], original_access["key_count"]), ("index_candidates", "equality", 1))
+                    session.drop_index(DATABASE, COLLECTION, "v_1")
+                    second = session.get_more(DATABASE, COLLECTION, first["cursor_id"], batch_size=1, plan_diagnostics=True)
+                    self.assertEqual(second["plan"]["read_access"], {"kind": "scan", "reason": "no_ready_index"})
+                    session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                    third = session.get_more(DATABASE, COLLECTION, second["cursor_id"], batch_size=1, plan_diagnostics=True)
+                    self.assertNotEqual(third["plan"]["read_access"]["index_id"], original_access["index_id"])
+                    last = session.get_more(DATABASE, COLLECTION, third["cursor_id"])
+                    self.assertNotIn("read_access", last["plan"])
+                    self.assertEqual(first["documents"] + second["documents"] + third["documents"] + last["documents"], ordinary["documents"])
+                    for query, kind, count in [
+                        ({"v": {"$in": [1, 2, 1.0]}}, "necessary_finite", 2),
+                        ({"$or": [{"v": 1}, {"v": 2}]}, "logical_finite", 2),
+                    ]:
+                        access = session.find(DATABASE, COLLECTION, query, plan_diagnostics=True)["plan"]["read_access"]
+                        self.assertEqual((access["candidate_kind"], access["key_count"]), (kind, count))
+                    private = "never-return-query-values-in-plans"
+                    result = session.find(DATABASE, COLLECTION, {"v": private}, plan_diagnostics=True)
+                    self.assertNotIn(private, repr(result["plan"]))
+                    distinct = session.distinct(DATABASE, COLLECTION, "v", {"v": 1}, plan_diagnostics=True)
+                    self.assertEqual(distinct["values"], [1])
+                    self.assertEqual(distinct["plan"]["read_access"]["candidate_kind"], "equality")
+                    aggregate = session.aggregate(DATABASE, COLLECTION, [{"$match": {"v": 1}}], batch_size=1, plan_diagnostics=True)
+                    self.assertEqual(aggregate["plan"]["read_access"], {"kind": "scan", "reason": "aggregation_input"})
+                    continued = session.get_more(DATABASE, COLLECTION, aggregate["cursor_id"], plan_diagnostics=True)
+                    self.assertEqual(continued["plan"]["read_access"], aggregate["plan"]["read_access"])
+                    point = session.find(DATABASE, COLLECTION, {"_id": 1}, plan_diagnostics=True)
+                    self.assertEqual(point["plan"]["kind"], "point")
+                    self.assertNotIn("read_access", point["plan"])
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    for kwargs, error in [({"max_result_bytes": 1}, briskdb.LimitExceededError), ({"cancellation": token}, briskdb.CancelledError)]:
+                        with self.assertRaises(error):
+                            session.find(DATABASE, COLLECTION, {"v": 1}, plan_diagnostics=True, **kwargs)
+                    self.assertEqual(len(session.find(DATABASE, COLLECTION, plan_diagnostics=True)["documents"]), 6)
+
     def test_nonunique_nested_candidates_follow_mutations_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -2020,6 +2073,27 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_opt_in_plan_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for identity in range(3):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": 1})
+                    await session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                    first = await session.find(DATABASE, COLLECTION, {"v": 1}, batch_size=1, plan_diagnostics=True)
+                    self.assertEqual(first["plan"]["read_access"]["candidate_kind"], "equality")
+                    await session.drop_index(DATABASE, COLLECTION, "v_1")
+                    next_page = await session.get_more(DATABASE, COLLECTION, first["cursor_id"], plan_diagnostics=True)
+                    self.assertEqual(next_page["plan"]["read_access"], {"kind": "scan", "reason": "no_ready_index"})
+                    self.assertEqual(len(first["documents"] + next_page["documents"]), 3)
+                    distinct = await session.distinct(DATABASE, COLLECTION, "v", plan_diagnostics=True)
+                    self.assertEqual(distinct["plan"]["read_access"], {"kind": "scan", "reason": "unfiltered"})
+                    aggregate = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], plan_diagnostics=True)
+                    self.assertEqual(aggregate["plan"]["read_access"], {"kind": "scan", "reason": "aggregation_input"})
+                    self.assertEqual(aggregate["documents"], [{"n": 3}])
+                    self.assertNotIn("read_access", (await session.find(DATABASE, COLLECTION))["plan"])
+
     async def test_async_nonunique_nested_candidates_upsert_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

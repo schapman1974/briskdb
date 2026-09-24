@@ -74,7 +74,7 @@ def sync_contract(path: str) -> None:
         "app", "notes", {"_id": 1, "body": "typed"}
     )["inserted_count"]
     documents: List[dict[str, object]] = document_session.find(
-        "app", "notes", {"_id": 1}, projection=["body"], sort={"body": 1}
+        "app", "notes", {"_id": 1}, projection=["body"], sort={"body": 1}, plan_diagnostics=True
     )["documents"]
     count: int = document_session.count_documents("app", "notes")["count"]
     exists: bool = document_session.collection_exists("app", "notes")["exists"]
@@ -87,10 +87,18 @@ def sync_contract(path: str) -> None:
     dropped_collection: bool = document_session.drop_collection("app", "missing")["existed"]
     dropped_database: bool = document_session.drop_database("missing")["existed"]
     print(dropped_collection, dropped_database)
-    distinct: List[object] = document_session.distinct("app", "notes", "body")["values"]
-    aggregated: List[dict[str, object]] = document_session.aggregate("app", "notes", [{"$count": "n"}], batch_size=1)["documents"]
+    distinct: List[object] = document_session.distinct("app", "notes", "body", plan_diagnostics=True)["values"]
+    diagnostic_plan = document_session.find("app", "notes", plan_diagnostics=True)["plan"]
+    if diagnostic_plan is not None and "read_access" in diagnostic_plan:
+        access = diagnostic_plan["read_access"]
+        if access["kind"] == "index_candidates":
+            index_id: int = access["index_id"]
+            print(index_id, access["candidate_kind"], access["key_count"])
+        else:
+            print(access["reason"])
+    aggregated: List[dict[str, object]] = document_session.aggregate("app", "notes", [{"$count": "n"}], batch_size=1, plan_diagnostics=True)["documents"]
     print(aggregated)
-    continued: List[dict[str, object]] = document_session.get_more("app", "notes", 1)["documents"]
+    continued: List[dict[str, object]] = document_session.get_more("app", "notes", 1, plan_diagnostics=True)["documents"]
     killed: bool = document_session.kill_cursor("app", "notes", 1)["killed"]
     deleted: int = document_session.delete_one("app", "notes", {"_id": 1})[
         "deleted_count"
@@ -167,11 +175,11 @@ async def async_contract(path: str) -> None:
     dropped_collection: bool = (await session.drop_collection("app", "missing"))["existed"]
     dropped_database: bool = (await session.drop_database("missing"))["existed"]
     print(dropped_collection, dropped_database)
-    distinct: List[object] = (await session.distinct("app", "typed", "_id"))["values"]
-    aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1))["documents"]
+    distinct: List[object] = (await session.distinct("app", "typed", "_id", plan_diagnostics=True))["values"]
+    aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1, plan_diagnostics=True))["documents"]
     print(aggregated)
-    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}))["documents"]
-    continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1))["documents"]
+    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}, plan_diagnostics=True))["documents"]
+    continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1, plan_diagnostics=True))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     deleted_many: int = (await session.delete_many("app", "typed", {}))["deleted_count"]
     removed: Optional[dict[str, object]] = (await session.find_one_and_delete("app", "typed", {}, projection={"_id": 1}, sort={"_id": -1}))["document"]

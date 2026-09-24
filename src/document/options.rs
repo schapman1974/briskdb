@@ -170,6 +170,7 @@ pub struct DocumentReadOptions {
     limit: Option<NonZeroU64>,
     batch_size: u64,
     batch_byte_limit: Option<NonZeroU64>,
+    plan_diagnostics: bool,
 }
 
 impl DocumentReadOptions {
@@ -182,6 +183,7 @@ impl DocumentReadOptions {
             limit: None,
             batch_size: DEFAULT_DOCUMENT_BATCH_SIZE,
             batch_byte_limit: None,
+            plan_diagnostics: false,
         }
     }
 
@@ -189,6 +191,21 @@ impl DocumentReadOptions {
     pub fn with_projection(mut self, projection: DocumentProjection) -> Self {
         self.projection = Some(projection);
         self
+    }
+
+    /// Opt in to payload-free access-path diagnostics for find/cursor,
+    /// aggregation and distinct reads. Counts and find-and-modify reject this
+    /// option; catalog commands do not report a data access path. This does not
+    /// execute an extra query, measure physical work, or retain index authority
+    /// between requests.
+    #[must_use]
+    pub const fn with_plan_diagnostics(mut self, enabled: bool) -> Self {
+        self.plan_diagnostics = enabled;
+        self
+    }
+
+    pub const fn plan_diagnostics(&self) -> bool {
+        self.plan_diagnostics
     }
 
     #[must_use]
@@ -269,6 +286,8 @@ impl DocumentReadOptions {
         self.batch_size
     }
 
+    /// Extract the original payload/pagination fields. Read `plan_diagnostics()`
+    /// before consuming this value if the opt-in metadata flag is also needed.
     pub fn into_parts(
         self,
     ) -> (
@@ -309,6 +328,7 @@ impl fmt::Debug for DocumentReadOptions {
             .field("limit", &self.limit())
             .field("batch_size", &self.batch_size())
             .field("batch_byte_limit", &self.batch_byte_limit())
+            .field("plan_diagnostics", &self.plan_diagnostics)
             .finish()
     }
 }
@@ -392,6 +412,18 @@ mod tests {
 
     #[test]
     fn read_options_validate_bounds_and_hide_bson() {
+        assert!(!DocumentReadOptions::new().plan_diagnostics());
+        assert!(
+            DocumentReadOptions::new()
+                .with_plan_diagnostics(true)
+                .plan_diagnostics()
+        );
+        assert!(
+            !DocumentReadOptions::new()
+                .with_plan_diagnostics(true)
+                .with_plan_diagnostics(false)
+                .plan_diagnostics()
+        );
         let projection = DocumentProjection::new(secret_document()).unwrap();
         let options = DocumentReadOptions::new()
             .with_projection(projection)

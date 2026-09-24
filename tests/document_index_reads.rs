@@ -23,6 +23,8 @@ use briskdb::{
 
 #[path = "document_index_reads/absence.rs"]
 mod absence;
+#[path = "document_index_reads/diagnostics.rs"]
+mod diagnostics;
 #[path = "document_index_reads/logical.rs"]
 mod logical;
 #[path = "document_index_reads/membership.rs"]

@@ -130,7 +130,7 @@ impl Engine {
             .unwrap_or(u64::MAX)
             .min(options.batch_size());
         let mut documents = Vec::new();
-        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count());
+        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count(), options);
         loop {
             check(&cancellation, deadline)?;
             let capacity = state

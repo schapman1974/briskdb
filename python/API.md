@@ -60,11 +60,12 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `list_index_metadata(database, collection, *, batch_size=101, batch_byte_limit=None, ...)`
 - `insert_one(database, collection, document, ...)`
-- `find(database, collection, filter=None, *, projection=None, sort=None, skip=0, limit=None, batch_size=101, ...)`
-- `get_more(database, collection, cursor_id, *, batch_size=101, ...)`
+- `find(database, collection, filter=None, *, projection=None, sort=None, skip=0, limit=None, batch_size=101, plan_diagnostics=False, ...)`
+- `aggregate(database, collection, pipeline, *, batch_size=101, plan_diagnostics=False, ...)`
+- `get_more(database, collection, cursor_id, *, batch_size=101, plan_diagnostics=False, ...)`
 - `kill_cursor(database, collection, cursor_id, ...)`
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
-- `distinct(database, collection, field, filter=None, ...)`
+- `distinct(database, collection, field, filter=None, *, plan_diagnostics=False, ...)`
 - `delete_one(database, collection, filter, ...)`
 - `delete_many(database, collection, filter, ...)`
 - `find_one_and_delete(database, collection, filter, *, projection=None, sort=None, ...)`
@@ -73,6 +74,30 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `update_many(database, collection, filter, update, *, upsert=False, ...)`
 - `find_one_and_replace(database, collection, filter, replacement, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
 - `find_one_and_update(database, collection, filter, update, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
+
+For native sync and async reads, `plan_diagnostics=True` optionally adds
+`result["plan"]["read_access"]` to scatter plans:
+
+```python
+result = session.find("app", "notes", {"tag": {"$in": ["work", "home"]}},
+                      plan_diagnostics=True)
+print(result["plan"])  # routing shards plus the selected access path
+```
+
+An index candidate path contains `kind="index_candidates"`, a numeric `index_id`,
+`candidate_kind` (`equality`, `necessary_finite`, `logical_finite` or
+`sparse_presence`) and `key_count` (zero for sparse-entry scanning). A scan has
+`kind="scan"` and `reason`: `unfiltered`, `no_ready_index`, `no_safe_probe`,
+`probe_work_limit` or `aggregation_input`. No filter values, encoded keys or
+index names are returned. Exact-ID point plans keep their existing shape.
+Repeat the option on each `get_more` that should report diagnostics; it is not
+retained by the cursor, and current index authority is reselected on each call.
+Default output is unchanged. Diagnostic scatter metadata adds 32 bytes to the
+engine's logical result budget. These are **plan choices, not measured work**:
+`shards` lists planned owners, not actual visits; aggregation still scans its
+routed input for pipeline accounting. This is not MongoDB `explain` or
+`executionStats`, an index-only plan, or a new optimization. Count and mutation
+methods do not expose this option; catalog reads have no data access path.
 
 Both delete methods accept the shared BSON filters and return an acknowledged
 `deleted_count`. Exact `_id` filters route directly; other `delete_one` filters
