@@ -1710,6 +1710,40 @@ async def async_index_removal_smoke(uri):
         assert await collection.count_documents({}) == 1
 
 
+def indexed_mutation_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_mutations.items
+        collection.insert_many([{"_id": i, "a": [1, i], "rank": i, "counter": 0} for i in range(8)])
+        collection.create_index("a")
+        result = collection.update_many({"a": 1}, {"$inc": {"counter": 1}})
+        assert (result.matched_count, result.modified_count) == (8, 8)
+        assert all(row["counter"] == 1 for row in collection.find({"a": 1}))
+        assert collection.find_one_and_update({"a": 1}, {"$inc": {"counter": 1}},
+            sort=[("rank", -1)], projection={"counter": 1},
+            return_document=pymongo.ReturnDocument.AFTER) == {"_id": 7, "counter": 2}
+        assert collection.find_one_and_replace({"a": 1}, {"a": 9, "counter": 5, "rank": 0},
+            sort=[("_id", 1)], projection={"counter": 1}) == {"_id": 0, "counter": 1}
+        assert collection.find_one_and_delete({"a": 1}, sort=[("_id", -1)])["_id"] == 7
+        assert collection.update_one({"a": 99, "_id": 100}, {"$inc": {"counter": 10}}, upsert=True).upserted_id == 100
+        assert collection.update_many({"a": 99, "_id": 100}, {"$inc": {"counter": 1}}, upsert=True).matched_count == 1
+        assert collection.replace_one({"a": 9}, {"a": 1, "counter": 0}).modified_count == 1
+        assert collection.delete_many({"a": 1}).deleted_count == 7
+        assert list(collection.find({})) == [{"_id": 100, "a": 99, "counter": 11}]
+
+
+async def async_indexed_mutation_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_mutations.async_items
+        await collection.insert_many([{"_id": i, "a": [1, i], "counter": 0} for i in range(8)])
+        await collection.create_index("a")
+        result = await collection.update_many({"a": 1}, {"$inc": {"counter": 1}})
+        assert (result.matched_count, result.modified_count) == (8, 8)
+        assert (await collection.find_one_and_update({"a": 3}, {"$set": {"a": 8}},
+            return_document=pymongo.ReturnDocument.AFTER)) == {"_id": 3, "a": 8, "counter": 1}
+        assert (await collection.delete_many({"a": 1})).deleted_count == 7
+        assert [row async for row in collection.find({})] == [{"_id": 3, "a": 8, "counter": 1}]
+
+
 def indexed_read_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.wire_index_reads.items
@@ -1876,6 +1910,8 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert list(client.wire_index_mutations.items.find({})) == [{"_id": 100, "a": 99, "counter": 11}]
+        assert list(client.wire_index_mutations.async_items.find({})) == [{"_id": 3, "a": 8, "counter": 1}]
         assert client.wire_index_reads.items.count_documents({"a": 1}) == 9
         assert client.wire_index_reads.items.count_documents({"a": None}) == 2
         assert client.wire_index_reads.items.find_one({"a": 88}) is None
@@ -2322,6 +2358,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "reopened":
         persisted_smoke(sys.argv[1])
     else:
+        indexed_mutation_smoke(sys.argv[1])
+        asyncio.run(async_indexed_mutation_smoke(sys.argv[1]))
         indexed_read_smoke(sys.argv[1])
         asyncio.run(async_indexed_read_smoke(sys.argv[1]))
         index_creation_smoke(sys.argv[1])

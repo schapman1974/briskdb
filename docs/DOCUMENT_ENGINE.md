@@ -243,8 +243,8 @@ implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 ### Equality index candidates
 
-Find (including sorted/paged reads) and filtered count/distinct can use a current
-Ready non-unique index when every indexed
+Find (including sorted/paged reads), filtered count/distinct and mutation
+selection can use a current Ready non-unique index when every indexed
 path has a necessary supported scalar equality. Direct equality, `$eq` and
 positive `$and` clauses are recognized; the entire BSON matcher still verifies
 each candidate. Compound paths and scalar membership in final arrays reuse the
@@ -265,7 +265,7 @@ pass the full matcher. A cursor does not retain index authority between requests
 drop/recreation selects current authority or resumes scanning from the existing
 natural-order frontier. This does not add a cross-request snapshot. Shard routing
 and the public `Point`/`Scatter` plan remain unchanged; access-method reasons and
-row counters, index-only reads, ordering/range pushdown, mutation selection and aggregation pushdown
+row counters, index-only reads, ordering/range pushdown and aggregation pushdown
 remain work under #178. No format migration is needed.
 
 Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
@@ -276,7 +276,17 @@ is `cargo test --locked --features documents --test document_index_reads
 equality_candidate_benchmark -- --ignored --exact --nocapture`; timings are local
 measurements, not CI performance assertions.
 
-It generates ordered compound tuples with at most one final array field, removes
+Update/delete, replacements and find-and-modify use the same candidate helper,
+including sorted selection and upsert rechecks. Each shard-local write retains
+its existing transaction and full predicate/identity recheck. Multi-document
+operations advance by immutable natural order, not mutable index position, so
+changing a searched key cannot cause the same record to be updated twice.
+Records and derived entries roll back together on the failing shard; earlier
+shard commits remain visible as before. Cancellation and task abort preserve
+that boundary and release admission after worker cleanup. This adds no unique
+constraint, global snapshot or cross-shard atomicity guarantee.
+
+`DocumentIndexKeyGenerator` generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
 empty arrays a separate identity. Sparse compound membership requires any indexed
 field to exist (including explicit null). Partial membership is evaluated before
