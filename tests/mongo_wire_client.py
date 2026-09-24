@@ -2166,6 +2166,67 @@ async def async_logical_index_smoke(uri, reopened):
         assert (await collection.find_one({"_id": selected[0]}))["a"] == 9
 
 
+def partial_index_fixture():
+    records, _, _ = logical_index_fixture(False)
+    for row in records:
+        row["enabled"] = row["_id"] % 2 == 0
+    query = {"$or": [{"a": 1, "enabled": True}, {"a": {"$in": [2]}, "enabled": True}]}
+    selected = [i for i in range(42) if i % 7 in (2, 4) and i % 2 == 0]
+    return records, query, selected
+
+
+def partial_index_smoke(uri, reopened):
+    records, query, selected = partial_index_fixture()
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_partial_index.sync_items
+        if not reopened:
+            collection.insert_many(records)
+            baseline = [BSON.encode(row) for row in collection.find(query).batch_size(1)]
+            collection.create_index("a", partialFilterExpression={"enabled": True})
+            assert [BSON.encode(row) for row in collection.find(query).batch_size(1)] == baseline
+            assert collection.count_documents({"a": 1}) == 12  # Must not omit nonmembers.
+            assert [row["_id"] for row in collection.find(query).batch_size(1)] == selected
+            result = collection.update_many(query, {"$inc": {"hits": 1}})
+            assert (result.matched_count, result.modified_count) == (len(selected), len(selected))
+            assert collection.find_one_and_update(query, {"$set": {"enabled": False}}, sort=[("rank", -1)], return_document=True)["_id"] == selected[-1]
+            assert collection.replace_one(dict(query, _id=selected[0]), {"a": 1, "hits": 3}).modified_count == 1
+            assert collection.update_one(dict(query, _id=100), {"$set": {"a": 1, "enabled": True, "hits": 10}}, upsert=True).upserted_id == 100
+        rows = list(collection.find(query).sort("_id", 1).batch_size(1))
+        assert [row["_id"] for row in rows] == selected[1:-1] + [100]
+        assert [row["hits"] for row in rows] == [1] * (len(selected) - 2) + [10]
+        assert collection.count_documents({"a": 1}) == 13
+        assert collection.count_documents(query) == len(selected) - 1
+        assert sorted(collection.distinct("hits", query)) == [1, 10]
+        assert collection.find_one({"_id": selected[-1]})["enabled"] is False
+        assert "enabled" not in collection.find_one({"_id": selected[0]})
+
+
+async def async_partial_index_smoke(uri, reopened):
+    records, query, selected = partial_index_fixture()
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_partial_index.async_items
+        if not reopened:
+            await collection.insert_many(records)
+            baseline = [BSON.encode(row) async for row in collection.find(query).batch_size(1)]
+            await collection.create_index("a", partialFilterExpression={"enabled": True})
+            assert [BSON.encode(row) async for row in collection.find(query).batch_size(1)] == baseline
+            assert await collection.count_documents({"a": 1}) == 12
+            assert [row["_id"] async for row in collection.find(query).batch_size(1)] == selected
+            result = await collection.update_many(query, {"$inc": {"hits": 1}})
+            assert (result.matched_count, result.modified_count) == (len(selected), len(selected))
+            assert (await collection.find_one_and_update(query, {"$set": {"enabled": False}}, sort=[("rank", -1)], return_document=True))["_id"] == selected[-1]
+            assert (await collection.replace_one(dict(query, _id=selected[0]), {"a": 1, "hits": 3})).modified_count == 1
+            assert (await collection.update_one(dict(query, _id=100), {"$set": {"a": 1, "enabled": True, "hits": 10}}, upsert=True)).upserted_id == 100
+        rows = await collection.find(query).sort("_id", 1).batch_size(1).to_list()
+        assert [row["_id"] for row in rows] == selected[1:-1] + [100]
+        assert [row["hits"] for row in rows] == [1] * (len(selected) - 2) + [10]
+        assert await collection.count_documents({"a": 1}) == 13
+        assert await collection.count_documents(query) == len(selected) - 1
+        assert sorted(await collection.distinct("hits", query)) == [1, 10]
+        assert (await collection.find_one({"_id": selected[-1]}))["enabled"] is False
+        assert "enabled" not in await collection.find_one({"_id": selected[0]})
+
+
 def unique_index_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         database = client.wire_unique
@@ -3034,6 +3095,8 @@ if __name__ == "__main__":
     asyncio.run(asyncio.wait_for(async_absence_index_smoke(sys.argv[1], reopened), timeout=20))
     logical_index_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_logical_index_smoke(sys.argv[1], reopened), timeout=20))
+    partial_index_smoke(sys.argv[1], reopened)
+    asyncio.run(asyncio.wait_for(async_partial_index_smoke(sys.argv[1], reopened), timeout=20))
     index_metadata_smoke(sys.argv[1])
     asyncio.run(async_index_metadata_smoke(sys.argv[1]))
     if reopened:

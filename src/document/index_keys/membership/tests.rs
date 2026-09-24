@@ -107,7 +107,7 @@ fn necessary_membership_tuples_have_no_false_negatives_for_scalar_multikey_and_s
 }
 
 #[test]
-fn unknown_negative_partial_incomplete_and_sparse_null_shapes_keep_scans() {
+fn unknown_negative_incomplete_and_unproven_partial_shapes_keep_scans() {
     let one = BsonValue::Int32(1);
     for value in [
         member(vec![]),
@@ -154,12 +154,24 @@ fn unknown_negative_partial_incomplete_and_sparse_null_shapes_keep_scans() {
         Some(&doc([("enabled", BsonValue::Boolean(true))])),
     )
     .unwrap();
+    assert_eq!(
+        keys(
+            &partial,
+            &doc([
+                ("a", member(vec![one.clone()])),
+                ("enabled", BsonValue::Boolean(true)),
+            ])
+        )
+        .unwrap()
+        .len(),
+        1
+    );
     assert!(
         keys(
             &partial,
             &doc([
                 ("a", member(vec![one])),
-                ("enabled", BsonValue::Boolean(true))
+                ("enabled", BsonValue::Boolean(false)),
             ])
         )
         .is_none()

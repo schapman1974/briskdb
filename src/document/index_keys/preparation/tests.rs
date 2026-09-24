@@ -443,6 +443,83 @@ fn storage_selection_never_interprets_or_enforces_unselected_pending_definitions
 }
 
 #[test]
+fn partial_storage_probe_requires_selected_authority_and_preserves_control_errors() {
+    let partial = doc([("active", BsonValue::Boolean(true))]);
+    let index = DocumentIndexMetadata::from_validated_parts(
+        DocumentIndexId::from_validated(7),
+        "private-index-7".into(),
+        membership(7, false, Some(partial.clone()))
+            .specification()
+            .clone(),
+        true,
+        false,
+        DocumentIndexLifecycle::Ready,
+    );
+    let metadata = collection([index]);
+    let matcher = DocumentMatcher::compile(&doc([
+        ("v", BsonValue::Int32(5)),
+        ("active", BsonValue::Boolean(true)),
+    ]))
+    .unwrap();
+    let preparation = DocumentIndexPreparation::compile_selected_with_check(
+        metadata.id(),
+        metadata.indexes(),
+        |_| false,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        preparation
+            .equality_probe_with_check(&matcher, &mut || Ok(()))
+            .unwrap()
+            .is_none()
+    );
+    let preparation = DocumentIndexPreparation::compile_selected_with_check(
+        metadata.id(),
+        metadata.indexes(),
+        |index| index.lifecycle() == DocumentIndexLifecycle::Ready,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let mut steps = 0;
+    let probe = preparation
+        .equality_probe_with_check(&matcher, &mut || {
+            steps += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 7);
+    assert_eq!(probe_keys(&probe).len(), 1);
+    for stop in 1..=steps {
+        let mut seen = 0;
+        let result = preparation.equality_probe_with_check(&matcher, &mut || {
+            seen += 1;
+            if seen == stop {
+                Err(EngineError::new(EngineErrorKind::Cancelled, "cancelled"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(error) if error.kind() == EngineErrorKind::Cancelled));
+    }
+    // Private Ready selection must not silently expand the frozen public helper.
+    assert!(
+        DocumentIndexKeyGenerator::compile(&keys(), false, Some(&partial))
+            .unwrap()
+            .equality_key(&matcher)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        preparation
+            .equality_probe_with_check(&matcher, &mut || Ok(()))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn preparation_preserves_scoped_encoded_keys_membership_and_input() {
     let metadata = collection([
         secondary(7, keys()),

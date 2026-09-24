@@ -38,6 +38,39 @@ impl DocumentIndexKeyGenerator {
         if self.partial.is_some() {
             return Ok(None);
         }
+        self.equality_components_with_budget(matcher, budget)
+    }
+
+    /// Storage-only extension; the public single-equality API keeps its frozen
+    /// partial-index fallback. Current Ready authority is still the caller's job.
+    pub(super) fn storage_equality_key_with_budget(
+        &self,
+        matcher: &DocumentMatcher,
+        budget: &mut Budget<'_>,
+    ) -> EngineResult<Option<DocumentIndexKey>> {
+        if !self.proves_partial_membership(matcher, budget)? {
+            return Ok(None);
+        }
+        self.equality_components_with_budget(matcher, budget)
+    }
+
+    pub(super) fn proves_partial_membership(
+        &self,
+        matcher: &DocumentMatcher,
+        budget: &mut Budget<'_>,
+    ) -> EngineResult<bool> {
+        budget.step()?;
+        match &self.partial {
+            Some(partial) => partial.is_implied_by_index_query(matcher, budget),
+            None => Ok(true),
+        }
+    }
+
+    fn equality_components_with_budget(
+        &self,
+        matcher: &DocumentMatcher,
+        budget: &mut Budget<'_>,
+    ) -> EngineResult<Option<DocumentIndexKey>> {
         budget.charge(128 + self.paths.len() * 32)?;
         let mut components = Vec::new();
         components

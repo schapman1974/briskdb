@@ -29,6 +29,8 @@ mod diagnostics;
 mod logical;
 #[path = "document_index_reads/membership.rs"]
 mod membership;
+#[path = "document_index_reads/partial.rs"]
+mod partial;
 #[path = "document_index_reads/presence.rs"]
 mod presence;
 #[path = "document_index_reads/read_stats.rs"]
