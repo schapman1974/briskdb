@@ -117,7 +117,10 @@ async fn run(
     shutdown: CancellationToken,
     metrics: Arc<metrics::Metrics>,
 ) -> io::Result<()> {
-    let executor = Arc::new(commands::Executor::new(database.clone()));
+    let executor = Arc::new(commands::Executor::new(
+        database.clone(),
+        Arc::clone(&metrics),
+    ));
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = JoinSet::new();
     let mut lifecycle = tokio::time::interval(Duration::from_millis(100));

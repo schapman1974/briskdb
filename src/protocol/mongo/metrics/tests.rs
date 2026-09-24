@@ -138,6 +138,7 @@ fn metrics_guards_drain_concurrent_connections_and_aborted_commands_without_loss
             scope.spawn(move || {
                 metrics.accepted();
                 let _connection = metrics.admit();
+                let _cursor = metrics.register_cursor();
                 barrier.wait();
                 let body = doc([("ok", BsonValue::Double(1.0))]);
                 for n in 0..250 {
@@ -161,6 +162,17 @@ fn metrics_guards_drain_concurrent_connections_and_aborted_commands_without_loss
         (8, 8, 8, 8)
     );
     assert_eq!(snapshot.active_connections, 0);
+    assert_eq!(
+        snapshot.cursors,
+        MongoCursorMetrics {
+            registered: 8,
+            active: 0,
+            peak: 8,
+            closed: 8,
+            idle_expired: 0,
+            limit_rejections: 0,
+        }
+    );
     let ping = snapshot.command(MongoCommandKind::Ping);
     assert_eq!(
         (ping.started, ping.completed, ping.aborted, ping.in_flight),
@@ -176,6 +188,7 @@ fn metrics_guards_release_live_gauges_during_unwinding() {
         metrics.accepted();
         let _connection = metrics.admit();
         let _command = metrics.command("update", Instant::now());
+        let _cursor = metrics.register_cursor();
         panic!("injected command unwind");
     });
     assert!(failed.is_err());
@@ -185,6 +198,17 @@ fn metrics_guards_release_live_gauges_during_unwinding() {
         (0, 1)
     );
     let update = snapshot.command(MongoCommandKind::Update);
+    assert_eq!(
+        snapshot.cursors,
+        MongoCursorMetrics {
+            registered: 1,
+            active: 0,
+            peak: 1,
+            closed: 1,
+            idle_expired: 0,
+            limit_rejections: 0,
+        }
+    );
     assert_eq!(
         (
             update.started,

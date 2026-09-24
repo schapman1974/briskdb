@@ -1696,7 +1696,25 @@ async fn cursor_limits_malformed_commands_and_unacknowledged_reads_do_not_leak()
         Some(&BsonValue::Array(ids))
     );
     assert!(live_cursor_id(&send_command(&mut stream, &cursor_find("cursor_limits", 0)).await) > 0);
+    let cursors = server.metrics().cursors;
+    assert_eq!(
+        (
+            cursors.registered,
+            cursors.closed,
+            cursors.active,
+            cursors.peak
+        ),
+        (9, 8, 1, 8)
+    );
+    assert_eq!((cursors.limit_rejections, cursors.idle_expired), (1, 0));
     server.close().await.unwrap();
+    assert_eq!(
+        (
+            server.metrics().cursors.active,
+            server.metrics().cursors.closed
+        ),
+        (0, 9)
+    );
     database.close().await.unwrap();
 }
 
@@ -2233,6 +2251,15 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
     ));
     let metrics = server.metrics();
     assert_eq!(metrics.response_limit_rejections, 3);
+    assert_eq!(
+        (
+            metrics.cursors.registered,
+            metrics.cursors.closed,
+            metrics.cursors.active,
+            metrics.cursors.peak
+        ),
+        (10, 2, 8, 8)
+    );
     assert_eq!(metrics.errors_with_code(10334), Some(6));
     assert_eq!(metrics.errors_with_code(43), Some(2));
     assert_eq!(
@@ -2248,6 +2275,13 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         4
     );
     server.close().await.unwrap();
+    assert_eq!(
+        (
+            server.metrics().cursors.active,
+            server.metrics().cursors.closed
+        ),
+        (0, 10)
+    );
     database.close().await.unwrap();
 }
 
