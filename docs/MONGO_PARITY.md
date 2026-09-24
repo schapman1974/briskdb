@@ -165,17 +165,23 @@ multi-batch reads with `getMore` and explicit `killCursors` cleanup. The legacy
 this engine through both synchronous and asynchronous clients. Basic aggregation
 pipelines also use retained cursors over the shared global document engine.
 Exact `_id` and `_id: {$eq: value}` filters keep single-shard routing.
-A sole `_id: {$in: [literal, ...]}` with 1–1024 values scans only their distinct
+A safe `_id: {$in: [literal, ...]}` scans only its distinct
 owning shards, using the same canonical BSON identities as storage. Numeric
 aliases and repeated IDs do not duplicate output or shard access. The complete
 matcher still checks every candidate; this is shard pruning, not a multi-key
 index lookup. Find/getMore, legacy count, distinct, update, replace, delete and
 find-and-modify share the restriction, including sorting and global pagination.
-Empty/larger lists, regex members and other filter shapes retain ordinary scans.
+Compound filters and positive `$and` clauses intersect proven exact-ID/list
+owners; `$or` unions owners only when every alternative is bounded. These keep
+the full matcher even with one owner, including nonmatching upsert conflicts.
+Canonical-ID work is limited to 1024 values across the filter. Empty/oversized
+lists, regex members, negations and dotted IDs provide no restriction; unproven
+queries (and empty owner intersections) retain ordinary scans.
 Aggregation (including PyMongo `count_documents()`) uses the same shard restriction
-for a safe first-stage `$match`: exact IDs use one owner, and literal lists use
-their distinct owners. Every original stage remains in the pipeline, and list
-sources do not prefilter rows before aggregation's cumulative input/work limits.
+for a safe first-stage `$match`: sole exact IDs use one owner, and proven logical
+or list constraints use their selected owners. Every original stage remains in
+the pipeline, and subset sources do not prefilter rows before aggregation's
+cumulative input/work limits.
 Matches after transformations or other preceding stages do not establish a route.
 Scans merge matching documents in durable
 natural order unless an explicit sort is supplied. Storage format, cursor

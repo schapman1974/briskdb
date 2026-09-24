@@ -543,7 +543,7 @@ requires an earlier dependency:
       response limits. Missing collections read empty without creating metadata.
       Additional update operators,
       and broader database options remain open.
-    - [ ] [#180](https://github.com/schapman1974/briskdb/issues/180) — bounded sole
+    - [ ] [#180](https://github.com/schapman1974/briskdb/issues/180) — bounded
       `_id: {$in: [...]}` literal lists now prune to distinct canonical-ID owners
       for find/getMore, legacy count, distinct and single/multi mutations. The
       existing matcher, natural-order merge, sorting, global pagination, cursor
@@ -553,7 +553,12 @@ requires an earlier dependency:
       keep scans. Aggregation now also routes a safe leading exact-ID/list match,
       including PyMongo `count_documents()`, while retaining the complete pipeline
       and its input/work accounting. Matches after transforms/skip/limit do not
-      establish routes. Broader predicate planning and routing vectors remain.
+      establish routes. Compound/positive-AND exact-ID and list constraints now
+      intersect owner sets; OR unions them only when every alternative is bounded,
+      with at most 1024 canonical-ID visits across the filter. Full predicates
+      still govern single-owner reads, mutations and upsert conflicts. Negations,
+      dotted IDs, unbounded OR branches and empty owner intersections keep safe
+      fallback behavior. Broader predicate planning and routing vectors remain.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
       single-shard worker grouping. Missing IDs receive ObjectIds; explicit

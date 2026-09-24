@@ -1089,6 +1089,34 @@ def id_in_routing_smoke(uri, reopened):
         assert collection.count_documents({}) == 60
         assert collection.find_one({"_id": 5}) == {"_id": 5, "rank": 5}
         assert list(collection.find({"_id": {"$in": []}})) == []
+        compound = {"_id": Int64(9), "changed": 3}
+        conjunctive = {"$and": [query, {"changed": {"$gte": 2}}]}
+        alternatives = {"$or": [compound, {"_id": {"$eq": 18.0}, "changed": 4}]}
+        for predicate, expected in [(compound, [9]), (conjunctive, [9, 18, 22]),
+                                    (alternatives, [9, 18]),
+                                    ({"$or": [compound, {"rank": 5}]}, [5, 9])]:
+            assert [row["_id"] for row in collection.find(predicate).sort("_id", 1).batch_size(1)] == expected
+            assert collection.count_documents(predicate) == len(expected)
+            assert sorted(collection.distinct("_id", predicate)) == expected
+            pipeline = [{"$match": predicate}, {"$sort": {"_id": 1}}, {"$project": {"_id": 1}}]
+            assert list(collection.aggregate(pipeline, batchSize=1)) == [{"_id": i} for i in expected]
+        miss = {"_id": 9, "changed": -1}
+        before = collection.find_one({"_id": 9})
+        assert collection.update_one(miss, {"$set": {"changed": -1}}).matched_count == 0
+        assert collection.update_many(miss, {"$set": {"changed": -1}}).matched_count == 0
+        assert collection.replace_one(miss, {"changed": -1}).matched_count == 0
+        assert collection.delete_one(miss).deleted_count == 0
+        assert collection.delete_many(miss).deleted_count == 0
+        assert collection.find_one_and_update(miss, {"$set": {"changed": -1}}) is None
+        assert collection.find_one_and_replace(miss, {"changed": -1}) is None
+        assert collection.find_one_and_delete(miss) is None
+        try:
+            collection.update_one(miss, {"$set": {"changed": -1}}, upsert=True)
+        except pymongo.errors.DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("a failed extra predicate must not update the existing ID")
+        assert collection.find_one({"_id": 9}) == before
 
 
 async def async_id_in_routing_smoke(uri, reopened):
@@ -1115,6 +1143,24 @@ async def async_id_in_routing_smoke(uri, reopened):
         cursor = await collection.aggregate(stages, batchSize=1)
         assert await cursor.to_list() == [{"_id": 12}, {"_id": 8}]
         assert await collection.count_documents({}) == 31
+        predicate = {"$and": [query, {"$or": [{"_id": Int64(8), "changed": 1},
+                                              {"_id": 18.0, "changed": 2}]}]}
+        assert [row["_id"] async for row in collection.find(predicate).batch_size(1)] == [8, 18]
+        assert await collection.count_documents(predicate) == 2
+        assert sorted(await collection.distinct("_id", predicate)) == [8, 18]
+        cursor = await collection.aggregate([{"$match": predicate}, {"$count": "n"}], batchSize=1)
+        assert await cursor.to_list() == [{"n": 2}]
+        miss = {"_id": 8, "changed": -1}
+        assert (await collection.update_many(miss, {"$set": {"changed": -1}})).matched_count == 0
+        assert (await collection.delete_many(miss)).deleted_count == 0
+        assert await collection.find_one_and_update(miss, {"$set": {"changed": -1}}) is None
+        try:
+            await collection.update_one(miss, {"$set": {"changed": -1}}, upsert=True)
+        except pymongo.errors.DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("async upsert must preserve the full predicate")
+        assert (await collection.find_one({"_id": 8}))["changed"] == 1
 
 
 def document_smoke(uri):

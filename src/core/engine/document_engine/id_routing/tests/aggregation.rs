@@ -80,6 +80,57 @@ fn encoded(rows: &[BsonDocument]) -> Vec<Vec<u8>> {
 }
 
 #[tokio::test]
+async fn leading_logical_matches_preserve_full_pipeline_semantics_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    for reopen in [false, true] {
+        let engine = Engine::open(root.path(), 8).await.unwrap();
+        let session = engine.session();
+        if !reopen {
+            seed(&engine, &session).await;
+        }
+        for (query, shards) in super::logical::cases(&engine) {
+            for tail in [
+                vec![
+                    stage(
+                        "$sort",
+                        BsonValue::Document(doc([("rank", BsonValue::Int32(1))])),
+                    ),
+                    stage("$skip", BsonValue::Int32(1)),
+                    stage("$limit", BsonValue::Int32(3)),
+                ],
+                vec![stage(
+                    "$group",
+                    BsonValue::Document(doc([
+                        ("_id", BsonValue::Null),
+                        (
+                            "n",
+                            BsonValue::Document(doc([("$sum", BsonValue::Int32(1))])),
+                        ),
+                    ])),
+                )],
+            ] {
+                let pipeline = DocumentPipeline::new(
+                    std::iter::once(matched(&query))
+                        .chain(tail)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let expected = DocumentAggregator::compile(&pipeline)
+                    .unwrap()
+                    .execute(&source_documents())
+                    .unwrap();
+                for batch in [0, 2] {
+                    let actual =
+                        aggregate_rows(&engine, &session, pipeline.clone(), batch, &shards).await;
+                    assert_eq!(encoded(&actual), encoded(&expected), "query: {query:?}");
+                }
+            }
+        }
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn leading_id_lists_preserve_pipeline_stages_global_paging_and_restart() {
     let root = tempfile::tempdir().unwrap();
     for reopen in [false, true] {

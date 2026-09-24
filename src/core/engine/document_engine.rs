@@ -2231,7 +2231,7 @@ fn prepare_filter_route(
             let matcher = Arc::new(matcher);
             // Validate every query branch before deriving any routing shortcut.
             if let Some(shards) =
-                id_routing::literal_in_shards(storage, filter, cancellation, control)?
+                id_routing::proven_id_shards(storage, filter, cancellation, control)?
             {
                 return Ok(PreparedFilterRoute::ShardSubset {
                     matcher: Some(matcher),

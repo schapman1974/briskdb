@@ -1,5 +1,6 @@
 use super::*;
 mod aggregation;
+mod logical;
 use crate::{
     core::RequestContext,
     document::{
@@ -282,10 +283,14 @@ async fn literal_in_reads_prune_actual_shards_and_preserve_global_pagination_aft
         };
         assert_eq!(values.as_ref(), ids(&actual));
 
-        // Independent forced-scatter execution retains the same matcher.
+        // Double negation keeps an equivalent, independent forced scatter;
+        // positive conjunctions themselves can now establish an ID route.
         let forced = DocumentFilter::new(doc([(
-            "$and",
-            BsonValue::Array(vec![BsonValue::Document(query.document().clone())]),
+            "$nor",
+            BsonValue::Array(vec![BsonValue::Document(doc([(
+                "$nor",
+                BsonValue::Array(vec![BsonValue::Document(query.document().clone())]),
+            )]))]),
         )]))
         .unwrap();
         let oracle = rows(
@@ -571,12 +576,39 @@ async fn bson_literal_lists_keep_canonical_identity_and_exact_array_semantics_af
             let found = rows(
                 &engine,
                 &session,
-                in_values(vec![value.clone(), variant]),
+                in_values(vec![value.clone(), variant.clone()]),
                 DocumentReadOptions::new(),
                 &[shard],
             )
             .await;
             assert_eq!(ids(&found), vec![value.clone()]);
+            // Compound and nested positive constraints retain exactly the
+            // same canonical identity, including arrays and ordered objects.
+            let equality = doc([("_id", BsonValue::Document(doc([("$eq", variant)])))]);
+            let absent = (
+                "absent",
+                BsonValue::Document(doc([("$exists", BsonValue::Boolean(false))])),
+            );
+            for query in [
+                doc([("_id", value.clone()), absent.clone()]),
+                doc([(
+                    "$and",
+                    BsonValue::Array(vec![
+                        BsonValue::Document(equality),
+                        BsonValue::Document(doc([absent])),
+                    ]),
+                )]),
+            ] {
+                let actual = rows(
+                    &engine,
+                    &session,
+                    DocumentFilter::new(query).unwrap(),
+                    DocumentReadOptions::new(),
+                    &[shard],
+                )
+                .await;
+                assert_eq!(ids(&actual), vec![value.clone()]);
+            }
         }
         // An array ID is one identity, not a match for any scalar member.
         let scalar = BsonValue::Int32(1);
