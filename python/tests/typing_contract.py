@@ -19,6 +19,18 @@ def remote_contract(database: briskdb.Database, token: str) -> None:
     server.close()
 
 
+def mongo_contract(database: briskdb.Database) -> None:
+    with database.serve(mongo="127.0.0.1:0") as server:
+        address: Optional[str] = server.mongo_address
+        print(address)
+
+
+async def async_mongo_contract(database: briskdb.AsyncDatabase) -> None:
+    async with await database.serve(mongo="127.0.0.1:0") as server:
+        address: Optional[str] = server.mongo_address
+        print(address)
+
+
 def sync_contract(path: str) -> None:
     conflict_type: type[briskdb.IntegrityError] = briskdb.IdempotencyConflictError
     config: briskdb.Config = briskdb.Config(shards=2)

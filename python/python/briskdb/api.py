@@ -976,6 +976,7 @@ class AsyncDatabase:
         http: str = "127.0.0.1:0",
         admin: Optional[str] = "127.0.0.1:0",
         postgres: Optional[str] = None,
+        mongo: Optional[str] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
@@ -991,6 +992,7 @@ class AsyncDatabase:
             http=http,
             admin=admin,
             postgres=postgres,
+            mongo=mongo,
             postgres_tls_cert=postgres_tls_cert,
             postgres_tls_key=postgres_tls_key,
             postgres_user=postgres_user,
@@ -1037,6 +1039,10 @@ class AsyncServer:
     @property
     def postgres_address(self) -> Optional[str]:
         return self._server.postgres_address
+
+    @property
+    def mongo_address(self) -> Optional[str]:
+        return self._server.mongo_address
 
     @property
     def closed(self) -> bool:

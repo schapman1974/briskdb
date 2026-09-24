@@ -125,8 +125,20 @@ attached server stops its listeners without closing that borrowed engine;
 `close().await` joins cleanup and can be retried after cancellation. The
 process-owned equivalent is `server::run_with_mongo(config, options, address)`
 (`server,mongo`). Existing `Config` / `ListenerConfig` literals, and existing
-entry points with Mongo disabled, remain source-compatible. This does not yet
-add a Mongo option to Python's `db.serve()`.
+entry points with Mongo disabled, remain source-compatible. The corresponding
+`start_secure_with_mongo` and `start_sqlite_remote_with_mongo` entry points keep
+Mongo loopback-only alongside their separately secured SQL connectors.
+
+Python's synchronous and asyncio `db.serve(mongo="127.0.0.1:0")` now attaches
+this same listener to an explicitly `documents=True` database. Both server
+handles expose `mongo_address`; `mongo=None` remains the default. The wheel
+includes the Rust transport without requiring a Python Mongo client dependency.
+Native document methods and stock PyMongo clients access the same collections.
+Server close drains listeners without closing the database; database close drains
+all registered servers first. Startup validates numeric loopback addresses,
+document enablement and fixed-port collisions, and releases sockets on bind
+failure. PostgreSQL TLS/SCRAM and SQLite remote bearer tokens do not authenticate
+Mongo or permit exposing its port. SQL tables and BSON collections stay distinct.
 
 The non-default `mongo` Cargo feature exposes `protocol::mongo::MongoServer`.
 The host explicitly starts it on a loopback address and closes it before

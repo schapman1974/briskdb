@@ -417,11 +417,33 @@ impl AttachedServer {
         config: ListenerConfig,
         security: postgres::SecurityConfig,
     ) -> anyhow::Result<Self> {
+        Self::start_secure_optional_mongo(database, config, security, None).await
+    }
+
+    /// Attach loopback Mongo alongside TLS/SCRAM PostgreSQL. PostgreSQL's
+    /// security configuration does not authenticate or expose Mongo remotely.
+    #[cfg(feature = "mongo")]
+    pub async fn start_secure_with_mongo(
+        database: &BriskDb,
+        config: ListenerConfig,
+        security: postgres::SecurityConfig,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        Self::start_secure_optional_mongo(database, config, security, Some(address)).await
+    }
+
+    async fn start_secure_optional_mongo(
+        database: &BriskDb,
+        config: ListenerConfig,
+        security: postgres::SecurityConfig,
+        mongo_address: Option<SocketAddr>,
+    ) -> anyhow::Result<Self> {
         validate_listener_addresses(&config, true)?;
+        validate_optional_mongo(&config, mongo_address)?;
         let security = security
             .load()
             .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-        Self::start_with_security(database, config, Some(security), None, None).await
+        Self::start_with_security(database, config, Some(security), None, mongo_address).await
     }
 
     /// Start a dedicated authenticated SQLite remote data plane instead of
@@ -432,9 +454,31 @@ impl AttachedServer {
         config: ListenerConfig,
         remote: crate::protocol::sqlite_remote::Config,
     ) -> anyhow::Result<Self> {
+        Self::start_sqlite_remote_optional_mongo(database, config, remote, None).await
+    }
+
+    /// Attach loopback Mongo alongside the authenticated SQLite remote data
+    /// plane. The SQLite token does not authenticate Mongo clients.
+    #[cfg(feature = "mongo")]
+    pub async fn start_sqlite_remote_with_mongo(
+        database: &BriskDb,
+        config: ListenerConfig,
+        remote: crate::protocol::sqlite_remote::Config,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        Self::start_sqlite_remote_optional_mongo(database, config, remote, Some(address)).await
+    }
+
+    async fn start_sqlite_remote_optional_mongo(
+        database: &BriskDb,
+        config: ListenerConfig,
+        remote: crate::protocol::sqlite_remote::Config,
+        mongo_address: Option<SocketAddr>,
+    ) -> anyhow::Result<Self> {
+        validate_optional_mongo(&config, mongo_address)?;
         let router = crate::protocol::sqlite_remote::router(database.engine().clone(), remote)
             .map_err(anyhow::Error::msg)?;
-        Self::start_with_security(database, config, None, Some(router), None).await
+        Self::start_with_security(database, config, None, Some(router), mongo_address).await
     }
 
     async fn start_with_security(

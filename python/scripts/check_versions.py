@@ -46,9 +46,10 @@ def main() -> None:
     if dependency["uses_default_features"] or dependency["features"] != [
         "documents",
         "listeners",
+        "mongo",
     ]:
         raise SystemExit(
-            "briskdb-python must depend only on the documents and host-controlled listeners features"
+            "briskdb-python must depend only on the documents, listeners, and mongo features"
         )
     if pathlib.Path(dependency["path"]).resolve() != ROOT:
         raise SystemExit("briskdb-python must bind the workspace's exact briskdb core")

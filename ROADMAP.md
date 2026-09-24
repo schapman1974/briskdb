@@ -504,7 +504,12 @@ requires an earlier dependency:
       `AttachedServer::start_with_mongo` now share the daemon/attached listener
       lifecycle, with passive all-listener binding, fail-closed startup,
       actual bound Mongo addresses, signal drain, and restart coverage. Existing
-      config struct shapes and disabled defaults remain unchanged. Negotiated
+      config struct shapes and disabled defaults remain unchanged. Python's
+      synchronous/async `db.serve(mongo=...)` now exposes the same listener and
+      `mongo_address`, requires explicit document enablement, and shares native
+      document storage and attached-server cleanup. It coexists with PostgreSQL
+      TLS/SCRAM and SQLite remote without inheriting their authentication or
+      relaxing Mongo's loopback boundary. Negotiated
       zlib now has bounded compressed/expanded envelopes, strict stream and
       original CRC validation, malformed/bomb/property tests, compressed replies
       with safe plain fallback, and real sync/async PyMongo restart coverage.
