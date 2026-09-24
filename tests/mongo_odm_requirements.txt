@@ -1,0 +1,23 @@
+# Test-only Python 3.13 environment for actual upstream ODM application bodies.
+# Separate from the immutable v1 frozen command/reference environment.
+pip==26.0.1
+setuptools==82.0.1
+wheel==0.47.0
+beanie==2.1.0
+mongoengine==0.29.3
+pymongo==4.17.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+lazy-model==0.4.0
+annotated-types==0.8.0
+typing-inspection==0.4.4
+typing-extensions==4.16.0
+click==8.5.0
+dnspython==2.8.0
+pytest==8.4.2
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+tinydb==3.15.2
+portalocker==4.4.0

@@ -42,6 +42,36 @@ BRISKDB_MONGO_CONTRACT_PYTHON=python3 cargo test --locked \
   -- --ignored --nocapture
 ```
 
+### Real ODM application checkpoint
+
+A separate required CI job runs the actual locked TinyMongo Beanie and MongoEngine
+application fixtures, not only the frozen command contracts with similar names.
+Beanie 2.1.0, MongoEngine 0.29.3 and stock PyMongo 4.17.0 use a real four-shard
+BriskDB listener. Fixture source hashes are checked before execution; only client
+construction/connection configuration changes. Models, data-access calls and
+application assertions stay unchanged, without monkeypatching driver methods or
+rewriting replies. TinyMongo supplies test-only fixture code and an ID factory;
+it is not the candidate storage or client implementation.
+
+Both application bodies run before and after a full engine/listener restart.
+The gate also verifies persisted application data and the ODM-created index.
+Missing dependencies, modified sources, omitted/duplicated/skipped/failed cases,
+or a child exceeding its 60-second phase bound fail the gate. The separate
+`mongo-real-odm-results` artifact contains `initial.json` and `reopened.json`.
+This is coverage for two baseline CRUD fixtures, not all ODM features, Talk Python
+applications or the larger #181 acceptance matrix; it does not change the frozen
+corpus, reports or difference policy.
+
+To reproduce, install `tests/mongo_odm_requirements.txt` and the source-locked
+TinyMongo package in a separate Python 3.13 environment, then point to its checkout:
+
+```sh
+BRISKDB_MONGO_ODM_PYTHON=python3 \
+BRISKDB_MONGO_ODM_SOURCE_ROOT=/path/to/locked/tinymongo \
+  cargo test --locked --no-default-features --features mongo --test mongo_odm \
+  -- --ignored --nocapture
+```
+
 ## Current wire checkpoint
 
 The non-default `mongo` Cargo feature exposes `protocol::mongo::MongoServer`.
