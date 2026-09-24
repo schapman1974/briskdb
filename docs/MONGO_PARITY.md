@@ -58,8 +58,8 @@ The gate also verifies persisted application data and the ODM-created index.
 Missing dependencies, modified sources, omitted/duplicated/skipped/failed cases,
 or a child exceeding its 60-second phase bound fail the gate. The separate
 `mongo-real-odm-results` artifact contains `initial.json` and `reopened.json`.
-This is coverage for two baseline CRUD fixtures, not all ODM features, Talk Python
-applications or the larger #181 acceptance matrix; it does not change the frozen
+This is coverage for two baseline CRUD fixtures, not all ODM features or the
+larger #181 acceptance matrix; it does not change the frozen
 corpus, reports or difference policy.
 
 To reproduce, install `tests/mongo_odm_requirements.txt` and the source-locked
@@ -70,6 +70,44 @@ BRISKDB_MONGO_ODM_PYTHON=python3 \
 BRISKDB_MONGO_ODM_SOURCE_ROOT=/path/to/locked/tinymongo \
   cargo test --locked --no-default-features --features mongo --test mongo_odm \
   -- --ignored --nocapture
+```
+
+### Unchanged Talk Python wire contracts
+
+The same pinned application environment also runs the full locked
+`tests/contracts/test_talkpython_contract.py` using its original pytest fixtures,
+support code, parameterization and async adapter. Only `TINYMONGO_MONGODB_URI`
+changes to the real four-shard BriskDB listener. The source's `mongodb` target
+profile means stock-PyMongo wire behavior, not a claim that the candidate server
+is MongoDB. All 58 cases (29 sync and 29 async) must pass before and after a full
+engine/listener restart. The 348 other TinyMongo backend variants are outside
+this wire target, not skipped candidate cases. No test globals, application
+methods or driver replies are patched.
+
+The harness checks five source/configuration hashes, exact case identities and
+per-case API/backend/suite metadata. Missing, duplicate, failed, errored, skipped,
+or unexpected cases fail acceptance. Each pytest phase has a 120-second bound;
+the Rust parent has a 180-second cleanup bound. Existing ODM and driver timeouts
+are unchanged. Upstream fixtures drop their own databases on teardown, so a
+separate BSON/index sentinel verifies same-root restart; the harness does not
+claim those dropped application documents persist. Fresh JUnit reports prevent
+stale results from satisfying a new run. `mongo-real-talkpython-results` contains
+phase JSON inventories and raw JUnit XML, separately from the frozen corpus.
+
+This covers the application's wire contracts for query/projection/sort/cursors,
+CRUD/upserts, indexes/uniqueness, BSON fidelity and errors. The source's original
+wire profile deliberately excludes TinyMongo-client-only conveniences such as
+bytearray encoding and Python index warnings; it does not test the entire Talk
+Python application deployment or user-supplied large apps. Those remain #181
+work, not hidden xfails or extra frozen-corpus allowances.
+
+```sh
+BRISKDB_MONGO_ODM_PYTHON=python3 \
+BRISKDB_MONGO_ODM_SOURCE_ROOT=/path/to/locked/tinymongo \
+BRISKDB_MONGO_TALKPYTHON_REPORT_DIR=target/mongo-talkpython \
+  cargo test --locked --no-default-features --features mongo --test mongo_odm \
+  unchanged_talkpython_contracts_use_real_pymongo_before_and_after_restart \
+  -- --ignored --exact --nocapture
 ```
 
 ## Current wire checkpoint
