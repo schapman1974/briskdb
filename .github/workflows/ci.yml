@@ -99,16 +99,6 @@ jobs:
           --test document_index_keys_oracle
           -- --ignored --nocapture
 
-      - name: Run frozen supported contracts against BriskDB
-        # The candidate checkpoint is deliberately separate from the full
-        # reference-only report: unimplemented suites are not allowlisted.
-        env:
-          BRISKDB_MONGO_CONTRACT_PYTHON: python
-          BRISKDB_MONGO_CONTRACT_REPORT: target/mongo-parity/candidate-aggregation.xml
-        run: >-
-          cargo +1.85.0 test --locked --no-default-features --features mongo
-          --test mongo_candidate_contract -- --ignored --nocapture
-
       - name: Generate full reference-only Mongo parity report
         run: |
           mkdir -p target/mongo-parity
@@ -131,6 +121,65 @@ jobs:
         with:
           name: mongo-parity-report
           path: target/mongo-parity/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  mongo-candidate:
+    name: Mongo full frozen candidate corpus (456 executions)
+    runs-on: ubuntu-24.04
+    # Run independently of the long reference/oracle job. Both remain required;
+    # no existing timeout, source contract, or intentional difference is relaxed.
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python 3.9 replay environment
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.9.25"
+
+      - name: Check out locked TinyMongo oracle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: schapman1974/tinymongo
+          ref: 53cbf44e98b8caa036163725d195fd29592e1cc0
+          path: target/tinymongo-source
+          persist-credentials: false
+
+      - name: Install contract-only dependencies
+        run: |
+          python -m pip install -r compat/mongo/v1/runner/requirements.txt
+          python -m pip install --no-build-isolation --no-deps ./target/tinymongo-source
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Restore candidate build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-candidate-full-1.85
+
+      - name: Require all frozen contracts against BriskDB
+        env:
+          BRISKDB_MONGO_CONTRACT_PYTHON: python
+          BRISKDB_MONGO_CONTRACT_REPORT: target/mongo-parity/candidate-full.xml
+        run: |
+          mkdir -p target/mongo-parity
+          cargo +1.85.0 test --locked --no-default-features --features mongo \
+            --test mongo_candidate_contract -- --ignored --nocapture
+          python scripts/mongo_parity.py ingest --implementation briskdb \
+            --junit target/mongo-parity/candidate-full.xml \
+            --output target/mongo-parity/candidate-full.json
+
+      - name: Upload full candidate results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-full-candidate-results
+          path: target/mongo-parity/candidate-full.*
           if-no-files-found: ignore
           retention-days: 14
 

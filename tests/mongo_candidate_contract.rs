@@ -3,8 +3,8 @@
 use briskdb::{BriskDb, DocumentSupport, protocol::mongo::MongoServer};
 use std::process::Command;
 
-/// Executes unchanged frozen cases through the ordinary BriskDB PyMongo adapter.
-/// Kept separate from the reference-only report until the full corpus passes.
+/// Executes the entire unchanged frozen corpus through the BriskDB PyMongo adapter.
+/// The candidate artifact remains separate from the immutable reference report.
 #[tokio::test]
 #[ignore = "requires the frozen Mongo contract Python dependencies"]
 async fn frozen_supported_contracts_against_real_briskdb_endpoint() {
@@ -22,7 +22,7 @@ async fn frozen_supported_contracts_against_real_briskdb_endpoint() {
     let report_root = tempfile::tempdir().unwrap();
     let report = std::env::var_os("BRISKDB_MONGO_CONTRACT_REPORT")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| report_root.path().join("candidate-aggregation.xml"));
+        .unwrap_or_else(|| report_root.path().join("candidate-full.xml"));
     let output = tokio::task::spawn_blocking(move || run_contract(&uri, &report))
         .await
         .unwrap();
@@ -53,50 +53,7 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
         ])
         .arg("--rootdir")
         .arg(env!("CARGO_MANIFEST_DIR"))
-        .args([
-            "compat/mongo/v1/runner/contracts/test_aggregation_basic_stages_contract.py",
-            "compat/mongo/v1/runner/contracts/test_aggregation_projection_stages_contract.py",
-            "compat/mongo/v1/runner/contracts/test_aggregation_contract.py",
-            "compat/mongo/v1/runner/contracts/test_group_accumulators_contract.py",
-            "compat/mongo/v1/runner/contracts/test_client_read_fidelity_contract.py",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_min_and_max_follow_bson_order_and_report_noops",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_min_and_max_include_null_in_whole_bson_value_order",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_rename_moves_nested_values_overwrites_and_ignores_missing_source",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_pop_handles_front_back_nested_empty_and_missing_arrays",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_follow_numeric_array_paths",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_malformed_new_update_operands_report_mongodb_codes",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_update_path_conflicts_report_code_40_before_writing",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_preserve_immutable_id_semantics",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_report_target_and_path_errors_atomically",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_cover_upsert_update_many_and_find_and_modify",
-            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_apply_to_upsert_equality_fields",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_and_delete_metadata",
-            "compat/mongo/v1/runner/contracts/test_bson_value_types_contract.py::test_tm037_zero_timestamp_write_boundaries_match_mongodb",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_comment_remains_invalid_as_a_field_operator",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py",
-            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_tm036_pull_reuses_unbounded_min_max_key_ranges",
-            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_pull_reuses_recursive_bson_range_comparison",
-            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_pull_document_ranges_share_missing_and_array_path_semantics",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_invalid_not_operands",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_operator_typos",
-            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_replace_one_preserves_id_and_replaces_the_full_document",
-            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_write_result_metadata_used_by_the_application",
-            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_binary_ids_use_bson_equality_without_losing_subtype",
-            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_boolean_and_numeric_ids_are_bson_distinct",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_unset_removes_top_level_and_nested_fields",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_update_and_result_metadata",
-            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_inc_creates_a_missing_counter",
-            "compat/mongo/v1/runner/contracts/test_decimal128_contract.py::test_decimal128_inc_promotes_the_result",
-            "compat/mongo/v1/runner/contracts/test_decimal128_contract.py::test_decimal128_representation_changes_are_persisted",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_preserves_equality_bound_id",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_stores_id_first",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids",
-            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_rejects_conflicting_filter_and_replacement_ids",
-            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_indexed_ranges_feed_every_filter_consumer",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_dotted_query_paths_traverse_document_arrays_not_raw_nested_arrays",
-            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_tuple_equality_keeps_array_matches_visible_after_indexing",
-        ])
+        .arg("compat/mongo/v1/runner/contracts")
         .args([
             "--mongo-contract-target=briskdb",
             "--mongo-contract-api=both",
@@ -123,75 +80,14 @@ from scripts.mongo_parity import ingest_junit
 
 with open('compat/mongo/v1/corpus.json', encoding='utf-8') as source:
     corpus = json.load(source)
-modules = {
-    'tests.contracts.test_aggregation_basic_stages_contract',
-    'tests.contracts.test_aggregation_projection_stages_contract',
-    'tests.contracts.test_aggregation_contract',
-    'tests.contracts.test_group_accumulators_contract',
-    'tests.contracts.test_client_read_fidelity_contract',
-    'tests.contracts.test_array_update_contract',
-}
-individual = {'tests.contracts.test_talkpython_contract::' + name for name in [
-    'test_replace_one_preserves_id_and_replaces_the_full_document',
-    'test_write_result_metadata_used_by_the_application',
-    'test_binary_ids_use_bson_equality_without_losing_subtype',
-    'test_boolean_and_numeric_ids_are_bson_distinct',
-    'test_inc_creates_a_missing_counter',
-]}
-individual.update('tests.contracts.test_query_operator_contract::' + name for name in [
-    'test_comment_remains_invalid_as_a_field_operator',
-    'test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic',
-    'test_every_filtering_crud_entrypoint_rejects_invalid_not_operands',
-    'test_every_filtering_crud_entrypoint_rejects_operator_typos',
-    'test_dotted_query_paths_traverse_document_arrays_not_raw_nested_arrays',
-    'test_tuple_equality_keeps_array_matches_visible_after_indexing',
-])
-individual.update('tests.contracts.test_update_operator_contract::' + name for name in [
-    'test_min_and_max_follow_bson_order_and_report_noops',
-    'test_min_and_max_include_null_in_whole_bson_value_order',
-    'test_rename_moves_nested_values_overwrites_and_ignores_missing_source',
-    'test_pop_handles_front_back_nested_empty_and_missing_arrays',
-    'test_new_update_operators_follow_numeric_array_paths',
-    'test_malformed_new_update_operands_report_mongodb_codes',
-    'test_update_path_conflicts_report_code_40_before_writing',
-    'test_new_update_operators_preserve_immutable_id_semantics',
-    'test_new_update_operators_report_target_and_path_errors_atomically',
-    'test_new_update_operators_cover_upsert_update_many_and_find_and_modify',
-    'test_new_update_operators_apply_to_upsert_equality_fields',
-])
-individual.add('tests.contracts.test_crud_contract::test_replace_upsert_and_delete_metadata')
-individual.add('tests.contracts.test_bson_value_types_contract::test_tm037_zero_timestamp_write_boundaries_match_mongodb')
-individual.update('tests.contracts.test_bson_comparison_contract::' + name for name in [
-    'test_tm036_pull_reuses_unbounded_min_max_key_ranges',
-    'test_pull_reuses_recursive_bson_range_comparison',
-    'test_pull_document_ranges_share_missing_and_array_path_semantics',
-    'test_indexed_ranges_feed_every_filter_consumer',
-])
-individual.update('tests.contracts.test_decimal128_contract::' + name for name in [
-    'test_decimal128_inc_promotes_the_result',
-    'test_decimal128_representation_changes_are_persisted',
-])
-individual.add('tests.contracts.test_crud_contract::test_update_and_result_metadata')
-individual.update('tests.contracts.test_crud_contract::' + name for name in [
-    'test_replace_upsert_preserves_equality_bound_id[query0-77]',
-    'test_replace_upsert_preserves_equality_bound_id[query1-pinned-key]',
-    'test_replace_upsert_preserves_equality_bound_id[query2-88]',
-    'test_replace_upsert_preserves_equality_bound_id[query3-None]',
-    'test_replace_upsert_stores_id_first',
-    'test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids',
-    'test_replace_upsert_rejects_conflicting_filter_and_replacement_ids',
-])
-expected = {(case['id'], api) for case in corpus['cases']
-            if (case['id'].split('::', 1)[0] in modules or case['id'] in individual or
-                case['id'] == 'tests.contracts.test_crud_contract::test_unset_removes_top_level_and_nested_fields')
-            for api in case['apis']}
+expected = {(case['id'], api) for case in corpus['cases'] for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 252, ('locked suite coverage changed', len(expected), len(executions))
+assert len(expected) == len(executions) == 456, ('locked suite coverage changed', len(expected), len(executions))
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 252 exact frozen candidate executions, with no skips.')
+print('Verified all 456 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

@@ -1906,8 +1906,13 @@ def index_creation_smoke(uri):
                 raise AssertionError("index conflict/options must fail")
         # Invalid late shapes are rejected before an implicit collection exists.
         for bad in [
-            {"key": {"bad": "hashed"}}, {"key": {"bad": True}},
-            {"key": {"bad": 1}, "expireAfterSeconds": 60},
+            {"key": {"bad": "hashed"}, "unique": True}, {"key": {"bad": True}},
+            {"key": {"bad": 1}, "expireAfterSeconds": 60, "unique": True},
+            {"key": {"bad": 1}, "expireAfterSeconds": -1},
+            {"key": {"bad": 1}, "expireAfterSeconds": True},
+            {"key": {"bad": 1}, "expireAfterSeconds": float("inf")},
+            {"key": {"bad": 1}, "background": 1},
+            {"key": {"bad": "text"}},
             {"key": {"bad": 1}, "unique": 1},
             {"key": {"bad": 1}, "partialFilterExpression": {"bad": {"$unknown": 1}}},
             {"key": {"bad": 1}, "sparse": True, "partialFilterExpression": {"bad": 1}},
@@ -1935,6 +1940,55 @@ def index_creation_smoke(uri):
         collection.delete_one({"_id": 2})
         collection.insert_one({"_id": 12, "value": 12, "tail": 0, "active": True})
         assert collection.count_documents({}) == 12
+
+
+def mixed_index_models_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_index_models
+        collection = database.items
+        collection.insert_one({"_id": 1, "token": {"nested": 1}, "created": datetime(2000, 1, 1), "email": "one"})
+        models = [
+            pymongo.IndexModel([("token", "hashed")]),
+            pymongo.IndexModel([("created", 1)], expireAfterSeconds=0),
+            pymongo.IndexModel([("email", 1)], unique=True, background=True),
+            pymongo.IndexModel([("rank", -1)], name="descending"),
+        ]
+        assert collection.create_indexes(models) == ["token_hashed", "created_1", "email_1", "descending"]
+        result = database.command("createIndexes", "items", indexes=[model.document for model in models])
+        assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (5, 5)
+        assert result["briskdbIndexWarnings"] == [
+            {"name": "token_hashed", "reducedBehavior": ["hashed: ascending equality indexing"]},
+            {"name": "created_1", "reducedBehavior": ["ttl: expiration is not performed"]},
+            {"name": "email_1", "reducedBehavior": ["background: builds run synchronously"]},
+        ]
+        metadata = collection.index_information()
+        assert metadata["token_hashed"] == {"key": [("token", 1)]}
+        assert metadata["created_1"] == {"key": [("created", 1)]}
+        assert metadata["email_1"] == {"key": [("email", 1)], "unique": True}
+        assert metadata["descending"] == {"key": [("rank", -1)]}
+        assert collection.find_one({"token": {"nested": 1}})["_id"] == 1
+        collection.update_one({"_id": 1}, {"$set": {"token": "changed"}})
+        assert collection.find_one({"token": "changed"})["created"] == datetime(2000, 1, 1)
+        try:
+            collection.insert_one({"_id": 2, "email": "one"})
+        except DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("background compatibility weakened unique enforcement")
+
+
+async def async_mixed_index_models_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_index_models
+        collection = database.async_items
+        models = [pymongo.IndexModel([("token", "hashed")]), pymongo.IndexModel("created", expireAfterSeconds=1.5, background=True)]
+        assert await collection.create_indexes(models) == ["token_hashed", "created_1"]
+        await collection.insert_one({"_id": 1, "token": [1, {"x": 2}], "created": datetime(2000, 1, 1)})
+        assert (await collection.find_one({"token": 1}))["_id"] == 1
+        result = await database.command("createIndexes", "async_items", indexes=[model.document for model in models])
+        assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (3, 3)
+        assert result["briskdbIndexWarnings"][1] == {"name": "created_1", "reducedBehavior": ["ttl: expiration is not performed", "background: builds run synchronously"]}
+        assert (await collection.index_information())["token_hashed"] == {"key": [("token", 1)]}
 
 
 async def async_index_creation_smoke(uri):
@@ -1991,6 +2045,9 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_index_models.items.index_information()["token_hashed"] == {"key": [("token", 1)]}
+        assert client.wire_index_models.items.find_one({"token": "changed"})["created"] == datetime(2000, 1, 1)
+        assert client.wire_index_models.async_items.find_one({"token": 1})["created"] == datetime(2000, 1, 1)
         assert client.wire_unique.items.count_documents({}) == 8
         assert client.wire_unique.items.index_information()["value_1"]["unique"] is True
         assert client.wire_unique.async_items.find_one({"value": 7}) == {"_id": 1, "value": 7}
@@ -2457,6 +2514,8 @@ if __name__ == "__main__":
         asyncio.run(async_indexed_read_smoke(sys.argv[1]))
         index_creation_smoke(sys.argv[1])
         asyncio.run(async_index_creation_smoke(sys.argv[1]))
+        mixed_index_models_smoke(sys.argv[1])
+        asyncio.run(async_mixed_index_models_smoke(sys.argv[1]))
         index_removal_smoke(sys.argv[1])
         asyncio.run(async_index_removal_smoke(sys.argv[1]))
         sync_smoke(sys.argv[1])

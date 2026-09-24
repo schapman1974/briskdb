@@ -238,7 +238,7 @@ pub(super) enum Command {
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
     ListIndexes(DocumentListIndexMetadataRequest, Option<Duration>),
-    CreateIndexes(DocumentCreateIndexesRequest),
+    CreateIndexes(indexes::PreparedIndexes),
     DropIndexes(DocumentDropIndexesRequest),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
@@ -1336,7 +1336,7 @@ impl Executor {
                     )),
                 }
             }
-            Command::CreateIndexes(request) => {
+            Command::CreateIndexes(indexes::PreparedIndexes { request, warnings }) => {
                 self.ensure_collection(session, identity, &context, request.namespace())
                     .await?;
                 match self
@@ -1348,11 +1348,9 @@ impl Executor {
                     )
                     .await?
                 {
-                    DocumentResult::IndexesBuilt { before, after } => Ok(fields([
-                        ("ok", BsonValue::Double(1.0)),
-                        ("numIndexesBefore", BsonValue::Int64(before as i64)),
-                        ("numIndexesAfter", BsonValue::Int64(after as i64)),
-                    ])),
+                    DocumentResult::IndexesBuilt { before, after } => {
+                        Ok(indexes::reply(before, after, warnings))
+                    }
                     _ => Err(CommandError::new(
                         1,
                         "InternalError",

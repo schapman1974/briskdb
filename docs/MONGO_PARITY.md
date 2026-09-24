@@ -16,38 +16,23 @@ This is a frozen behavioral input, not a claim that BriskDB already has MongoDB
 parity. The checked-in report contains only the 456 sync/async executions from
 the `tinymongo-memory` reference. BriskDB's owned runner reproduces all 456 in
 CI and byte-compares the normalized result with the checked-in reference. The
-full report remains `reference-only`; partial candidate coverage is not folded
-into that report or treated as full parity.
+checked-in report remains `reference-only`; candidate results are published
+separately and are not treated as complete TinyMongo parity.
 
-Required CI separately runs 252 exact sync/async executions in the frozen
-`test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
-`test_aggregation_contract`, `test_group_accumulators_contract`, and
-`test_client_read_fidelity_contract` modules,
-plus four `test_talkpython_contract` cases: full-document replacement, application
-write-result metadata, binary ID/subtype equality, and distinct boolean/numeric IDs,
-the CRUD top-level/nested `$unset` case, and three query-validation cases covering
-invalid field `$comment`, invalid `$not`, and operator typos across CRUD methods,
-plus all eleven `test_update_operator_contract` cases (min/max, pop,
-rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
-plus the complete `test_array_update_contract` suite, the add-to-set non-array
-atomicity case through both update-one/update-many, and three BSON comparison
-cases covering pull ranges, missing/array paths, and embedded IDs,
-plus missing-counter and CRUD increment metadata cases and two Decimal128
-increment promotion/representation contracts, plus replacement-upsert equality
-IDs (four parameter cases), ID-first order, numeric ID aliases, and ID conflicts,
-operator-upsert equality fields/CRUD metadata, and zero-timestamp write boundaries,
-plus non-unique indexed object ranges, dotted document-array paths and nested-array
-equality (including their shared read/mutation consumers),
-against a real four-shard BriskDB listener.
-It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
-cleanup. The JUnit result is checked against the exact locked case/API set;
-missing, substituted, duplicate, skipped, or failed cases reject the gate.
-`target/mongo-parity/candidate-aggregation.xml` is uploaded alongside (not merged
-into) the full reference-only report. Frozen sources, corpus, adapters, reference
-results, and intentional-difference allowances are unchanged. This completes the
-basic and projection-stage suites (#179/#177) and the frozen group-accumulator
-cases. The full 456-execution corpus and partial-shard state merging (#176)
-remain open.
+Required CI runs all 456 exact frozen sync/async executions (228 logical cases)
+against a real four-shard BriskDB listener. It uses the unchanged BriskDB PyMongo
+adapter, including ordinary database-drop cleanup. The JUnit result is checked
+against the complete locked case/API set: missing, substituted, duplicate,
+skipped or failed cases reject the gate.
+
+The full candidate job runs independently of the reference/oracle job so neither
+loses coverage or needs a longer timeout. Its `mongo-full-candidate-results`
+artifact contains `candidate-full.xml` and normalized `candidate-full.json`.
+The immutable reference report remains separate. Frozen sources, corpus,
+adapters, reference results and intentional-difference allowances are unchanged.
+Passing this frozen slice does not complete the larger TinyMongo test inventory,
+application matrices, bulk-write boundaries, security or hardening work; issues
+#174/#181/#183/#184/#186/#187/#188 retain their separate acceptance criteria.
 
 To reproduce with the frozen runner's test dependencies installed:
 
@@ -161,7 +146,7 @@ Pending declarations. Matching retries keep identities and metadata; same-name
 definition conflicts return 86, equivalent definitions with another name return
 85, and explicit uniqueness options on ascending `_id` return 197. Valid ascending
 `_id` requests are no-ops even when PyMongo supplies its default `_id_1` name.
-Duplicate unique builds/writes return 11000; unknown options (including TTL, background,
+Duplicate unique builds/writes return 11000; unknown options (including
 collation and commit quorum), descending `_id` creation and document sequences are
 not supported. Ready indexes also provide conservative equality candidates.
 Ready unique indexes enforce cross-shard ownership for inserts, replacements,
@@ -171,6 +156,39 @@ survives reopening and ends with recoverable index removal. Bulk writes retain
 the existing per-input/per-shard commit boundary: they are not globally atomic,
 and an otherwise unique final bulk image can fail on a transient collision.
 Whole-post-image sharded TinyMongo parity remains #183.
+
+Mixed PyMongo `IndexModel` batches now accept selected TinyMongo-style reduced
+behavior: non-unique `"hashed"` components become ascending equality keys;
+`expireAfterSeconds` accepts a finite nonnegative integer/double but **does not
+expire documents**; `background=True` still builds synchronously. Existing numeric
+directions and names are preserved, and generated hashed names retain `_hashed`.
+The catalog reports only effective keys/options, never fictitious hashed or TTL
+support. Unique hashed/TTL combinations and those options on the built-in `_id`
+index are rejected before collection creation. Background unique builds still
+enforce uniqueness normally. Text indexes and degraded-equivalent-name reuse
+remain unsupported; differently named equivalent definitions still return 85.
+Native Rust/Python index-request semantics are unchanged.
+
+Successful commands with reduced behavior include `briskdbIndexWarnings`, an
+ordered array of `{name, reducedBehavior}` documents. PyMongo's `create_index()` /
+`create_indexes()` helpers return names and discard these extra reply fields;
+inspect a raw command reply or use PyMongo command monitoring to see them:
+
+```python
+result = client.app.command(
+    "createIndexes", "events",
+    indexes=[{"key": {"created": 1}, "name": "created_lookup", "expireAfterSeconds": 60}],
+)
+assert result["briskdbIndexWarnings"] == [{
+    "name": "created_lookup",
+    "reducedBehavior": ["ttl: expiration is not performed"],
+}]
+```
+
+Malformed options, unsafe unique combinations and oversized warning replies fail
+before any mutation. Warnings are not durable index metadata; retries return them
+again. These compatibility options do not add a background worker, hashing,
+expiration, ordered index scans or distributed transactions.
 
 Mongo `dropIndexes` and sync/async PyMongo `drop_index` / `drop_indexes` now use
 the shared engine's exclusive removal path. String selectors accept an exact
@@ -696,7 +714,7 @@ cmp compat/mongo/v1/reference-results.json \
 ```
 
 CI checks out commit `53cbf44e98b8caa036163725d195fd29592e1cc0`
-under `target/`, installs it only in this contract job, runs the same 456 owned
+under `target/`, installs it only in test jobs, runs the same 456 owned
 fixture executions, and requires the byte comparison to pass. The source
 snapshot records its original Python 3.9.6 harvest environment. CI replays it
 with Python 3.9.25, the pinned 3.9 patch available for Ubuntu 24.04.

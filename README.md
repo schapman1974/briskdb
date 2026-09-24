@@ -463,6 +463,9 @@ more valuable than a star. Start with the
   supported equality tuples use Ready index candidates with full BSON matching;
   non-unique indexes accept nested/object/array and other valid BSON values,
   retaining conservative candidates when a value has no ordinary equality key.
+  Mixed PyMongo index models also accept non-unique hashed keys as equality
+  indexes and TTL/background options with explicit reduced-behavior warnings;
+  **TTL does not expire data**. See [index compatibility](docs/MONGO_PARITY.md#current-wire-checkpoint).
   Partial indexes, sparse all-null queries and unsupported shapes retain scans.
   PyMongo `drop_index` / `drop_indexes` remove secondary indexes
   without deleting documents; `_id_` remains protected. Multi-document writes commit per shard,
