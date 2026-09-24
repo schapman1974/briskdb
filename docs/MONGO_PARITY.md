@@ -203,6 +203,14 @@ multi-batch reads with `getMore` and explicit `killCursors` cleanup. The legacy
 this engine through both synchronous and asynchronous clients. Basic aggregation
 pipelines also use retained cursors over the shared global document engine.
 Exact `_id` and `_id: {$eq: value}` filters keep single-shard routing.
+Thirty-eight frozen BSON-ID vectors pin canonical v1 bytes and BLAKE3 digest
+prefixes, including numeric/NaN/UUID aliases, ordered objects, arrays, regex and
+scoped code. Initial-owner checks cover every supported shard count (2–64).
+On 3-, 8- and 64-shard roots, typed point reads/updates/deletes verify actual
+pool access; read counters independently report one record read on one shard.
+Record bytes, natural order, identity keys, checksums and physical owners survive
+a validated synthetic v17-schema upgrade and reopening. This is not a fixture
+created by an archived release binary or proof of arbitrary future upgrades.
 A safe `_id: {$in: [literal, ...]}` scans only its distinct
 owning shards, using the same canonical BSON identities as storage. Numeric
 aliases and repeated IDs do not duplicate output or shard access. The complete

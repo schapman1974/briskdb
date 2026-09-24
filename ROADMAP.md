@@ -549,7 +549,7 @@ requires an earlier dependency:
       response limits. Missing collections read empty without creating metadata.
       Additional update operators,
       and broader database options remain open.
-    - [ ] [#180](https://github.com/schapman1974/briskdb/issues/180) — bounded
+    - [x] [#180](https://github.com/schapman1974/briskdb/issues/180) — bounded
       `_id: {$in: [...]}` literal lists now prune to distinct canonical-ID owners
       for find/getMore, legacy count, distinct and single/multi mutations. The
       existing matcher, natural-order merge, sorting, global pagination, cursor
@@ -564,7 +564,14 @@ requires an earlier dependency:
       with at most 1024 canonical-ID visits across the filter. Full predicates
       still govern single-owner reads, mutations and upsert conflicts. Negations,
       dotted IDs, unbounded OR branches and empty owner intersections keep safe
-      fallback behavior. Broader predicate planning and routing vectors remain.
+      fallback behavior. Thirty-eight frozen BSON-ID vectors now pin v1 bytes,
+      hash prefixes and initial ownership for every supported shard count.
+      Typed reads/updates/deletes prove physical access on 3/8/64-shard roots;
+      exact record/key/order/checksum/owner images survive a validated synthetic
+      v17-schema upgrade and reopen. This closes the current v1 canonical-ID
+      routing slice, not general candidate planning (#178), online resharding,
+      or archived-release binary upgrade certification. No routing format or
+      feature behavior changes in this test-only checkpoint.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
       single-shard worker grouping. Missing IDs receive ObjectIds; explicit
