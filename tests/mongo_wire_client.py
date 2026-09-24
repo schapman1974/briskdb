@@ -1710,6 +1710,53 @@ async def async_index_removal_smoke(uri):
         assert await collection.count_documents({}) == 1
 
 
+def indexed_read_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_reads.items
+        documents = [{"_id": i, "a": [i % 3, 7], "b": i % 2, "rank": 30 - i}
+                     for i in range(30)] + [{"_id": 30}, {"_id": 31, "a": None}]
+        collection.insert_many(documents)
+        queries = [{"a": 1.0}, {"a": None}, {"a": {"$gt": 0}},
+                   {"a": 1, "b": 1}, {"$and": [{"a": 1}, {"a": 7}]},
+                   {"$or": [{"a": 1}, {"b": 0}]}, {"a": 999}]
+        before = [list(collection.find(query).batch_size(2)) for query in queries]
+        ordered = [list(collection.find(query).sort("rank", -1).skip(1).limit(5)) for query in queries]
+        for keys, options in [
+            ("a", {}), ("a", {"sparse": True}),
+            ([("a", 1), ("b", 1)], {"sparse": True}),
+            ("a", {"partialFilterExpression": {"b": 1}}),
+        ]:
+            collection.create_index(keys, name="candidate", **options)
+            for query, expected, sorted_expected in zip(queries, before, ordered):
+                assert list(collection.find(query).batch_size(2)) == expected
+                assert list(collection.find(query).sort("rank", -1).skip(1).limit(5)) == sorted_expected
+                assert collection.count_documents(query) == len(expected)
+            collection.drop_index("candidate")
+        collection.create_index("a", name="candidate")
+        cursor = collection.find({"a": 1}).batch_size(1)
+        first = next(cursor)
+        collection.drop_index("candidate")
+        assert [first] + list(cursor) == before[0]
+        collection.create_index("a", name="candidate")
+        collection.update_one({"a": 1}, {"$set": {"a": 88}})
+        assert collection.count_documents({"a": 1}) == len(before[0]) - 1
+        assert collection.find_one({"a": 88})["_id"] == first["_id"]
+        assert collection.delete_one({"a": 88}).deleted_count == 1
+        assert collection.find_one({"a": 88}) is None
+
+
+async def async_indexed_read_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_reads.async_items
+        await collection.insert_many([{"_id": i, "a": [1, i]} for i in range(8)])
+        await collection.create_index("a")
+        assert len([row async for row in collection.find({"a": 1}).batch_size(2)]) == 8
+        assert await collection.distinct("_id", {"a": 3}) == [3]
+        await collection.update_one({"a": 3}, {"$set": {"a": 9}})
+        assert await collection.count_documents({"a": 3}) == 0
+        assert (await collection.find_one({"a": 9}))["_id"] == 3
+
+
 def index_creation_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         database = client.wire_index_create
@@ -1829,6 +1876,11 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_index_reads.items.count_documents({"a": 1}) == 9
+        assert client.wire_index_reads.items.count_documents({"a": None}) == 2
+        assert client.wire_index_reads.items.find_one({"a": 88}) is None
+        assert client.wire_index_reads.async_items.count_documents({"a": 1}) == 7
+        assert client.wire_index_reads.async_items.find_one({"a": 9})["_id"] == 3
         assert set(client.wire_index_drop.items.index_information()) == {"_id_"}
         assert client.wire_index_drop.items.count_documents({}) == 9
         assert set(client.wire_index_drop.keep.index_information()) == {"_id_", "value_1"}
@@ -2270,6 +2322,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "reopened":
         persisted_smoke(sys.argv[1])
     else:
+        indexed_read_smoke(sys.argv[1])
+        asyncio.run(async_indexed_read_smoke(sys.argv[1]))
         index_creation_smoke(sys.argv[1])
         asyncio.run(async_index_creation_smoke(sys.argv[1]))
         index_removal_smoke(sys.argv[1])

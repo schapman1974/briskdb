@@ -1808,8 +1808,10 @@ ID bytes, u64 LE length plus BDIK tuple bytes, and the current record checksum's
 32 bytes. Thus unindexed-field changes also require new entry checksums. Reopen
 reproduces the bounded complete key set and rejects missing, extra, stale,
 malformed or orphan entries without repair outside explicit journal ownership.
-Checksums detect damage, not malicious changes by a directory writer. Uniqueness
-and index-backed query plans are not implemented by this format checkpoint.
+Checksums detect damage, not malicious changes by a directory writer. Ready
+entries now serve conservative equality candidates with full BSON matching,
+using this existing format and checksum binding. Secondary uniqueness and broader
+index-backed query plans remain unimplemented.
 
 ## Previous version 17
 

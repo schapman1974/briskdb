@@ -5,7 +5,7 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         BsonDocument, BsonErrorContext, DocumentCollectionId, DocumentCollectionMetadata,
-        DocumentIndexId, DocumentIndexMetadata, encode_document, memory,
+        DocumentIndexId, DocumentIndexMetadata, DocumentMatcher, encode_document, memory,
     },
 };
 
@@ -35,6 +35,26 @@ struct CompiledIndex {
     id: DocumentIndexId,
     unique: bool,
     generator: DocumentIndexKeyGenerator,
+}
+
+/// Request-local derived selection. Only storage's schema-admitted Ready cache
+/// may provide authority; never retain this across separate cursor requests.
+pub(crate) struct DocumentIndexProbe {
+    collection_id: DocumentCollectionId,
+    index_id: DocumentIndexId,
+    key: Vec<u8>,
+}
+
+impl DocumentIndexProbe {
+    pub(crate) const fn collection_id(&self) -> DocumentCollectionId {
+        self.collection_id
+    }
+    pub(crate) const fn index_id(&self) -> DocumentIndexId {
+        self.index_id
+    }
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.key
+    }
 }
 
 /// All secondary entries for one input, or nothing if preparation failed.
@@ -140,6 +160,32 @@ impl DocumentIndexPreparation {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.indexes.is_empty()
+    }
+
+    pub(crate) fn equality_probe_with_check(
+        &self,
+        matcher: &DocumentMatcher,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<DocumentIndexProbe>> {
+        let mut budget = Budget::new(check);
+        budget.charge(self.retained_bytes)?;
+        for index in &self.indexes {
+            budget.step()?;
+            if let Some(key) = index
+                .generator
+                .equality_key_with_budget(matcher, &mut budget)?
+            {
+                let bytes = key.encoded_len_with_check(&mut || budget.step())?;
+                budget.charge(bytes)?;
+                return Ok(Some(DocumentIndexProbe {
+                    collection_id: self.collection_id,
+                    index_id: index.id,
+                    key: key.to_bytes_with_check(&mut || budget.step())?,
+                }));
+            }
+        }
+        budget.step()?;
+        Ok(None)
     }
 
     /// Conservative owned-heap charge for retained compiled definitions.

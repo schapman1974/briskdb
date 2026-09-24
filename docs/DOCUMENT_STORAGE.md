@@ -86,11 +86,14 @@ For example, BSON integer `1` and double `1.0` collide, as do a Standard UUID
 and binary subtype 4 containing the same 16 bytes.
 
 The fixed table and exact canonical-ID key provide safe `_id` candidate
-filtering today. Later query and index work may add conservative candidate
-structures, but BSON matching remains authoritative; SQLite candidates may
-never exclude a true Mongo match. Secondary declarations start `PendingBuild`;
+filtering. Complete supported scalar equality tuples can also use Ready secondary
+entries; BSON matching remains authoritative and verifies every candidate.
+SQLite candidates may never exclude a true Mongo match. Secondary declarations start `PendingBuild`;
 an explicit non-unique build can publish maintained physical entries as `Ready`.
-Secondary entries are not yet used by the query planner.
+Partial indexes, incomplete/unsupported equality shapes and sparse all-null
+tuples retain scans. Probes are request-local under schema admission, never
+cursor-retained authority. The [engine contract](DOCUMENT_ENGINE.md#equality-index-candidates)
+describes selection, checksums and fallback boundaries.
 
 All shard-local insert, replace and delete storage primitives require a
 caller-owned Rust transaction and reject handles whose SQLite transaction has
@@ -142,7 +145,7 @@ unindexed-field changes), and deletes maintain entries in the document's own
 transaction. A schema-fenced root-shared compiled cache selects only Ready
 indexes; opaque or unique pending declarations remain non-enforcing. Startup
 rejects missing, extra, stale or orphan entries without repair unless an explicit
-journal owns their cleanup. Global uniqueness and planner use remain work under
+journal owns their cleanup. Global uniqueness and broader planner use remain work under
 #174. Native/wire batch creation and removal retain one admission
 guard across entries; completed entries survive a later failure, and only an
 unfinished entry's journal fences the root until reopen. Built-index drops use journal-owned cleanup

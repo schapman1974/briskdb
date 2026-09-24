@@ -490,6 +490,255 @@ fn setup(root: &Path, count: u16) -> (Storage, DocumentCollectionId) {
     (storage, collection.id())
 }
 
+#[test]
+fn equality_candidates_require_current_ready_authority_and_keep_natural_pagination() {
+    for count in [2, 4] {
+        let root = tempfile::tempdir().unwrap();
+        let (storage, collection) = setup(root.path(), count);
+        let matcher = DocumentMatcher::compile(
+            &BsonDocument::from_entries([("value", BsonValue::Double(99.0))]).unwrap(),
+        )
+        .unwrap();
+        let admission = storage.enter_schema_operation().unwrap();
+        assert!(
+            storage
+                .document_equality_probe(collection, &matcher, &mut || Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        drop(admission);
+        let metadata = build(&storage, "value").unwrap();
+        let admission = storage.enter_schema_operation().unwrap();
+        let probe = storage
+            .document_equality_probe(collection, &matcher, &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.index_id(), metadata.id());
+        let token = CancellationToken::new();
+        let mut total = 0;
+        for shard in 0..count {
+            let connection =
+                Connection::open(root.path().join(format!("shards/{shard:04}.sqlite"))).unwrap();
+            assert_eq!(
+                storage
+                    .scan_document_candidates_on_connection(
+                        &connection,
+                        DocumentCollectionId::from_validated(collection.get() + 1),
+                        shard,
+                        None,
+                        1,
+                        Some(&probe),
+                        &token
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            let scan = storage
+                .scan_document_shard_on_connection(
+                    &connection,
+                    collection,
+                    shard,
+                    None,
+                    100,
+                    &token,
+                )
+                .unwrap();
+            let mut after = None;
+            for expected in scan {
+                let page = storage
+                    .scan_document_candidates_on_connection(
+                        &connection,
+                        collection,
+                        shard,
+                        after,
+                        1,
+                        Some(&probe),
+                        &token,
+                    )
+                    .unwrap();
+                assert_eq!(page.len(), 1);
+                assert_eq!(page[0].id_key(), expected.id_key());
+                assert_eq!(page[0].natural_order(), expected.natural_order());
+                after = Some(page[0].natural_order());
+                total += 1;
+            }
+            assert!(
+                storage
+                    .scan_document_candidates_on_connection(
+                        &connection,
+                        collection,
+                        shard,
+                        after,
+                        1,
+                        Some(&probe),
+                        &token
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                storage
+                    .scan_document_candidates_on_connection(
+                        &connection,
+                        collection,
+                        shard,
+                        None,
+                        0,
+                        Some(&probe),
+                        &token
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert_eq!(
+                storage
+                    .scan_document_candidates_on_connection(
+                        &connection,
+                        collection,
+                        shard,
+                        None,
+                        1,
+                        Some(&probe),
+                        &cancelled
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Cancelled
+            );
+        }
+        assert_eq!(total, 12);
+        drop(admission);
+        drop_built(&storage, "value").unwrap();
+        let admission = storage.enter_schema_operation().unwrap();
+        assert!(
+            storage
+                .document_equality_probe(collection, &matcher, &mut || Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        drop(admission);
+        drop(storage);
+        let storage = Storage::open(root.path(), count).unwrap();
+        create_built(&storage, "value", "value").unwrap();
+        let _admission = storage.enter_schema_operation().unwrap();
+        let replacement = storage
+            .document_equality_probe(collection, &matcher, &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.index_id(), probe.index_id());
+    }
+}
+
+#[test]
+fn equality_candidates_skip_unselected_bson_but_validate_selected_entry_binding() {
+    for damage in ["checksum", "version", "record"] {
+        let root = tempfile::tempdir().unwrap();
+        let (storage, collection) = setup(root.path(), 2);
+        build(&storage, "value").unwrap();
+        let _admission = storage.enter_schema_operation().unwrap();
+        let matcher = DocumentMatcher::compile(
+            &BsonDocument::from_entries([("value", BsonValue::Int32(0))]).unwrap(),
+        )
+        .unwrap();
+        let probe = storage
+            .document_equality_probe(collection, &matcher, &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        let token = CancellationToken::new();
+        let mut found = false;
+        for shard in 0..2 {
+            let connection =
+                Connection::open(root.path().join(format!("shards/{shard:04}.sqlite"))).unwrap();
+            let selected = storage
+                .scan_document_candidates_on_connection(
+                    &connection,
+                    collection,
+                    shard,
+                    None,
+                    100,
+                    Some(&probe),
+                    &token,
+                )
+                .unwrap();
+            if let Some(record) = selected.first() {
+                assert_eq!(selected.len(), 1);
+                found = true;
+                // A test-owned, deliberately damaged noncandidate proves that
+                // the index restricts BSON decoding, not just post-filtering.
+                let changed = connection.execute("UPDATE briskdb_documents_v1 SET document_checksum = zeroblob(32) WHERE id_key != ?1",
+                    [record.id_key().as_bytes()]).unwrap();
+                assert!(changed > 0);
+                assert_eq!(
+                    storage
+                        .scan_document_candidates_on_connection(
+                            &connection,
+                            collection,
+                            shard,
+                            None,
+                            100,
+                            Some(&probe),
+                            &token
+                        )
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    storage
+                        .scan_document_shard_on_connection(
+                            &connection,
+                            collection,
+                            shard,
+                            None,
+                            100,
+                            &token
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    EngineErrorKind::DataCorruption
+                );
+                let sql = match damage {
+                    "checksum" => {
+                        "UPDATE briskdb_document_index_entries_v1 SET entry_checksum = zeroblob(32) WHERE id_key = ?1"
+                    }
+                    "version" => {
+                        "UPDATE briskdb_document_index_entries_v1 SET entry_format_version = 2 WHERE id_key = ?1"
+                    }
+                    _ => {
+                        "UPDATE briskdb_documents_v1 SET document_checksum = zeroblob(32) WHERE id_key = ?1"
+                    }
+                };
+                connection
+                    .execute_batch("PRAGMA ignore_check_constraints = ON")
+                    .unwrap();
+                connection
+                    .execute(sql, [record.id_key().as_bytes()])
+                    .unwrap();
+                assert_eq!(
+                    storage
+                        .scan_document_candidates_on_connection(
+                            &connection,
+                            collection,
+                            shard,
+                            None,
+                            100,
+                            Some(&probe),
+                            &token
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    EngineErrorKind::DataCorruption
+                );
+            }
+        }
+        assert!(found);
+    }
+}
+
 fn rows(connection: &Connection, sql: &str) -> Vec<Vec<Value>> {
     let mut statement = connection.prepare(sql).unwrap();
     let columns = statement.column_count();

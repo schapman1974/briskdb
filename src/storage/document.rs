@@ -173,8 +173,8 @@ mod enabled {
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
             DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
-            DocumentIndexMetadata, DocumentIndexPreparation, DocumentNamespace, DocumentPlacement,
-            PreparedDocumentIndexEntries, encode_document,
+            DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexProbe, DocumentMatcher,
+            DocumentNamespace, DocumentPlacement, PreparedDocumentIndexEntries, encode_document,
         },
         sqlite_error,
     };
@@ -395,7 +395,7 @@ mod enabled {
             Ok(())
         }
 
-        /// The caller retains schema admission for the entire write. Build/drop
+        /// The caller retains schema admission for the entire operation. Build/drop
         /// publication drains that admission before replacing this shared cache.
         fn active_document_indexes(
             &self,
@@ -418,6 +418,29 @@ mod enabled {
                 )
             })?;
             Ok(current.get(&collection).cloned())
+        }
+
+        /// Derive a request-local probe only from the validated Ready cache.
+        /// The caller retains schema admission until its final candidate read.
+        pub(crate) fn document_equality_probe(
+            &self,
+            collection: DocumentCollectionId,
+            matcher: &DocumentMatcher,
+            check: &mut dyn FnMut() -> EngineResult<()>,
+        ) -> EngineResult<Option<DocumentIndexProbe>> {
+            check()?;
+            let Some(indexes) = self.active_document_indexes(collection)? else {
+                return Ok(None);
+            };
+            match indexes.equality_probe_with_check(matcher, check) {
+                // Optional optimization work has its own shared bound. Running
+                // out of that budget must not reject an otherwise valid scan.
+                Err(error) if error.kind() == EngineErrorKind::LimitExceeded => {
+                    check()?;
+                    Ok(None)
+                }
+                result => result,
+            }
         }
     }
 
@@ -2097,8 +2120,39 @@ mod enabled {
             limit: usize,
             cancellation: &CancellationToken,
         ) -> EngineResult<Vec<DocumentStorageRecord>> {
+            self.scan_document_candidates_on_connection(
+                connection,
+                collection_id,
+                shard,
+                after_natural_order,
+                limit,
+                None,
+                cancellation,
+            )
+        }
+
+        /// The probe was selected under this request's schema admission. It is
+        /// never cursor-retained authority; an absent/dropped index falls back
+        /// when the next request selects from the current Ready cache.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn scan_document_candidates_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            after_natural_order: Option<u64>,
+            limit: usize,
+            probe: Option<&DocumentIndexProbe>,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<Vec<DocumentStorageRecord>> {
             ensure_document_operation_not_cancelled(cancellation, "before scanning documents")?;
             self.ensure_shard_in_range(shard)?;
+            if probe.is_some_and(|probe| probe.collection_id() != collection_id) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "document index probe belongs to another collection",
+                ));
+            }
             if !(1..=MAX_DOCUMENT_SHARD_SCAN_RECORDS).contains(&limit) {
                 return Err(EngineError::new(
                     EngineErrorKind::InvalidArgument,
@@ -2114,26 +2168,45 @@ mod enabled {
             let sqlite_limit =
                 i64::try_from(limit).expect("bounded document scan limit fits SQLite");
             require_schema(connection)?;
-            let mut statement = connection
-                .prepare(
-                    "SELECT natural_order, id_key, document_bson, document_checksum,
-                            storage_format_version
-                     FROM briskdb_documents_v1
-                     WHERE collection_id = ?1 AND natural_order > ?2
-                     ORDER BY natural_order LIMIT ?3",
-                )
-                .map_err(|error| {
-                    shard_read_error(error, "failed to prepare stored BSON document scan")
-                })?;
-            let mut rows = statement
-                .query(params![
+            let sql = if probe.is_some() {
+                // Keep natural-order pagination and let SQLite choose join
+                // order. Forcing an index-first join would repeatedly sort
+                // large equality groups for each one-record merge frontier.
+                "SELECT d.natural_order, d.id_key, d.document_bson, d.document_checksum,
+                        d.storage_format_version, e.entry_checksum, e.entry_format_version
+                 FROM briskdb_documents_v1 AS d
+                 JOIN briskdb_document_index_entries_v1 AS e
+                   ON e.collection_id = d.collection_id AND e.id_key = d.id_key
+                 WHERE d.collection_id = ?1 AND d.natural_order > ?2
+                   AND e.index_id = ?4 AND e.index_key = ?5
+                 ORDER BY d.natural_order LIMIT ?3"
+            } else {
+                "SELECT natural_order, id_key, document_bson, document_checksum,
+                        storage_format_version
+                 FROM briskdb_documents_v1
+                 WHERE collection_id = ?1 AND natural_order > ?2
+                 ORDER BY natural_order LIMIT ?3"
+            };
+            let mut statement = connection.prepare(sql).map_err(|error| {
+                shard_read_error(error, "failed to prepare stored BSON document scan")
+            })?;
+            let mut rows = match probe {
+                Some(probe) => statement.query(params![
+                    to_sqlite_id(collection_id)?,
+                    after_natural_order,
+                    sqlite_limit,
+                    probe.index_id().get() as i64,
+                    probe.key(),
+                ]),
+                None => statement.query(params![
                     to_sqlite_id(collection_id)?,
                     after_natural_order,
                     sqlite_limit
-                ])
-                .map_err(|error| {
-                    shard_read_error(error, "failed to start stored BSON document scan")
-                })?;
+                ]),
+            }
+            .map_err(|error| {
+                shard_read_error(error, "failed to start stored BSON document scan")
+            })?;
             let mut records = Vec::with_capacity(limit);
             while let Some(row) = rows.next().map_err(|error| {
                 shard_read_error(error, "failed while scanning stored BSON documents")
@@ -2161,7 +2234,7 @@ mod enabled {
                         "stored BSON document is on a shard that disagrees with its canonical _id route",
                     ));
                 }
-                records.push(decode_storage_record(
+                let record = decode_storage_record(
                     collection_id,
                     shard,
                     natural_order,
@@ -2169,7 +2242,29 @@ mod enabled {
                     document_bson,
                     checksum,
                     version,
-                )?);
+                )?;
+                if let Some(probe) = probe {
+                    let stored = row
+                        .get_ref(5)
+                        .and_then(|value| value.as_blob().map_err(Into::into))
+                        .map_err(|error| {
+                            shard_read_error(error, "invalid document index checksum")
+                        })?;
+                    let version = row.get::<_, i64>(6).map_err(|error| {
+                        shard_read_error(error, "invalid document index entry version")
+                    })?;
+                    super::index_storage::validate_probe_entry(
+                        collection_id,
+                        probe.index_id(),
+                        shard,
+                        record.id_key.as_bytes(),
+                        probe.key(),
+                        &record.checksum,
+                        stored,
+                        version,
+                    )?;
+                }
+                records.push(record);
             }
             ensure_document_operation_not_cancelled(cancellation, "after scanning documents")?;
             Ok(records)

@@ -13,7 +13,9 @@ use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 mod codec;
 mod preparation;
+mod probe;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
+pub(crate) use preparation::DocumentIndexProbe;
 pub use preparation::{
     DocumentIndexPreparation, MAX_DOCUMENT_PREPARED_INDEXES, PreparedDocumentIndexEntries,
     PreparedDocumentIndexKeys,
@@ -277,14 +279,7 @@ fn component_keys(
     let mut output = Vec::new();
     for value in values {
         budget.step()?;
-        if matches!(
-            value,
-            BsonValue::Document(_)
-                | BsonValue::Array(_)
-                | BsonValue::ObjectId(_)
-                | BsonValue::DateTime(_)
-        ) || matches!(value.canonical_number(), Some(number) if !matches!(number, CanonicalNumber::Finite(_)))
-        {
+        if !supported_scalar(value) {
             return Err(unsupported());
         }
         // Includes nested code scopes. Preflight bounded work before encoding
@@ -310,6 +305,16 @@ fn component_keys(
     }
     budget.step()?;
     Ok(output)
+}
+
+fn supported_scalar(value: &BsonValue) -> bool {
+    !matches!(
+        value,
+        BsonValue::Document(_)
+            | BsonValue::Array(_)
+            | BsonValue::ObjectId(_)
+            | BsonValue::DateTime(_)
+    ) && !matches!(value.canonical_number(), Some(number) if !matches!(number, CanonicalNumber::Finite(_)))
 }
 
 fn validate_partial(

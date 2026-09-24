@@ -677,8 +677,8 @@ requires an earlier dependency:
       exact records and startup verifies full coverage without silent repair.
       Process-exit tests cover build/abort commit boundaries. Interrupted builds
       reopen as pending with only their derived entries removed. Opaque/unique
-      pending declarations stay non-enforcing; reads still scan. Global uniqueness
-      and planner use remain open.
+      pending declarations stay non-enforcing. Ready equality reads are described
+      below; global uniqueness and broader planner use remain open.
       Exact native `DropIndex`/sync/async `drop_index` now removes built indexes
       with version-19 Drop intent, sealed per-shard cleanup and restart completion.
       BSON, surviving Ready entries and permanent allocation history are preserved;
@@ -706,7 +706,7 @@ requires an earlier dependency:
       prefixes survive runtime failures; unfinished new entries are removed on
       reopen without changing earlier indexes or records. Real-driver restart,
       raw malformed-batch, source-locked metadata and crash-boundary tests cover
-      this path. Unique enforcement, planner acceleration and
+      this path. Unique enforcement, broader planner acceleration and
       broader IndexModel warning/degradation compatibility remain open.
       Native `DropIndexes` now powers Mongo/PyMongo named, unambiguous legacy-field
       and wildcard removal under one sole-process/exclusive admission. It resolves
@@ -716,6 +716,14 @@ requires an earlier dependency:
       finished on reopen, not later unstarted indexes. Raw-wire, sync/async driver,
       locked metadata/alias, cancellation and per-index crash tests cover this path.
       Name arrays/key-pattern selectors and ambiguous-alias parity remain open.
+      Ready non-unique equality candidates now serve complete supported scalar
+      tuples from direct/positive-conjunctive filters, with authoritative matching
+      after bound SQLite probes. Natural paging, checksummed entry/record binding,
+      write maintenance and index churn across cursor requests are covered.
+      Partial indexes, sparse all-null tuples and unsupported/incomplete shapes
+      fall back to scans. Source-locked comparisons cover 201,349 matcher
+      evaluations with no excluded true matches. Broader predicates, planner
+      diagnostics and secondary uniqueness remain open under #174/#178.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

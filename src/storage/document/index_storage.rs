@@ -11,7 +11,7 @@ mod entries;
 #[cfg(feature = "documents")]
 pub(super) use entries::{
     insert_entries, insert_selected_entries, remove_record_entries, require_no_orphans,
-    validate_record_entries,
+    validate_probe_entry, validate_record_entries,
 };
 
 pub(super) const ENTRIES_TABLE: &str = "briskdb_document_index_entries_v1";

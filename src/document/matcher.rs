@@ -201,6 +201,44 @@ impl DocumentMatcher {
         self.retained_bytes
     }
 
+    /// Borrow one necessary equality, never an alternative or negation. Array
+    /// documents may satisfy multiple equalities on one field, so selecting one
+    /// is a candidate restriction, not a replacement for this matcher.
+    pub(crate) fn equality_for_index_path<'a>(
+        &'a self,
+        requested: &[String],
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<&'a BsonValue>> {
+        for clause in &self.clauses {
+            check()?;
+            match clause {
+                Clause::Field {
+                    path, predicates, ..
+                } if path == requested => {
+                    for predicate in predicates {
+                        check()?;
+                        if let Predicate::Equal(value) = predicate {
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                Clause::Logical {
+                    kind: Logical::And,
+                    children,
+                } => {
+                    for child in children {
+                        if let Some(value) = child.equality_for_index_path(requested, check)? {
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        check()?;
+        Ok(None)
+    }
+
     /// Match caller-supplied BSON after structural size/depth validation.
     pub fn matches(&self, document: &BsonDocument) -> EngineResult<bool> {
         encode_document(document)
