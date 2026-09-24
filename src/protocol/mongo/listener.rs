@@ -83,6 +83,14 @@ impl MongoServer {
         self.metrics.snapshot()
     }
 
+    /// Opt in to engine read-work, access-plan and shard-fanout counters. Off by
+    /// default to avoid read collectors and extra bounded planner diagnostics.
+    /// A complete frame samples this choice before command preparation; toggling
+    /// does not reset totals or cancel already opted-in work. No wire fields change.
+    pub fn set_read_metrics_enabled(&self, enabled: bool) {
+        self.metrics.set_read_metrics_enabled(enabled);
+    }
+
     pub fn begin_close(&self) {
         self.shutdown.cancel();
     }
@@ -214,12 +222,13 @@ async fn connection(
         response_id = response_id.wrapping_add(1);
         let started = Instant::now();
         let compressed = frame.is_compressed();
+        let read_metrics = metrics.read_metrics_enabled();
         let (request, prepared) = tokio::task::spawn_blocking(move || {
             let request = decode_request(frame.into_frame()?)?;
             if compressed {
                 compression::validate_command(&request)?;
             }
-            let prepared = commands::prepare(&request);
+            let prepared = commands::prepare(&request, read_metrics);
             Ok::<_, io::Error>((request, prepared))
         })
         .await

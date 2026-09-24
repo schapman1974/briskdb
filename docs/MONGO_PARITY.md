@@ -507,8 +507,42 @@ commands, from complete frame through reply construction; socket framing and
 delivery are excluded. Live snapshots sample atomics separately; accounting
 identities are meaningful after drain, not during concurrent updates. Totals
 saturate, gauges are admission-bounded, close retains final counters, and a new
-listener starts at zero. This is not a Prometheus endpoint, row/shard
-telemetry, correlated tracing, or completion of the broader #187 hardening gate.
+listener starts at zero. This is not a Prometheus endpoint, correlated tracing,
+or completion of the broader #187 hardening gate.
+
+Read-work telemetry is separately opt-in for Rust hosts:
+
+```rust,ignore
+mongo.set_read_metrics_enabled(true); // before the requests to observe
+// Run normal PyMongo find/getMore/aggregate/distinct commands.
+let reads = mongo.metrics().reads;
+println!("examined={} candidates={} scans={} shard_visits={}",
+    reads.documents_examined, reads.index_candidate_plans,
+    reads.scan_plans, reads.shard_visits);
+mongo.set_read_metrics_enabled(false); // counters are not reset
+```
+
+The default is off: ordinary reads allocate no execution collector and request
+no extra access-plan diagnostics. An enabled complete frame samples the flag
+before preparation; already prepared requests retain that choice when it changes.
+The `reads` snapshot aggregates successful engine find/getMore/aggregate/distinct
+executions, record-read calls (including misses/lookahead/rescans), examined BSON
+documents, source matcher evaluations, and returned documents/distinct values.
+It excludes partial work from failed engine calls, legacy count, mutations and
+catalog reads. A successful engine result counts even if later reply encoding or
+socket delivery fails; these are not successful-client-operation counters.
+
+Point/index-candidate/scan/unclassified plan counts describe the selected access
+path, not index-only reads or full matcher elimination. Planned shard targets
+are distinct from measured per-request shard visits: buffered aggregate output
+can read zero shards. Eight fixed fanout buckets (inclusive exported bounds
+0/1/2/4/8/16/32/64), peak fanout and 64 fixed physical-ordinal request counters
+make fanout and request distribution visible without namespace/identity labels.
+They do not measure matched rows, per-shard row/CPU skew, physical SQLite page or
+byte I/O, or pipeline-predicate evaluations. Enabled requests use the existing
+bounded engine diagnostics and account for their result metadata; protocol replies
+do not gain fields. Native Python/CLI metric controls, Mongo `explain`/`serverStatus`,
+exporters, correlated tracing and broader #187 acceptance remain separate work.
 
 Projection uses the shared engine transform after filtering; projected fields
 retain BSON types and stored field order. The same projection persists across

@@ -17,6 +17,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 #[path = "mongo_wire/metrics.rs"]
 mod metrics;
+#[path = "mongo_wire/read_metrics.rs"]
+mod read_metrics;
 
 async fn setup() -> (tempfile::TempDir, BriskDb, MongoServer) {
     let root = tempfile::tempdir().unwrap();
@@ -479,6 +481,7 @@ async fn real_pymongo_index_candidates() {
 
 async fn assert_driver_restart(script: &'static str) {
     let (root, database, mut server) = setup().await;
+    server.set_read_metrics_enabled(true);
     seed_index_metadata(&database).await;
     let output = run_driver(server.address(), "initial", script).await;
     server.close().await.unwrap();
@@ -494,6 +497,7 @@ async fn assert_driver_restart(script: &'static str) {
     let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
+    server.set_read_metrics_enabled(true);
     let output = run_driver(server.address(), "reopened", script).await;
     server.close().await.unwrap();
     metrics::assert_driver_metrics_drained(&server.metrics());
@@ -2099,6 +2103,7 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         DocumentCommand, DocumentInsertRequest, DocumentNamespace, DocumentWriteOptions,
     };
     let (_root, database, mut server) = setup().await;
+    server.set_read_metrics_enabled(true);
     let mut stream = TcpStream::connect(server.address()).await.unwrap();
     let seed = BsonDocument::from_entries([("_id", BsonValue::from("seed"))]).unwrap();
     assert!(matches!(
@@ -2251,6 +2256,9 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
     ));
     let metrics = server.metrics();
     assert_eq!(metrics.response_limit_rejections, 3);
+    // Successful engine reads are counted even when later wire encoding fails.
+    assert!(metrics.reads.executions > 8);
+    assert!(metrics.reads.documents_examined >= 3);
     assert_eq!(
         (
             metrics.cursors.registered,

@@ -5,12 +5,15 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
 
-use crate::document::{BsonDocument, BsonValue};
+use crate::document::{BsonDocument, BsonValue, DocumentExecution};
+
+mod reads;
+pub use reads::{MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoReadMetrics};
 
 const COMMANDS: usize = 22;
 #[cfg(test)]
@@ -202,6 +205,9 @@ pub struct MongoMetricsSnapshot {
     pub connection_task_failures: u64,
     pub transport_failures: MongoTransportFailures,
     pub cursors: MongoCursorMetrics,
+    /// Current opt-in state; already prepared reads retain their sampled policy.
+    pub read_metrics_enabled: bool,
+    pub reads: MongoReadMetrics,
     pub write_errors: u64,
     pub response_limit_rejections: u64,
     commands: [MongoCommandMetrics; COMMANDS],
@@ -267,6 +273,8 @@ pub(super) struct Metrics {
     write_errors: AtomicU64,
     response_limits: AtomicU64,
     cursors: CursorCounters,
+    read_metrics_enabled: AtomicBool,
+    reads: reads::ReadCounters,
     commands: [CommandCounters; COMMANDS],
     error_codes: [AtomicU64; 31],
     other_codes: AtomicU64,
@@ -314,6 +322,8 @@ impl Metrics {
                 idle_expired: get(&self.cursors.expired),
                 limit_rejections: get(&self.cursors.rejected),
             },
+            read_metrics_enabled: self.read_metrics_enabled(),
+            reads: self.reads.snapshot(),
             response_limit_rejections: get(&self.response_limits),
             commands: std::array::from_fn(|i| {
                 let c = &self.commands[i];
@@ -358,6 +368,16 @@ impl Metrics {
     }
     pub(super) fn cursor_rejected(&self) {
         add(&self.cursors.rejected, 1);
+    }
+    pub(super) fn set_read_metrics_enabled(&self, enabled: bool) {
+        self.read_metrics_enabled.store(enabled, Ordering::Relaxed);
+    }
+    pub(super) fn read_metrics_enabled(&self) -> bool {
+        self.read_metrics_enabled.load(Ordering::Relaxed)
+    }
+    pub(super) fn observe_read(&self, execution: &DocumentExecution) {
+        // Do not re-sample the toggle: in-flight reads retain their opt-in choice.
+        self.reads.observe(execution);
     }
     pub(super) fn connection_error(&self, kind: io::ErrorKind) {
         let i = match kind {

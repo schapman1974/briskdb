@@ -260,8 +260,14 @@ pub(super) struct Prepared {
     timeout: Duration,
 }
 
+fn observed_read_options(enabled: bool) -> DocumentReadOptions {
+    DocumentReadOptions::new()
+        .with_execution_stats(enabled)
+        .with_plan_diagnostics(enabled)
+}
+
 /// Called on the bounded blocking parser, before any engine work is admitted.
-pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
+pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
     if !matches!(
         name,
@@ -832,7 +838,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     Ok(())
                 }
             })?;
-            let mut options = DocumentReadOptions::new();
+            let mut options = observed_read_options(read_metrics);
             if let Some(BsonValue::Document(projection)) = request.body.get_first("projection") {
                 DocumentProjector::compile_with_check(projection, &mut || {
                     if started.elapsed() >= timeout {
@@ -913,7 +919,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             let Some(BsonValue::Document(cursor)) = request.body.get_first("cursor") else {
                 return Err(CommandError::invalid());
             };
-            let mut options = DocumentReadOptions::new();
+            let mut options = observed_read_options(read_metrics);
             for (field, value) in cursor.iter() {
                 if field != "batchSize" {
                     return Err(CommandError::options());
@@ -971,7 +977,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 namespace,
                 field,
                 DocumentFilter::new(filter)?,
-                DocumentReadOptions::new(),
+                observed_read_options(read_metrics),
             )?)
         } else if name == "count" {
             if !request.sequences.is_empty() {
@@ -1020,7 +1026,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             if batch == 0 || batch > 1000 {
                 return Err(CommandError::invalid());
             }
-            let options = DocumentReadOptions::new()
+            let options = observed_read_options(read_metrics)
                 .with_batch_size(batch)?
                 .with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
             Command::GetMore(DocumentContinueCursorRequest::new(namespace, id, options))
@@ -1173,6 +1179,7 @@ fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
 /// the engine's durable schema gate; no SQLite or routing logic lives here.
 pub(super) struct Executor {
     database: BriskDb,
+    metrics: Arc<metrics::Metrics>,
     creation: Mutex<()>,
     cursors: Arc<cursors::WireCursors>,
 }
@@ -1181,6 +1188,7 @@ impl Executor {
     pub(super) fn new(database: BriskDb, metrics: Arc<metrics::Metrics>) -> Self {
         Self {
             database,
+            metrics: Arc::clone(&metrics),
             creation: Mutex::new(()),
             cursors: Arc::new(cursors::WireCursors::new(metrics)),
         }
@@ -1251,7 +1259,10 @@ impl Executor {
                 DocumentRequest::new(identity, context.clone(), command),
             )
             .await
-            .map(|execution| execution.into_parts().2)
+            .map(|execution| {
+                self.metrics.observe_read(&execution);
+                execution.into_parts().2
+            })
             .map_err(Into::into)
     }
 
