@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-four locked suites is classified; 946 reference parameter cases are not 946 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-six locked suites is classified; 959 reference parameter cases are not 959 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3441,6 +3441,90 @@
             "python/tests/test_upstream_bulk_updates.py::test_quiet_decimal_nan_increment_reports_execution_without_changing_bid"
           ],
           "note": "Adding Decimal128 zero to an existing quiet NaN reports matched=1/modified=1 while preserving exact NaN BID bytes, matching the original public contract."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_warning_attribution.py",
+      "sha256": "12eb017c9466166a82dc013670303bd5c7e6343fa600a53813aea7402d477282",
+      "reference_case_count": 8,
+      "function_count": 8,
+      "coverage": [
+        {
+          "source": [
+            "test_sync_cursor_sort_warning_points_to_application_call",
+            "test_sync_deferred_cursor_sort_warning_keeps_sort_origin",
+            "test_sync_aggregation_sort_warning_points_to_application_call"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_sync_warning_origin_and_non_bson_sort_boundary"
+          ],
+          "note": "A Python date is rejected before persistence by real PyMongo's BSON encoder, rather than entering TinyMongo's private in-memory cursor or aggregation fallback and warning during sort. Valid datetime documents sort exactly through lazy cursors, clones and aggregation with no fallback warnings."
+        },
+        {
+          "source": [
+            "test_sync_create_indexes_warning_keeps_application_call_origin"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_sync_warning_origin_and_non_bson_sort_boundary"
+          ],
+          "note": "Both raw mapping and real IndexModel descending declarations use the existing opt-in compatibility path. Exactly one IndexCompatibilityWarning points to the application's actual create_indexes call filename and line; effective ascending equality-index metadata and descending query results are verified. TinyMongo's warning class itself is not imported."
+        },
+        {
+          "source": [
+            "test_async_create_indexes_warning_keeps_await_call_origin"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_async_warning_origin_and_non_bson_sort_boundary"
+          ],
+          "note": "The async create_indexes await call retains the application's exact filename and line for both mapping and IndexModel warnings, with effective metadata and query results verified after the await."
+        },
+        {
+          "source": [
+            "test_async_find_cursor_sort_warning_keeps_sort_origin_through_clone",
+            "test_async_aggregation_sort_warning_keeps_await_call_origin"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_async_warning_origin_and_non_bson_sort_boundary"
+          ],
+          "note": "TinyMongo monkeypatches private Python loaders to return date objects that cannot enter BriskDB through real BSON. The async boundary rejects date before write; valid datetime sorts, cloned cursors and aggregation complete with exact results and no fallback warnings."
+        },
+        {
+          "source": [
+            "test_warning_context_defensive_and_module_fallbacks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_sync_warning_origin_and_non_bson_sort_boundary",
+            "python/tests/test_upstream_legacy_examples.py::test_async_warning_origin_and_non_bson_sort_boundary"
+          ],
+          "note": "TinyMongo's warning_context module, WarningOrigin records and synthetic inspect-frame fallbacks are not BriskDB APIs. BriskDB's real sync/async index compatibility warnings are tested at their public application call sites; no parity claim is made for private warning-context internals."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_mongo_like.py",
+      "sha256": "6393215964f4db24b965e7df09b15cd4bb9f9522e77170a71b65c3054645a5a3",
+      "reference_case_count": 5,
+      "function_count": 5,
+      "coverage": [
+        {
+          "source": [
+            "test_upsert_and_find",
+            "test_update_operators",
+            "test_projection_like",
+            "test_find_and_modify_semantics",
+            "test_unique_index_simulation"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_legacy_examples.py::test_original_mongo_like_examples_keep_exact_public_results"
+          ],
+          "note": "The original five examples run as real-wire insert/find, repeated $set, inclusion projection, update-then-read and duplicate-ID scenarios, with exact results/counts, code 11000, unchanged rejected record and durable reopen. Despite their names, the source upsert and find-and-modify examples simulate those actions with ordinary writes; this mapping does not misrepresent them as actual upsert or atomic findAndModify coverage."
         }
       ]
     }

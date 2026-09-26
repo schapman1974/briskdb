@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 425 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 438 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -57,14 +57,15 @@ functions in the locked `test_query_more.py`,
 `test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
 `test_bson_codec.py`, `test_typed_physical_ids.py` and
 `test_sqlite_optimistic_inserts.py`, `test_sharded_sqlite_concurrency.py` and
-`test_sqlite_unique_update_fast_path.py` and `test_sqlite_bulk_updates.py` suites
-(946 reference parameter cases). 254 added wheel scenarios and existing patch
+`test_sqlite_unique_update_fast_path.py`, `test_sqlite_bulk_updates.py`,
+`test_warning_attribution.py` and `test_mongo_like.py` suites
+(959 reference parameter cases). 257 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 946 unchanged upstream candidate passes or complete #186 certification.
+not 959 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -142,6 +143,15 @@ Six simultaneously retained managed clients now complete concurrent increments
 across three reopen cycles. Their shared embedded listener reserves 32 sockets
 for real driver monitor/pool connections, fixing resets under the former
 eight-socket capacity; standalone listener defaults remain eight.
+
+Legacy examples retain exact insert/update/projection/duplicate-ID results
+through reopen. Sync and async index-compatibility warnings point to the exact
+application call/await filename and line for mappings and real `IndexModel`
+objects. Descending model declarations explicitly warn about their effective
+ascending equality index, while descending query sorting remains correct.
+Python `date` objects fail BSON encoding before write, instead of reaching
+TinyMongo's private warning-only cursor/aggregation fallbacks; valid `datetime`
+sorting, cloning and aggregation are verified without those fallback warnings.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
