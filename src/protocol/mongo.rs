@@ -10,6 +10,7 @@ mod compression;
 mod events;
 mod listener;
 mod metrics;
+mod readiness;
 mod wire;
 
 pub use client_metadata::{MongoClientMetadata, MongoDriverKind};
@@ -18,6 +19,9 @@ pub use metrics::{
     MONGO_LATENCY_UPPER_BOUNDS_MICROS, MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoCommandKind,
     MongoCommandMetrics, MongoCursorMetrics, MongoMetricsSnapshot, MongoReadMetrics,
     MongoTransportFailures,
+};
+pub use readiness::{
+    MongoListenerState, MongoReadinessReason, MongoReadinessSnapshot, MongoSecurityMode,
 };
 pub use wire::{DocumentSequence, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request};
 

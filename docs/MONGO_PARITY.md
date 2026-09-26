@@ -677,8 +677,38 @@ drop emits an aborted outcome after releasing its in-flight gauge, including on 
 unwind. There is at most one live request guard per admitted connection; the host
 must bound its own export queues. Malformed frames that never become commands
 remain transport metrics, not fabricated request events. Engine/shard phase
-tracing, readiness/security diagnostics and broader fault/soak acceptance remain
-separate #187 work.
+tracing and broader fault/soak acceptance remain separate #187 work.
+
+Rust hosts can inspect local document readiness without a network command:
+
+```rust,ignore
+let status = mongo.readiness();
+println!("ready={} listener={} security={} reason={}",
+    status.ready(), status.listener.code(), status.security.code(),
+    status.reason().map_or("ready", |reason| reason.code()));
+// status.engine contains the neighboring live engine/schema admission snapshot.
+```
+
+The primary reason is ordered listener closing/closed/failed, documents disabled,
+engine unavailable/draining/stopped, then schema migrating/pending/degraded.
+All component fields remain available to inspect simultaneous conditions. The
+listener state is local to that handle; closing it does not close another listener
+or the borrowed engine. A failed or aborted listener stays failed after close.
+Engine state is observed through a weak internal handle: reads perform no I/O,
+query admission, polling, retained sessions or retries. After the last engine
+owner is released, `engine` is `None`; retaining closed listener handles or
+snapshots cannot keep pools or the old database identity alive.
+
+`ready()` means local document admission, not spare connection capacity or a
+guarantee that the next operation will succeed. These neighboring live fields
+are not one atomic system snapshot. The schema gate reflects **detected** catalog
+or shard corruption as `schema_degraded` but does not identify the failed file
+or probe for new on-disk corruption; global-index health is a separate engine
+surface. `ping`/discovery can succeed when document support is disabled. Security
+is explicitly `anonymous_loopback`: Mongo authentication and TLS are not implemented,
+local processes must be trusted, and non-loopback binding still fails. This is
+not readiness for exposing Mongo to a network. No admin endpoint, Python readiness
+API, automatic repair or security-policy change is added.
 
 Read-work telemetry is separately opt-in for Rust hosts:
 

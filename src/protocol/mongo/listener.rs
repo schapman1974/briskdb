@@ -18,7 +18,8 @@ use tokio_util::codec::Decoder;
 use tracing::instrument::WithSubscriber;
 
 use super::{
-    Request, client_metadata, commands, compression, decode_request, invalid, metrics, wire,
+    Request, client_metadata, commands, compression, decode_request, invalid, metrics, readiness,
+    wire,
 };
 use crate::{
     BriskDb, CancellationToken, EngineState,
@@ -28,6 +29,9 @@ use crate::{
 const MAX_CONNECTIONS: usize = client_metadata::MAX_CONNECTIONS;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[cfg(test)]
+mod tests;
 
 /// A caller-owned Mongo listener. Does not close the borrowed engine,
 /// install signal handlers, or enable any listener through default features.
@@ -39,6 +43,9 @@ pub struct MongoServer {
     task: Option<JoinHandle<io::Result<()>>>,
     metrics: Arc<metrics::Metrics>,
     clients: Arc<client_metadata::Registry>,
+    health: Arc<readiness::ListenerHealth>,
+    engine_readiness: crate::core::EngineReadinessProbe,
+    document_support: crate::DocumentSupport,
 }
 
 impl MongoServer {
@@ -69,14 +76,21 @@ impl MongoServer {
         let token = shutdown.clone();
         let metrics = Arc::new(metrics::Metrics::default());
         let clients = Arc::new(client_metadata::Registry::default());
+        let health = Arc::new(readiness::ListenerHealth::default());
+        let guard = health.guard();
+        let run = run(
+            listener,
+            database.clone(),
+            token,
+            Arc::clone(&metrics),
+            Arc::clone(&clients),
+        );
         let task = tokio::spawn(
-            run(
-                listener,
-                database.clone(),
-                token,
-                Arc::clone(&metrics),
-                Arc::clone(&clients),
-            )
+            async move {
+                let result = run.await;
+                guard.finish(result.is_ok());
+                result
+            }
             .with_current_subscriber(),
         );
         Ok(Self {
@@ -85,11 +99,26 @@ impl MongoServer {
             task: Some(task),
             metrics,
             clients,
+            health,
+            engine_readiness: database.engine().readiness_probe(),
+            document_support: database.document_support(),
         })
     }
 
     pub const fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Cheap live local-document readiness and explicit security mode. No I/O
+    /// or admission; the engine probe is weak and cannot keep a closed root alive.
+    /// See [`super::MongoReadinessSnapshot`] for observation and integrity limits.
+    pub fn readiness(&self) -> super::MongoReadinessSnapshot {
+        super::MongoReadinessSnapshot {
+            listener: self.health.state(self.shutdown.is_cancelled()),
+            engine: self.engine_readiness.snapshot(),
+            document_support: self.document_support,
+            security: super::MongoSecurityMode::AnonymousLoopback,
+        }
     }
 
     /// Fixed-cardinality, payload-free cumulative counters for this listener.
@@ -114,6 +143,7 @@ impl MongoServer {
     }
 
     pub fn begin_close(&self) {
+        self.health.begin_close();
         self.shutdown.cancel();
     }
 
