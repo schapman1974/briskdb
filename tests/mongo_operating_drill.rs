@@ -17,6 +17,8 @@ use briskdb::{
     protocol::mongo::MongoServer,
 };
 
+#[path = "mongo_operating_drill/legacy_blob.rs"]
+mod legacy_blob;
 #[path = "mongo_operating_drill/typed_ids.rs"]
 mod typed_ids;
 

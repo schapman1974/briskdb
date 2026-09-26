@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-seven locked suites is classified; 982 reference parameter cases are not 982 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-eight locked suites is classified; 997 reference parameter cases are not 997 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3656,6 +3656,94 @@
             "python/tests/test_upstream_bulk_planning.py::test_bulk_numeric_aliases_and_distinctions_match_bson_precision"
           ],
           "note": "Current Decimal128/integer aliases, naive/UTC datetime aliases and identical ordered document IDs reject through real bulk writes with zero inserted, index zero, code 11000 and unchanged BSON records. Native canonical keys replace private legacy full-scan heuristics."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_storage_backends.py",
+      "sha256": "0973c01422d695976626e9d187746d01d7a9610599ccc96963afb53762eb4d17",
+      "reference_case_count": 15,
+      "function_count": 12,
+      "coverage": [
+        {
+          "source": [
+            "test_tinydb_backend_default",
+            "test_parquet_backend",
+            "test_duckdb_backend",
+            "test_duckdb_backend_uses_collection_tables",
+            "test_duckdb_backend_multiple_writes"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_upstream_storage_backends.py::test_default_and_sqlite_aliases_use_native_collection_storage_and_reopen",
+            "python/tests/test_upstream_storage_backends.py::test_common_storage_queries_mutations_and_natural_counts_survive_reopen"
+          ],
+          "note": "BriskDB uses native sharded SQLite, not TinyDB/JSON, DuckDB or Parquet. Sync and async foreign-backend requests reject before storage acquisition or folder creation. Equivalent multi-write/query/durability outcomes run on native SQLite; foreign storage files, formats and SQL table layouts are not claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_backend",
+            "test_sqlite_backend_uses_collection_tables"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_default_and_sqlite_aliases_use_native_collection_storage_and_reopen"
+          ],
+          "note": "Default, sqlite and sqlite-sharded spellings retain independent logical users/events collections through reopen. Native manifest plus two shard files and shared briskdb_documents_v1 tables hold the two records; there is no per-database app.sqlite, TinyDB blob table or per-collection SQL table/physical-ID-text contract."
+        },
+        {
+          "source": [
+            "test_sqlite_backend_migrates_legacy_blob_file"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/legacy_blob.rs::genuine_legacy_blob_import_preserves_tagged_values_and_unchanged_source"
+          ],
+          "note": "A genuine source-locked SQLiteStorage blob is imported explicitly into four native shards with users/events/empty collections. Reads, duplicate ID rejection, updates, replacement and durable reopen work while source hashes remain unchanged. TinyMongo's automatic in-place migration is verified only on an owned disposable source copy, not imposed on BriskDB."
+        },
+        {
+          "source": [
+            "test_duckdb_backend_migrates_legacy_blob_file"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "tests/mongo_operating_drill/legacy_blob.rs::genuine_legacy_blob_import_preserves_tagged_values_and_unchanged_source"
+          ],
+          "note": "DuckDB live storage and legacy ingestion are not supported; backend selection fails before acquisition. The separate genuine legacy import evidence is SQLite-only and is not represented as a DuckDB migration pass."
+        },
+        {
+          "source": [
+            "test_legacy_blob_migration_restores_tagged_bson_values"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/legacy_blob.rs::genuine_legacy_blob_import_preserves_tagged_values_and_unchanged_source",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "The SQLite parameter's real SQLiteStorage serialization preserves ObjectId, datetime and 16-byte subtype-4 Binary through native import, stock PyMongo mutations and reopen; the untouched source also passes the original client after migration of a disposable copy. The DuckDB parameter remains an explicit unsupported storage/import variant."
+        },
+        {
+          "source": [
+            "test_table_backends_support_common_queries"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_common_storage_queries_mutations_and_natural_counts_survive_reopen",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "The original three-record age range, membership, missing-field, all-array-members, increment and delete/count outcomes pass through native four-shard SQLite and reopen. Modern count_documents replaces legacy Cursor.count. The three source backend parameters are not three different BriskDB backend implementations; DuckDB/Parquet selection is explicitly rejected."
+        },
+        {
+          "source": [
+            "test_internal_client_attrs_are_preserved"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_default_and_sqlite_aliases_use_native_collection_storage_and_reopen"
+          ],
+          "note": "TinyMongo _backend, _storage and _foldername internals are not retained. Real PyMongo rejects those attribute lookups rather than creating hidden databases/collections; native logical collections and files are unchanged and no _storage.json is created."
         }
       ]
     }
