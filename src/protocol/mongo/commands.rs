@@ -43,6 +43,7 @@ pub(super) struct CommandError {
     name: &'static str,
     message: &'static str,
     rolled_back_update: bool,
+    missing_collection: bool,
 }
 
 impl CommandError {
@@ -52,6 +53,7 @@ impl CommandError {
             name,
             message,
             rolled_back_update: false,
+            missing_collection: false,
         }
     }
 
@@ -107,6 +109,12 @@ impl CommandError {
     fn from_engine_error(error: &EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
+            if cause.is::<crate::document::DocumentCollectionNotFound>() {
+                return Self {
+                    missing_collection: true,
+                    ..Self::invalid()
+                };
+            }
             if let Some(update) = cause.downcast_ref::<DocumentUpdateError>() {
                 return Self::new(
                     update.mongo_code(),
@@ -1865,6 +1873,7 @@ impl Executor {
                     &command,
                     Command::ListCollections(..) | Command::ListIndexes(..)
                 );
+                let direct_find = matches!(&command, Command::Find(..));
                 if let Command::ListIndexes(request, _) = &command {
                     if !self
                         .exists(session, identity, &context, request.namespace())
@@ -1912,7 +1921,15 @@ impl Executor {
                     ),
                     _ => unreachable!("cursor command"),
                 };
-                if !metadata && !self.exists(session, identity, &context, &namespace).await? {
+                // A normal find already resolves its collection inside the
+                // admitted engine command and verified manifest snapshot. Do
+                // not execute a second catalog command just to check absence.
+                // A zero-sized single batch skips execution, so it still needs
+                // the original admission/health check before returning empty.
+                if !metadata
+                    && (!direct_find || empty_single_batch)
+                    && !self.exists(session, identity, &context, &namespace).await?
+                {
                     return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
                 if empty_single_batch {
@@ -1923,9 +1940,13 @@ impl Executor {
                 let cursor_session = Arc::new(self.session());
                 match self
                     .call(&cursor_session, identity, &context, command)
-                    .await?
+                    .await
                 {
-                    DocumentResult::Cursor(batch) => {
+                    Err(error) if direct_find && error.missing_collection => {
+                        Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false))
+                    }
+                    Err(error) => Err(error),
+                    Ok(DocumentResult::Cursor(batch)) => {
                         let (_, id, documents) = batch.into_parts();
                         let id = if single_batch { None } else { id };
                         if let Some(id) = id {
@@ -2088,4 +2109,31 @@ pub(super) fn validate_response(body: &BsonDocument) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_typed_catalog_absence_can_be_translated_to_an_empty_find() {
+        let absent = crate::document::DocumentCollectionNotFound.into_engine_error();
+        assert_eq!(absent.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(absent.diagnostic(), "document collection does not exist");
+        let mapped = CommandError::from(absent.context("private database path"));
+        assert!(mapped.missing_collection);
+        // Preserve ordinary error mapping for callers other than find.
+        assert_eq!(mapped.code, 2);
+        assert!(
+            mapped
+                .document()
+                .representation_eq(&CommandError::invalid().document())
+        );
+        for kind in EngineErrorKind::ALL {
+            let untyped = EngineError::new(*kind, "document collection does not exist");
+            assert!(!CommandError::from(untyped).missing_collection);
+        }
+        let index = crate::document::DocumentIndexError::CollectionNotFound.into_engine_error();
+        assert!(!CommandError::from(index).missing_collection);
+    }
 }

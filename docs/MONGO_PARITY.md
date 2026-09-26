@@ -1305,6 +1305,25 @@ All nine runs finish with the same 1,256 documents and content hash.
 This snapshot exposes substantial current BriskDB overhead to profile; it does
 not demonstrate performance parity, a universal ranking, or a release pass.
 
+Following that baseline, normal wire `find` commands resolve collection existence
+inside their admitted engine operation instead of issuing a separate catalog
+preflight. Only a typed missing-collection result becomes an empty cursor;
+arbitrary validation, corruption, cancellation and storage errors remain errors.
+The engine's verified manifest snapshot and schema/shard checks are unchanged.
+Zero-sized `singleBatch` requests still perform the original admission/catalog
+check because they intentionally skip the engine read. Regression coverage checks
+drop/recreate, zero-batch cursor continuation, disabled document support and
+post-startup manifest corruption for existing and absent collections.
+
+The [same-host follow-up report](benchmarks/mongo-public-clients-find-2026-09-26.json)
+retains the identical workload, worker hash and reference configuration. Median
+BriskDB point-read latency fell from 9.007 ms to 4.757 ms (47%); materialized
+indexed-equality latency fell from 41.531 ms to 37.628 ms (9%). All nine trials
+retain identical final records, and all 36 baseline checks pass the 1.5x bound.
+These are measurements of this small fixture, not a general speedup guarantee;
+write latency and the remaining engine/storage overhead are not fixed by this
+read-path change.
+
 ## Versioned files
 
 [`compat/mongo/v1/manifest.json`](../compat/mongo/v1/manifest.json) is the

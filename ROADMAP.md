@@ -1026,7 +1026,10 @@ requires an earlier dependency:
       Raw timings, configuration/provenance and final-record hashes are retained;
       CI runs correctness smoke and controlled hosts can gate median regressions
       against a matching baseline. Cross-implementation timings are not equivalent
-      transport/storage costs or a speedup claim. Wider app/soak/security gates,
+      transport/storage costs or a speedup claim. Normal wire finds now avoid a
+      redundant collection-existence catalog command while retaining engine
+      admission, manifest integrity verification and typed missing-namespace
+      handling. Wider app/soak/security gates,
       representative sustained-load evidence and complete release acceptance
       remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts

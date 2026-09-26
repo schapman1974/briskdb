@@ -4,6 +4,26 @@ use std::{error::Error, fmt};
 
 use crate::core::{EngineError, EngineErrorKind};
 
+/// A verified catalog lookup found no active collection. This private marker
+/// lets adapters distinguish absence from arbitrary invalid-argument failures
+/// without parsing diagnostic text or bypassing engine admission.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DocumentCollectionNotFound;
+
+impl DocumentCollectionNotFound {
+    pub(crate) fn into_engine_error(self) -> EngineError {
+        EngineError::from_source(EngineErrorKind::InvalidArgument, self.to_string(), self)
+    }
+}
+
+impl fmt::Display for DocumentCollectionNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("document collection does not exist")
+    }
+}
+
+impl Error for DocumentCollectionNotFound {}
+
 /// Stable, payload-free failures for retained document cursor operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentCursorError {
