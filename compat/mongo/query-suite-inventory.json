@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these eighteen locked suites is classified; 555 reference parameter cases are not 555 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these nineteen locked suites is classified; 642 reference parameter cases are not 642 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1891,6 +1891,210 @@
             "python/tests/test_upstream_aggregation_projection.py::test_async_projection_stages_use_real_command_cursor"
           ],
           "note": "Async composition uses a real PyMongo AsyncCommandCursor and explicit ID sort; TinyMongo's cursor class and implicit natural ordering are not promised."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_aggregation.py",
+      "sha256": "d568cfa26c9f7fa2de2b8e1ed730e295ad721e0b0052f7ea902bad461dd3094f",
+      "reference_case_count": 87,
+      "function_count": 27,
+      "coverage": [
+        {
+          "source": [
+            "test_empty_pipeline_returns_cloneable_snapshot_without_mutation",
+            "test_aggregate_cursor_is_a_context_manager"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_empty_pipeline_uses_real_command_cursor_and_isolates_returned_values"
+          ],
+          "note": "Real PyMongo CommandCursor supports iteration/context cleanup but has no clone/rewind API. Returned nested values and caller pipelines remain isolated; rerunning aggregation is not a snapshot clone."
+        },
+        {
+          "source": [
+            "test_dotted_paths_arrays_and_bson_group_identity"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_group_identity_distinguishes_bool_arrays_and_ordered_documents",
+            "python/tests/test_upstream_aggregation_core.py::test_dotted_array_references_skip_missing_members"
+          ],
+          "note": "Numeric equality groups 1/1.0 separately from bool; arrays and ordered documents retain BSON identity. Missing dotted groups map to null and array references skip absent members. Unsorted cross-shard group order/representative numeric encoding is not promised."
+        },
+        {
+          "source": [
+            "test_shared_bson_order_rejects_unsupported_container_members",
+            "test_add_to_set_rejects_values_without_a_bson_identity"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_non_bson_group_values_reject_in_driver_not_private_python_helpers",
+            "python/tests/test_upstream_aggregation_core.py::test_group_identity_distinguishes_bool_arrays_and_ordered_documents"
+          ],
+          "note": "Arbitrary Python object members cannot enter BSON and fail driver encoding, not TinyMongo's private helper None/custom-error policy. Public ordered-document group identity is checked separately."
+        },
+        {
+          "source": [
+            "test_pipeline_must_be_a_list",
+            "test_pipeline_stage_shape_is_validated"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_pipeline_and_stage_shapes_reject_before_catalog_creation"
+          ],
+          "note": "All four non-list pipeline forms reject as TypeError. A trailing null stage fails pinned PyMongo's own stage inspection as TypeError; the other three malformed stage shapes fail server validation. None create a collection."
+        },
+        {
+          "source": [
+            "test_pipeline_is_prepared_before_collection_storage_is_opened"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_unsupported_stages_and_expressions_fail_for_empty_and_populated_input",
+            "python/tests/test_upstream_aggregation_core.py::test_empty_pipeline_uses_real_command_cursor_and_isolates_returned_values"
+          ],
+          "note": "Unsupported lookup rejects before catalog creation. Empty-pipeline identity is tested through real wire execution instead of the private direct Python engine."
+        },
+        {
+          "source": [
+            "test_leading_match_is_pushed_into_the_collection_query"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_leading_and_post_group_match_preserve_stage_semantics",
+            "src/core/engine/document_engine/id_routing/tests/aggregation.rs::leading_exact_ids_use_one_owner_without_repeating_a_point_on_continuation",
+            "src/core/engine/document_engine/id_routing/tests/aggregation.rs::unsafe_leading_shapes_and_matches_after_transformations_keep_full_source_routing"
+          ],
+          "note": "Public leading and post-group matches preserve stage semantics. Native routing tests prove safe leading-ID pruning and preservation of the original pipeline; TinyMongo's monkeypatched collection.find call counts do not exist."
+        },
+        {
+          "source": [
+            "test_project_includes_fields_and_computes_against_original_document",
+            "test_project_default_id_special_id_exclusion_and_missing_inclusion"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_project_evaluates_original_input_and_default_id_modes"
+          ],
+          "note": "Computed fields use original input, retain default/special ID rules, omit missing values and preserve stored documents/pipelines."
+        },
+        {
+          "source": [
+            "test_project_ifnull_preserves_non_null_values_and_size_accepts_arrays"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_ifnull_preserves_false_zero_arrays_and_is_lazy"
+          ],
+          "note": "Zero/false/empty arrays are non-null, fallback is variadic and lazy, missing final fallback is omitted, and size accepts array expressions."
+        },
+        {
+          "source": [
+            "test_project_size_rejects_non_array_runtime_values"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_size_runtime_errors_keep_code"
+          ],
+          "note": "All five non-array runtime inputs reject with code 17124."
+        },
+        {
+          "source": [
+            "test_project_validation_fails_before_storage_read"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_invalid_expressions_and_path_collisions_preflight"
+          ],
+          "note": "All 15 source malformed/unsupported expression/path cases reject before catalog creation. Wire OperationFailure replaces TinyMongo's custom unsupported type and diagnostic message text is not an equivalence promise."
+        },
+        {
+          "source": [
+            "test_unsupported_features_name_the_feature",
+            "test_unsupported_expressions_fail_before_empty_input_is_read"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_unsupported_stages_and_expressions_fail_for_empty_and_populated_input"
+          ],
+          "note": "Unsupported stages/variables/expressions reject with code 115 on empty and populated input. Native constant group keys are supported beyond this TinyMongo version and are explicitly tested, not rejected to imitate its narrower helper."
+        },
+        {
+          "source": [
+            "test_match_rejects_unknown_or_malformed_query_operators",
+            "test_match_accepts_literal_documents_and_valid_nested_not"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_match_rejects_malformed_predicates_but_accepts_literals_and_not"
+          ],
+          "note": "All source malformed predicates reject, while literal objects and valid nested not remain accepted. Non-string BSON keys fail PyMongo encoding; diagnostic wording is not promised."
+        },
+        {
+          "source": [
+            "test_supported_stage_arguments_are_validated",
+            "test_group_validation_reports_mongodb_error_codes",
+            "test_group_rejects_non_string_output_fields"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_group_argument_validation_preserves_error_precedence_and_codes"
+          ],
+          "note": "All source stage/group validation forms are checked, including exact group codes and precedence. Non-string accumulator/output keys fail driver InvalidDocument instead of server/direct-helper validation."
+        },
+        {
+          "source": [
+            "test_sessions_options_and_unsupported_comparison_values_fail_loudly"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_sessions_and_spill_fail_explicitly_using_driver_options",
+            "python/tests/test_upstream_aggregation_core.py::test_non_bson_group_values_reject_in_driver_not_private_python_helpers"
+          ],
+          "note": "Spill rejects with native code 72. Real explicit sessions fail driver ConfigurationError, fake session objects fail ValueError, and non-BSON literals fail InvalidDocument. The pinned PyMongo third positional let=None argument is valid unlike TinyMongo's narrower signature."
+        },
+        {
+          "source": [
+            "test_capability_descriptions_are_fresh_and_supports_is_true"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_tinymongo_capability_helpers_are_not_part_of_the_pymongo_client_api"
+          ],
+          "note": "TinyMongo-specific capabilities()/supports() introspection is not implemented by the real PyMongo client surface. Those attribute names remain database selectors; successful grouping is checked separately. This explicit API gap is not represented as equivalent introspection or a completed full-parity gate."
+        },
+        {
+          "source": [
+            "test_expression_literals_are_copied_and_unsupported_paths_fail"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_expression_literals_are_copied_and_paths_validated",
+            "python/tests/test_upstream_aggregation_core.py::test_invalid_expressions_and_path_collisions_preflight"
+          ],
+          "note": "Public literal isolation, missing objects, tuple arrays, size, DBRef-style $id paths and malformed/unsupported expressions are checked. Direct AggregationContext path-validation methods are private and are not exposed; ordinary strings are literal expressions."
+        },
+        {
+          "source": [
+            "test_repeated_group_results_are_deterministic",
+            "test_sum_ignores_every_supported_non_numeric_value"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_group_is_repeatable_with_explicit_order_and_sum_ignores_non_numbers"
+          ],
+          "note": "Repeated group results use an explicit ID source sort rather than promising TinyMongo insertion order across shards. Sum ignores bool, strings, null, arrays and missing values."
+        },
+        {
+          "source": [
+            "test_async_aggregate_returns_async_cursor"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_core.py::test_async_command_cursor_iteration_close_and_context_manager"
+          ],
+          "note": "Async real command cursors cover grouping, iteration, close, empty/alive state, context cleanup, projection and unsupported lookup. PyMongo lacks rewind; a new aggregate is checked without claiming it restores the old cursor snapshot."
         }
       ]
     }
