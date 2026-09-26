@@ -13,6 +13,9 @@ use briskdb::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "document_aggregation/partial.rs"]
+mod partial;
+
 fn doc(entries: &[(&str, BsonValue)]) -> BsonDocument {
     BsonDocument::from_entries(entries.iter().map(|(name, value)| (*name, value.clone()))).unwrap()
 }

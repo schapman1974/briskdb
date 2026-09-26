@@ -15,6 +15,8 @@ use super::{
 };
 use crate::core::EngineResult;
 
+pub(super) mod partial;
+
 pub(super) struct Group {
     key: Expression,
     accumulators: Vec<(String, Operator, Expression)>,

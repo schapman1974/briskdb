@@ -1285,8 +1285,8 @@ agreement on those malformed inputs. Pass-through results retain the raw BID.
 Grouping is blocking but retains states, not source documents. The global
 natural or preceding sort order feeds the states, so first/last and ordered
 numeric addition do not depend on physical shard boundaries or cursor batches.
-Rounded shard-local totals are **not** merged: partial aggregation pushdown is
-still open because rounding is not associative. Group keys/states/output and
+Rounded shard-local totals are **not** merged because rounding is not associative.
+Group keys/states/output and
 per-row expression allocation share conservative 64 MiB working bounds,
 reduced by unconsumed rows already retained upstream. Specifications are capped
 at 1 MiB/4,096 charged syntax/path nodes. Pipeline row/work/cancellation limits
@@ -1294,6 +1294,32 @@ remain cumulative. Every completed group document is BSON-size/depth validated
 before any result is delivered, even if a later limit/project would shrink it.
 Failures poison the execution and release its cursor without partial group
 results. No disk spill, indexed grouping, or snapshot is promised.
+
+Pipelines whose first stage is `$group` use exact shard-local partial states when
+every accumulator is an integer-literal `$sum` or `$first`/`$last`/`$min`/`$max`.
+The existing expression evaluator still handles the group key and operands.
+Integer totals merge in i128 and select their BSON result type only after the
+final merge. Group order and key representation use the earliest global source
+position; first/last use the corresponding positions, and equal min/max values
+retain the latest representation. Completion order therefore cannot alter any
+of these BSON results. Remaining pipeline stages execute only after global merge.
+
+Up to eight admitted shard workers scan concurrently. One shared budget accounts
+for every active/completed partial and the final merge: 65,536 consumed rows,
+four million work checkpoints, and 64 MiB of conservatively charged aggregation
+state/working allocation. There is no fresh quota per shard. At most eight source
+BSON decodes can be in flight separately, each under the existing BSON decode
+limits. State accounting includes conversion-container capacity; BSON payloads
+move without cloning during merge. Cancellation/failure drains all children
+before the operation releases schema/session guards or returns an error. A zero
+first batch defers execution, and normal cursor/result budgets still apply.
+
+Dynamic or noninteger sums, averages, push/addToSet, and any preceding pipeline
+stage select the original globally ordered stream. This conservative eligibility
+is not a loss of query support: it avoids reordering floating/Decimal arithmetic,
+array encounter order, or an earlier match/skip/limit/sort/transform. Partial
+state duplication can reach the bounded memory ceiling earlier than a single
+state map; neither executor promises unbounded grouping or spilling.
 
 Required CI covers 9,509 accumulator pipelines and 5,663 additional key pipelines,
 each tested in both execution modes. Of these, 24 and 5,400 respectively use
@@ -1308,8 +1334,12 @@ byte-for-byte comparisons. The unchanged reference produces all expectations;
 unencodable integer totals are separate Rust edge tests, not coerced oracle
 outputs. Tests also cover structured identity, stage ordering, numeric quantum,
 resource limits, every cancellation/deadline checkpoint, cursor cleanup,
-cross-shard byte paging, sync/async native and wire clients, and restart. Full
-frozen command-corpus acceptance and partial-shard state merging remain open.
+cross-shard byte paging, sync/async native and wire clients, and restart. Exact-BSON
+partial-versus-stream properties cover 1–64 partitions, reordered completion,
+numeric/structured key aliases and extremum ties. Native worker tests cover
+bounded waves, failed admission, cancellation, caller abort and resource reuse.
+The full frozen 456-execution command corpus is required independently; broader
+source-inventory coverage and release acceptance remain separate work.
 
 PyMongo `count_documents()` now works through its actual `$match`, optional
 `$skip`/`$limit`, and constant-key `$group` pipeline, without adapter rewrites.
