@@ -215,6 +215,18 @@ class UpstreamAdvancedIndexTests(unittest.TestCase):
                 self.assertEqual(keys, original)
                 self.assertNotIn("items", self.client.app.list_collection_names())
 
+    def test_invalid_direct_fields_and_options_leave_no_namespace(self):
+        for keys, options, error_type in [
+            (123, {}, TypeError), (object(), {}, TypeError),
+            ([("tenant", 1), ("", 1)], {}, OperationFailure),
+            ("email", {"unique": 1}, OperationFailure),
+            ("email", {"name": ""}, OperationFailure),
+        ]:
+            with self.subTest(keys=keys, options=options):
+                with self.assertRaises(error_type):
+                    self.items.create_index(keys, **options)
+                self.assertNotIn("items", self.client.app.list_collection_names())
+
     def test_direct_create_index_preserves_driver_forms_options_and_directions(self):
         for number, keys in enumerate([
             [("tenant", -1), "email"], (("tenant", -1), ("email", 1)),
