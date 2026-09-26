@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifteen locked suites is classified; 406 reference parameter cases are not 406 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these sixteen locked suites is classified; 449 reference parameter cases are not 449 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1418,6 +1418,134 @@
           ],
           "kind": "contract_difference",
           "note": "Nested non-BSON scope values raise InvalidDocument and never write a record. BriskDB retains the driver's error surface, not TinyMongo's enriched collection/ID/path message or error.document identity."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_uuid_regex.py",
+      "sha256": "89782c98cb6fe1f25adcdcfcb1fb6cdde584e47b7bef042f60005eb0ded8e981",
+      "reference_case_count": 43,
+      "function_count": 12,
+      "coverage": [
+        {
+          "source": [
+            "test_regex_query_forms_distinguish_predicates_from_explicit_equality"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_regex_predicates_and_explicit_equality_keep_distinct_meanings"
+          ],
+          "note": "Real wire queries distinguish regex execution against strings/arrays, exact stored regex identity and explicit equality; stored option differences remain significant."
+        },
+        {
+          "source": [
+            "test_regex_in_nin_all_not_and_empty_all_semantics"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_regex_membership_all_not_and_empty_all"
+          ],
+          "note": "Membership, all/not and empty-all results are checked over scalar and array records through the authoritative native matcher."
+        },
+        {
+          "source": [
+            "test_regex_options_validation_accepts_u_and_rejects_invalid_combinations"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_regex_options_and_embedded_flag_conflicts_keep_error_codes"
+          ],
+          "note": "Valid imsxu/zero-embedded flags and exact 51108/2/51075 option-conflict codes are checked. Private validator entry points and diagnostic strings are not exposed."
+        },
+        {
+          "source": [
+            "test_regex_locale_flag_can_still_match_an_exact_stored_regex"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_locale_flag_matches_stored_regex_identity_but_not_string_execution"
+          ],
+          "note": "Locale-flagged regex matches only its exact stored BSON identity, not string predicate execution."
+        },
+        {
+          "source": [
+            "test_malformed_regex_queries_fail_before_persistent_storage_reads"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_malformed_regex_queries_reject_without_creating_a_collection"
+          ],
+          "note": "All 15 source cases reject without creating collections. BSON-serializable malformed queries retain source error codes. Regex cstrings containing NUL or invalid UTF-8 fail as driver InvalidDocument/InvalidStringData before transmission. Real PyMongo cursors validate server query semantics when consumed, not eagerly at find construction; private storage-read hooks are not claimed."
+        },
+        {
+          "source": [
+            "test_public_queries_preserve_exact_locale_regex_identity"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_locale_flag_matches_stored_regex_identity_but_not_string_execution"
+          ],
+          "note": "Direct, $regex and explicit equality forms preserve locale regex identity, leaving same-text strings unmatched."
+        },
+        {
+          "source": [
+            "test_regex_only_preflight_ignores_non_query_documents"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_full_wire_validation_does_not_expose_private_regex_only_shortcuts"
+          ],
+          "note": "TinyMongo's partial regex-only validator is a private optimization hook. BriskDB has no such public API; PyMongo find(None) uses the ordinary empty-filter path."
+        },
+        {
+          "source": [
+            "test_regex_only_preflight_matches_contextual_filter_validation"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_contextual_validation_distinguishes_literal_regex_from_predicates"
+          ],
+          "note": "All 18 source contexts are represented: malformed predicates reject with exact codes, nested literal regex values are not compiled, and malformed BSON regex cstrings fail in the driver before transmission. One authoritative full matcher is used, not two private Python validation passes."
+        },
+        {
+          "source": [
+            "test_regex_only_preflight_keeps_ignoring_non_regex_query_shape_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_full_wire_validation_does_not_expose_private_regex_only_shortcuts"
+          ],
+          "note": "No partial-validator bypass is exposed. The real wire frontend rejects malformed $in/$elemMatch shapes with code 2 even though TinyMongo's private regex-only fast preflight intentionally ignores them."
+        },
+        {
+          "source": [
+            "test_full_filter_validation_rejects_operator_documents_inside_regex_arrays"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_malformed_regex_queries_reject_without_creating_a_collection"
+          ],
+          "note": "Operator documents inside $in/$nin/$all regex arrays reject with code 2 before implicit catalog creation."
+        },
+        {
+          "source": [
+            "test_remote_unique_indexes_fail_closed_for_extended_binary_identities"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_native_unique_binary_keys_are_not_tinymongo_remote_sql_policy"
+          ],
+          "note": "TinyMongo's Remote SQL backend rejection hook does not exist in BriskDB's native SQLite engine. A real native unique index instead checks UUID/subtype-4 binary equivalence and duplicate code 11000. This is not a claim to implement TinyMongo's external SQL-backend policy or support its runtime backend plugins."
+        },
+        {
+          "source": [
+            "test_distinct_uses_recursive_bson_identity_and_keeps_unsupported_type_rules"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_regex_values.py::test_distinct_deduplicates_recursive_numeric_identity_but_rejects_non_bson_objects"
+          ],
+          "note": "Recursive numeric identity deduplicates 1/1.0 while preserving bool separation. Arbitrary Python equality objects returned by a mocked TinyMongo collection cannot enter native BSON and are rejected by the driver. Representative numeric encoding/order is not promised across native shard traversal."
         }
       ]
     }
