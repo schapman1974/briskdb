@@ -18,15 +18,14 @@ use tokio_util::codec::Decoder;
 use tracing::instrument::WithSubscriber;
 
 use super::{
-    Request, client_metadata, commands, compression, decode_request, invalid, metrics, readiness,
-    wire,
+    MongoResourceLimits, Request, client_metadata, commands, compression, decode_request, invalid,
+    metrics, readiness, wire,
 };
 use crate::{
     BriskDb, CancellationToken, EngineState,
     document::{BsonDocument, BsonValue},
 };
 
-const MAX_CONNECTIONS: usize = client_metadata::MAX_CONNECTIONS;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -39,6 +38,7 @@ mod tests;
 /// commands require the host's `DocumentSupport::Enabled` setting.
 pub struct MongoServer {
     address: SocketAddr,
+    limits: MongoResourceLimits,
     shutdown: CancellationToken,
     task: Option<JoinHandle<io::Result<()>>>,
     metrics: Arc<metrics::Metrics>,
@@ -50,6 +50,15 @@ pub struct MongoServer {
 
 impl MongoServer {
     pub async fn start(database: &BriskDb, address: SocketAddr) -> io::Result<Self> {
+        Self::start_with_limits(database, address, MongoResourceLimits::default()).await
+    }
+
+    /// Start a listener with a host policy that only narrows the default caps.
+    pub async fn start_with_limits(
+        database: &BriskDb,
+        address: SocketAddr,
+        limits: MongoResourceLimits,
+    ) -> io::Result<Self> {
         if !address.ip().is_loopback() {
             return Err(invalid("Mongo listener requires loopback"));
         }
@@ -57,14 +66,24 @@ impl MongoServer {
             return Err(invalid("Mongo listener requires a running engine"));
         }
         let listener = TcpListener::bind(address).await?;
-        Self::from_bound(database, listener, CancellationToken::new())
+        Self::from_bound_with_limits(database, listener, CancellationToken::new(), limits)
     }
 
     /// Start only after the owning server has bound every configured listener.
+    #[cfg(feature = "listeners")]
     pub(crate) fn from_bound(
         database: &BriskDb,
         listener: TcpListener,
         shutdown: CancellationToken,
+    ) -> io::Result<Self> {
+        Self::from_bound_with_limits(database, listener, shutdown, MongoResourceLimits::default())
+    }
+
+    fn from_bound_with_limits(
+        database: &BriskDb,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+        limits: MongoResourceLimits,
     ) -> io::Result<Self> {
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
@@ -84,6 +103,7 @@ impl MongoServer {
             token,
             Arc::clone(&metrics),
             Arc::clone(&clients),
+            limits,
         );
         let task = tokio::spawn(
             async move {
@@ -95,6 +115,7 @@ impl MongoServer {
         );
         Ok(Self {
             address,
+            limits,
             shutdown,
             task: Some(task),
             metrics,
@@ -107,6 +128,11 @@ impl MongoServer {
 
     pub const fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// The immutable policy selected when this listener was started.
+    pub const fn resource_limits(&self) -> MongoResourceLimits {
+        self.limits
     }
 
     /// Cheap live local-document readiness and explicit security mode. No I/O
@@ -177,12 +203,13 @@ async fn run(
     shutdown: CancellationToken,
     metrics: Arc<metrics::Metrics>,
     clients: Arc<client_metadata::Registry>,
+    limits: MongoResourceLimits,
 ) -> io::Result<()> {
     let executor = Arc::new(commands::Executor::new(
         database.clone(),
         Arc::clone(&metrics),
     ));
-    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let slots = Arc::new(Semaphore::new(limits.max_connections()));
     let mut connections = JoinSet::new();
     let mut lifecycle = tokio::time::interval(Duration::from_millis(100));
     let mut outcome = Ok(());
@@ -214,7 +241,7 @@ async fn run(
                     // including during shutdown; malformed clients cannot grow the queue.
                     let _permit = permit;
                     let _admission = admission;
-                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics), clients).await {
+                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics), clients, limits).await {
                         metrics.connection_error(error.kind());
                     }
                 }.with_current_subscriber());
@@ -237,6 +264,7 @@ async fn connection(
     executor: Arc<commands::Executor>,
     metrics: Arc<metrics::Metrics>,
     clients: Arc<client_metadata::Registry>,
+    limits: MongoResourceLimits,
 ) -> io::Result<()> {
     let session = executor.session();
     let mut client = clients.connection(session.id().get());
@@ -288,7 +316,7 @@ async fn connection(
             if compressed {
                 compression::validate_command(&request)?;
             }
-            let prepared = commands::prepare(&request, read_metrics);
+            let prepared = commands::prepare_with_limits(&request, read_metrics, started, limits);
             Ok::<_, io::Error>((request, prepared))
         })
         .await

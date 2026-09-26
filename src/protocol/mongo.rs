@@ -8,12 +8,14 @@ mod client_metadata;
 mod commands;
 mod compression;
 mod events;
+mod limits;
 mod listener;
 mod metrics;
 mod readiness;
 mod wire;
 
 pub use client_metadata::{MongoClientMetadata, MongoDriverKind};
+pub use limits::MongoResourceLimits;
 pub use listener::MongoServer;
 pub use metrics::{
     MONGO_LATENCY_UPPER_BOUNDS_MICROS, MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoCommandKind,
