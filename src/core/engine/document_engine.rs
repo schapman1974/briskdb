@@ -2464,8 +2464,12 @@ fn next_server_timestamp() -> EngineResult<BsonTimestamp> {
                 "server clock exceeds BSON timestamp range",
             )
         })?;
+    advance_server_timestamp(&SERVER_TIMESTAMP, seconds)
+}
+
+fn advance_server_timestamp(clock: &AtomicU64, seconds: u32) -> EngineResult<BsonTimestamp> {
     let mut next = 0;
-    SERVER_TIMESTAMP
+    clock
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
             let old_seconds = (previous >> 32) as u32;
             let increment = previous as u32;
@@ -2958,6 +2962,60 @@ mod tests {
         document::{DocumentCollectionOptions, DocumentCreateCollectionRequest, DocumentRequestId},
         storage::SchemaGateState,
     };
+
+    #[test]
+    fn server_timestamp_clock_is_monotonic_across_backward_time_rollover_and_exhaustion() {
+        let clock = AtomicU64::new(0);
+        for (seconds, expected) in [
+            (1000, (1000, 1)),
+            (1000, (1000, 2)),
+            (999, (1000, 3)),
+            (1001, (1001, 1)),
+        ] {
+            assert_eq!(
+                advance_server_timestamp(&clock, seconds).unwrap(),
+                BsonTimestamp::new(expected.0, expected.1)
+            );
+        }
+        clock.store((2000u64 << 32) | u64::from(u32::MAX), Ordering::Relaxed);
+        assert_eq!(
+            advance_server_timestamp(&clock, 2000).unwrap(),
+            BsonTimestamp::new(2001, 1)
+        );
+        clock.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(
+            advance_server_timestamp(&clock, u32::MAX)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::NumericOutOfRange
+        );
+        assert_eq!(clock.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_server_timestamp_allocations_are_unique_without_a_global_test_clock() {
+        let clock = Arc::new(AtomicU64::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let clock = Arc::clone(&clock);
+                std::thread::spawn(move || {
+                    (0..64)
+                        .map(|_| {
+                            let value = advance_server_timestamp(&clock, 1000).unwrap();
+                            assert_eq!(value.time(), 1000);
+                            value.increment()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut increments: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        increments.sort_unstable();
+        assert_eq!(increments, (1..=512).collect::<Vec<_>>());
+    }
 
     #[cfg(feature = "mongo")]
     #[tokio::test]
