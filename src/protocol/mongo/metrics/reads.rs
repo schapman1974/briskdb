@@ -22,6 +22,9 @@ pub struct MongoReadMetrics {
     pub documents_examined: u64,
     /// Source matcher evaluations, not pipeline predicates or matched rows.
     pub matcher_evaluations: u64,
+    /// Source-predicate acceptances, including repeated/lookahead reads and
+    /// unfiltered/ID hits, before skip/limit/projection/pipeline processing.
+    pub source_matches: u64,
     /// Documents in returned engine batches, or distinct values (not matches).
     pub output_items: u64,
     pub point_plans: u64,
@@ -44,6 +47,7 @@ pub(super) struct ReadCounters {
     storage_reads: AtomicU64,
     documents: AtomicU64,
     matchers: AtomicU64,
+    matches: AtomicU64,
     outputs: AtomicU64,
     point: AtomicU64,
     indexed: AtomicU64,
@@ -63,6 +67,7 @@ impl Default for ReadCounters {
             storage_reads: AtomicU64::new(0),
             documents: AtomicU64::new(0),
             matchers: AtomicU64::new(0),
+            matches: AtomicU64::new(0),
             outputs: AtomicU64::new(0),
             point: AtomicU64::new(0),
             indexed: AtomicU64::new(0),
@@ -86,6 +91,7 @@ impl ReadCounters {
         add(&self.storage_reads, stats.storage_reads());
         add(&self.documents, stats.documents_examined());
         add(&self.matchers, stats.matcher_evaluations());
+        add(&self.matches, stats.source_matches());
         let outputs = match execution.result() {
             DocumentResult::Cursor(batch) => batch.documents().len(),
             DocumentResult::Distinct(values) => values.len(),
@@ -125,6 +131,7 @@ impl ReadCounters {
             storage_reads: get(&self.storage_reads),
             documents_examined: get(&self.documents),
             matcher_evaluations: get(&self.matchers),
+            source_matches: get(&self.matches),
             output_items: get(&self.outputs),
             point_plans: get(&self.point),
             index_candidate_plans: get(&self.indexed),

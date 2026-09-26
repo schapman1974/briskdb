@@ -48,9 +48,10 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
             scan.storage_reads,
             scan.documents_examined,
             scan.matcher_evaluations,
+            scan.source_matches,
             scan.output_items
         ),
-        (1, 14, 12, 12, 2)
+        (1, 14, 12, 12, 2, 2)
     );
     assert_eq!(
         (
@@ -71,6 +72,7 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     assert_eq!(point.storage_reads - scan.storage_reads, 1);
     assert_eq!(point.documents_examined - scan.documents_examined, 1);
     assert_eq!(point.matcher_evaluations, scan.matcher_evaluations);
+    assert_eq!(point.source_matches - scan.source_matches, 1);
     assert_eq!(point.shard_visits - scan.shard_visits, 1);
     let created = send_command(
         &mut stream,
@@ -97,6 +99,7 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     assert_eq!(indexed.index_candidate_plans, 1);
     assert_eq!(indexed.documents_examined - point.documents_examined, 2);
     assert_eq!(indexed.matcher_evaluations - point.matcher_evaluations, 2);
+    assert_eq!(indexed.source_matches - point.source_matches, 2);
     assert_eq!(indexed.storage_reads - point.storage_reads, 4);
     assert_eq!(indexed.shard_visits - point.shard_visits, 2);
     let mut sorted_find = find_by_a();
@@ -119,6 +122,7 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     );
     assert_eq!(sorted.documents_examined - indexed.documents_examined, 4);
     assert_eq!(sorted.matcher_evaluations - indexed.matcher_evaluations, 4);
+    assert_eq!(sorted.source_matches - indexed.source_matches, 4);
     assert_eq!(sorted.storage_reads - indexed.storage_reads, 6);
     // Catalog cursors and legacy count have no engine read-work snapshots.
     let listing = send_command(
@@ -188,6 +192,7 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
         (1, 0, 0)
     );
     assert_eq!(empty.fanout_buckets[0], 1);
+    assert_eq!(empty.source_matches, 0);
     server.set_read_metrics_enabled(false);
     assert_eq!(
         live_cursor_id(&send_command(&mut stream, &cursor_more("read_metrics", id, 1)).await),
@@ -203,6 +208,7 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     assert_eq!(continued.executions, 2);
     assert_eq!(continued.output_items, 6);
     assert!(continued.documents_examined >= 6);
+    assert_eq!(continued.source_matches, continued.documents_examined);
     let id = live_cursor_id(
         &send_command(&mut stream, &cursor_aggregate("read_metrics", 1, true)).await,
     );
@@ -215,6 +221,7 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
         continued.matcher_evaluations
     );
     assert_eq!(aggregated.shard_visits - continued.shard_visits, 2);
+    assert_eq!(aggregated.source_matches, aggregated.documents_examined);
     assert_eq!(
         live_cursor_id(&send_command(&mut stream, &cursor_more("read_metrics", id, 1000)).await),
         0
@@ -223,6 +230,7 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     assert_eq!(buffered.executions, 4);
     assert_eq!(buffered.output_items - aggregated.output_items, 6);
     assert_eq!(buffered.storage_reads, aggregated.storage_reads);
+    assert_eq!(buffered.source_matches, aggregated.source_matches);
     assert_eq!(buffered.shard_visits, aggregated.shard_visits);
     assert_eq!(buffered.fanout_buckets[0] - aggregated.fanout_buckets[0], 1);
     let values = send_command(
@@ -247,6 +255,7 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
         13
     );
     assert_eq!(distinct.shard_visits - buffered.shard_visits, 2);
+    assert_eq!(distinct.source_matches - buffered.source_matches, 13);
     // Stale continuations do not fabricate successful read work.
     assert_eq!(
         send_command(&mut stream, &cursor_more("read_metrics", id, 1000))

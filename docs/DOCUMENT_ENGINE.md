@@ -390,15 +390,19 @@ diagnostics; no Mongo `explain` response or physical-page accounting is implied.
 `DocumentReadOptions::with_execution_stats(true)` independently enables native
 per-request `DocumentExecution::read_stats()` (`execution_stats=True` /
 `result["read_stats"]` in sync/async Python). The payload-free snapshot contains
-record-read call counts, BSON documents examined, source-matcher
-evaluations, and actual distinct read shards. Exact-ID, pruned-shard, natural,
+record-read call counts, BSON documents examined, source-matcher evaluations,
+`source_matches`, and actual distinct read shards. A source match is a record
+observation accepted by the source predicate, including direct-ID hits and
+unfiltered reads, before sort-position rechecks, projection, skip/limit and
+pipeline stages. It is not a unique-document or returned-row count.
+Exact-ID, pruned-shard, natural,
 sorted, distinct and aggregation source reads share the collector. Lookahead
 and repeated sorting/source reads count again, including sorted-output refetches
 and their matcher rechecks; buffered aggregation pages can
 correctly report zero source work. Pipeline predicates, catalog/index-entry
 work and physical SQLite rows/pages/bytes are excluded. Each requested page
 starts fresh, detaches the collector before cursor retention, and charges a
-fixed conservative 160 bytes in output limits/page packing. Unrequested reads
+fixed conservative 192 bytes in output limits/page packing. Unrequested reads
 allocate no collector or update counters. Failed/aborted requests return no
 snapshot; counters saturate rather than wrap. This does not change filtering,
 routing, transaction boundaries or MongoDB wire explain support.

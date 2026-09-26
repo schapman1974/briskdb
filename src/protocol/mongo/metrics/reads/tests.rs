@@ -11,7 +11,7 @@ fn execution(plan: Option<DocumentPlan>, shards: u64) -> DocumentExecution {
         plan,
         DocumentResult::Distinct(vec![BsonValue::from("private-value")].into_boxed_slice()),
     )
-    .with_read_stats(Some(DocumentReadStats::from_counters(7, 5, 3, shards)))
+    .with_read_stats(Some(DocumentReadStats::from_counters(7, 5, 3, 2, shards)))
 }
 
 #[test]
@@ -73,9 +73,10 @@ fn read_metrics_classify_plans_without_retaining_payloads_or_counting_unobserved
             snapshot.storage_reads,
             snapshot.documents_examined,
             snapshot.matcher_evaluations,
+            snapshot.source_matches,
             snapshot.output_items
         ),
-        (63, 45, 27, 9)
+        (63, 45, 27, 18, 9)
     );
     assert_eq!(
         (snapshot.planned_shard_targets, snapshot.shard_visits),
@@ -114,11 +115,13 @@ fn read_metrics_bucket_every_bounded_fanout_and_saturate_totals() {
         .storage_reads
         .store(u64::MAX - 1, Ordering::Relaxed);
     counters.fanout[7].store(u64::MAX, Ordering::Relaxed);
+    counters.matches.store(u64::MAX - 1, Ordering::Relaxed);
     counters.shards[63].store(u64::MAX, Ordering::Relaxed);
     counters.observe(&execution(None, u64::MAX));
     let snapshot = counters.snapshot();
     assert_eq!(snapshot.executions, u64::MAX);
     assert_eq!(snapshot.storage_reads, u64::MAX);
+    assert_eq!(snapshot.source_matches, u64::MAX);
     assert_eq!(snapshot.fanout_buckets[7], u64::MAX);
     assert_eq!(snapshot.shard_requests[63], u64::MAX);
 }
@@ -147,5 +150,6 @@ fn read_metrics_toggle_preserves_inflight_observations_and_concurrent_totals() {
     assert_eq!(snapshot.reads.executions, 4000);
     assert_eq!(snapshot.reads.shard_visits, 8000);
     assert_eq!(snapshot.reads.storage_reads, 28000);
+    assert_eq!(snapshot.reads.source_matches, 8000);
     assert_eq!(snapshot.reads.fanout_buckets, [0, 0, 4000, 0, 0, 0, 0, 0]);
 }

@@ -83,6 +83,7 @@ class DocumentReadStats(TypedDict):
     storage_reads: int
     documents_examined: int
     matcher_evaluations: int
+    source_matches: int
     shards_read: List[int]
 
 class DocumentExecutionDiagnostics(TypedDict, total=False):

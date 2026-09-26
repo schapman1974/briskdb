@@ -15,7 +15,7 @@ use super::{
     validate_point_record,
 };
 use crate::{
-    core::engine::document_cursor::{CursorState, SortPosition},
+    core::engine::document_cursor::{CursorState, ReadStats, SortPosition},
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, ResultLimits},
     document::{
         BsonDocument, DocumentMatcher, DocumentReadOptions, DocumentSortKey, DocumentSorter,
@@ -316,14 +316,12 @@ impl Engine {
                             else {
                                 return Ok(None);
                             };
-                            if let (Some(_), Some(stats)) = (&fetch_matcher, &fetch_stats) {
-                                stats.match_document();
-                            }
                             if !still_selected(
                                 record.document(),
                                 fetch_matcher.as_deref(),
                                 &fetch_sorter,
                                 &expected.key,
+                                fetch_stats.as_deref(),
                                 &mut || check(cancellation, deadline),
                             )? {
                                 return Ok(None);
@@ -392,13 +390,20 @@ fn still_selected(
     matcher: Option<&DocumentMatcher>,
     sorter: &DocumentSorter,
     expected: &DocumentSortKey,
+    stats: Option<&ReadStats>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<bool> {
     check()?;
     if let Some(matcher) = matcher {
+        if let Some(stats) = stats {
+            stats.match_document();
+        }
         if !matcher.matches_with_check(document, check)? {
             return Ok(false);
         }
+    }
+    if let Some(stats) = stats {
+        stats.source_match();
     }
     let current = sorter.key_validated_with_check(document, check)?;
     check()?;
@@ -474,6 +479,7 @@ mod tests {
                 Some(&matcher),
                 &sorter,
                 &expected,
+                None,
                 &mut || Ok(())
             )
             .unwrap()
@@ -484,6 +490,7 @@ mod tests {
                 Some(&matcher),
                 &sorter,
                 &expected,
+                None,
                 &mut || Ok(())
             )
             .unwrap()
@@ -494,6 +501,7 @@ mod tests {
                 Some(&matcher),
                 &sorter,
                 &expected,
+                None,
                 &mut || Ok(())
             )
             .unwrap()
@@ -504,6 +512,7 @@ mod tests {
                 Some(&matcher),
                 &sorter,
                 &expected,
+                None,
                 &mut || Ok(())
             )
             .unwrap()
@@ -514,11 +523,12 @@ mod tests {
                 None,
                 &sorter,
                 &expected,
+                None,
                 &mut || Ok(())
             )
             .unwrap()
         );
-        let error = still_selected(&original, None, &sorter, &expected, &mut || {
+        let error = still_selected(&original, None, &sorter, &expected, None, &mut || {
             Err(EngineError::new(
                 EngineErrorKind::Cancelled,
                 "test cancellation",
@@ -526,6 +536,66 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn source_matches_are_counted_before_sort_position_rechecks() {
+        let document = |rank, visible| {
+            BsonDocument::from_entries([
+                ("rank", BsonValue::Int32(rank)),
+                ("visible", BsonValue::Boolean(visible)),
+            ])
+            .unwrap()
+        };
+        let original = document(1, true);
+        let sorter = DocumentSorter::compile(
+            &BsonDocument::from_entries([("rank", BsonValue::Int32(1))]).unwrap(),
+        )
+        .unwrap();
+        let matcher = DocumentMatcher::compile(
+            &BsonDocument::from_entries([("visible", BsonValue::Boolean(true))]).unwrap(),
+        )
+        .unwrap();
+        let expected = sorter.key(&original).unwrap();
+        let stats = ReadStats::default();
+        for (row, predicate, selected, matches, evaluations) in [
+            (document(2, true), Some(&matcher), false, 1, 1),
+            (document(1, false), Some(&matcher), false, 1, 2),
+            (original.clone(), Some(&matcher), true, 2, 3),
+            (original.clone(), None, true, 3, 3),
+        ] {
+            assert_eq!(
+                still_selected(
+                    &row,
+                    predicate,
+                    &sorter,
+                    &expected,
+                    Some(&stats),
+                    &mut || Ok(())
+                )
+                .unwrap(),
+                selected
+            );
+            assert_eq!(stats.snapshot().source_matches(), matches);
+            assert_eq!(stats.snapshot().matcher_evaluations(), evaluations);
+        }
+        let snapshot = stats.snapshot();
+        let error = still_selected(
+            &original,
+            Some(&matcher),
+            &sorter,
+            &expected,
+            Some(&stats),
+            &mut || {
+                Err(EngineError::new(
+                    EngineErrorKind::Cancelled,
+                    "test cancellation",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(stats.snapshot(), snapshot);
     }
 
     #[test]

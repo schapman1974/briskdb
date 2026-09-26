@@ -46,7 +46,10 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
     assert!(
         matches!(scan.plan(), Some(DocumentPlan::Scatter(plan)) if plan.read_access().is_none())
     );
+    let scan_matches = stats(&scan).source_matches();
     let expected = page(scan).1;
+    let expected_matches = expected.len() as u64;
+    assert_eq!(scan_matches, expected_matches);
     build(
         &engine,
         &session,
@@ -69,6 +72,7 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
         stats(&indexed).documents_examined(),
         stats(&indexed).matcher_evaluations()
     );
+    assert_eq!(stats(&indexed).source_matches(), expected_matches);
     assert_eq!(page(indexed).1, expected);
     let missing = call(
         &engine,
@@ -77,6 +81,7 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
     )
     .await;
     assert_eq!(stats(&missing).documents_examined(), 0);
+    assert_eq!(stats(&missing).source_matches(), 0);
     assert_eq!(stats(&missing).storage_reads(), 4);
     assert_eq!(stats(&missing).shards_read().count(), 4);
     for id in [1, 999] {
@@ -90,6 +95,7 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
         assert_eq!(actual.storage_reads(), 1);
         assert_eq!(actual.documents_examined(), u64::from(id == 1));
         assert_eq!(actual.matcher_evaluations(), 0);
+        assert_eq!(actual.source_matches(), u64::from(id == 1));
         assert_eq!(
             actual.shards_read().collect::<Vec<_>>(),
             point.plan().unwrap().shards()
@@ -116,6 +122,7 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
         subset.plan().unwrap().shards()
     );
     assert!(stats(&subset).shards_read().count() <= 2);
+    assert_eq!(stats(&subset).source_matches(), 2);
     assert_eq!(page(subset).1.len(), 2);
     drop_index(&engine, &session, &namespace).await;
     let scan = call(
@@ -125,6 +132,7 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
     )
     .await;
     assert_eq!(stats(&scan).documents_examined(), 14);
+    assert_eq!(stats(&scan).source_matches(), expected_matches);
     let ordinary = call(
         &engine,
         &session,
@@ -150,6 +158,7 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
     )
     .await;
     assert_eq!(stats(&first).storage_reads(), 0);
+    assert_eq!(stats(&first).source_matches(), 0);
     assert_eq!(stats(&first).shards_read().count(), 0);
     let mut cursor = page(first).0;
     let mut count = 0;
@@ -173,6 +182,10 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
             assert_eq!(stats(&next).storage_reads(), 3);
             assert!((1..=3).contains(&stats(&next).documents_examined()));
             assert_eq!(stats(&next).matcher_evaluations(), 0);
+            assert_eq!(
+                stats(&next).source_matches(),
+                stats(&next).documents_examined()
+            );
         } else {
             assert!(next.read_stats().is_none());
         }
@@ -199,6 +212,10 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
     .await;
     assert!(stats(&aggregate).documents_examined() >= 7);
     assert_eq!(stats(&aggregate).matcher_evaluations(), 0);
+    assert_eq!(
+        stats(&aggregate).source_matches(),
+        stats(&aggregate).documents_examined()
+    );
     let (cursor, _) = page(aggregate);
     let next = call(
         &engine,
@@ -216,6 +233,7 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
         "buffered aggregate output is not a new source read"
     );
     assert_eq!(stats(&next).shards_read().count(), 0);
+    assert_eq!(stats(&next).source_matches(), 0);
     let distinct = call(
         &engine,
         &session,
@@ -232,6 +250,10 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
     .await;
     assert!(stats(&distinct).documents_examined() >= 7);
     assert_eq!(stats(&distinct).matcher_evaluations(), 0);
+    assert_eq!(
+        stats(&distinct).source_matches(),
+        stats(&distinct).documents_examined()
+    );
     let sorted = call(
         &engine,
         &session,
@@ -246,6 +268,7 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
     assert_eq!(stats(&sorted).documents_examined(), 14);
     assert_eq!(stats(&sorted).storage_reads(), 16);
     assert_eq!(stats(&sorted).matcher_evaluations(), 0);
+    assert_eq!(stats(&sorted).source_matches(), 14);
     let filtered_sorted = call(
         &engine,
         &session,
@@ -259,7 +282,50 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
     assert_eq!(stats(&filtered_sorted).documents_examined(), 14);
     assert_eq!(stats(&filtered_sorted).storage_reads(), 16);
     assert_eq!(stats(&filtered_sorted).matcher_evaluations(), 14);
+    assert_eq!(stats(&filtered_sorted).source_matches(), 14);
     assert_eq!(page(filtered_sorted).1, page(sorted).1);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_matches_precede_skip_and_pipeline_filters() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    let namespace = ns("stats_source_matches");
+    seed(&engine, &session, &namespace, 7).await;
+    let skipped = call(
+        &engine,
+        &session,
+        command(
+            &namespace,
+            doc([("_id", BsonValue::Int32(1))]),
+            options().with_skip(1),
+        ),
+    )
+    .await;
+    assert_eq!(stats(&skipped).source_matches(), 1);
+    assert!(page(skipped).1.is_empty());
+    let pipeline = DocumentPipeline::new(vec![
+        doc([("$project", obj([("_id", BsonValue::Int32(1))]))]),
+        doc([("$match", obj([("_id", BsonValue::Int32(1))]))]),
+    ])
+    .unwrap();
+    let filtered = call(
+        &engine,
+        &session,
+        DocumentCommand::Aggregate(
+            DocumentAggregateRequest::new(namespace.clone(), pipeline, options()).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(stats(&filtered).matcher_evaluations(), 0);
+    assert_eq!(
+        stats(&filtered).source_matches(),
+        stats(&filtered).documents_examined()
+    );
+    assert!(stats(&filtered).source_matches() >= 7);
+    assert_eq!(page(filtered).1.len(), 1);
     engine.shutdown().await.unwrap();
 }
 
@@ -281,7 +347,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     for _ in 0..12 {
         let request = DocumentRequest::new(
             DocumentRequestId::new([2; 16]).unwrap(),
-            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 159).unwrap()),
+            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 191).unwrap()),
             command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
         );
         assert_eq!(
@@ -295,7 +361,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     }
     let request = DocumentRequest::new(
         DocumentRequestId::new([3; 16]).unwrap(),
-        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 160).unwrap()),
+        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 192).unwrap()),
         command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
     );
     assert_eq!(
@@ -311,7 +377,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
         .await;
         let documents = page(result).1;
         let row = 17 + encode_document(&documents[0]).unwrap().len() as u64;
-        let read = options().with_batch_byte_limit(base + 160 + row).unwrap();
+        let read = options().with_batch_byte_limit(base + 192 + row).unwrap();
         let command = if aggregate {
             DocumentCommand::Aggregate(
                 DocumentAggregateRequest::new(
