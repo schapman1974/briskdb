@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 456 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 468 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -59,14 +59,14 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_optimistic_inserts.py`, `test_sharded_sqlite_concurrency.py` and
 `test_sqlite_unique_update_fast_path.py`, `test_sqlite_bulk_updates.py`,
 `test_warning_attribution.py`, `test_mongo_like.py` and
-`test_bulk_insert_planning.py` suites
-(982 reference parameter cases). 261 added wheel scenarios and existing patch
+`test_bulk_insert_planning.py` and `test_storage_backends.py` suites
+(997 reference parameter cases). 264 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 982 unchanged upstream candidate passes or complete #186 certification.
+not 997 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -163,6 +163,16 @@ The genuine legacy-file import drill also checks negative-zero sign preservation
 decimal aliases and distinct string/number IDs after import and reopen, while
 verifying the source remains unchanged. Private Python planner/decoder counters
 and SQL trace patterns are not native performance guarantees.
+
+Storage-backend coverage verifies default/`sqlite`/`sqlite-sharded` aliases,
+logical collection separation, native manifest/shard layout and common query/
+mutation results through reopen. Foreign backends reject before folder creation
+or storage acquisition; their file formats and private client attributes are not
+emulated. A separate real `SQLiteStorage` legacy single-blob import drill preserves
+ObjectId, datetime, UUID-subtype Binary and empty collections through stock-driver
+writes and reopen. TinyMongo's own in-place migration runs only on a disposable
+copy for reference validation; the actual source remains byte-for-byte unchanged.
+This does not add DuckDB/Parquet ingestion or automatic migration on client open.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
