@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 505 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 516 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -60,14 +60,15 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_unique_update_fast_path.py`, `test_sqlite_bulk_updates.py`,
 `test_warning_attribution.py`, `test_mongo_like.py` and
 `test_bulk_insert_planning.py`, `test_storage_backends.py` and
-`test_sqlite_complex_read_candidates.py` and `test_sqlite_read_optimizations.py` suites
-(1,034 reference parameter cases). 275 added wheel scenarios and existing patch
+`test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
+`test_sharded_sqlite_coverage_mutations.py` suites
+(1,046 reference parameter cases). 278 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,034 unchanged upstream candidate passes or complete #186 certification.
+not 1,046 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -193,6 +194,15 @@ are not SQLite page I/O or Python decoder counts. A retained collection handle
 observes another client's logical drop/recreate without stale data/index metadata.
 An unverifiable legacy container-ID alias is explicitly rejected during import
 without writing to its source.
+
+Routed mutation scenarios deliberately place the natural first document on a
+higher-numbered shard, then verify no-op/single/multi updates, cross-shard unique
+replacement conflicts, exact-ID point plans and grouped deletes through reopen.
+Public empty insert batches reject; duplicates retain the documented per-document
+commit behavior rather than private prepared-batch rollback. Existing native
+SQLite FULL and before/after-commit process-death gates cover actual transaction
+rollback and prior-commit durability; they do not impersonate Python connection
+proxies or guarantee whole-batch atomicity.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary

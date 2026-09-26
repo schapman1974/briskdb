@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty locked suites is classified; 1034 reference parameter cases are not 1034 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-one locked suites is classified; 1046 reference parameter cases are not 1046 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3999,6 +3999,101 @@
             "python/tests/test_upstream_complex_reads.py::test_or_negative_exists_and_large_membership_do_not_lose_candidates"
           ],
           "note": "The source injects a failure into a private Python SQL compiler. Native exists/missing and OR/negative candidate results are tested directly; no private compiler fallback hook or swallowed arbitrary Rust/storage failure is promised."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_coverage_mutations.py",
+      "sha256": "55918644755b0a8fb1e3076508791a4b643399e197dd17dd41509900e2e04a8a",
+      "reference_case_count": 12,
+      "function_count": 11,
+      "coverage": [
+        {
+          "source": [
+            "test_conflict_candidate_helpers_route_and_fail_closed"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_cross_shard_unique_updates_noops_and_replacement_preserve_owners",
+            "python/tests/test_upstream_shard_mutations.py::test_public_empty_and_duplicate_batches_keep_per_document_commit_contract"
+          ],
+          "note": "Private prepared/candidate hooks, fake shard callbacks and None sentinel fallback are not BriskDB APIs. Actual IDs are selected from native plans to occupy both shards; real cross-shard unique owners and ordered/unordered duplicate outcomes are verified without spoofing storage callbacks."
+        },
+        {
+          "source": [
+            "test_direct_prevalidated_insert_and_empty_prepared_batch"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_public_empty_and_duplicate_batches_keep_per_document_commit_contract"
+          ],
+          "note": "Real public insert_many accepts valid data with bypass_document_validation=True but still enforces ID uniqueness. Empty public batches raise TypeError, unlike the private prepared helper's empty-list return; no validation-bypassing internal backend hook is exposed."
+        },
+        {
+          "source": [
+            "test_insert_integrity_failure_rolls_back_before_any_commit"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_public_empty_and_duplicate_batches_keep_per_document_commit_contract",
+            "tests/document_engine.rs::insert_batches_preserve_partial_results_ordering_and_restart"
+          ],
+          "note": "BriskDB's public batch commits per document: a duplicate at position 1 leaves position 0 committed; ordered stops, unordered continues to the other shard, with exact original-op errors and counts. This differs deliberately from TinyMongo's private prevalidated same-shard whole-batch transaction rollback. Native engine coverage also checks same/different-shard restart behavior."
+        },
+        {
+          "source": [
+            "test_insert_runtime_failure_rolls_back_before_any_commit"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document/enabled/fault_tests.rs::sqlite_full_rolls_back_documents_and_unique_entries_then_recovers"
+          ],
+          "note": "The source monkeypatches a private insert callback. Native actual SQLite FULL failures during record/index writes test rollback of the current transaction, unchanged records/indexes/checksums, retained/released unique fence, successful subsequent retry and reopen. No Python RuntimeError injection surface is exposed."
+        },
+        {
+          "source": [
+            "test_insert_commit_failure_after_another_shard_committed_is_loud"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/core/engine/document_engine/write_recovery.rs::every_batch_commit_recovers_records_indexes_and_conditional_retries",
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_failure_rolls_back_one_shard_but_preserves_prior_shard_commits"
+          ],
+          "note": "Private Python connection-proxy exceptions are not native interfaces. Actual process death immediately before/after every input/shard commit verifies exact prior-commit durability, record/index recovery and conditional retries; the wire separately verifies terminal partial-failure errors rather than safe write-error continuation. These are explicit native failure boundaries, not a claim to execute TinyMongo's mocked commit exception types."
+        },
+        {
+          "source": [
+            "test_unique_update_paths_and_unique_replace_validation"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_cross_shard_unique_updates_noops_and_replacement_preserve_owners"
+          ],
+          "note": "On proven distinct physical shards, unique ownership, miss/no-op counts, natural-first updates, full replacement and cross-shard conflict rejection preserve exact documents through reopen. Python validate_document callbacks and modified-ID-list returns are replaced by native validation and real PyMongo results."
+        },
+        {
+          "source": [
+            "test_nonunique_single_update_methods_stop_after_first_matching_shard",
+            "test_nonunique_single_updates_use_global_merged_natural_order",
+            "test_nonunique_direct_id_single_updates_keep_targeted_route"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_cross_shard_unique_updates_noops_and_replacement_preserve_owners",
+            "python/tests/test_upstream_shard_mutations.py::test_natural_first_targeted_updates_and_grouped_deletes_keep_exact_counts"
+          ],
+          "note": "Natural first is deliberately on shard 1 and the later row on shard 0. Single updates/no-ops never skip ahead; residual predicates select the remaining row, multi updates cover both, and direct/equality IDs mutate only their target. Reopened native diagnostics prove the exact-ID update is a point plan for shard 0."
+        },
+        {
+          "source": [
+            "test_nonunique_updates_handle_an_empty_internal_route",
+            "test_delete_ids_empty_and_grouped_across_shards"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_shard_mutations.py::test_natural_first_targeted_updates_and_grouped_deletes_keep_exact_counts"
+          ],
+          "note": "Public empty-membership updates/deletes return zero without changes, and grouped deletion removes both proven-shard IDs with exact counts and empty reopen. A monkeypatched empty _target_shards tuple and private delete_ids return value are not native APIs."
         }
       ]
     }
