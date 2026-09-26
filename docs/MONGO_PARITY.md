@@ -1233,6 +1233,78 @@ operator validation, regex boundaries, and numeric families. This separate
 matcher matrix does not mark the full frozen candidate command corpus as passed.
 The broader #167 consumer/dialect conformance work remains open.
 
+## Reproducible public-client performance comparison
+
+`scripts/mongo_benchmark.py` runs the same checked synchronous workloads in isolated
+interpreters against the installed BriskDB wheel and the locked TinyMongo
+`sqlite-sharded` backend. A disposable MongoDB reference is optional. It covers
+seed inserts, point reads/inserts/updates/deletes, equality-index creation/queries,
+scans, grouped aggregation, cursor iteration, sorted scatter queries and a
+concurrent insert wave. Every operation's result is checked; individual command
+checks are outside their timers, while per-insert checks inside the threaded wave
+are included. All trials/backends must finish with identical document counts and
+content hashes.
+
+```sh
+python scripts/mongo_benchmark.py \
+  --briskdb-python /absolute/path/to/candidate/bin/python \
+  --tinymongo-python /absolute/path/to/locked-oracle/bin/python \
+  --documents 1000 --operations 64 --trials 3 --shards 4 --workers 4 \
+  --output mongo-benchmark-new.json
+```
+
+Use the isolated oracle environment described below, with source commit
+`53cbf44e98b8caa036163725d195fd29592e1cc0`, and a release-built candidate wheel.
+The interpreters are invoked with `-I`; candidate code never imports TinyMongo.
+An explicit `--mongodb-uri mongodb://127.0.0.1:PORT` plus
+`--mongodb-environment 'version/image digest, storage, CPU/memory limits'` adds a
+reference using the candidate environment's stock PyMongo. Remote addresses,
+credentials, URI database names and options are rejected. The worker creates and
+drops only a generated `briskdb_bench_<uuid>` database carrying the exact random
+ownership claim; timeout cleanup is retried by the parent and refuses an
+unclaimed/preexisting namespace. Local backend roots are fresh temporary directories, never an
+application database. Output files are exclusive-created, not overwritten.
+
+Raw reports retain every elapsed-nanosecond sample, operation units, runtime
+versions, candidate binary/Python hashes, the full reference Python-package hash
+and host configuration. Backend order rotates between trials. Startup/import
+timing is separate; up to 16 exact-ID reads warm each trial. Seed inserts and
+threaded waves use submitted-document units; scans/group/iteration use
+fixture-document units; the other workloads use one command per unit. Thread
+start/barrier/join and result materialization are included. These are end-to-end
+client costs, not equivalent storage implementations: TinyMongo is in-process;
+BriskDB and MongoDB use a wire driver, and Docker-hosted MongoDB uses VM storage.
+Backend transaction, bulk-commit and durability policies are not normalized.
+TinyMongo iteration has no server `getMore` batching; wire clients request
+64-record batches. No automatic write retries, cold-cache, durability,
+sustained-load or statistical speedup claim is implied.
+
+The installed-wheel CI tier runs a small correctness smoke, not a noisy timing
+threshold. For a controlled performance run, supply `--baseline previous.json
+--maximum-regression-ratio 1.5`. This gate requires at least three trials and
+matching workload/configuration/host/reference-runtime metadata, recomputes
+summaries from raw measurements, and fails if any median time per unit exceeds
+the selected ratio. Rebaseline deliberately when the workload or host changes;
+do not use another machine's sample as an acceptance threshold. The broader
+release/application/security/soak requirements of #185 remain separate.
+
+The [2026-09-26 raw example](benchmarks/mongo-public-clients-2026-09-26.json)
+records 1,000 seed documents, 64 operations, three rotating trials, four shards
+and four writer threads on macOS ARM64. It uses a development release-built
+BriskDB wheel from source at `aca9ea8e75dfc514e16a02c4db263408d1e649d3`, not the
+published alpha.7 feature set; TinyMongo is source-locked 1.3.0, and MongoDB 7.0.43
+runs in Docker Desktop with its image digest and resource limits recorded.
+All nine runs finish with the same 1,256 documents and content hash.
+
+| Median command latency in this small workload | BriskDB wire | TinyMongo in-process | MongoDB Docker wire |
+| --- | ---: | ---: | ---: |
+| Exact-ID read | 9.007 ms | 0.060 ms | 0.993 ms |
+| Exact-ID update | 9.854 ms | 0.643 ms | 0.982 ms |
+| Indexed equality query (materialized) | 41.531 ms | 4.543 ms | 2.261 ms |
+
+This snapshot exposes substantial current BriskDB overhead to profile; it does
+not demonstrate performance parity, a universal ranking, or a release pass.
+
 ## Versioned files
 
 [`compat/mongo/v1/manifest.json`](../compat/mongo/v1/manifest.json) is the

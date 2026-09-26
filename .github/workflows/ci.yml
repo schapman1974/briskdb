@@ -588,6 +588,12 @@ jobs:
           python -m unittest discover -s python/tests -p test_index_models_reference.py -v
           python -m unittest discover -s python/tests -p test_index_suite_inventory.py -v
           python -m unittest discover -s python/tests -p test_query_suite_inventory.py -v
+          python -m unittest discover -s tests -p test_mongo_benchmark.py -v
+          python scripts/mongo_benchmark.py \
+            --briskdb-python "$(command -v python)" \
+            --tinymongo-python "$BRISKDB_MONGO_ORACLE_PYTHON" \
+            --documents 32 --operations 4 --trials 1 --shards 2 --workers 2 \
+            --output "${{ runner.temp }}/mongo-benchmark-smoke.json"
 
       - name: Test and lint the native extension
         run: |

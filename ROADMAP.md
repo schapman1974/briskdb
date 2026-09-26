@@ -1021,7 +1021,14 @@ requires an earlier dependency:
       incomplete restores fail closed and the unchanged original source remains
       usable for pre-cutover rollback. This is not online backup, reverse data
       migration, cross-version/power-loss proof or complete release acceptance;
-      comparative benchmarks and wider app/soak/security gates remain open.
+      a checked 12-workload benchmark now compares isolated release-wheel,
+      locked TinyMongo sharded-SQLite and optional MongoDB reference clients.
+      Raw timings, configuration/provenance and final-record hashes are retained;
+      CI runs correctness smoke and controlled hosts can gate median regressions
+      against a matching baseline. Cross-implementation timings are not equivalent
+      transport/storage costs or a speedup claim. Wider app/soak/security gates,
+      representative sustained-load evidence and complete release acceptance
+      remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can now inspect payload-free listener-local Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way
