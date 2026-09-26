@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 325 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 333 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -53,17 +53,26 @@ functions in the locked `test_query_more.py`,
 `test_aggregation_projection_stages.py`, `test_aggregation.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
 `test_async_api.py`, `test_bson_registry_hardening.py`, `test_patching.py`,
-`test_pymongo_dropin.py` and `test_pymongo_contract.py` suites
-(740 reference parameter cases). 212 added wheel scenarios and existing patch
+`test_pymongo_dropin.py`, `test_pymongo_contract.py` and
+`test_talkpython_regressions.py` suites
+(766 reference parameter cases). 219 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 740 unchanged upstream candidate passes or complete #186 certification.
+not 766 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
+
+The original Talk Python regressions additionally cover every generated-ID write
+path, no-match invalid-payload rejection and ObjectId/datetime/binary/compound
+sorting. These seven adapted wheel scenarios are separate from the unchanged
+Talk Python contract runner below. Explicit string IDs work, but TinyMongo's
+`generate_id` export and no-BSON fallback allocator are not provided. Python-only
+`date` values fail BSON encoding before a batch is sent, rather than entering a
+warning-based in-memory cursor sorter.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
