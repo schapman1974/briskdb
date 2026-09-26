@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-two locked suites is classified; 671 reference parameter cases are not 671 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-three locked suites is classified; 691 reference parameter cases are not 691 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2343,6 +2343,129 @@
             "python/tests/test_patching.py::test_cancellation_during_exit_waits_for_native_release"
           ],
           "note": "A bounded barrier verifies cancelled direct-client close waits for native release, then acknowledged data is reopened. Shared async competing increments are checked separately. TinyMongo's arbitrary synchronous _state.call callback/draining mechanism is private and is not an equivalent BriskDB API or a guarantee that already-pending wire calls complete successfully during shutdown."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_bson_registry_hardening.py",
+      "sha256": "6a8c728a00c7a4fcd2dff729fbd88ac861974b84c25c9d6a4d70532ef8e91b17",
+      "reference_case_count": 20,
+      "function_count": 14,
+      "coverage": [
+        {
+          "source": [
+            "test_core_datetime_and_binary_values_do_not_require_pymongo",
+            "test_core_memory_crud_sort_and_batch_work_without_pymongo"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_datetime_binary_sort_and_unordered_batch_use_real_bson"
+          ],
+          "note": "Date/bytes roundtrip, date sorting and unordered duplicate continuation are checked through real wire operations. Unlike TinyMongo's optional-Python fallback, this addon requires PyMongo; bytearray is rejected by its BSON encoder and callers must convert it to bytes."
+        },
+        {
+          "source": [
+            "test_registry_is_the_encoding_metadata_source"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_extended_types_roundtrip_as_native_bson_not_python_registry_tags"
+          ],
+          "note": "Date/ObjectId/Decimal128/binary/UUID/native-regex/BSON-regex retain wire bytes with standard UUID representation. TinyMongo's Python registry metadata and tagged-JSON storage fields are private implementation details; Python patterns decode as bson.Regex."
+        },
+        {
+          "source": [
+            "test_binary_and_numeric_identity_keys_follow_bson_equality"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_binary_and_numeric_equality_preserve_bson_subtypes"
+          ],
+          "note": "Public equality checks subtype-0 bytes aliases, subtype-4 distinction, exact numeric families versus bool, binary 0.1 versus decimal 0.1, and numeric NaN aliases. Private Python identity tuples and bytearray conversion are not a native interface."
+        },
+        {
+          "source": [
+            "test_uuid_and_regex_identity_keys_match_their_bson_wire_values"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_uuid_and_regex_identity_and_scalar_order_match_wire_values"
+          ],
+          "note": "Standard UUID and subtype-4 binary aliases, native/BSON regex flags, ignored unknown Regex-constructor flags and bytes patterns are checked through wire equality. Private regex_components validation methods are not exported."
+        },
+        {
+          "source": [
+            "test_uuid_and_regex_follow_mongodb_scalar_sort_order"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_uuid_and_regex_identity_and_scalar_order_match_wire_values"
+          ],
+          "note": "Native whole-value sorting preserves UUID byte order and regex pattern/options ordering without exposing Python tuple sort keys."
+        },
+        {
+          "source": [
+            "test_numeric_sort_places_nan_below_all_other_numbers",
+            "test_equal_bson_sort_keys_preserve_input_order_in_both_directions"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_nan_order_and_equal_sort_keys_preserve_explicit_input_order"
+          ],
+          "note": "NaNs sort below other numeric values; equal numeric and millisecond-normalized date keys preserve a deliberately sorted input sequence in both directions. Unsorted insertion order across native shards is not promised."
+        },
+        {
+          "source": [
+            "test_recursive_bson_equality_preserves_nested_scalar_types"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_recursive_bson_equality_keeps_nested_bool_and_document_order"
+          ],
+          "note": "Native grouping checks whole-value recursive numeric identity, bool separation, ordered objects and array/object differences. Scalar query element matching is checked separately. Arbitrary Python sets/objects fail driver encoding instead of participating in TinyMongo's private fallback equality."
+        },
+        {
+          "source": [
+            "test_datetime_identity_normalizes_to_signed_utc_milliseconds"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_datetime_identity_uses_signed_utc_milliseconds"
+          ],
+          "note": "Timezone aliases, submillisecond equality, adjacent milliseconds and the negative epoch millisecond are checked via native stored/query values."
+        },
+        {
+          "source": [
+            "test_malformed_and_unknown_tags_are_preserved_exactly",
+            "test_valid_datetime_and_object_id_tags_still_decode"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_json_tag_lookalikes_stay_documents_including_valid_tags",
+            "python/tests/test_upstream_bson_registry.py::test_extended_types_roundtrip_as_native_bson_not_python_registry_tags"
+          ],
+          "note": "Malformed/unknown and valid TinyMongo JSON tag lookalikes all remain ordinary native BSON documents. Real datetime/ObjectId values use BSON types, not implicit decoding of user-shaped JSON markers."
+        },
+        {
+          "source": [
+            "test_fresh_process_without_pymongo_keeps_core_codec_available"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_extended_types_roundtrip_as_native_bson_not_python_registry_tags",
+            "python/tests/test_patching.py::test_import_and_scope_construction_do_not_require_pymongo"
+          ],
+          "note": "The native BriskDB package remains importable without optional PyMongo, but its real Mongo client/patch addon deliberately raises an installation-guidance ImportError. TinyMongo's optional Python codec/registry/ID/error fallback is not implemented; actual BSON behaviors are tested with the required driver."
+        },
+        {
+          "source": [
+            "test_sync_and_async_sqlite_uuid_regex_work_without_pymongo"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_uuid_regex_survive_sync_and_async_reopen_with_required_driver"
+          ],
+          "note": "UUID/regex values and queries survive sync-to-async-to-sync native reopen with required PyMongo and explicit standard UUID representation. This does not claim TinyMongo's dependency-free Python client or Python re.Pattern return type."
         }
       ]
     }

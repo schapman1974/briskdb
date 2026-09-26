@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 278 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 292 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -52,13 +52,13 @@ functions in the locked `test_query_more.py`,
 `test_uuid_regex.py`, `test_aggregation_basic_stages.py`,
 `test_aggregation_projection_stages.py`, `test_aggregation.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
-`test_async_api.py` suites
-(671 reference parameter cases). 193 owned wheel tests check public
+`test_async_api.py` and `test_bson_registry_hardening.py` suites
+(691 reference parameter cases). 202 owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 671 unchanged upstream candidate passes or complete #186 certification.
+not 691 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -140,6 +140,12 @@ helpers, database context managers, permanent-close semantics and metadata retur
 differ from modern PyMongo. Full database statistics remain the #166 gap; no
 TinyMongo private callback/cache or successful in-flight-call shutdown guarantee
 is claimed.
+
+Type-registry coverage checks BSON subtype/numeric/recursive identity, UUID and
+regex ordering, stable explicitly ordered sort ties, signed UTC milliseconds,
+tag-lookalike documents and sync/async persistence. The Mongo client addon needs
+PyMongo; its encoder rejects `bytearray` (convert to `bytes`). Native values do
+not use TinyMongo's optional Python registry or implicitly decode its JSON tags.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings
