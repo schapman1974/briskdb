@@ -71,7 +71,10 @@ enum DocumentIndexOperation {
     Build(String),
     Drop(String),
     Create(crate::document::DocumentIndexRequest),
-    CreateBatch(Box<[crate::document::DocumentIndexRequest]>),
+    CreateBatch {
+        indexes: Box<[crate::document::DocumentIndexRequest]>,
+        resolve_names: bool,
+    },
     DropBatch(Option<String>),
 }
 
@@ -139,6 +142,7 @@ impl Engine {
                 }
             }
             DocumentCommand::CreateIndexes(request) => {
+                let resolve_names = request.resolve_names();
                 let (namespace, indexes, options) = request.into_parts();
                 if let Err(error) = require_catalog_write_options(options) {
                     Err(error)
@@ -148,7 +152,10 @@ impl Engine {
                         session,
                         request_id,
                         namespace,
-                        DocumentIndexOperation::CreateBatch(indexes),
+                        DocumentIndexOperation::CreateBatch {
+                            indexes,
+                            resolve_names,
+                        },
                     )
                     .await
                 }
@@ -1223,21 +1230,41 @@ impl Engine {
                         DocumentResult::IndexesDropped { before, after },
                     ));
                 }
-                if let DocumentIndexOperation::CreateBatch(indexes) = action {
+                if let DocumentIndexOperation::CreateBatch {
+                    indexes,
+                    resolve_names,
+                } = action
+                {
                     let definitions = crate::document::normalize_index_batch(indexes, &mut || {
                         ensure_document_cpu_active(&cancellation, &worker_control)
                     })?;
                     let execution = DocumentExecution::new(
                         request_id,
                         None,
-                        DocumentResult::IndexesBuilt {
-                            before: 0,
-                            after: 0,
+                        if resolve_names {
+                            // Reuse may resolve to a longer existing name. Admit
+                            // the bounded worst case before the first mutation.
+                            DocumentResult::IndexModelsBuilt {
+                                names: vec![
+                                    "x".repeat(
+                                        crate::document::MAX_DOCUMENT_INDEX_NAME_BYTES
+                                    );
+                                    definitions.len()
+                                ]
+                                .into_boxed_slice(),
+                                before: 0,
+                                after: 0,
+                            }
+                        } else {
+                            DocumentResult::IndexesBuilt {
+                                before: 0,
+                                after: 0,
+                            }
                         },
                     );
                     enforce_execution_result_limits(&execution, result_limits)?;
                     connections.retire_idle_for_schema_migration()?;
-                    let (before, after) = storage.create_document_indexes_controlled(
+                    let (before, after, names) = storage.create_document_indexes_controlled(
                         &namespace,
                         definitions,
                         migration,
@@ -1246,11 +1273,19 @@ impl Engine {
                     return Ok(DocumentExecution::new(
                         request_id,
                         None,
-                        DocumentResult::IndexesBuilt { before, after },
+                        if resolve_names {
+                            DocumentResult::IndexModelsBuilt {
+                                before,
+                                after,
+                                names,
+                            }
+                        } else {
+                            DocumentResult::IndexesBuilt { before, after }
+                        },
                     ));
                 }
                 let (name, declaration, response) = match action {
-                    DocumentIndexOperation::CreateBatch(_)
+                    DocumentIndexOperation::CreateBatch { .. }
                     | DocumentIndexOperation::DropBatch(_) => unreachable!("batch handled above"),
                     DocumentIndexOperation::Create(index) => {
                         let (specification, name, unique) =
@@ -2726,6 +2761,14 @@ fn enforce_execution_result_limits_with_check(
             budget.add_rows(1)?;
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 16)?;
         }
+        DocumentResult::IndexModelsBuilt { names, .. } => {
+            budget.add_rows(1)?;
+            budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + 2 * DOCUMENT_RESULT_VALUE_BYTES + 16)?;
+            for name in names {
+                check()?;
+                budget.add_bytes(DOCUMENT_RESULT_VALUE_BYTES + name.len() as u64)?;
+            }
+        }
         DocumentResult::Indexes(indexes) => {
             budget.add_rows(indexes.len())?;
             for index in indexes {
@@ -2859,6 +2902,7 @@ fn execution_result_is_mutation(result: &DocumentResult) -> bool {
             | DocumentResult::IndexReady(_)
             | DocumentResult::IndexBuilt { .. }
             | DocumentResult::IndexesBuilt { .. }
+            | DocumentResult::IndexModelsBuilt { .. }
             | DocumentResult::IndexesDropped { .. }
             | DocumentResult::CursorKilled(_)
     )
@@ -2904,6 +2948,112 @@ mod tests {
         document::{DocumentCollectionOptions, DocumentCreateCollectionRequest, DocumentRequestId},
         storage::SchemaGateState,
     };
+
+    #[cfg(feature = "mongo")]
+    #[tokio::test]
+    async fn index_model_names_preflight_worst_case_result_before_building() {
+        use crate::document::{DocumentCreateIndexesRequest, DocumentIndexRequest};
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open(root.path(), 2).await.unwrap();
+        let session = engine.session();
+        let identity = DocumentRequestId::new([9; 16]).unwrap();
+        let namespace = DocumentNamespace::new("app", "items").unwrap();
+        engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    identity,
+                    RequestContext::new(),
+                    DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                        namespace.clone(),
+                        DocumentCollectionOptions::empty(),
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        let command = || {
+            DocumentCommand::CreateIndexes(
+                DocumentCreateIndexesRequest::new(
+                    namespace.clone(),
+                    vec![
+                        DocumentIndexRequest::new(
+                            BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                        )
+                        .unwrap(),
+                    ],
+                    DocumentWriteOptions::new(),
+                )
+                .unwrap()
+                .with_resolved_names(),
+            )
+        };
+        // A short requested name may resolve to a 255-byte existing name.
+        let required = DOCUMENT_RESULT_ENVELOPE_BYTES
+            + DOCUMENT_RESULT_ROW_BYTES
+            + 3 * DOCUMENT_RESULT_VALUE_BYTES
+            + 16
+            + crate::document::MAX_DOCUMENT_INDEX_NAME_BYTES as u64;
+        let before = engine.inner.database.storage.document_catalog().unwrap();
+        let rejected = engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    identity,
+                    RequestContext::new()
+                        .with_result_limits(ResultLimits::new(1, required - 1).unwrap()),
+                    command(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(
+            engine.inner.database.storage.document_catalog().unwrap(),
+            before
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    DocumentRequest::new(
+                        identity,
+                        RequestContext::new().with_cancellation_token(token),
+                        command()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            engine.inner.database.storage.document_catalog().unwrap(),
+            before
+        );
+        let result = engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    identity,
+                    RequestContext::new()
+                        .with_result_limits(ResultLimits::new(1, required).unwrap()),
+                    command(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.result(),
+            &DocumentResult::IndexModelsBuilt {
+                names: vec!["value_1".into()].into_boxed_slice(),
+                before: 1,
+                after: 2
+            }
+        );
+        engine.shutdown().await.unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accepted_drop_recovers_after_cancel_deadline_and_task_abort() {

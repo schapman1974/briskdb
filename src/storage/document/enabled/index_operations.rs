@@ -562,7 +562,7 @@ impl Storage {
         indexes: Vec<crate::document::DocumentIndexBuildDefinition>,
         mut migration: SchemaMigrationGuard,
         control: Arc<OperationControl>,
-    ) -> EngineResult<(u64, u64)> {
+    ) -> EngineResult<(u64, u64, Box<[String]>)> {
         let result = (|| {
             ensure_control_active(&control, "before creating document indexes")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -587,14 +587,55 @@ impl Storage {
                         .count() as u64)
                 })?;
             let mut after = before;
+            let mut names = Vec::with_capacity(indexes.len());
             for index in indexes {
                 ensure_control_active(&control, "between document index builds")?;
                 if let crate::document::DocumentIndexBuildDefinition::Secondary {
                     specification,
                     name,
                     unique,
+                    reuse_equivalent,
                 } = index
                 {
+                    if reuse_equivalent {
+                        // Planning and creation share this same exclusive schema
+                        // and process admission. Reload after each earlier batch
+                        // entry; a client-side list-then-create cannot do this.
+                        let reused = run_manifest_controlled(
+                            &mut connection,
+                            Arc::clone(&control),
+                            |connection| {
+                                require_ready_manifest(connection, self.shard_count())?;
+                                let catalog = load_catalog_rows(connection)?;
+                                let collection = catalog.collection(namespace.database(), namespace.collection())
+                                .ok_or_else(|| corrupt("document index namespace disappeared under exclusive admission"))?;
+                                let proposed = DocumentIndexMetadata::from_validated_parts(
+                                    DocumentIndexId::from_validated(1),
+                                    name.clone(),
+                                    specification.clone(),
+                                    unique,
+                                    false,
+                                    DocumentIndexLifecycle::PendingBuild,
+                                );
+                                for existing in collection.indexes() {
+                                    ensure_control_active(
+                                        &control,
+                                        "while resolving an equivalent document index",
+                                    )?;
+                                    if existing.lifecycle() == DocumentIndexLifecycle::Ready
+                                        && equivalent_definition(existing, &proposed)
+                                    {
+                                        return Ok(Some(existing.name().to_owned()));
+                                    }
+                                }
+                                Ok(None)
+                            },
+                        )?;
+                        if let Some(name) = reused {
+                            names.push(name);
+                            continue;
+                        }
+                    }
                     after = self
                         .build_or_create_document_index_under_guard(
                             namespace.database(),
@@ -606,10 +647,13 @@ impl Storage {
                             true,
                         )?
                         .after;
+                    names.push(name);
+                } else {
+                    names.push("_id_".to_owned());
                 }
             }
             migration.publish_ready()?;
-            Ok((before, after))
+            Ok((before, after, names.into_boxed_slice()))
         })();
         self.fail_closed_on_corruption(result)
     }

@@ -6,6 +6,41 @@ use crate::document::{DocumentIndexError, DocumentIndexRequest, normalize_index_
 pub(in crate::protocol::mongo) struct PreparedIndexes {
     pub(super) request: DocumentCreateIndexesRequest,
     pub(super) warnings: Vec<BsonValue>,
+    pub(super) model_names: Option<Vec<ModelName>>,
+}
+
+pub(super) struct ModelName {
+    requested: String,
+    index: Option<usize>,
+    warning: Option<usize>,
+}
+
+pub(super) fn model_reply(
+    before: u64,
+    after: u64,
+    mut warnings: Vec<BsonValue>,
+    models: Vec<ModelName>,
+    names: &[String],
+) -> BsonDocument {
+    let mut resolved = Vec::with_capacity(models.len());
+    for model in models {
+        let name = model.index.map_or(&model.requested, |index| &names[index]);
+        if name != &model.requested {
+            if let Some(warning) = model.warning {
+                if let BsonValue::Document(warning) = &mut warnings[warning] {
+                    warning
+                        .push("reusedIndex", BsonValue::String(name.clone()))
+                        .expect("static field");
+                }
+            }
+        }
+        resolved.push(BsonValue::String(name.clone()));
+    }
+    let mut result = reply(before, after, warnings);
+    result
+        .push("briskdbIndexNames", BsonValue::Array(resolved))
+        .expect("static field");
+    result
 }
 
 pub(super) fn reply(before: u64, after: u64, warnings: Vec<BsonValue>) -> BsonDocument {
@@ -73,8 +108,11 @@ pub(super) fn prepare(
         return Err(CommandError::invalid());
     }
     let documents = write_documents(request, "indexes")?;
+    let compatibility =
+        request.body.get_first("briskdbIndexModelCompatibility") == Some(&BsonValue::Boolean(true));
     let mut indexes = Vec::with_capacity(documents.len());
     let mut warnings = Vec::new();
+    let mut model_names = compatibility.then(Vec::new);
     let mut check = || {
         if started.elapsed() >= timeout {
             Err(EngineError::deadline_exceeded(
@@ -112,11 +150,17 @@ pub(super) fn prepare(
             .iter()
             .any(|(_, value)| matches!(value, BsonValue::String(value) if value == "text"));
         let ttl = document.get_first("expireAfterSeconds").is_some();
+        let descending =
+            compatibility && keys.iter().any(|(_, value)| value == &BsonValue::Int32(-1));
         let unique = document.get_first("unique") == Some(&BsonValue::Boolean(true));
         // A performance-only fallback must never weaken a uniqueness constraint,
         // including the implicit unique built-in ID index.
         if ((hashed || ttl || text) && unique)
-            || (!text && (hashed || ttl) && keys.len() == 1 && keys.get_first("_id").is_some())
+            || (!compatibility
+                && !text
+                && (hashed || ttl)
+                && keys.len() == 1
+                && keys.get_first("_id").is_some())
         {
             return Err(CommandError::unsupported());
         }
@@ -124,7 +168,7 @@ pub(super) fn prepare(
             && keys
                 .get_first("_id")
                 .is_some_and(|value| value == &BsonValue::Int32(1))
-            && document.get_first("unique").is_some()
+            && (document.get_first("unique").is_some() && (!compatibility || unique))
         {
             return Err(DocumentIndexError::InvalidIdOptions
                 .into_engine_error()
@@ -136,7 +180,8 @@ pub(super) fn prepare(
             effective
                 .push(
                     field,
-                    if matches!(value, BsonValue::String(value) if value == "hashed" || value == "text") {
+                    if matches!(value, BsonValue::String(value) if value == "hashed" || value == "text")
+                        || (descending && value == &BsonValue::Int32(-1)) {
                         BsonValue::Int32(1)
                     } else {
                         value.clone()
@@ -147,7 +192,7 @@ pub(super) fn prepare(
         let mut index = DocumentIndexRequest::new(effective)?;
         if let Some(BsonValue::String(name)) = document.get_first("name") {
             index = index.with_name(name)?;
-        } else if hashed || text {
+        } else if hashed || text || descending {
             index = index.with_name(requested_name(keys)?)?;
         }
         if let Some(BsonValue::Boolean(unique)) = document.get_first("unique") {
@@ -160,10 +205,20 @@ pub(super) fn prepare(
             index = index.with_partial_filter(DocumentFilter::new(filter.clone())?);
         }
         if text {
+            if let Some(models) = &mut model_names {
+                models.push(ModelName {
+                    requested: index.name().expect("text name").to_owned(),
+                    index: None,
+                    warning: Some(warnings.len()),
+                });
+            }
             warnings.push(skipped_text_warning(&index, &mut check)?);
             continue;
         }
         let mut reduced = Vec::new();
+        if descending {
+            reduced.push(BsonValue::from("descending: ascending equality indexing"));
+        }
         if hashed {
             reduced.push(BsonValue::from("hashed: ascending equality indexing"));
         }
@@ -173,6 +228,18 @@ pub(super) fn prepare(
         if document.get_first("background") == Some(&BsonValue::Boolean(true)) {
             reduced.push(BsonValue::from("background: builds run synchronously"));
         }
+        let warning = (!reduced.is_empty()).then_some(warnings.len());
+        index = index.with_equivalent_reuse(compatibility && !reduced.is_empty());
+        if let Some(models) = &mut model_names {
+            models.push(ModelName {
+                requested: match index.name() {
+                    Some(name) => name.to_owned(),
+                    None => requested_name(keys)?,
+                },
+                index: Some(indexes.len()),
+                warning,
+            });
+        }
         if !reduced.is_empty() {
             // Built-in requests are validated/no-op'd by normalize_index_batch,
             // which ignores the requested alias. Do not apply the secondary
@@ -180,7 +247,14 @@ pub(super) fn prepare(
             let name = if index.keys().len() == 1
                 && index.keys().get_first("_id") == Some(&BsonValue::Int32(1))
             {
-                "_id_".to_owned()
+                if compatibility {
+                    index
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or(requested_name(keys)?)
+                } else {
+                    "_id_".to_owned()
+                }
             } else {
                 crate::document::normalize_index_definition(index.keys(), index.name(), &mut check)?
                     .1
@@ -201,15 +275,46 @@ pub(super) fn prepare(
             BsonValue::Int32(1),
         )]))?);
     }
-    let request =
+    let mut request =
         DocumentCreateIndexesRequest::new(namespace, indexes, DocumentWriteOptions::new())?;
+    if compatibility {
+        request = request.with_resolved_names();
+    }
     // Native execution repeats validation on its bounded worker. This first
     // pass is essential: a malformed late entry must not create a namespace.
     normalize_index_batch(request.indexes().to_vec().into_boxed_slice(), &mut check)?;
     // Counts are fixed-width Int64 values: preflight the exact reply shape before
     // any namespace or index mutation, not after an oversized acknowledgement.
+    let preflight = if let Some(models) = &model_names {
+        // Reuse can select a longer existing name, and adds a warning field.
+        // Bound the complete opt-in reply before implicit namespace creation.
+        let worst = "x".repeat(crate::document::MAX_DOCUMENT_INDEX_NAME_BYTES);
+        let mut preflight_warnings = warnings.clone();
+        for warning in &mut preflight_warnings {
+            if let BsonValue::Document(warning) = warning {
+                warning
+                    .push("reusedIndex", BsonValue::String(worst.clone()))
+                    .expect("static field");
+            }
+        }
+        let mut result = reply(0, 0, preflight_warnings);
+        result
+            .push(
+                "briskdbIndexNames",
+                BsonValue::Array(
+                    models
+                        .iter()
+                        .map(|_| BsonValue::String(worst.clone()))
+                        .collect(),
+                ),
+            )
+            .expect("static field");
+        result
+    } else {
+        reply(0, 0, warnings.clone())
+    };
     encode_document_with_options(
-        &reply(0, 0, warnings.clone()),
+        &preflight,
         &BsonCodecOptions::new().with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES),
     )
     .map_err(|_| {
@@ -220,7 +325,11 @@ pub(super) fn prepare(
         )
     })?;
     check()?;
-    Ok(PreparedIndexes { request, warnings })
+    Ok(PreparedIndexes {
+        request,
+        warnings,
+        model_names,
+    })
 }
 
 fn skipped_text_warning(

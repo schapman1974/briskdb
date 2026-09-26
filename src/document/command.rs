@@ -145,6 +145,7 @@ pub struct DocumentIndexRequest {
     unique: bool,
     sparse: bool,
     partial_filter: Option<DocumentFilter>,
+    reuse_equivalent: bool,
 }
 
 impl DocumentIndexRequest {
@@ -157,6 +158,7 @@ impl DocumentIndexRequest {
             unique: false,
             sparse: false,
             partial_filter: None,
+            reuse_equivalent: false,
         })
     }
 
@@ -203,6 +205,17 @@ impl DocumentIndexRequest {
 
     pub const fn partial_filter(&self) -> Option<&DocumentFilter> {
         self.partial_filter.as_ref()
+    }
+
+    /// Transient operation policy, never persisted in an index definition.
+    pub(crate) const fn reuse_equivalent(&self) -> bool {
+        self.reuse_equivalent
+    }
+
+    #[cfg(feature = "mongo")]
+    pub(crate) const fn with_equivalent_reuse(mut self, enabled: bool) -> Self {
+        self.reuse_equivalent = enabled;
+        self
     }
 
     pub fn into_parts(
@@ -1243,6 +1256,7 @@ pub struct DocumentCreateIndexesRequest {
     namespace: DocumentNamespace,
     indexes: Box<[DocumentIndexRequest]>,
     write_options: DocumentWriteOptions,
+    resolve_names: bool,
 }
 
 impl DocumentCreateIndexesRequest {
@@ -1266,6 +1280,7 @@ impl DocumentCreateIndexesRequest {
             namespace,
             indexes: indexes.into_boxed_slice(),
             write_options,
+            resolve_names: false,
         })
     }
 
@@ -1274,6 +1289,14 @@ impl DocumentCreateIndexesRequest {
     }
     pub fn indexes(&self) -> &[DocumentIndexRequest] {
         &self.indexes
+    }
+    pub(crate) const fn resolve_names(&self) -> bool {
+        self.resolve_names
+    }
+    #[cfg(feature = "mongo")]
+    pub(crate) const fn with_resolved_names(mut self) -> Self {
+        self.resolve_names = true;
+        self
     }
     pub const fn write_options(&self) -> DocumentWriteOptions {
         self.write_options

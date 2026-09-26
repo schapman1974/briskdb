@@ -364,9 +364,28 @@ enforce uniqueness normally. Non-unique text declarations are accepted but the
 **entire index is skipped**, including any other keys/options in that declaration.
 No text index or placeholder is stored, and `$text` queries remain unsupported.
 Unique text declarations are rejected. A skipped declaration cannot replace an
-existing index of the same name or weaken its uniqueness. Degraded-equivalent-name
-reuse remains unsupported; differently named equivalent definitions still return 85.
-Native Rust/Python index-request semantics are unchanged.
+existing index of the same name or weaken its uniqueness. Ordinary PyMongo still
+returns its own requested names; differently named equivalent definitions return
+85 unless the explicit local-client compatibility mode below is selected.
+Native Rust/Python index-request defaults are unchanged.
+
+The optional local clients now provide
+[TinyMongo-style model inputs and returned names](../python/API.md#local-index-model-compatibility-source-builds).
+Their `create_indexes` uses the boolean `briskdbIndexModelCompatibility: true`
+command option. This mode normalizes descending models to ascending equality
+keys and permits reduced models to reuse an equivalent Ready index under the
+same exclusive admission as the whole build batch. It returns ordered
+`briskdbIndexNames`, and adds `reusedIndex` to the relevant warning. Skipped text
+names occupy their original result positions without becoming catalog entries.
+Non-unique built-in models resolve to `_id_` without changing its authority.
+Unique/sparse/partial/compound distinctions cannot be lost through reuse.
+Worst-case resolved names and warning sizes are admitted before mutation; a
+runtime error still follows the existing completed-prefix build policy.
+The wrapper emits Python `IndexCompatibilityWarning` diagnostics, preserves
+driver options and performs no client-side list-then-create race. Stock PyMongo
+and native APIs do not implicitly opt in. Concurrent DDL retains bounded busy
+rejection; the helper does not silently retry writes. Old TinyMongo private
+catalog repair and ambiguous legacy alias ordering are not added.
 
 Successful commands with reduced behavior include `briskdbIndexWarnings`, an
 ordered array of `{name, reducedBehavior}` documents (plus `skipped: true` for
@@ -913,8 +932,12 @@ It reuses the v19 cleanup journal and does not change the frozen contract.
 Version 20 additionally permits unique builds. Equality candidates use the separately validated
 Ready-cache read path. Native batch and wire creation
 now reuse that lifecycle, with completed-prefix recovery tests at every new-entry
-commit boundary on two- and four-shard roots. TinyMongo's broader IndexModel
-warning/degradation behavior and the full frozen index suites remain open.
+commit boundary on two- and four-shard roots. Local-client model compatibility
+has an additional 144 source-locked public outcome comparisons, plus real sync/
+async wheel tests for mixed input types, name reuse, concurrent admission/retry,
+membership distinctions, uniqueness and reopen. This is not a claim that all
+TinyMongo private backend/helper tests run unchanged; that full inventory and
+the release gate remain tracked separately in #186 and #185.
 
 Ready-index equality reads now have 1,087 additional source-locked probe groups:
 201,349 matcher evaluations and 9,541 eligible matching candidates without false

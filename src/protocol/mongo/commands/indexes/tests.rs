@@ -38,6 +38,181 @@ fn plan(models: Vec<BsonDocument>) -> Result<PreparedIndexes> {
     )
 }
 
+fn model_plan(models: Vec<BsonDocument>) -> Result<PreparedIndexes> {
+    let mut request = request(models);
+    request
+        .body
+        .push("briskdbIndexModelCompatibility", BsonValue::Boolean(true))
+        .unwrap();
+    prepare(
+        &request,
+        DocumentNamespace::new("compat", "items").unwrap(),
+        Instant::now(),
+        Duration::from_secs(10),
+    )
+}
+
+#[test]
+fn opt_in_model_names_preserve_slots_and_use_server_resolved_names() {
+    let prepared = model_plan(vec![
+        model(document([("body", BsonValue::from("text"))]), []),
+        model(
+            document([
+                ("tenant", BsonValue::Int64(-1)),
+                ("token", BsonValue::from("hashed")),
+            ]),
+            [],
+        ),
+        model(
+            document([("email", BsonValue::Int32(1))]),
+            [("unique", BsonValue::Boolean(true))],
+        ),
+        model(
+            document([("_id", BsonValue::from("hashed"))]),
+            [("unique", BsonValue::Boolean(false))],
+        ),
+    ])
+    .unwrap();
+    assert!(prepared.request.resolve_names());
+    let indexes = prepared.request.indexes();
+    assert_eq!(indexes.len(), 3);
+    assert_eq!(
+        indexes[0].keys(),
+        &document([
+            ("tenant", BsonValue::Int32(1)),
+            ("token", BsonValue::Int32(1))
+        ])
+    );
+    assert!(indexes[0].reuse_equivalent());
+    assert!(!indexes[1].reuse_equivalent());
+    let result = model_reply(
+        2,
+        3,
+        prepared.warnings,
+        prepared.model_names.unwrap(),
+        &["existing".into(), "email_1".into(), "_id_".into()],
+    );
+    assert_eq!(
+        result.get_first("briskdbIndexNames"),
+        Some(&BsonValue::Array(vec![
+            "body_text".into(),
+            "existing".into(),
+            "email_1".into(),
+            "_id_".into()
+        ]))
+    );
+    let Some(BsonValue::Array(warnings)) = result.get_first("briskdbIndexWarnings") else {
+        panic!("warnings")
+    };
+    let BsonValue::Document(warning) = &warnings[2] else {
+        panic!("warning")
+    };
+    assert_eq!(
+        warning.get_first("name"),
+        Some(&BsonValue::from("_id_hashed"))
+    );
+    assert_eq!(
+        warning.get_first("reusedIndex"),
+        Some(&BsonValue::from("_id_"))
+    );
+    let all_text = model_plan(vec![model(
+        document([("body", BsonValue::from("text"))]),
+        [],
+    )])
+    .unwrap();
+    let result = model_reply(
+        1,
+        1,
+        all_text.warnings,
+        all_text.model_names.unwrap(),
+        &["_id_".into()],
+    );
+    assert_eq!(
+        result.get_first("briskdbIndexNames"),
+        Some(&BsonValue::Array(vec!["body_text".into()]))
+    );
+}
+
+#[test]
+fn opt_in_models_still_reject_unsafe_uniqueness_and_late_invalid_entries() {
+    for key in ["_id", "value"] {
+        for direction in [BsonValue::from("hashed"), BsonValue::from("text")] {
+            assert_eq!(
+                model_plan(vec![model(
+                    document([(key, direction)]),
+                    [("unique", BsonValue::Boolean(true))]
+                )])
+                .err()
+                .unwrap()
+                .code,
+                115
+            );
+        }
+    }
+    assert_eq!(
+        model_plan(vec![model(
+            document([("_id", BsonValue::Int32(1))]),
+            [("unique", BsonValue::Boolean(true))]
+        )])
+        .err()
+        .unwrap()
+        .code,
+        197
+    );
+    assert!(
+        model_plan(vec![
+            model(document([("value", BsonValue::Int32(-1))]), []),
+            model(document([("bad", BsonValue::Boolean(true))]), [])
+        ])
+        .is_err()
+    );
+    let ordinary = plan(vec![model(document([("value", BsonValue::Int32(-1))]), [])]).unwrap();
+    assert!(!ordinary.request.resolve_names());
+    assert!(!ordinary.request.indexes()[0].reuse_equivalent());
+    assert_eq!(
+        ordinary.request.indexes()[0].keys().get_first("value"),
+        Some(&BsonValue::Int32(-1))
+    );
+    assert!(ordinary.model_names.is_none());
+}
+
+#[test]
+fn opt_in_resolved_names_and_reuse_warnings_admit_only_bounded_replies() {
+    let models = |count| {
+        (0..count)
+            .map(|_| {
+                model(
+                    document([("value", BsonValue::Int32(-1))]),
+                    [(
+                        "name",
+                        BsonValue::String(
+                            "n".repeat(crate::document::MAX_DOCUMENT_INDEX_NAME_BYTES),
+                        ),
+                    )],
+                )
+            })
+            .collect()
+    };
+    // The entry count is legal, but the conservative full acknowledgement is
+    // too large. Reject before namespace creation, not after committed builds.
+    assert_eq!(model_plan(models(1000)).err().unwrap().code, 10334);
+    let prepared = model_plan(models(500)).unwrap();
+    let names = vec!["r".repeat(crate::document::MAX_DOCUMENT_INDEX_NAME_BYTES); 500];
+    let result = model_reply(
+        1,
+        2,
+        prepared.warnings,
+        prepared.model_names.unwrap(),
+        &names,
+    );
+    let bytes = encode_document_with_options(
+        &result,
+        &BsonCodecOptions::new().with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES),
+    )
+    .unwrap();
+    assert!(bytes.len() > 380_000);
+}
+
 #[test]
 fn compatibility_plans_keep_effective_keys_names_and_explicit_warnings() {
     let original = request(vec![

@@ -943,7 +943,16 @@ requires an earlier dependency:
       metadata or full-text querying is added. Unique text and malformed late
       models fail eagerly; existing same-name indexes keep their enforcement.
       All-text batches match frozen memory/JSON namespace behavior, with retries
-      and reopen covered. Degraded equivalent-name reuse remains a separate gap.
+      and reopen covered. The optional local PyMongo clients now accept bounded
+      model iterables/mappings/duck models and resolve reduced equivalent names
+      inside the exclusive server batch. Descending models normalize to equality
+      keys; warnings identify actual reused names and skipped text models.
+      Sync/async factories and patch scopes retain driver options; ordinary
+      PyMongo behavior is unchanged. Ready-only reuse preserves ordered keys,
+      unique/sparse/partial membership and durable identities. New wheel/reopen,
+      concurrency-with-busy-retry, bounded-result and 144 source-locked public
+      model outcomes cover this slice. Full upstream index-suite certification
+      remains part of #174/#186; legacy private catalog repair is not claimed.
     - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate

@@ -429,6 +429,23 @@ Existing clients and aliases imported before patch entry are unchanged, so patch
 new Mongo queries or TinyMongo's alternative storage backends. See
 [patching and async examples](python/README.md#patch-pymongo-for-local-testing).
 
+Source builds also accept TinyMongo-style index-model dictionaries, generators,
+and PyMongo `IndexModel` objects through these local clients:
+
+```python
+with briskdb.MongoClient(folder="./app-data") as client:
+    users = client.app.users
+    users.create_index("name", name="by_name")
+    names = users.create_indexes([{"key": {"name": -1}}])
+    print(names)  # ["by_name"] — reuses the existing equality index, with a warning
+```
+
+Async clients use `await users.create_indexes(...)`. These optional helpers
+return server-resolved names and warn when descending/hashed/TTL/background/text
+models use reduced behavior. They do **not** add TTL expiration or text search.
+Ordinary PyMongo clients retain their own API behavior. See the
+[index-model boundary](python/API.md#local-index-model-compatibility-source-builds).
+
 ### Query registered SQL tables over HTTP
 
 Registered tables can also be queried over HTTP:

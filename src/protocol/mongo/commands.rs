@@ -416,6 +416,9 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
                 "filter" if matches!(name, "find" | "listCollections" | "listDatabases") => {
                     matches!(value, BsonValue::Document(_))
                 }
+                "briskdbIndexModelCompatibility" if name == "createIndexes" => {
+                    matches!(value, BsonValue::Boolean(_))
+                }
                 "query" | "fields" | "sort" if name == "findAndModify" => {
                     matches!(value, BsonValue::Document(_))
                 }
@@ -1355,7 +1358,11 @@ impl Executor {
                     )),
                 }
             }
-            Command::CreateIndexes(indexes::PreparedIndexes { request, warnings }) => {
+            Command::CreateIndexes(indexes::PreparedIndexes {
+                request,
+                warnings,
+                model_names,
+            }) => {
                 self.ensure_collection(session, identity, &context, request.namespace())
                     .await?;
                 match self
@@ -1370,6 +1377,17 @@ impl Executor {
                     DocumentResult::IndexesBuilt { before, after } => {
                         Ok(indexes::reply(before, after, warnings))
                     }
+                    DocumentResult::IndexModelsBuilt {
+                        before,
+                        after,
+                        names,
+                    } => Ok(indexes::model_reply(
+                        before,
+                        after,
+                        warnings,
+                        model_names.expect("opt-in model names"),
+                        &names,
+                    )),
                     _ => Err(CommandError::new(
                         1,
                         "InternalError",
