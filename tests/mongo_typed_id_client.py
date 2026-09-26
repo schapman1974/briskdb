@@ -53,6 +53,7 @@ def source(mode, root):
 
 def wire(mode, uri):
     import pymongo
+    from pymongo.errors import DuplicateKeyError
 
     assert not any(name == "tinymongo" or name.startswith("tinymongo.") for name in sys.modules)
     with pymongo.MongoClient(uri, maxPoolSize=1, serverMonitoringMode="poll",
@@ -60,6 +61,15 @@ def wire(mode, uri):
         database = client.app
         if mode == "mutate":
             before(database)
+            for name in NAMES[:2]:
+                try:
+                    database[name].insert_one({"_id": 1, "label": "duplicate"})
+                except DuplicateKeyError as error:
+                    assert error.code == 11000
+                else:
+                    raise AssertionError("imported legacy numeric aliases must remain unique")
+                assert database[name].count_documents({}) == 1
+                assert database[name].find_one({"_id": 1})["label"] == "before"
             assert database.legacy_integer.replace_one({"_id": 1.0}, {"_id": 1, "label": "after"}).modified_count == 1
             collection = database.legacy_double
             collection.insert_one({"_id": 2, "label": "current"})
