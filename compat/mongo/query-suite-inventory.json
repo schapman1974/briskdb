@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these three locked suites is classified; 75 reference parameter cases are not 75 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client representation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these four locked suites is classified; 144 reference parameter cases are not 144 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client/diagnostic differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -352,6 +352,131 @@
           ],
           "kind": "public_scenarios",
           "note": "Real async PyMongo find/clone/to_list/aggregate/distinct/find-and-modify preserve recursive OrderedDict and aware datetimes. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_insert_many_semantics.py",
+      "sha256": "a0160cc7ed515603ecd73307733e4c05e2fc02289b396d3ea7ff2890b2bc960d",
+      "reference_case_count": 69,
+      "function_count": 21,
+      "coverage": [
+        {
+          "source": [
+            "test_ordered_insert_many_stops_at_first_duplicate",
+            "test_insert_many_applies_ordering_to_unique_index_failures",
+            "test_insert_many_unique_missing_field_reports_null_key"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_ordered_and_unordered_duplicates_preserve_counts_indices_and_original_ops",
+            "python/tests/test_upstream_insert_many.py::test_unique_duplicates_follow_ordering_and_keep_redacted_error_details",
+            "python/tests/test_upstream_insert_many.py::test_unordered_mixed_unique_rejections_keep_input_alignment"
+          ],
+          "kind": "contract_difference",
+          "note": "Ordering, counts, input indices and caller-owned op objects are checked. BriskDB deliberately keeps server diagnostics payload-free: keyPattern/keyValue and interpolated index/key errmsg values are absent, not fabricated. Five reference backends do not imply five BriskDB backends."
+        },
+        {
+          "source": [
+            "test_unordered_insert_many_continues_and_reports_every_duplicate",
+            "test_sqlite_prepared_rows_align_after_mixed_duplicate_rejections"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_ordered_and_unordered_duplicates_preserve_counts_indices_and_original_ops",
+            "python/tests/test_upstream_insert_many.py::test_unordered_mixed_unique_rejections_keep_input_alignment"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real installed-wheel wire traffic checks accepted IDs, rejected input indices and original operation identity, including mixed ID/secondary-key/missing-key conflicts."
+        },
+        {
+          "source": [
+            "test_insert_many_serialization_preflight_is_all_or_nothing"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_late_serialization_error_precedes_all_wire_batches",
+            "python/tests/test_upstream_insert_many.py::test_late_oversized_document_is_rejected_before_any_insert"
+          ],
+          "kind": "contract_difference",
+          "note": "The local helper checks serialization before any insert even beyond 1,000 documents, with ordered/unordered and validation-bypass variants. Generated input IDs survive rejection and no namespace is created. Driver InvalidDocument text is retained, not TinyMongo's custom collection/index/path message format; no transaction or storage-error atomicity is promised."
+        },
+        {
+          "source": [
+            "test_async_insert_many_uses_the_same_unordered_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_async_preflight_and_unordered_error_indices_match_sync"
+          ],
+          "kind": "public_scenarios",
+          "note": "The actual async PyMongo client shares eager preflight, return IDs, partial duplicate counts and input error indices."
+        },
+        {
+          "source": [
+            "test_insert_many_validates_batch_and_ordering_arguments"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_invalid_arguments_and_failing_iterables_do_not_create_collections"
+          ],
+          "kind": "public_scenarios",
+          "note": "Empty/non-document input, nonboolean ordered and a late failing iterator are rejected before mutation. Empty generators are also rejected explicitly."
+        },
+        {
+          "source": [
+            "test_insert_many_accepts_document_iterables",
+            "test_insert_many_accepts_mutable_mapping_documents",
+            "test_embedded_document_ids_keep_boolean_and_number_identity_distinct",
+            "test_explicit_none_id_is_preserved_and_remains_unique",
+            "test_insert_many_all_duplicate_batch_reports_zero_inserts"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_iterables_mapping_ids_raw_documents_and_results_survive_restart"
+          ],
+          "kind": "public_scenarios",
+          "note": "Tuple/generator and UserDict input preserves caller IDs, embedded boolean/number identity, explicit null uniqueness, result objects and records across reopen. Caller RawBSONDocument IDs keep stock PyMongo's omission from inserted_ids."
+        },
+        {
+          "source": [
+            "test_tinydb_physical_id_operations_do_not_use_array_membership"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_indexes.py::test_exact_id_mutations_do_not_match_array_members"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public scalar-ID update/delete does not target an array-ID record; BriskDB does not share TinyDB's physical storage implementation."
+        },
+        {
+          "source": [
+            "test_tinydb_rejects_tuple_and_list_ids_in_the_same_batch"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_tuple_and_list_ids_share_the_same_bson_identity"
+          ],
+          "kind": "public_scenarios",
+          "note": "The wire normalizes tuples and lists to the same BSON array identity; the second insert is a duplicate and the first survives."
+        },
+        {
+          "source": [
+            "test_sqlite_targeted_preflight_preserves_batch_duplicate_semantics",
+            "test_sqlite_targeted_preflight_replans_a_native_id_race",
+            "test_sqlite_bulk_insert_encodes_and_keys_each_document_once",
+            "test_native_duplicate_race_is_replanned_as_a_bulk_write_error",
+            "test_persistent_native_duplicate_still_uses_bulk_write_error_shape"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_ordered_and_unordered_duplicates_preserve_counts_indices_and_original_ops",
+            "python/tests/test_upstream_insert_many.py::test_custom_encoder_is_called_once_per_value_before_any_write",
+            "python/tests/test_upstream_durable_indexes.py::test_concurrent_unique_inserts_allow_exactly_one_writer"
+          ],
+          "kind": "implementation_specific",
+          "note": "Excluded private implementation assertions: monkeypatched Python backend find/commit/physical-key functions, fabricated racing engines and exact retry/encoding call counts are not BriskDB APIs. Linked real-wire tests cover public duplicate/counter/identity/concurrency results and client custom encoders once, not the reference's private retry count or native storage optimization."
+        },
+        {
+          "source": [
+            "test_bulk_write_error_remains_available_without_pymongo"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_insert_many.py::test_ordered_and_unordered_duplicates_preserve_counts_indices_and_original_ops"
+          ],
+          "kind": "implementation_specific",
+          "note": "TinyMongo's fallback errors module when PyMongo is absent is not applicable to the opt-in BriskDB client, which explicitly requires pinned PyMongo. The real PyMongo BulkWriteError shape is exercised; no fallback class is shipped."
         }
       ]
     }

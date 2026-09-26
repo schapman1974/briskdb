@@ -41,15 +41,19 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 45 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 66 test
 functions in the locked `test_query_more.py`,
-`test_query_operator_coverage_edges.py` and `test_client_read_fidelity.py` suites
-(75 reference parameter cases). Twenty-six owned wheel tests check public
+`test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py` and
+`test_insert_many_semantics.py` suites (144 reference parameter cases).
+Thirty-nine owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 75 unchanged upstream candidate passes or complete #186 certification.
+not 144 unchanged upstream candidate passes or complete #186 certification.
+Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
+no-PyMongo fallback errors module are excluded with explicit rationales; real
+BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
 
 Read-fidelity checks cover recursive OrderedDict/UserDict/SON and parameterized
 mapping aliases, sync/async find/clone/projection/aggregate/distinct/find-and-modify,
@@ -619,6 +623,18 @@ result limits are checked before any document write. Direct non-ID zero
 timestamps are server-stamped; nested timestamps and IDs are preserved. Each
 write commits separately, including within one shard; cancellation or a storage
 failure can leave prior successes committed. No batch transaction is promised.
+
+The optional local Python clients additionally preflight all `insert_many()`
+input before the first insert. Previously, a serialization failure after the
+first 1,000 records could leave that earlier driver batch committed. The helper
+now assigns IDs and encodes immutable BSON once, retaining all encoded bytes in
+client memory and enforcing the existing 512-KiB document limit. Real sync/async
+wire tests cover late invalid/oversized input, custom encoders, mapping/RawBSON
+inputs, generated/null/embedded IDs, global duplicate indices and restart.
+This does not make server/storage failures atomic or modify ordinary PyMongo.
+Duplicate diagnostics remain intentionally payload-free: code 11000 and input
+indices are present, but TinyMongo's `keyPattern`/`keyValue` and interpolated
+index/key error strings are not exposed. PyMongo supplies the caller's own `op`.
 
 Retained find cursors use positive opaque IDs scoped to the listener and exact
 namespace. A dedicated engine session lets a cursor move between pooled TCP

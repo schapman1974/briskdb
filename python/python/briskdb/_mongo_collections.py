@@ -1,4 +1,4 @@
-"""Opt-in local-client index models; ordinary PyMongo classes are not patched."""
+"""Opt-in local-client compatibility; ordinary PyMongo classes are not patched."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from typing import Any
 import warnings
 
 from bson import BSON
-from pymongo.errors import InvalidOperation, OperationFailure
+from pymongo.errors import BulkWriteError, InvalidOperation, OperationFailure
+from pymongo.results import InsertManyResult
 from pymongo.synchronous.collection import Collection as _Collection
 from pymongo.synchronous.database import Database as _Database
 from pymongo.asynchronous.collection import AsyncCollection as _AsyncCollection
 from pymongo.asynchronous.database import AsyncDatabase as _AsyncDatabase
+
+from . import _mongo_bulk
 
 
 class IndexCompatibilityWarning(UserWarning):
@@ -153,7 +156,7 @@ def _options(value: Any) -> dict[str, Any]:
 
 
 class Collection(_Collection):
-    """A real PyMongo collection with TinyMongo-style index-model input."""
+    """Real PyMongo collection with local bulk preflight and index-model input."""
 
     @classmethod
     def _wrap(cls, value: Any) -> Collection:
@@ -164,6 +167,19 @@ class Collection(_Collection):
 
     def with_options(self, *args: Any, **kwargs: Any) -> Collection:
         return self._wrap(super().with_options(*args, **kwargs))
+
+    def insert_many(self, documents: Any, ordered: bool = True,
+                    bypass_document_validation: Any = None, session: Any = None,
+                    comment: Any = None) -> InsertManyResult:
+        originals, encoded, ids = _mongo_bulk.prepare(self, documents, ordered, bypass_document_validation)
+        try:
+            result = super().insert_many(encoded, ordered=ordered,
+                                         bypass_document_validation=bypass_document_validation,
+                                         session=session, comment=comment)
+        except BulkWriteError as error:
+            _mongo_bulk.restore_error_operations(error, originals)
+            raise
+        return InsertManyResult(ids, result.acknowledged)
 
     def create_index(self, keys: Any, session: Any = None, comment: Any = None,
                      **kwargs: Any) -> str:
@@ -180,7 +196,7 @@ class Collection(_Collection):
 
 
 class AsyncCollection(_AsyncCollection):
-    """Async PyMongo collection using the same bounded model protocol."""
+    """Async PyMongo collection using the same local compatibility helpers."""
 
     @classmethod
     def _wrap(cls, value: Any) -> AsyncCollection:
@@ -191,6 +207,19 @@ class AsyncCollection(_AsyncCollection):
 
     def with_options(self, *args: Any, **kwargs: Any) -> AsyncCollection:
         return self._wrap(super().with_options(*args, **kwargs))
+
+    async def insert_many(self, documents: Any, ordered: bool = True,
+                          bypass_document_validation: Any = None, session: Any = None,
+                          comment: Any = None) -> InsertManyResult:
+        originals, encoded, ids = _mongo_bulk.prepare(self, documents, ordered, bypass_document_validation)
+        try:
+            result = await super().insert_many(encoded, ordered=ordered,
+                                               bypass_document_validation=bypass_document_validation,
+                                               session=session, comment=comment)
+        except BulkWriteError as error:
+            _mongo_bulk.restore_error_operations(error, originals)
+            raise
+        return InsertManyResult(ids, result.acknowledged)
 
     async def create_index(self, keys: Any, session: Any = None, comment: Any = None,
                            **kwargs: Any) -> str:
