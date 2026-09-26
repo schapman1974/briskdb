@@ -2118,6 +2118,13 @@ pub(super) fn reply_cursor_id(body: &BsonDocument) -> Option<DocumentCursorId> {
 /// document larger than this listener advertises; reject it with a command
 /// error while keeping the connection usable.
 pub(super) fn validate_response(body: &BsonDocument) -> Result<()> {
+    if !wire::valid_uuid_widths(body) {
+        return Err(CommandError::new(
+            22,
+            "InvalidBSON",
+            "reply contains a UUID binary value without a 16-byte payload",
+        ));
+    }
     if let Some(BsonValue::Document(cursor)) = body.get_first("cursor") {
         for name in ["firstBatch", "nextBatch"] {
             if let Some(BsonValue::Array(documents)) = cursor.get_first(name) {

@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 339 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 378 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -54,14 +54,15 @@ functions in the locked `test_query_more.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
 `test_async_api.py`, `test_bson_registry_hardening.py`, `test_patching.py`,
 `test_pymongo_dropin.py`, `test_pymongo_contract.py` and
-`test_talkpython_regressions.py` and `test_sharded_sqlite_operation_atomicity.py` suites
-(772 reference parameter cases). 224 added wheel scenarios and existing patch
+`test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
+`test_bson_codec.py` suites
+(874 reference parameter cases). 232 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 772 unchanged upstream candidate passes or complete #186 certification.
+not 874 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -73,6 +74,24 @@ Talk Python contract runner below. Explicit string IDs work, but TinyMongo's
 `generate_id` export and no-BSON fallback allocator are not provided. Python-only
 `date` values fail BSON encoding before a batch is sent, rather than entering a
 warning-based in-memory cursor sorter.
+
+Main codec-source coverage includes nested ObjectId/date/timezone persistence,
+exact Decimal128 BID values, nonfinite doubles, binary subtype/legacy-length
+ordering, a 100-KB binary document, and literal JSON-tag-shaped mappings. The
+native format is not TinyMongo tagged JSON; bytearray needs explicit bytes
+conversion, patterns decode as BSON Regex, and driver exceptions do not adopt
+TinyMongo's extra inheritance, context or bounded value representation.
+For both [BSON UUID subtypes](https://bsonspec.org/spec.html) (3 and 4), PyMongo
+can encode arbitrary widths but its C decoder requires 16-byte payloads in
+replies. Opaque input/storage and projected queries remain supported, preserving
+the frozen binary-comparison contract. Replies containing other widths, including
+nested arrays/documents and JavaScript scope, return a bounded code-22
+`InvalidBSON` error without echoing payloads or closing the connection. Rejected
+first/continuation batches release their cursors. This is a response boundary,
+not rollback: a find-and-modify operation can commit before its returned image
+is rejected. Project out the opaque field when requesting such an image; do not
+blindly retry a mutation after a reply error. Generic native opaque-binary storage
+is unchanged; no repair or migration of existing values is performed.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary

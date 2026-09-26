@@ -33,6 +33,8 @@ mod readiness;
 mod resource_churn;
 #[path = "mongo_wire/resource_limits.rs"]
 mod resource_limits;
+#[path = "mongo_wire/uuid_widths.rs"]
+mod uuid_widths;
 
 async fn setup() -> (tempfile::TempDir, BriskDb, MongoServer) {
     let root = tempfile::tempdir().unwrap();
