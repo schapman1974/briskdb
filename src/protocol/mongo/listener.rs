@@ -53,7 +53,7 @@ impl MongoServer {
         Self::start_with_limits(database, address, MongoResourceLimits::default()).await
     }
 
-    /// Start a listener with a host policy that only narrows the default caps.
+    /// Start a listener with a host policy within the finite safety ceilings.
     pub async fn start_with_limits(
         database: &BriskDb,
         address: SocketAddr,
@@ -153,7 +153,7 @@ impl MongoServer {
         self.metrics.snapshot()
     }
 
-    /// Redacted metadata for at most eight active handshaken connections, in
+    /// Redacted metadata for at most 32 active handshaken connections, in
     /// connection-ID order. An atomic registry snapshot, not a snapshot of all
     /// engine/metrics state. Empty after close; never retains raw client strings.
     pub fn client_metadata(&self) -> Vec<super::MongoClientMetadata> {

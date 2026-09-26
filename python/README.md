@@ -125,7 +125,10 @@ retained and validated by PyMongo; automatic encryption is rejected, not bypasse
 There is no remote fallback. The unauthenticated loopback socket is **not a
 security boundary against other local users/processes**.
 
-Existing BriskDB Mongo query/resource limits still apply. This does not add
+Existing BriskDB Mongo query/resource limits still apply. Managed clients sharing
+a root share a bounded 32-socket listener,
+including PyMongo monitor/pool sockets (the default client pool size is two).
+Standalone Mongo listeners still default to eight sockets. This does not add
 transactions, change streams, TinyMongo-only metadata helpers or alternative
 memory/JSON/DuckDB/remote backends. `backend="sqlite"`/`"sqlite-sharded"` are
 accepted migration spellings; `backend="memory"` is rejected instead of calling
