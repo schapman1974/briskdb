@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-nine locked suites is classified; 874 reference parameter cases are not 874 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty locked suites is classified; 903 reference parameter cases are not 903 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3017,6 +3017,106 @@
             "python/tests/test_upstream_bson_registry.py::test_binary_and_numeric_equality_preserve_bson_subtypes"
           ],
           "note": "Public native ordering and boolean/numeric identity replace private tuple-key layout checks. Legacy binary subtype 2 includes its four-byte framing in the length-first ordering; Binary subclasses retain subtype before generic bytes handling."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_typed_physical_ids.py",
+      "sha256": "34b2e3b81303a368456e4fac89b765d1d051945774dd9d0bb5e0684f969d01cd",
+      "reference_case_count": 29,
+      "function_count": 10,
+      "coverage": [
+        {
+          "source": [
+            "test_physical_id_keys_follow_registered_bson_identity"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_bson_aliases_share_unique_identity_and_keep_original_representation",
+            "python/tests/test_upstream_typed_ids.py::test_distinct_bson_ids_coexist_and_stay_addressable_after_reopen",
+            "src/storage/document.rs::canonical_id_aliases_route_together_and_enforce_unique_id"
+          ],
+          "note": "Public ID equality, uniqueness, exact retained BSON and mutation addressability cover binary/numeric/date/NaN/container aliases and bool/ObjectId/string/infinity distinctions. Bytearray requires explicit bytes conversion in real PyMongo. TinyMongo's private key API and SHA-256 physical format are not exported."
+        },
+        {
+          "source": [
+            "test_exact_string_physical_id_fast_path_matches_canonical_format"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_string_id_escaping_survives_point_mutations_and_reopen",
+            "tests/bson_document.rs::canonical_key_has_a_frozen_header_and_validates_versions"
+          ],
+          "note": "All five original empty/quote/newline/NUL/Unicode strings survive exact ID lookup, update, reopen and deletion. BriskDB's versioned native canonical key is not TinyMongo's JSON/SHA-256 prefix or private fast-path implementation."
+        },
+        {
+          "source": [
+            "test_physical_id_fallback_and_malformed_legacy_rows"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/import/tinymongo.rs::semantic_duplicate_ids_and_missing_ids_fail_closed",
+            "src/import/tinymongo.rs::legacy_physical_ids_are_validated_and_restore_container_order"
+          ],
+          "note": "TinyMongo monkeypatches its private BSON-registry fallback and silently skips malformed JSON/missing-ID rows. BriskDB has no Python registry fallback; explicit source import rejects corrupt/missing-ID or inconsistent legacy-key data instead of hiding it. Native SQL/BSON storage is not a legacy JSON-row reader."
+        },
+        {
+          "source": [
+            "test_sql_compiler_supports_explicit_id_equality"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_bson_aliases_share_unique_identity_and_keep_original_representation",
+            "python/tests/test_upstream_typed_ids.py::test_numeric_string_and_boolean_ids_do_not_alias_in_logical_filters"
+          ],
+          "note": "Explicit $eq ID lookup and aliased mutations are checked through the real driver/native engine. TinyMongo SQLCompiler output text, physical-id candidate lists and parameter layout are not BriskDB APIs."
+        },
+        {
+          "source": [
+            "test_distinct_bson_id_types_coexist_and_remain_addressable"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_distinct_bson_ids_coexist_and_stay_addressable_after_reopen"
+          ],
+          "note": "Original binary subtype/numeric/boolean distinctions plus ObjectId/string and signed infinity remain separately addressable after replacement, deletion and reopen. Native four-shard SQLite replaces upstream SQLite/DuckDB/Parquet backend variants; private stored-key prefix equality is not claimed."
+        },
+        {
+          "source": [
+            "test_bson_equivalent_ids_share_one_native_key"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_bson_aliases_share_unique_identity_and_keep_original_representation",
+            "src/storage/document.rs::canonical_id_aliases_route_together_and_enforce_unique_id"
+          ],
+          "note": "Both original bytes/Binary-0 and integer/double aliases reject duplicates with code 11000 and retain the original BSON; additional exact Decimal, date, NaN and tuple/list aliases exercise the same native identity and routing."
+        },
+        {
+          "source": [
+            "test_legacy_stringified_rows_remain_readable_mutable_and_type_safe",
+            "test_legacy_string_id_survives_a_negated_numeric_id_filter",
+            "test_legacy_numeric_ids_accept_bson_equivalent_lookup_forms"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes",
+            "python/tests/test_upstream_typed_ids.py::test_numeric_string_and_boolean_ids_do_not_alias_in_logical_filters"
+          ],
+          "note": "A locked TinyMongo SQLite source creates integer/float/string records whose physical keys are changed to the original legacy str(_id) forms. Real TinyMongo first verifies them; explicit stopped import creates four native shards; stock PyMongo checks equality/$or/$nor, replacement, deletion and reopen, and the original source remains byte-identical/readable. BriskDB requires import, not in-place opening of TinyMongo storage. DuckDB/Parquet legacy-format ingestion is not claimed."
+        },
+        {
+          "source": [
+            "test_native_key_collision_guards_remain_mapped_to_duplicate_errors"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_typed_ids.py::test_bson_aliases_share_unique_identity_and_keep_original_representation",
+            "src/storage/document.rs::record_checksum_binds_collection_shard_order_key_and_payload",
+            "src/storage/document.rs::record_checksum_tampering_is_rejected_on_startup",
+            "src/import/tinymongo.rs::legacy_physical_ids_are_validated_and_restore_container_order"
+          ],
+          "note": "Genuine equal IDs return duplicate code 11000. BriskDB checksum-binds native key and payload and fails closed on corruption; mismatched legacy source keys reject explicit import. It deliberately does not relabel a forged key/payload row as a normal duplicate or expose TinyMongo's private raw-row mutation hooks."
         }
       ]
     }

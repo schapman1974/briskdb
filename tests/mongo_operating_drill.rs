@@ -17,6 +17,9 @@ use briskdb::{
     protocol::mongo::MongoServer,
 };
 
+#[path = "mongo_operating_drill/typed_ids.rs"]
+mod typed_ids;
+
 async fn client(reference: bool, arguments: Vec<String>) {
     let variable = if reference {
         "BRISKDB_MONGO_ORACLE_PYTHON"
