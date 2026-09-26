@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-two locked suites is classified; 922 reference parameter cases are not 922 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-three locked suites is classified; 933 reference parameter cases are not 933 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3252,6 +3252,80 @@
             "python/tests/test_patching.py::test_one_close_failure_does_not_skip_other_clients_or_native_cleanup"
           ],
           "note": "BriskDB's embedded Tokio runtime and real PyMongo monitor/pool threads are intentional; TinyMongo's no-background-threads contract does not apply. A newly created live client has observable PyMongo background threads and does not add multiprocessing-managed child workers. Existing lifecycle tests cover shared engine ownership and cleanup; no process-wide zero-thread claim or long-duration soak claim is made."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_unique_update_fast_path.py",
+      "sha256": "aba6ab5d3cb2b2c45222ea1bc79677cbcf343d501ca547045a683c972c14c0ec",
+      "reference_case_count": 11,
+      "function_count": 10,
+      "coverage": [
+        {
+          "source": [
+            "test_tm043_unrelated_id_update_with_unique_index_is_collection_size_bounded",
+            "test_tm043_same_unique_value_noop_stays_targeted",
+            "test_tm043_unique_index_id_miss_decodes_no_payloads",
+            "test_tm043_changed_unique_scalar_preserves_atomic_conflict_handling",
+            "test_tm043_no_index_id_update_keeps_existing_targeted_behavior"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_point_updates_noops_misses_and_scalar_conflicts_preserve_other_rows"
+          ],
+          "note": "Native point-update counts, no-ops, misses, available unique-value changes and rejected collisions are checked across 10/100/1000 rows with and without the unique index, with exact untouched rows and reopen. TinyMongo monkeypatches Python _json_loads to assert exact/constant decode counts; BriskDB decodes BSON in Rust, so those hooks/count thresholds are not claimed as a native performance measurement."
+        },
+        {
+          "source": [
+            "test_tm043_reordered_unique_multikey_entries_stay_targeted"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_reordered_multikey_entries_preserve_uniqueness_and_array_order"
+          ],
+          "note": "Reordering the same unique multikey entries changes the stored array once, becomes a subsequent no-op, remains queryable by either key and preserves uniqueness after a rejected overlap/reopen. Private Python decoder call counts are not exposed."
+        },
+        {
+          "source": [
+            "test_tm043_sparse_unique_membership_transitions_remain_atomic"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_sparse_unique_membership_transitions_roll_back_conflicts",
+            "src/storage/document/enabled/unique/tests.rs::sparse_partial_and_compound_membership_preserve_unique_rules"
+          ],
+          "note": "Outside/inside/outside sparse membership transitions release a key for another owner; conflicting re-entry rolls back all changed fields and leaves the original owner intact through reopen. Native storage replaces the private SQLite expression-index decode trace."
+        },
+        {
+          "source": [
+            "test_tm043_partial_unique_membership_transitions_remain_atomic"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_partial_unique_membership_can_transfer_ownership_after_a_rejected_entry",
+            "src/storage/document/enabled/unique/tests.rs::replacement_conflicts_roll_back_and_deletion_and_drop_release_unique_keys"
+          ],
+          "note": "Unrelated outside-index updates succeed; conflicting membership entry preserves the document; explicit old-owner exit permits the new owner to enter. Complete records survive reopen, with no private Python decode-count claim."
+        },
+        {
+          "source": [
+            "test_tm043_compound_multikey_overlap_is_detected_for_parent_path_update"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_parent_path_update_detects_compound_multikey_overlap_atomically"
+          ],
+          "note": "Updating an indexed parent object detects a compound multikey overlap with another owner. Duplicate code 11000 rolls back both the parent and an unrelated changed field while retaining array order and prior data through reopen."
+        },
+        {
+          "source": [
+            "test_tm043_update_many_uses_indexed_candidates_with_unrelated_unique_index"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_filtered_multi_update_keeps_unselected_rows_and_unrelated_unique_values"
+          ],
+          "note": "With both an unrelated unique email index and nonunique group index, the original 200-row/10-selected scenario yields exact counts and preserves every unselected row and unique value through reopen. The native candidate path uses storage index probes, but this wire scenario does not assert TinyMongo's Python decoder set or <=4-per-row threshold and is not a native performance benchmark."
         }
       ]
     }
