@@ -96,8 +96,9 @@ A future general coordinator requires a separate design and explicit capability:
 durable intent/decision records, fencing, bounded prepared resources, deterministic
 recovery of every participant/decision boundary, unknown-outcome reconciliation,
 retry deduplication, upgrade/backup rules and crash proofs. It is not a prerequisite
-for the documented non-atomic Mongo command surface. #183 must independently prove
-that surface's failure, retry, concurrency and recovery boundaries before closure.
+for the documented non-atomic Mongo command surface. #183's acceptance covers
+that surface's failure, retry, concurrency and process-death recovery boundaries;
+it does not implement or claim a general cross-shard coordinator.
 
 ## Target architecture
 
@@ -441,8 +442,8 @@ diagnose BriskDB using tested procedures.
 - [ ] Add a resumable offline reshard tool before attempting online movement.
 - [x] [#74](https://github.com/schapman1974/briskdb/issues/74) — retain the existing
   single-shard explicit transaction boundary for the alpha. No general distributed
-  transaction coordinator is enabled. Mongo's additional fault/retry acceptance
-  remains tracked independently in #183.
+  transaction coordinator is enabled. Mongo's non-atomic fault/retry acceptance
+  is recorded independently in #183; filesystem/power-loss soak remains separate.
 - [ ] Long-running soak, concurrency, filesystem fault, upgrade/downgrade, and
   compatibility suites.
 - [ ] Publish performance methodology and results against unsharded SQLite and
@@ -710,8 +711,8 @@ requires an earlier dependency:
       this boundary. Find-and-modify upserts now share the same synthesis and
       recheck path, with explicit inserted IDs and optional before/after images.
       Ready secondary entries now follow the same record transaction, with
-      post-image validation and cross-shard Ready-unique enforcement. Bulk
-      final-image policy and broader corpus acceptance remain under #183/#186.
+      post-image validation and cross-shard Ready-unique enforcement. #183 records
+      the chosen shard-local bulk policy; broader corpus acceptance remains #186.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
       Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
@@ -905,8 +906,15 @@ requires an earlier dependency:
       build/startup key memory; writer stripes span record/entry commit or rollback.
       Removal releases enforcement through the existing recoverable lifecycle.
       Bulk writes still commit per input/shard and can reject transient collisions
-      even when the eventual image is unique. Sharded TinyMongo whole-post-image
-      parity and crash-safe cross-shard bulk coordination remain #183; #174 stays open.
+      even when the eventual image is unique. Frozen TinyMongo memory and SQLite
+      backends differ here; #74/#183 retain the explicit non-atomic contract.
+      #183 adds 28 isolated process exits before/after every input/shard commit
+      for insert/update-many/delete-many, with exact recovered records, Ready
+      unique/multikey index queries, conditional/stable-ID replay, a second reopen,
+      and resource reuse. Existing cancellation/rollback/partial-wire-error and
+      independent-process unique-writer tests cover the other boundaries. This
+      is not generic retryable writes, distributed transactions or a power-loss
+      proof. Index selector compatibility remains #174; wider soak remains #185/#187.
       Non-unique physical indexes now accept nested/object/array and other valid
       BSON values via checksummed, record-bound fallback candidates. Candidate
       scans include these records before the complete matcher; unique indexes
@@ -1090,7 +1098,7 @@ requires an earlier dependency:
 12. [x] **Retain the single-shard transaction boundary (#74).** General distributed
     transactions remain unsupported for the alpha. Existing operation-specific
     coordinators and document batches keep only their documented guarantees;
-    the decision does not close #183's additional Mongo crash/retry gates.
+    #183 separately records the Mongo crash/retry acceptance for that policy.
 13. [ ] **Implement MySQL support.** Add the listener, wire lifecycle, prepared
     statements, type and error mapping, transactions, security, and real-client
     conformance after the higher-priority frontends are stable.

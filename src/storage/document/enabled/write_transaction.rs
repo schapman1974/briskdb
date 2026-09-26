@@ -170,7 +170,18 @@ impl<'c> DocumentWriteTransaction<'c> {
     }
 
     pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
-        self.transaction.take().expect("live transaction").commit()
+        #[cfg(test)]
+        let checkpoint = commit_crash_checkpoint();
+        #[cfg(test)]
+        if checkpoint.as_deref() == Some("before") {
+            std::process::exit(73);
+        }
+        let result = self.transaction.take().expect("live transaction").commit();
+        #[cfg(test)]
+        if result.is_ok() && checkpoint.as_deref() == Some("after") {
+            std::process::exit(73);
+        }
+        result
     }
 
     pub(crate) fn rollback(mut self) -> rusqlite::Result<()> {
@@ -179,6 +190,22 @@ impl<'c> DocumentWriteTransaction<'c> {
             .expect("live transaction")
             .rollback()
     }
+}
+
+/// Isolated subprocess acceptance tests can terminate at each actual document
+/// transaction commit, including later inputs/shards. Never compiled into the
+/// library, server, or wheel used by applications. No parent test changes env.
+#[cfg(test)]
+fn commit_crash_checkpoint() -> Option<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COMMIT: AtomicUsize = AtomicUsize::new(0);
+    let configured = std::env::var("BRISKDB_TEST_MONGO_COMMIT_CRASH").ok()?;
+    let (phase, target) = configured.split_once(':').expect("phase:ordinal");
+    assert!(matches!(phase, "before" | "after"));
+    let target: usize = target.parse().expect("commit ordinal");
+    assert!((1..=100).contains(&target));
+    let ordinal = COMMIT.fetch_add(1, Ordering::SeqCst) + 1;
+    (ordinal == target).then(|| phase.to_owned())
 }
 
 pub(super) fn acquire_fence(
