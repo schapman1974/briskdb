@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 333 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 339 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -54,14 +54,14 @@ functions in the locked `test_query_more.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
 `test_async_api.py`, `test_bson_registry_hardening.py`, `test_patching.py`,
 `test_pymongo_dropin.py`, `test_pymongo_contract.py` and
-`test_talkpython_regressions.py` suites
-(766 reference parameter cases). 219 added wheel scenarios and existing patch
+`test_talkpython_regressions.py` and `test_sharded_sqlite_operation_atomicity.py` suites
+(772 reference parameter cases). 224 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 766 unchanged upstream candidate passes or complete #186 certification.
+not 772 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -87,6 +87,16 @@ no native counterpart. Real PyMongo cursors retain buffered rows after close and
 permit rewind, unlike TinyMongo's permanent-close behavior; boolean argument
 validation also stays with the pinned driver. These differences are explicit,
 and full database statistics remain the #166 gap described below.
+
+Five additional real-wire contention scenarios verify conditional version winners,
+unique atomic counter before/after images, sorted replacement/deletion preimages,
+global natural/sorted selection across physical shards, and exact-ID shard
+independence while an external process holds a real SQLite write lock. Completed
+outcomes are checked after reopen. The lock holder is a separate spawned process
+because stdlib SQLite and the wheel bundle different SQLite builds; same-process
+lock bookkeeping is not a reliable fault injection boundary. These tests replace
+TinyMongo private Python pause hooks with native outcomes, not identical forced
+instruction interleavings or long-running soak certification.
 
 Update-modifier coverage checks BSON-order min/max with representation-preserving
 numeric equality, sparse array paths, rename movement/errors, pop validation and

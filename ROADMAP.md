@@ -996,9 +996,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, twenty-seven query/public-client suites now
-      have complete source accounting (333 functions/766 reference cases), backed
-      by 219 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, twenty-eight query/public-client suites now
+      have complete source accounting (339 functions/772 reference cases), backed
+      by 224 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions

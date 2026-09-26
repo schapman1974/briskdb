@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-seven locked suites is classified; 766 reference parameter cases are not 766 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-eight locked suites is classified; 772 reference parameter cases are not 772 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2784,6 +2784,54 @@
           "kind": "contract_difference",
           "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_python_only_date_sort_inputs_reject_before_mutation"],
           "note": "TinyMongo can construct a cursor from arbitrary Python date objects and warn once when sorting. Native PyMongo cursors contain server BSON; date is unencodable and rejects the whole local insert batch before mutation. There is no warning-based Python-object sorter or matching warning-count claim."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_operation_atomicity.py",
+      "sha256": "b709e8b11b7c8a74104d9003fc8d030c0e39b165cfc210ffb77bf601275c93c9",
+      "reference_case_count": 6,
+      "function_count": 6,
+      "coverage": [
+        {
+          "source": ["test_conditional_replace_cannot_overwrite_a_competing_version_change"],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_atomicity.py::test_conditional_replace_and_version_update_have_exactly_one_winner",
+            "tests/document_replacement.rs::concurrent_filtered_replacements_do_not_rewrite_stale_matches"
+          ],
+          "note": "Twenty-four barrier-started real-wire replacement/version-update races assert exactly one conditional winner and an exact matching stored image after reopen. Native concurrent filtered replacements also recheck stale matches. The source's private validate_unique_post_image pause and forced winner order have no identical native hook; no unchanged instruction-level interleaving claim is made."
+        },
+        {
+          "source": ["test_find_one_and_update_keeps_mutation_and_after_read_atomic"],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_atomicity.py::test_find_update_returns_each_atomic_before_and_after_counter_image",
+            "tests/document_replacement.rs::concurrent_find_updates_return_each_selected_record_once"
+          ],
+          "note": "Four wire workers contend on one record: all 96 before images and all 96 after images must each form the complete unique counter sequence, and final counters survive reopen. Native selected-record races additionally assert before/after state. This replaces private nested Python update monkeypatching, not a pass of that hook."
+        },
+        {
+          "source": ["test_find_one_and_replace_keeps_selection_mutation_and_before_atomic", "test_find_one_and_delete_keeps_selection_mutation_and_before_atomic"],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_atomicity.py::test_find_replace_and_delete_return_each_selected_preimage_once",
+            "tests/document_replacement.rs::concurrent_find_replacements_return_each_selected_id_once",
+            "tests/document_deletion.rs::concurrent_find_deletes_return_each_preimage_exactly_once"
+          ],
+          "note": "Four wire consumers receive each of 48 sorted selection preimages exactly once for replacement and deletion; no stale duplicate selection or lost record is allowed. Native tests cover the same atomic image boundaries. TinyMongo's nested collection-method pause hooks are not present and their exact forced scheduling is not reproduced."
+        },
+        {
+          "source": ["test_broad_and_sorted_find_and_modify_use_logical_cross_shard_order"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_shard_atomicity.py::test_natural_and_sorted_find_modify_ignore_physical_shard_order"],
+          "note": "Read-only inspection of the owned test shards proves the selected fixtures straddle physical shards in the opposite natural order. Broad replacement and sorted update select the global logical winners, preserve other records and survive reopen. This does not require TinyMongo's private shard hash function."
+        },
+        {
+          "source": ["test_exact_id_operations_on_different_shards_remain_independent"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_shard_atomicity.py::test_locked_shard_does_not_block_an_independent_exact_id_write"],
+          "note": "A spawned process holds a real SQLite BEGIN IMMEDIATE lock on one owned shard. A monitored wire update stays pending while another shard's exact-ID update completes; releasing the lock lets the first finish, and both persist after reopen. A separate process avoids shared-process POSIX locks and separate SQLite-build bookkeeping. This is a storage-lock boundary test, not TinyMongo's private post-update pause hook or long-duration soak."
         }
       ]
     }
