@@ -208,6 +208,7 @@ async fn run(
     let executor = Arc::new(commands::Executor::new(
         database.clone(),
         Arc::clone(&metrics),
+        limits,
     ));
     let slots = Arc::new(Semaphore::new(limits.max_connections()));
     let mut connections = JoinSet::new();

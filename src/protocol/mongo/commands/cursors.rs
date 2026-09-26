@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::super::metrics;
+use super::super::{MongoResourceLimits, metrics};
 use super::{CommandError, Result};
 use crate::{
     core::Session,
@@ -16,8 +16,6 @@ use crate::{
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-const MAX_CONNECTION_CURSORS: usize = 8;
-const MAX_WIRE_CURSORS: usize = 32;
 
 struct Entry {
     namespace: DocumentNamespace,
@@ -33,11 +31,17 @@ struct Entry {
 pub(super) struct WireCursors(
     Mutex<BTreeMap<DocumentCursorId, Entry>>,
     Arc<metrics::Metrics>,
+    MongoResourceLimits,
 );
 
 impl WireCursors {
+    #[cfg(test)]
     pub(super) fn new(metrics: Arc<metrics::Metrics>) -> Self {
-        Self(Mutex::new(BTreeMap::new()), metrics)
+        Self::with_limits(metrics, MongoResourceLimits::default())
+    }
+
+    pub(super) fn with_limits(metrics: Arc<metrics::Metrics>, limits: MongoResourceLimits) -> Self {
+        Self(Mutex::new(BTreeMap::new()), metrics, limits)
     }
 
     pub fn register(
@@ -50,12 +54,12 @@ impl WireCursors {
     ) -> Result<()> {
         let mut entries = self.0.lock().unwrap_or_else(|error| error.into_inner());
         prune(&mut entries);
-        if entries.len() >= MAX_WIRE_CURSORS
+        if entries.len() >= self.2.max_cursors()
             || entries
                 .values()
                 .filter(|entry| entry.connection == connection)
                 .count()
-                >= MAX_CONNECTION_CURSORS
+                >= self.2.max_cursors_per_connection()
         {
             self.1.cursor_rejected();
             return Err(CommandError::new(
@@ -97,7 +101,7 @@ impl WireCursors {
                 .values()
                 .filter(|entry| entry.connection == connection)
                 .count()
-                >= MAX_CONNECTION_CURSORS
+                >= self.2.max_cursors_per_connection()
         {
             self.1.cursor_rejected();
             return Err(CommandError::new(
@@ -397,6 +401,62 @@ mod tests {
             drop(registry);
             assert_counts(&metrics, (total, total, 0, total, 0, 1));
         }
+    }
+
+    #[test]
+    fn narrowed_quotas_preserve_handoff_ownership_and_reclaim_every_slot() {
+        let metrics = Arc::new(metrics::Metrics::default());
+        let limits = MongoResourceLimits::default()
+            .with_cursor_limits(3, 2)
+            .unwrap();
+        let registry = Arc::new(WireCursors::with_limits(Arc::clone(&metrics), limits));
+        let first = registry.connection(10);
+        let second = registry.connection(20);
+        let third = registry.connection(30);
+        let first_id = register(&registry, 1, 10, None);
+        register(&registry, 2, 10, None);
+        let rejected = |owner| {
+            registry
+                .register(
+                    DocumentCursorId::new(99).unwrap(),
+                    namespace(),
+                    Arc::new(Session::new(1, PreparedStatementLimits::default())),
+                    owner,
+                    None,
+                )
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(rejected(10), 10334); // Per-connection, below listener cap.
+        let moved_id = register(&registry, 3, 20, None);
+        assert_eq!(rejected(30), 10334); // Listener cap, empty receiving socket.
+        assert_eq!(
+            error_code(registry.lookup(moved_id, &namespace(), 10)),
+            10334
+        );
+        assert_eq!(
+            registry
+                .0
+                .lock()
+                .unwrap()
+                .get(&moved_id)
+                .unwrap()
+                .connection,
+            20
+        );
+        registry.discard(first_id);
+        registry
+            .lookup(moved_id, &namespace(), 10)
+            .unwrap()
+            .complete(Duration::ZERO, true)
+            .unwrap();
+        drop(second);
+        assert!(registry.0.lock().unwrap().contains_key(&moved_id));
+        drop(first);
+        assert!(registry.0.lock().unwrap().is_empty());
+        register(&registry, 4, 30, None);
+        drop(third);
+        assert_counts(&metrics, (4, 4, 0, 3, 0, 3));
     }
 
     #[test]

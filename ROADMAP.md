@@ -1052,6 +1052,10 @@ requires an earlier dependency:
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can narrow listener-local connection caps (1–8) and command deadlines
       (positive, at most 15 seconds) with immutable `MongoResourceLimits`.
+      The same policy narrows retained cursors to 1–32 per listener and 1–8 per
+      connection. Registrations and handoffs enforce both quotas; rejected
+      handoffs preserve the original owner, rejected registrations release
+      native resources, and kills/disconnects/shutdown reclaim capacity.
       Complete-frame decoding/parser queuing and engine work share an absolute
       deadline; client maxTimeMS cannot relax it. Defaults and independent BSON,
       cursor/result/socket limits remain unchanged; authenticated per-user quotas
