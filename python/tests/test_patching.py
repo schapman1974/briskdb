@@ -248,6 +248,49 @@ assert not _mongo_runtime._stores
         result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_explicit_sqlite_patch_without_folder_uses_an_owned_temporary_store(self):
+        with mock.patch.object(patching, "acquire", wraps=patching.acquire) as acquire:
+            with briskdb.patch(backend="sqlite", shards=2):
+                client = pymongo.MongoClient()
+                root = client.briskdb_path
+                self.assertTrue(client._briskdb_store.temporary)
+                self.assertTrue((root / "manifest.sqlite").is_file())
+                client.app.items.insert_one({"_id": 1})
+            acquire.assert_called_once_with(None, 2)
+        self.assertFalse(root.exists())
+
+    def test_unsupported_pymongo_version_rejects_before_engine_acquisition(self):
+        program = '''
+from unittest import mock
+import pymongo
+import briskdb
+from briskdb import patching, _mongo_runtime
+original_version = pymongo.version_tuple
+original_sync, original_async = pymongo.MongoClient, pymongo.AsyncMongoClient
+pymongo.version_tuple = (4, 10, 0)
+with mock.patch.object(_mongo_runtime._briskdb, "open", side_effect=AssertionError("engine opened")):
+    try:
+        with briskdb.patch():
+            raise AssertionError("unsupported driver entered")
+    except ImportError as error:
+        assert "pymongo==4.17.0" in str(error)
+    else:
+        raise AssertionError("unsupported driver accepted")
+assert pymongo.MongoClient is original_sync
+assert pymongo.AsyncMongoClient is original_async
+assert not patching._entries and patching._owner is None
+assert not _mongo_runtime._stores
+pymongo.version_tuple = original_version
+with briskdb.patch(shards=2):
+    client = pymongo.MongoClient()
+    client.app.items.insert_one({"_id": 1})
+    assert client.app.items.count_documents({}) == 1
+assert not patching._entries and patching._owner is None
+assert not _mongo_runtime._stores
+'''
+        result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_constructor_aliases_imported_before_scope_are_not_replaced(self):
         captured = self.original
         existing = captured("mongodb://untouched.invalid", connect=False)

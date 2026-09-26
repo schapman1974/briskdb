@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 292 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 308 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -52,13 +52,14 @@ functions in the locked `test_query_more.py`,
 `test_uuid_regex.py`, `test_aggregation_basic_stages.py`,
 `test_aggregation_projection_stages.py`, `test_aggregation.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
-`test_async_api.py` and `test_bson_registry_hardening.py` suites
-(691 reference parameter cases). 202 owned wheel tests check public
+`test_async_api.py`, `test_bson_registry_hardening.py` and `test_patching.py` suites
+(707 reference parameter cases). 204 added wheel scenarios and existing patch
+regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 691 unchanged upstream candidate passes or complete #186 certification.
+not 707 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -146,6 +147,11 @@ regex ordering, stable explicitly ordered sort ties, signed UTC milliseconds,
 tag-lookalike documents and sync/async persistence. The Mongo client addon needs
 PyMongo; its encoder rejects `bytearray` (convert to `bytes`). Native values do
 not use TinyMongo's optional Python registry or implicitly decode its JSON tags.
+Patch-source accounting reuses constructor restoration, nesting, thread/task
+exclusion, shared data and awaited cleanup tests. Explicit SQLite scopes without
+a folder stay temporary, unlike TinyMongo's default persistent path; async
+clients require `async with`. Unsupported older PyMongo versions reject before
+engine acquisition, without changing constructors or retaining patch state.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings

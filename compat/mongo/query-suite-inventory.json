@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-three locked suites is classified; 691 reference parameter cases are not 691 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-four locked suites is classified; 707 reference parameter cases are not 707 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2466,6 +2466,139 @@
             "python/tests/test_upstream_bson_registry.py::test_uuid_regex_survive_sync_and_async_reopen_with_required_driver"
           ],
           "note": "UUID/regex values and queries survive sync-to-async-to-sync native reopen with required PyMongo and explicit standard UUID representation. This does not claim TinyMongo's dependency-free Python client or Python re.Pattern return type."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_patching.py",
+      "sha256": "dda50ca07c1137af58f7426314129a05114e79e1b1758a0567e4b7969960f18d",
+      "reference_case_count": 16,
+      "function_count": 16,
+      "coverage": [
+        {
+          "source": [
+            "test_patch_context_uses_shared_isolated_memory_and_restores_client",
+            "test_clients_created_by_patch_are_closed_at_scope_exit"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_patching.py::test_shared_isolated_store_real_queries_results_and_cleanup",
+            "python/tests/test_patching.py::test_explicit_folders_and_decorator_persist_and_reopen_layout"
+          ],
+          "note": "Scope clients share isolated native SQLite state and constructors/handles are restored/closed. Caller backend/folder choices cannot redirect the owned scope. Unlike TinyMongo's RAM registry, BriskDB uses an owned temporary directory deleted after release; explicit folders persist."
+        },
+        {
+          "source": [
+            "test_patch_restores_client_when_body_raises"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_patching.py::test_restore_after_exception_invalid_constructor_and_startup_failure"
+          ],
+          "note": "Application exceptions, invalid constructors and failed engine startup leave patch state restored and later scopes usable."
+        },
+        {
+          "source": [
+            "test_patch_decorator_uses_explicit_folder_and_backend"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_patching.py::test_explicit_folders_and_decorator_persist_and_reopen_layout"
+          ],
+          "note": "Repeated synchronous decorator calls persist to the selected SQLite folder and preserve stored shard layout. Private TinyMongo _foldername/_backend attributes are not native APIs."
+        },
+        {
+          "source": [
+            "test_same_patch_object_can_be_nested_safely"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_patching.py::test_nested_reused_scope_restores_lifo_and_preserves_outer"
+          ],
+          "note": "A reused nested patch object gives independent scopes and restores the outer constructor/data before final restoration."
+        },
+        {
+          "source": [
+            "test_patch_scopes_must_exit_in_nested_order",
+            "test_patch_exit_without_entry_fails_clearly"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_patching.py::test_out_of_order_or_wrong_thread_exit_leaves_active_scope_unchanged"
+          ],
+          "note": "Wrong-order, wrong-owner and never-entered exits reject without corrupting the active constructor or patch stack."
+        },
+        {
+          "source": [
+            "test_non_memory_patch_without_folder_uses_default_path"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_patching.py::test_explicit_sqlite_patch_without_folder_uses_an_owned_temporary_store"
+          ],
+          "note": "Even explicit backend=sqlite without a folder deliberately uses an owned temporary root, not TinyMongo's persistent tinydb default. The root contains real storage while active and is removed after exit."
+        },
+        {
+          "source": [
+            "test_patch_imports_pymongo_only_when_entered"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_patching.py::test_import_and_scope_construction_do_not_require_pymongo"
+          ],
+          "note": "Fresh-process dependency blocking proves importing BriskDB and constructing a scope do not import PyMongo; entry fails with installation guidance and no retained patch/store state. Private import-module call counts are not a public contract."
+        },
+        {
+          "source": [
+            "test_overlapping_patch_scopes_in_different_threads_are_rejected"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_patching.py::test_overlapping_thread_scope_rejected"
+          ],
+          "note": "A distinct thread cannot overlap an active process-global scope; constructors remain restored afterward."
+        },
+        {
+          "source": [
+            "test_overlapping_patch_scopes_in_different_async_tasks_are_rejected"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_patching.py::test_other_tasks_cannot_overlap_even_on_same_thread"
+          ],
+          "note": "Distinct async tasks cannot overlap even on the same thread; owning-task cleanup restores the original constructors."
+        },
+        {
+          "source": [
+            "test_async_decorators_fail_clearly",
+            "test_sync_patch_context_closes_async_clients"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_patching.py::test_async_requires_awaited_scope_and_coroutine_decorator_rejected"
+          ],
+          "note": "Coroutine decorators reject. Unlike TinyMongo's sync-exit async-client cleanup, BriskDB rejects AsyncMongoClient construction in a synchronous scope and requires async with for awaited native cleanup."
+        },
+        {
+          "source": [
+            "test_patch_async_context_routes_and_restores_async_client",
+            "test_async_patch_context_closes_sync_clients"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_patching.py::test_async_and_sync_share_scope_and_clients_are_closed"
+          ],
+          "note": "An async scope routes real sync and async clients to shared native data and closes both kinds before restoring constructors."
+        },
+        {
+          "source": [
+            "test_patch_supports_pymongo_without_an_async_client"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_patching.py::test_unsupported_pymongo_version_rejects_before_engine_acquisition"
+          ],
+          "note": "BriskDB explicitly pins PyMongo 4.17.0, including its async client implementation; older sync-only drivers are outside the supported contract. An isolated older-version probe rejects before engine acquisition or constructor mutation and proves clean recovery with the supported driver."
         }
       ]
     }
