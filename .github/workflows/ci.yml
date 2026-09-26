@@ -587,6 +587,7 @@ jobs:
           "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install --no-build-isolation --no-deps ./target/tinymongo-model-source
           python -m unittest discover -s python/tests -p test_index_models_reference.py -v
           python -m unittest discover -s python/tests -p test_index_suite_inventory.py -v
+          python -m unittest discover -s python/tests -p test_query_suite_inventory.py -v
 
       - name: Test and lint the native extension
         run: |

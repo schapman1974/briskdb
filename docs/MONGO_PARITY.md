@@ -41,6 +41,25 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
+`compat/mongo/query-suite-inventory.json` separately accounts for all 38 test
+functions in the locked `test_query_more.py` and
+`test_query_operator_coverage_edges.py` suites (51 reference parameter cases).
+Eighteen owned wheel tests check their public query/write/index results, Mongo
+error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
+regex behavior. Hashes, exact function membership, reference collection counts
+and actual candidate test symbols are validated; these are adapted scenarios,
+not 51 unchanged upstream candidate passes or complete #186 certification.
+
+The inventory explicitly distinguishes modern PyMongo from TinyMongo's legacy
+cursor `.count()`/negative indexing and list-shaped index metadata. It also
+records Python values that BSON cannot encode: arbitrary objects, non-string
+field names and integers outside Int64 fail in the driver, rather than becoming
+stored Python values or receiving a server error code. Private Python helper
+return objects are replaced by observable query outcomes; the two private tests
+for injected Python conversion failure and custom missing-sentinel identity are
+implementation-specific, not claimed as reproduced branches. Native limits,
+query semantics and the immutable frozen v1 contract are unchanged.
+
 To reproduce with the frozen runner's test dependencies installed:
 
 ```sh

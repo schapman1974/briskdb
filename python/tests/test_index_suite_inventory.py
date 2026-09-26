@@ -25,7 +25,7 @@ def checked_path(root, relative):
     return path
 
 
-def validate_inventory(data, source_root=None):
+def validate_inventory(data, source_root=None, *, expected_scope=(4, 73, 217)):
     if data["schema_version"] != 1 or data["source_commit"] != SOURCE_COMMIT:
         raise ValueError("unexpected source/schema version")
     source_paths = set()
@@ -73,7 +73,7 @@ def validate_inventory(data, source_root=None):
                 raise ValueError(f"unmapped or unexpected source test: {suite['path']}")
         total_functions += len(names)
         total_cases += suite["reference_case_count"]
-    if len(source_paths) != 4 or (total_functions, total_cases) != (73, 217):
+    if (len(source_paths), total_functions, total_cases) != expected_scope:
         raise ValueError("source inventory changed; review the complete mapped scope")
 
 
