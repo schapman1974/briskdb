@@ -15,6 +15,8 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
+#[path = "mongo_wire/client_metadata.rs"]
+mod client_metadata;
 #[path = "mongo_wire/metrics.rs"]
 mod metrics;
 #[path = "mongo_wire/read_metrics.rs"]
@@ -328,10 +330,18 @@ async fn modern_discovery_ping_and_unsupported_commands() {
 #[tokio::test]
 async fn legacy_handshake_uses_correlated_op_reply() {
     let (_root, database, mut server) = setup().await;
-    let body = BsonDocument::from_entries([
+    let mut body = BsonDocument::from_entries([
         ("ismaster", BsonValue::Int32(1)),
         ("helloOk", BsonValue::Boolean(true)),
     ])
+    .unwrap();
+    body.push(
+        "client",
+        client_metadata::hello("PyMongo|c", "4.17.0")
+            .get_first("client")
+            .unwrap()
+            .clone(),
+    )
     .unwrap();
     let mut payload = BytesMut::new();
     payload.put_i32_le(0);
@@ -364,7 +374,9 @@ async fn legacy_handshake_uses_correlated_op_reply() {
         body.get_first("helloOk"),
         Some(BsonValue::Boolean(true))
     ));
+    assert_eq!(server.client_metadata()[0].driver_version, Some([4, 17, 0]));
     server.close().await.unwrap();
+    assert!(server.client_metadata().is_empty());
     database.close().await.unwrap();
 }
 
@@ -489,8 +501,9 @@ async fn assert_driver_restart(script: &'static str) {
     let (root, database, mut server) = setup().await;
     server.set_read_metrics_enabled(true);
     seed_index_metadata(&database).await;
-    let output = run_driver(server.address(), "initial", script).await;
+    let output = client_metadata::observe_driver(&server, "initial", script).await;
     server.close().await.unwrap();
+    assert!(server.client_metadata().is_empty());
     metrics::assert_driver_metrics_drained(&server.metrics());
     database.close().await.unwrap();
     assert_driver(output);
@@ -504,8 +517,9 @@ async fn assert_driver_restart(script: &'static str) {
         .await
         .unwrap();
     server.set_read_metrics_enabled(true);
-    let output = run_driver(server.address(), "reopened", script).await;
+    let output = client_metadata::observe_driver(&server, "reopened", script).await;
     server.close().await.unwrap();
+    assert!(server.client_metadata().is_empty());
     metrics::assert_driver_metrics_drained(&server.metrics());
     database.close().await.unwrap();
     assert_driver(output);

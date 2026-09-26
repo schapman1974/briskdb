@@ -195,6 +195,20 @@ mongo.close().await?;
 database.close().await?;
 ```
 
+Rust hosts can inspect `MongoServer::client_metadata()` for at most eight active
+connections, sorted by listener-local connection ID. The first successful modern
+or legacy handshake freezes each connection's metadata; later monitoring hellos
+cannot replace it, and an initial hello without `client` remains unrecorded.
+Only a closed driver-family enum (PyMongo sync/async or Other) and, for recognized
+names, an exact three-component unsigned-16-bit numeric version are retained.
+Unknown names, arbitrary version strings, application/OS/platform/environment
+values and extra fields are discarded, not logged, hashed or metric labels.
+This deliberately redacted view follows the `client.driver` field layout in the
+[MongoDB handshake specification](https://specifications.readthedocs.io/en/latest/mongodb-handshake/handshake/),
+not MongoDB's full client-metadata logging surface. It is untrusted diagnostic
+information, never authentication. Metadata disappears on disconnect, failure,
+abort or listener close; the API retains no history and changes no wire replies.
+
 Ordinary PyMongo 4.17.0 synchronous and asynchronous clients can discover,
 ping, inspect build information, insert one or many documents, and run bounded
 find queries through the [shared BSON matcher](DOCUMENT_ENGINE.md), including
