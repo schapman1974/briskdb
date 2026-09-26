@@ -59,11 +59,11 @@ pub use command::{
     DocumentUpdateRequest, MAX_DOCUMENT_INDEX_BATCH_SIZE, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
-pub(crate) use error::DocumentWriteRollback;
 pub use error::{
     BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError,
     DocumentIndexError, DocumentMutationError,
 };
+pub(crate) use error::{DocumentCollectionNotFound, DocumentWriteRollback};
 pub use index_definition::DocumentIndexDefinition;
 pub(crate) use index_definition::{
     DocumentIndexBuildDefinition, normalize_index_batch, normalize_index_definition,

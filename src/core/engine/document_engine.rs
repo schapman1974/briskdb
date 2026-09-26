@@ -732,7 +732,11 @@ impl Engine {
                                 catalog_namespace.collection(),
                                 Arc::clone(&control),
                             )?;
-                            let collection_id = require_collection(collection)?.id();
+                            let collection_id = collection
+                                .ok_or_else(|| {
+                                    crate::document::DocumentCollectionNotFound.into_engine_error()
+                                })?
+                                .id();
                             let route = prepare_filter_route(
                                 &catalog_storage,
                                 &filter,

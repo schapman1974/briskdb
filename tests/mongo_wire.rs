@@ -21,6 +21,8 @@ mod cancellation;
 mod client_metadata;
 #[path = "mongo_wire/events.rs"]
 mod events;
+#[path = "mongo_wire/find_catalog.rs"]
+mod find_catalog;
 #[path = "mongo_wire/metrics.rs"]
 mod metrics;
 #[path = "mongo_wire/read_metrics.rs"]
