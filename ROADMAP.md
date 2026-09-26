@@ -995,6 +995,14 @@ requires an earlier dependency:
       and arbitrary key arrival with memory trimming. Point reads remain direct;
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
+    - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
+      frozen corpus and index inventory, two original query suites now have
+      complete source accounting (38 functions/51 reference cases), backed by
+      18 installed-wheel scenario tests. Legacy cursor/index representations,
+      non-BSON Python values and two private-helper exclusions are explicit;
+      hash/membership/count/test-symbol gates reject unexplained omissions.
+      These adapted scenarios are not the entire upstream corpus or unchanged
+      source-body passes; larger inventories and fault/property tiers remain.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks

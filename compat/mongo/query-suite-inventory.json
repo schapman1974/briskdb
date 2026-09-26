@@ -1,0 +1,280 @@
+{
+  "schema_version": 1,
+  "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these two locked suites is classified; 51 reference parameter cases are not 51 candidate passes. Private Python helpers and BSON/client representation differences are explicit.",
+  "suites": [
+    {
+      "path": "tests/test_query_more.py",
+      "sha256": "8fcdde866077b98f5f8d1ec1c61639836ebb8b9a230da1f9f1f2ff6bcc581237",
+      "reference_case_count": 19,
+      "function_count": 19,
+      "coverage": [
+        {
+          "source": [
+            "test_nin_query_operator",
+            "test_all_operator_matches_arrays",
+            "test_nor_operator_excludes_matching_documents",
+            "test_exists_query_operator"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_membership_logical_existence_and_filtered_counts"
+          ],
+          "kind": "contract_difference",
+          "note": "Query/result semantics are checked with modern PyMongo iteration, count_documents and materialized-page indexing. TinyMongo's legacy Cursor.count()/negative cursor indexing are not exposed by modern PyMongo."
+        },
+        {
+          "source": [
+            "test_count_documents_uses_filter"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_membership_logical_existence_and_filtered_counts"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_write_filters_share_regex_options_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_regex_filters_are_shared_by_single_multi_and_replacement_writes"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_replace_one_replaces_single_document",
+            "test_find_one_and_update_returns_old_document"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_replacement_and_find_modify_preserve_ids_and_return_old_image"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_skip_limit_pagination_with_find"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_pagination_uses_modern_pymongo_not_legacy_cursor_helpers"
+          ],
+          "kind": "contract_difference",
+          "note": "Query/result semantics are checked with modern PyMongo iteration, count_documents and materialized-page indexing. TinyMongo's legacy Cursor.count()/negative cursor indexing are not exposed by modern PyMongo."
+        },
+        {
+          "source": [
+            "test_update_operator_support",
+            "test_nested_update_creates_missing_subdocuments"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_mixed_updates_create_nested_paths_and_apply_to_every_match"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_update_many_applies_to_all_matches",
+            "test_update_many_applies_operators_to_each_match"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_mixed_updates_create_nested_paths_and_apply_to_every_match"
+          ],
+          "kind": "contract_difference",
+          "note": "Query/result semantics are checked with modern PyMongo iteration, count_documents and materialized-page indexing. TinyMongo's legacy Cursor.count()/negative cursor indexing are not exposed by modern PyMongo."
+        },
+        {
+          "source": [
+            "test_update_rejects_list_operator_target",
+            "test_update_many_requires_operators"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_invalid_updates_leave_records_unchanged"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_equality_index_deduplicates_repeated_array_values"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_equality_index_results_follow_insert_update_delete_and_drop"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_collection_indexes_accelerate_equality_queries",
+            "test_index_cache_is_invalidated_after_insert_and_delete",
+            "test_index_matches_array_membership_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_equality_index_results_follow_insert_update_delete_and_drop"
+          ],
+          "kind": "contract_difference",
+          "note": "Query/result semantics are checked with modern PyMongo iteration, count_documents and materialized-page indexing. TinyMongo's legacy Cursor.count()/negative cursor indexing are not exposed by modern PyMongo. list_indexes is a PyMongo cursor of BSON key documents, not TinyMongo's list of key pairs; index_information checks equivalent key metadata. This fixture proves result/cache maintenance, not a timing threshold."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_query_operator_coverage_edges.py",
+      "sha256": "376f7747df2adc9c6d76f21aabf0e3e2a31d21bcacd80e888f3ef61175b13a4d",
+      "reference_case_count": 32,
+      "function_count": 19,
+      "coverage": [
+        {
+          "source": [
+            "test_size_rejects_nonfinite_fractional_and_out_of_range_values",
+            "test_mod_rejects_a_zero_divisor_with_mongodb_error_metadata",
+            "test_type_rejects_empty_invalid_and_wrongly_typed_operands"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_size_mod_and_type_validation_keep_mongo_error_codes"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_mod_skips_nonfinite_and_out_of_int64_stored_values"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_mod_nonfinite_and_out_of_int64_bson_numbers_do_not_match",
+            "python/tests/test_upstream_queries.py::test_unencodable_python_values_fail_at_the_driver_boundary"
+          ],
+          "kind": "contract_difference",
+          "note": "Nonfinite BSON values and exact Decimal128 representations beyond Int64 do not match. Arbitrary Python integers outside BSON Int64 cannot travel over the wire and are rejected before mutation, not stored as Python-only values."
+        },
+        {
+          "source": [
+            "test_mod_treats_a_defensive_numeric_conversion_failure_as_no_match"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_mod_nonfinite_and_out_of_int64_bson_numbers_do_not_match"
+          ],
+          "kind": "implementation_specific",
+          "note": "This monkeypatches TinyMongo's private Python numeric conversion to raise ArithmeticError. BriskDB has no such helper or hook; typed-BSON nonfinite/out-of-range matching is tested instead. This is not an unchanged injected-branch pass."
+        },
+        {
+          "source": [
+            "test_type_deduplicates_equivalent_aliases_and_codes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_type_alias_duplicates_and_decimal_types_preserve_matches"
+          ],
+          "kind": "native_equivalent",
+          "note": "Private normalized frozenset identity is replaced by public alias/code-deduplicated matching outcomes."
+        },
+        {
+          "source": [
+            "test_type_names_cover_unregistered_and_decimal_values"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_type_alias_duplicates_and_decimal_types_preserve_matches",
+            "python/tests/test_upstream_queries.py::test_unencodable_python_values_fail_at_the_driver_boundary"
+          ],
+          "kind": "contract_difference",
+          "note": "Decimal BSON query types are checked over the wire. A private helper's classification of an arbitrary Python object is not representable in BSON; the stock driver rejects it before mutation."
+        },
+        {
+          "source": [
+            "test_malformed_query_shapes_use_mongodb_parse_error_code"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_malformed_queries_and_known_unsupported_operators_are_explicit",
+            "python/tests/test_upstream_queries.py::test_unencodable_python_values_fail_at_the_driver_boundary"
+          ],
+          "kind": "contract_difference",
+          "note": "BSON-encodable malformed filters return code 2. Python dictionaries with non-string field names fail BSON encoding in the stock driver rather than receiving a server code; exact diagnostic text is not compared."
+        },
+        {
+          "source": [
+            "test_known_mongodb_operators_remain_honestly_unsupported"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_malformed_queries_and_known_unsupported_operators_are_explicit"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_empty_elem_match_matches_only_container_array_members"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_empty_elem_match_requires_container_array_members"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_query_path_candidates_cover_numeric_fanout_and_scalar_boundaries"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_numeric_paths_preserve_indexed_endpoints_and_named_field_fanout"
+          ],
+          "kind": "native_equivalent",
+          "note": "Private candidate arrays/tuple representation are replaced by BSON document matches for numeric indexes, named numeric fields, leading zeros, nested-array endpoints and scalar traversal."
+        },
+        {
+          "source": [
+            "test_multiple_query_path_candidates_preserve_operator_semantics",
+            "test_query_null_equality_distinguishes_missing_from_zero_candidates"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_missing_null_and_multiple_path_candidates_keep_operator_semantics"
+          ],
+          "kind": "native_equivalent",
+          "note": "Private candidate/missing-sentinel identities are replaced by complete public filters preserving missing versus zero candidates, negation, existence and fanout."
+        },
+        {
+          "source": [
+            "test_all_accepts_elem_match_but_rejects_other_nested_operator_documents",
+            "test_in_and_nin_reject_nested_operator_documents",
+            "test_regex_compatibility_validator_rejects_operator_documents_in_arrays"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_all_elem_match_and_nested_membership_operator_validation"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_elem_match_accepts_logical_document_queries"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_elem_match_accepts_logical_document_queries"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_regex_compatibility_validator_walks_every_legacy_query_shape"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_regex_validation_traverses_legacy_logical_and_value_shapes"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public results are checked through the installed BriskDB wheel and its real PyMongo wire client; diagnostic message text is not a byte-stable compatibility promise."
+        },
+        {
+          "source": [
+            "test_get_nested_returns_custom_default_for_missing_paths"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_missing_null_and_multiple_path_candidates_keep_operator_semantics"
+          ],
+          "kind": "implementation_specific",
+          "note": "This tests identity of a caller-owned arbitrary Python default object in a private helper. No corresponding native/wire API exists; public missing/null/path behavior remains tested, not waived."
+        }
+      ]
+    }
+  ]
+}
