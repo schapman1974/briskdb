@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-one locked suites is classified; 919 reference parameter cases are not 919 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-two locked suites is classified; 922 reference parameter cases are not 922 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3212,6 +3212,46 @@
             "src/storage/document.rs::document_mutations_reject_transaction_handles_after_rollback"
           ],
           "note": "Native insert/replace/delete reject stale transaction handles after both explicit rollback and SQLite automatic rollback, preserving the original record. TinyMongo's catalog-read monkeypatch and successful fallback-planner retry are private and not reproduced; the native guard errors instead of silently continuing a stale transaction."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_concurrency.py",
+      "sha256": "c939bad83e5d28d85711391e084ab5f54d3cdd322b6661c3a308d3e25178a8ac",
+      "reference_case_count": 3,
+      "function_count": 3,
+      "coverage": [
+        {
+          "source": [
+            "test_different_shards_accept_independent_subprocess_writes"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_processes.py::test_spawned_writers_on_different_shards_progress_independently"
+          ],
+          "note": "Two spawned real BriskDB/PyMongo writers finish initialization before an external process holds a shard's SQLite write transaction. Both wire inserts start; the independent shard completes while the blocked writer remains active, then release permits its write. Reopen verifies both values and exact total count. Native SQLite locks/routing replace TinyMongo's portalocker files and private _shard_index helper."
+        },
+        {
+          "source": [
+            "test_wal_reader_sees_last_commit_during_raw_write_transaction"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_shard_processes.py::test_wal_readers_never_observe_uncommitted_raw_bson_damage"
+          ],
+          "note": "A spawned SQLite process writes invalid uncommitted BSON inside BEGIN IMMEDIATE on an owned shard; native point reads/counts retain the committed snapshot. The damage is always rolled back, never committed, and reads/reopen remain healthy. An external process avoids same-process lock bookkeeping differences between stdlib SQLite and the bundled native library."
+        },
+        {
+          "source": [
+            "test_client_use_starts_no_background_threads_or_processes"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shard_processes.py::test_real_driver_uses_background_threads_without_python_worker_processes",
+            "python/tests/test_patching.py::test_direct_clients_share_engine_until_last_close_and_match_native_data",
+            "python/tests/test_patching.py::test_one_close_failure_does_not_skip_other_clients_or_native_cleanup"
+          ],
+          "note": "BriskDB's embedded Tokio runtime and real PyMongo monitor/pool threads are intentional; TinyMongo's no-background-threads contract does not apply. A newly created live client has observable PyMongo background threads and does not add multiprocessing-managed child workers. Existing lifecycle tests cover shared engine ownership and cleanup; no process-wide zero-thread claim or long-duration soak claim is made."
         }
       ]
     }
