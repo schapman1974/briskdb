@@ -1016,8 +1016,12 @@ requires an earlier dependency:
       tasks/blocking workers. Fixed outcome/error classifications retain no BSON,
       namespace, comment, credential or diagnostic payload; guards release on
       completion/abort/unwind without installing a subscriber or export queue.
-      Matched-row/per-shard work telemetry, exporters/engine-phase tracing, readiness
-      and broader fault/soak acceptance remain open; no timeout changes.
+      Host readiness now reports listener/document/engine/schema admission states
+      and explicit anonymous-loopback security through a non-owning live probe.
+      Detected catalog/shard failures map to schema-degraded, without paths or
+      hidden I/O; this is not deep integrity or authenticated network readiness.
+      Matched-row/per-shard work telemetry, exporters/engine-phase tracing, full
+      governance and broader fault/soak acceptance remain open; no timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

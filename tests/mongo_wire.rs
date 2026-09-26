@@ -25,6 +25,8 @@ mod events;
 mod metrics;
 #[path = "mongo_wire/read_metrics.rs"]
 mod read_metrics;
+#[path = "mongo_wire/readiness.rs"]
+mod readiness;
 
 async fn setup() -> (tempfile::TempDir, BriskDb, MongoServer) {
     let root = tempfile::tempdir().unwrap();

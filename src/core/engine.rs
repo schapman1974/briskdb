@@ -535,6 +535,17 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+/// Internal observation only: never keeps a database or its pools alive.
+#[cfg(feature = "mongo")]
+pub(crate) struct EngineReadinessProbe(std::sync::Weak<EngineInner>);
+
+#[cfg(feature = "mongo")]
+impl EngineReadinessProbe {
+    pub(crate) fn snapshot(&self) -> Option<ReadinessSnapshot> {
+        self.0.upgrade().map(|inner| Engine { inner }.readiness())
+    }
+}
+
 impl Engine {
     /// Open a database without blocking the async runtime executor.
     pub async fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
@@ -872,6 +883,11 @@ impl Engine {
     /// Return the lifecycle state shared by every engine clone.
     pub fn state(&self) -> EngineState {
         self.inner.lifecycle.state()
+    }
+
+    #[cfg(feature = "mongo")]
+    pub(crate) fn readiness_probe(&self) -> EngineReadinessProbe {
+        EngineReadinessProbe(Arc::downgrade(&self.inner))
     }
 
     /// Return a narrow readiness snapshot without admitting an operation.
@@ -6292,6 +6308,45 @@ mod tests {
         let draining = engine.readiness();
         assert!(!draining.ready());
         assert_eq!(draining.lifecycle_state(), EngineState::Draining);
+    }
+
+    #[cfg(feature = "mongo")]
+    #[test]
+    fn weak_readiness_probe_tracks_live_gates_without_retaining_engine() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let owners = Arc::strong_count(&engine.inner);
+        let probe = engine.readiness_probe();
+        assert!(probe.snapshot().unwrap().ready());
+        assert_eq!(Arc::strong_count(&engine.inner), owners);
+        let mut migration = engine
+            .inner
+            .database
+            .storage
+            .begin_schema_migration()
+            .unwrap();
+        assert_eq!(
+            probe.snapshot().unwrap().schema_state(),
+            SchemaState::Migrating
+        );
+        migration.mark_pending_on_drop();
+        drop(migration);
+        assert_eq!(
+            probe.snapshot().unwrap().schema_state(),
+            SchemaState::Pending
+        );
+        engine.inner.database.storage.record_schema_degraded();
+        assert_eq!(
+            probe.snapshot().unwrap().schema_state(),
+            SchemaState::Degraded
+        );
+        engine.begin_shutdown();
+        assert_eq!(
+            probe.snapshot().unwrap().lifecycle_state(),
+            EngineState::Draining
+        );
+        assert_eq!(Arc::strong_count(&engine.inner), owners);
+        drop(engine);
+        assert!(probe.snapshot().is_none());
     }
 
     #[test]
