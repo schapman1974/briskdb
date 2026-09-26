@@ -27,6 +27,7 @@ pub(crate) fn execution_to_python(
         counters.set_item("storage_reads", stats.storage_reads())?;
         counters.set_item("documents_examined", stats.documents_examined())?;
         counters.set_item("matcher_evaluations", stats.matcher_evaluations())?;
+        counters.set_item("source_matches", stats.source_matches())?;
         counters.set_item("shards_read", stats.shards_read().collect::<Vec<_>>())?;
         output.set_item("read_stats", counters)?;
     }

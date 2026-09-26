@@ -60,8 +60,8 @@ const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
 const DOCUMENT_READ_ACCESS_BYTES: u64 = 32;
-// Three counters, bounded shard bookkeeping, and at most 64 u16 shard IDs.
-const DOCUMENT_READ_STATS_BYTES: u64 = 160;
+// Four counters, bounded shard bookkeeping, and at most 64 u16 shard IDs.
+const DOCUMENT_READ_STATS_BYTES: u64 = 192;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
 const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
@@ -1775,6 +1775,9 @@ impl Engine {
                 let Some(record) = record else {
                     return Ok((Vec::new(), false));
                 };
+                if let Some(stats) = &state.read_stats {
+                    stats.source_match();
+                }
                 // Sorting validates the original value even when skip removes
                 // this point result; array-key errors must not be hidden.
                 let record = if let Some(sorter) = state.sorter.clone() {
@@ -2128,6 +2131,9 @@ fn next_matching_document(
                 after = Some(record.natural_order());
                 continue;
             }
+        }
+        if let Some(stats) = stats {
+            stats.source_match();
         }
         check()?;
         return Ok(Some(record));

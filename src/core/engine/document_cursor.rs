@@ -104,6 +104,7 @@ pub(super) struct ReadStats {
     storage_reads: AtomicU64,
     documents_examined: AtomicU64,
     matcher_evaluations: AtomicU64,
+    source_matches: AtomicU64,
     shard_mask: AtomicU64,
 }
 
@@ -124,17 +125,22 @@ impl ReadStats {
         Self::add(&self.matcher_evaluations, 1);
     }
 
+    pub fn source_match(&self) {
+        Self::add(&self.source_matches, 1);
+    }
+
     fn add(counter: &AtomicU64, value: u64) {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_add(value))
         });
     }
 
-    fn snapshot(&self) -> DocumentReadStats {
+    pub(super) fn snapshot(&self) -> DocumentReadStats {
         DocumentReadStats::from_counters(
             self.storage_reads.load(Ordering::Relaxed),
             self.documents_examined.load(Ordering::Relaxed),
             self.matcher_evaluations.load(Ordering::Relaxed),
+            self.source_matches.load(Ordering::Relaxed),
             self.shard_mask.load(Ordering::Relaxed),
         )
     }
@@ -560,11 +566,17 @@ mod tests {
         counters.examine(u64::MAX);
         counters.examine(1);
         counters.match_document();
+        counters
+            .source_matches
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        counters.source_match();
+        counters.source_match();
         let snapshot = state.finish_read_stats().unwrap();
         assert!(state.read_stats.is_none());
         assert_eq!(snapshot.storage_reads(), 3);
         assert_eq!(snapshot.documents_examined(), u64::MAX);
         assert_eq!(snapshot.matcher_evaluations(), 1);
+        assert_eq!(snapshot.source_matches(), u64::MAX);
         assert_eq!(snapshot.shards_read().collect::<Vec<_>>(), vec![0, 63]);
         assert!(state.finish_read_stats().is_none());
     }

@@ -200,14 +200,17 @@ print(result["plan"], result["read_stats"])
 
 The counters are `storage_reads` (point/candidate record-read calls, including
 misses), `documents_examined` (stored BSON records received before filtering or
-projection), `matcher_evaluations` (full source-matcher evaluations), and
+projection), `matcher_evaluations` (full source-matcher evaluations),
+`source_matches` (record observations accepted by the source predicate), and
 `shards_read` (distinct physical shards where those calls ran). Lookahead and
-sorting rescans count again; these are not distinct-document counts. Buffered
+sorting rescans count again; these are not distinct-document counts. Source
+matches include unfiltered reads and direct-ID hits before sort-position
+rechecks, projection, skip/limit and pipeline stages, not final output rows. Buffered
 aggregation output can have zero source reads on a later page. Pipeline
 predicates, catalog queries, index-entry work and SQLite pages/bytes are not
 measured by these counters. Each request starts from zero; repeat the flag on
 each continuation. Empty initial batches do zero record reads. This independent
-option works with exact-ID points too and adds a fixed conservative 160-byte
+option works with exact-ID points too and adds a fixed conservative 192-byte
 logical result-budget charge (covering up to 64 shard IDs). Counters saturate at
 `u64::MAX`; failed requests return no snapshot. Defaults allocate no collector
 and keep existing output unchanged. This is a native diagnostic API, not MongoDB

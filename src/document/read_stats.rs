@@ -8,6 +8,7 @@ pub struct DocumentReadStats {
     storage_reads: u64,
     documents_examined: u64,
     matcher_evaluations: u64,
+    source_matches: u64,
     shard_mask: u64,
 }
 
@@ -16,12 +17,14 @@ impl DocumentReadStats {
         storage_reads: u64,
         documents_examined: u64,
         matcher_evaluations: u64,
+        source_matches: u64,
         shard_mask: u64,
     ) -> Self {
         Self {
             storage_reads,
             documents_examined,
             matcher_evaluations,
+            source_matches,
             shard_mask,
         }
     }
@@ -41,6 +44,14 @@ impl DocumentReadStats {
     /// source matcher evaluations and are deliberately not counted here.
     pub const fn matcher_evaluations(&self) -> u64 {
         self.matcher_evaluations
+    }
+
+    /// Record observations accepted by the source predicate (including direct
+    /// ID hits and unfiltered reads), before sort-key position rechecks,
+    /// projection, skip/limit and pipeline processing. Lookahead and repeated
+    /// sort reads count again; this is neither distinct matches nor output rows.
+    pub const fn source_matches(&self) -> u64 {
+        self.source_matches
     }
 
     /// Distinct physical shards on which a record-read call actually ran.

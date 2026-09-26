@@ -825,7 +825,11 @@ no extra access-plan diagnostics. An enabled complete frame samples the flag
 before preparation; already prepared requests retain that choice when it changes.
 The `reads` snapshot aggregates successful engine find/getMore/aggregate/distinct
 executions, record-read calls (including misses/lookahead/rescans), examined BSON
-documents, source matcher evaluations, and returned documents/distinct values.
+documents, source matcher evaluations, `source_matches`, and returned
+documents/distinct values. A source match counts a record observation accepted
+by the source predicate, including direct-ID hits and unfiltered reads, before
+sort-position rechecks, projection, skip/limit and pipeline stages. It is not
+a unique-match count or final output count.
 Sorted output refetches and source-matcher rechecks count again, independently
 of the preceding key-window scan; distinct also counts its internal lookahead.
 It excludes partial work from failed engine calls, legacy count, mutations and
@@ -838,7 +842,7 @@ are distinct from measured per-request shard visits: buffered aggregate output
 can read zero shards. Eight fixed fanout buckets (inclusive exported bounds
 0/1/2/4/8/16/32/64), peak fanout and 64 fixed physical-ordinal request counters
 make fanout and request distribution visible without namespace/identity labels.
-They do not measure matched rows, per-shard row/CPU skew, physical SQLite page or
+They do not measure unique matched rows, per-shard row/CPU skew, physical SQLite page or
 byte I/O, or pipeline-predicate evaluations. Enabled requests use the existing
 bounded engine diagnostics and account for their result metadata; protocol replies
 do not gain fields. Native Python/CLI metric controls, Mongo `explain`/`serverStatus`,
