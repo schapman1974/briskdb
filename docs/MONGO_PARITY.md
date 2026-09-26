@@ -686,6 +686,33 @@ bounded to 15 seconds. Exhaustion returns ID zero; stale or wrong-namespace IDs
 return code 43. Simultaneous use returns code 237. No SQLite lease is held between
 batches, and no cross-batch snapshot is promised under concurrent writes.
 
+Rust hosts can narrow connection admission and per-command execution time for
+one listener without relaxing any existing ceiling:
+
+```rust,ignore
+use briskdb::protocol::mongo::{MongoResourceLimits, MongoServer};
+use std::time::Duration;
+
+let limits = MongoResourceLimits::new(4, Duration::from_secs(3))?;
+let mut mongo = MongoServer::start_with_limits(
+    &database, "127.0.0.1:0".parse()?, limits,
+).await?;
+assert_eq!(mongo.resource_limits(), limits);
+```
+
+The immutable policy accepts 1–8 connections and a positive timeout up to 15
+seconds. `start` and daemon/Python listeners retain the existing defaults.
+Overflow sockets are rejected immediately, not queued. The command deadline
+starts when a complete frame is received, charges blocking-parser queue/decode
+time, and is never restarted between preparation and engine admission/execution.
+Client `maxTimeMS` can only narrow it; zero does not disable the host deadline.
+Each getMore is bounded anew by the host timeout and any remaining client cursor
+budget. Discovery/handshake, reply construction/delivery and socket idle/frame I/O
+retain their independent bounds. Expiry reports code 50 through existing metrics;
+the policy is listener-local, not a new authenticated per-user quota. Engine,
+BSON, cursor and result limits remain independently authoritative. Per-user
+governance awaits the shared authentication/authorization work.
+
 Natural-order reads load initial source frontiers from at most eight targeted
 shards concurrently, including find/getMore and distinct/aggregate source pages.
 Global ordering, pagination, owner pruning and the shared frontier byte bound

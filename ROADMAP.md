@@ -1044,7 +1044,12 @@ requires an earlier dependency:
       representative sustained-load evidence and complete release acceptance
       remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
-      can now inspect payload-free listener-local Mongo metrics: connection
+      can narrow listener-local connection caps (1–8) and command deadlines
+      (positive, at most 15 seconds) with immutable `MongoResourceLimits`.
+      Complete-frame decoding/parser queuing and engine work share an absolute
+      deadline; client maxTimeMS cannot relax it. Defaults and independent BSON,
+      cursor/result/socket limits remain unchanged; authenticated per-user quotas
+      await shared security. Hosts can inspect payload-free Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way
       outcomes, write/response-limit errors and bounded latency histograms.
       Wire cursor metrics track registration, active/peak/closed entries, idle
@@ -1079,7 +1084,7 @@ requires an earlier dependency:
       cursors after reopen. Gauge/accounting checks are not allocator/RSS or
       long-duration/power-loss/disk-full soak certification.
       Per-shard timing/physical-I/O telemetry, exporters/engine-phase tracing, full
-      governance and broader fault/soak acceptance remain open; no timeout changes.
+      governance and broader fault/soak acceptance remain open; no ceilings raised.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

@@ -266,7 +266,7 @@ pub(super) enum Command {
 
 pub(super) struct Prepared {
     command: Command,
-    timeout: Duration,
+    deadline: Instant,
     advisory_hint: bool,
 }
 
@@ -277,7 +277,22 @@ fn observed_read_options(enabled: bool) -> DocumentReadOptions {
 }
 
 /// Called on the bounded blocking parser, before any engine work is admitted.
+#[cfg(test)]
 pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Prepared>> {
+    prepare_with_limits(
+        request,
+        read_metrics,
+        Instant::now(),
+        super::MongoResourceLimits::default(),
+    )
+}
+
+pub(super) fn prepare_with_limits(
+    request: &Request,
+    read_metrics: bool,
+    started: Instant,
+    limits: super::MongoResourceLimits,
+) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
     if !matches!(
         name,
@@ -303,7 +318,13 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
         return None;
     }
     Some((|| {
-        let started = Instant::now();
+        if started.elapsed() >= limits.command_timeout() {
+            return Err(CommandError::new(
+                50,
+                "MaxTimeMSExpired",
+                "command deadline exceeded",
+            ));
+        }
         if request.more_to_come && !matches!(name, "insert" | "delete" | "update") {
             return Err(CommandError::options());
         }
@@ -343,7 +364,7 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
             };
             DocumentNamespace::new(&request.database, collection)?
         };
-        let mut timeout = Duration::from_secs(15);
+        let mut timeout = limits.command_timeout();
         let mut cursor_budget = None;
         for (field, value) in request.body.iter().skip(1) {
             if let Some(valid) = read_options::accepts(name, field, value) {
@@ -1083,7 +1104,7 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
         }
         Ok(Prepared {
             command,
-            timeout: timeout - elapsed,
+            deadline: started + timeout,
             advisory_hint: request.body.get_first("hint").is_some(),
         })
     })())
@@ -1239,6 +1260,10 @@ impl Executor {
         prepared: Prepared,
         shutdown: CancellationToken,
     ) -> BsonDocument {
+        if Instant::now() >= prepared.deadline {
+            return CommandError::new(50, "MaxTimeMSExpired", "command deadline exceeded")
+                .document();
+        }
         // A returned mutation document must fit BSON *before* the delete
         // commits, not merely the larger OP_MSG envelope checked on delivery.
         let reply_limit = if matches!(
@@ -1251,7 +1276,7 @@ impl Executor {
         };
         let context = RequestContext::new()
             .with_cancellation_token(shutdown)
-            .with_deadline(Instant::now() + prepared.timeout)
+            .with_deadline(prepared.deadline)
             // Reserve protocol-envelope space and bound results from documents
             // written through other, less restrictive embedded interfaces too.
             .with_result_limits(
@@ -2109,6 +2134,65 @@ pub(super) fn validate_response(body: &BsonDocument) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::protocol::mongo::MongoResourceLimits;
+
+    fn request(max_time: i32) -> Request {
+        Request {
+            request_id: 1,
+            database: "deadline".into(),
+            body: fields([
+                ("find", BsonValue::from("absent")),
+                ("maxTimeMS", BsonValue::Int32(max_time)),
+                ("$db", BsonValue::from("deadline")),
+            ]),
+            sequences: vec![],
+            more_to_come: false,
+            legacy_handshake: false,
+        }
+    }
+
+    #[test]
+    fn host_and_client_deadlines_can_only_narrow_and_charge_parser_queue_time() {
+        let limits = MongoResourceLimits::new(2, Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        for (client_ms, expected_ms) in [(0, 5000), (10_000, 5000), (2000, 2000)] {
+            let prepared = prepare_with_limits(&request(client_ms), false, started, limits)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                prepared.deadline,
+                started + Duration::from_millis(expected_ms)
+            );
+        }
+        let expired = started - Duration::from_secs(6);
+        let result = prepare_with_limits(&request(0), false, expired, limits).unwrap();
+        assert_eq!(result.err().unwrap().code, 50);
+    }
+
+    #[tokio::test]
+    async fn execution_does_not_restart_an_expired_preparation_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let database = BriskDb::builder(root.path())
+            .with_shard_count(2)
+            .with_document_support(crate::DocumentSupport::Enabled)
+            .open()
+            .await
+            .unwrap();
+        let executor = Executor::new(database.clone(), Arc::new(metrics::Metrics::default()));
+        let mut prepared = prepare(&request(0), false).unwrap().unwrap();
+        prepared.deadline = Instant::now() - Duration::from_secs(1);
+        let session = database.session();
+        let reply = executor
+            .execute(&session, 1, prepared, CancellationToken::new())
+            .await;
+        assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(50)));
+        database.close().await.unwrap();
+    }
 }
 
 #[cfg(test)]
