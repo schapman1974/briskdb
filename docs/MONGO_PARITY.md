@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 388 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 399 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -55,14 +55,15 @@ functions in the locked `test_query_more.py`,
 `test_async_api.py`, `test_bson_registry_hardening.py`, `test_patching.py`,
 `test_pymongo_dropin.py`, `test_pymongo_contract.py` and
 `test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
-`test_bson_codec.py` and `test_typed_physical_ids.py` suites
-(903 reference parameter cases). 236 added wheel scenarios and existing patch
+`test_bson_codec.py`, `test_typed_physical_ids.py` and
+`test_sqlite_optimistic_inserts.py` suites
+(919 reference parameter cases). 239 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 903 unchanged upstream candidate passes or complete #186 certification.
+not 919 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -103,6 +104,15 @@ This requires explicit stopped import; TinyMongo's private key format, fallback
 registry, SQL compiler text and DuckDB/Parquet legacy ingestion are not claimed.
 Forged keys or damaged checksums fail closed as corruption rather than being
 relabelled as ordinary duplicate-key errors.
+
+Empty-insert coverage includes clean/reused collections, ordered/unordered
+duplicate indices and original error operations, unique/nonunique constraints,
+custom mappings and zero-timestamp caller preservation. Imported legacy numeric
+IDs reject equivalent duplicate inserts without changing the original row.
+Private optimistic retries, SQL probe counts and externally substituted SQLite
+schemas are not BriskDB extension APIs. Real native disk-full and stale-transaction
+guards supply separate fault evidence, with rollback scoped to the affected shard
+transaction rather than a promise of whole-batch cross-shard atomicity.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary

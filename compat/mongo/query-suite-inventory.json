@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty locked suites is classified; 903 reference parameter cases are not 903 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-one locked suites is classified; 919 reference parameter cases are not 919 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3117,6 +3117,101 @@
             "src/import/tinymongo.rs::legacy_physical_ids_are_validated_and_restore_container_order"
           ],
           "note": "Genuine equal IDs return duplicate code 11000. BriskDB checksum-binds native key and payload and fails closed on corruption; mismatched legacy source keys reject explicit import. It deliberately does not relabel a forged key/payload row as a normal duplicate or expose TinyMongo's private raw-row mutation hooks."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_optimistic_inserts.py",
+      "sha256": "a3c3c85c4ff9b559db3228a4250f409f2e964d8270e2d03338167b530ae078ed",
+      "reference_case_count": 16,
+      "function_count": 11,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_empty_clean_batch_skips_conflict_planning",
+            "test_sqlite_known_nonempty_collection_skips_repeated_empty_probes"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_empty_inserts.py::test_clean_empty_and_reused_collections_keep_rows_ids_and_caller_values"
+          ],
+          "note": "Clean inserts, empty-after-delete reuse, subsequent nonempty inserts, returned IDs and durable rows are checked on four native shards. TinyMongo private planner/candidate-read monkeypatches, exact BEGIN/probe/INSERT/COMMIT SQL order and cached empty-probe counts are implementation-specific and not claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_empty_duplicate_rolls_back_before_planning"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_empty_inserts.py::test_empty_duplicates_preserve_ordered_and_unordered_results_and_error_ops"
+          ],
+          "note": "Both original ordered/unordered empty-batch duplicate outcomes are checked for explicit and implicit collections: exact inserted counts, index 2/code 11000, original error-op object, surviving IDs and healthy subsequent writes. BriskDB does not expose TinyMongo's two-attempt optimistic rollback/replan hooks; neither a whole cross-shard batch transaction nor those private call counts is claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_index_gate_keeps_only_unique_indexes_on_the_planner",
+            "test_sqlite_optimistic_path_rechecks_unique_specs_inside_transaction"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_empty_inserts.py::test_empty_unique_and_nonunique_indexes_enforce_their_actual_constraints",
+            "src/storage/document/enabled/fault_tests.rs::sqlite_full_rolls_back_documents_and_unique_entries_then_recovers"
+          ],
+          "note": "Real native unique/nonunique indexes retain their constraints on initially empty collections and after reopen; unique entries share actual storage transaction/failure boundaries. TinyMongo private planner counts and the two-call monkeypatched index-spec race are not reproduced or claimed as public behavior."
+        },
+        {
+          "source": [
+            "test_sqlite_zero_timestamp_and_custom_mapping_skip_optimistic_path"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_empty_inserts.py::test_clean_empty_and_reused_collections_keep_rows_ids_and_caller_values",
+            "python/tests/test_upstream_bson_values.py::test_batch_timestamps_preserve_error_inputs_with_explicit_reservation_gaps"
+          ],
+          "note": "UserDict and two direct zero Timestamps insert without changing caller values and survive reopen with increasing server stamps. Native timestamps do not use the monkeypatched Python wall clock and can reserve gaps during full-batch preflight; exact seconds 1000 and private optimistic-path avoidance are not claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_nonempty_legacy_row_gates_optimistic_write"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes",
+            "python/tests/test_upstream_insert_many.py::test_ordered_and_unordered_duplicates_preserve_counts_indices_and_original_ops"
+          ],
+          "note": "Real legacy SQLite rows require explicit stopped import. After source-locked numeric-ID import, stock PyMongo rejects equivalent duplicate IDs with code 11000 and preserves original rows before mutations/reopen. Native seeded bulk-write details are separately checked; TinyMongo in-place legacy access and zero private insert-attempt counts are not exposed."
+        },
+        {
+          "source": [
+            "test_sqlite_unexpected_optimistic_error_rolls_back_and_propagates"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/fault_tests.rs::sqlite_full_rolls_back_documents_and_unique_entries_then_recovers"
+          ],
+          "note": "A real bounded SQLITE_FULL failure at document or index allocation rolls back earlier mutations in the same native shard transaction, preserves exact records/indexes, releases fences and permits durable recovery. This replaces a private Python RuntimeError injection; it does not promise rollback across earlier committed wire batches or independent shards."
+        },
+        {
+          "source": [
+            "test_sqlite_custom_table_conflict_rules_gate_optimistic_path",
+            "test_sqlite_external_schema_features_gate_optimistic_path"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document.rs::document_table_schema_tampering_is_rejected_on_startup",
+            "python/tests/test_upstream_empty_inserts.py::test_empty_unique_and_nonunique_indexes_enforce_their_actual_constraints"
+          ],
+          "note": "TinyMongo's replacement table schemas (no primary key/IGNORE/REPLACE), external trigger/index injection and fallback-planner counts are not supported configuration for BriskDB private document storage. Native schema tampering and supported public index behavior are separately checked. This is not a claim to implement those backend extension hooks or detect every externally injected SQLite object."
+        },
+        {
+          "source": [
+            "test_sqlite_optimistic_path_fails_closed_if_catalog_read_ends_transaction"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document.rs::document_mutations_reject_transaction_handles_after_rollback"
+          ],
+          "note": "Native insert/replace/delete reject stale transaction handles after both explicit rollback and SQLite automatic rollback, preserving the original record. TinyMongo's catalog-read monkeypatch and successful fallback-planner retry are private and not reproduced; the native guard errors instead of silently continuing a stale transaction."
         }
       ]
     }
