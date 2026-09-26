@@ -41,19 +41,32 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 83 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 115 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
-`test_insert_many_semantics.py` and `test_client_configuration.py` suites
-(198 reference parameter cases). Fifty owned wheel tests check public
+`test_insert_many_semantics.py`, `test_client_configuration.py`,
+`test_projection.py`, `test_projection_memory.py` and `test_unset_semantics.py`
+suites (259 reference parameter cases). Sixty-seven owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 198 unchanged upstream candidate passes or complete #186 certification.
+not 259 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
+
+Local sync/async client `find()` calls now snapshot caller-owned filters and
+projections after driver option validation. Later mutations of those mappings
+cannot change an already-created cursor, its clone or its rewind. Bare-string
+projections are rejected instead of being interpreted as individual character
+field names. These helpers retain real PyMongo cursors and do not modify ordinary
+PyMongo classes; they snapshot query inputs, not database contents or transactions.
+Projection coverage includes nested/scalar/array paths, exact conflict codes,
+scan/index/sorted/reopened reads, BSON ID fidelity and sync/async `$unset` no-ops.
+The 64 x 100KB projection/first/count/full-read memory check measures Python-client
+heap only, not native Rust RSS. TinyMongo-only backend plugins, private SQL traces
+and decoder call counts remain explicitly excluded from unchanged-pass claims.
 
 Read-fidelity checks cover recursive OrderedDict/UserDict/SON and parameterized
 mapping aliases, sync/async find/clone/projection/aggregate/distinct/find-and-modify,

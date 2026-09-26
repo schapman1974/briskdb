@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 import warnings
 
@@ -155,8 +156,22 @@ def _options(value: Any) -> dict[str, Any]:
                 write_concern=value.write_concern, read_concern=value.read_concern)
 
 
+def _snapshot_find(cursor: Any, projection: Any) -> Any:
+    """Freeze lazy query inputs after the pinned driver validates its options.
+
+    Only local-client cursors are changed. Keep the real driver's cursor,
+    batching, cloning and codec behavior; no TinyMongo runtime is involved.
+    PyMongo 4.17 otherwise retains both caller-owned mappings until execution.
+    """
+    if isinstance(projection, str):
+        raise TypeError("projection must be a mapping or a non-string field sequence")
+    cursor._spec = deepcopy(cursor._spec)
+    cursor._projection = deepcopy(cursor._projection)
+    return cursor
+
+
 class Collection(_Collection):
-    """Real PyMongo collection with local bulk preflight and index-model input."""
+    """Real PyMongo collection with opt-in local-client compatibility."""
 
     @classmethod
     def _wrap(cls, value: Any) -> Collection:
@@ -167,6 +182,10 @@ class Collection(_Collection):
 
     def with_options(self, *args: Any, **kwargs: Any) -> Collection:
         return self._wrap(super().with_options(*args, **kwargs))
+
+    def find(self, *args: Any, **kwargs: Any) -> Any:
+        cursor = super().find(*args, **kwargs)
+        return _snapshot_find(cursor, args[1] if len(args) > 1 else kwargs.get("projection"))
 
     def insert_many(self, documents: Any, ordered: bool = True,
                     bypass_document_validation: Any = None, session: Any = None,
@@ -207,6 +226,10 @@ class AsyncCollection(_AsyncCollection):
 
     def with_options(self, *args: Any, **kwargs: Any) -> AsyncCollection:
         return self._wrap(super().with_options(*args, **kwargs))
+
+    def find(self, *args: Any, **kwargs: Any) -> Any:
+        cursor = super().find(*args, **kwargs)
+        return _snapshot_find(cursor, args[1] if len(args) > 1 else kwargs.get("projection"))
 
     async def insert_many(self, documents: Any, ordered: bool = True,
                           bypass_document_validation: Any = None, session: Any = None,
