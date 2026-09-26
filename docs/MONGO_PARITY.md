@@ -41,19 +41,20 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 130 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 145 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
 `test_projection.py`, `test_projection_memory.py`, `test_unset_semantics.py`,
-`test_common_api.py`, `test_collection_attributes.py`, `test_thread_safety.py`
-and `test_multi_write.py` suites (289 reference parameter cases).
-Eighty owned wheel tests check public
+`test_common_api.py`, `test_collection_attributes.py`, `test_thread_safety.py`,
+`test_multi_write.py` and `test_update_operator_modifiers.py` suites
+(320 reference parameter cases).
+Ninety-four owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 289 unchanged upstream candidate passes or complete #186 certification.
+not 320 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -71,6 +72,13 @@ no native counterpart. Real PyMongo cursors retain buffered rows after close and
 permit rewind, unlike TinyMongo's permanent-close behavior; boolean argument
 validation also stays with the pinned driver. These differences are explicit,
 and full database statistics remain the #166 gap described below.
+
+Update-modifier coverage checks BSON-order min/max with representation-preserving
+numeric equality, sparse array paths, rename movement/errors, pop validation and
+integral-float directions, equality-seeded upserts and no-match preflight errors.
+Rejected single-record updates leave the record unchanged, including when an
+earlier modifier would have changed it. Private Python helper inputs that cannot
+be stored/transmitted as BSON remain explicitly classified in the inventory.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings

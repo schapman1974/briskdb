@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twelve locked suites is classified; 289 reference parameter cases are not 289 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirteen locked suites is classified; 320 reference parameter cases are not 320 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -952,6 +952,164 @@
           "evidence": ["python/tests/test_upstream_common.py::test_six_spawned_writers_preserve_every_acknowledged_document"],
           "kind": "contract_difference",
           "note": "On supported Linux/macOS shared-root lock hosts, six spawned processes each own a BriskDB client/listener and insert 50 generated-ID records; parent checks all exit codes, exact 300 values/unique IDs after reopen, with bounded joins and owned-child cleanup. Other platforms explicitly skip this host-dependent test. Unlike TinyDB implicit creation, schema is created before overlapping native roots because shared-root DDL admission is explicitly separate. No inherited native runtime, retry masking, unbounded soak or cross-process schema-creation claim."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_update_operator_modifiers.py",
+      "sha256": "bf76e98cc75eb94ae7b014ca7d3938a4ed02737109389f3514ba89437abb8837",
+      "reference_case_count": 31,
+      "function_count": 15,
+      "coverage": [
+        {
+          "source": [
+            "test_min_max_use_bson_order_and_preserve_equal_numeric_representation"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_min_max_bson_order_preserves_equal_numeric_representation"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_min_max_create_missing_nested_fields_and_empty_operands_are_noops"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_missing_nested_fields_and_empty_operands"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_min_max_and_pop_support_numeric_array_paths_and_sparse_growth"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_numeric_array_paths_and_sparse_growth"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_new_update_paths_reject_existing_scalar_and_null_ancestors"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_existing_scalar_null_and_array_ancestors_reject_without_mutation"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_rename_moves_nested_values_overwrites_and_ignores_missing_source"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_rename_moves_overwrites_and_ignores_missing_source"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_rename_rejects_invalid_paths"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_rename_invalid_overlapping_and_positional_paths"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_update_path_conflicts_and_empty_paths_report_mongodb_codes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_update_path_conflicts_empty_paths_and_operand_types"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_pop_removes_front_back_and_handles_missing_or_empty_arrays"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_pop_both_directions_missing_empty_and_integral_float_forms"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_pop_rejects_every_operand_except_integral_plus_or_minus_one"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_pop_rejects_invalid_directions"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_pop_accepts_integral_float_directions"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_pop_both_directions_missing_empty_and_integral_float_forms"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_pop_rejects_non_array_targets_with_type_mismatch"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_pop_rejects_nonarray_targets"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_new_operator_failures_do_not_partially_apply_other_changes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_failed_modifier_cannot_commit_an_earlier_set"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_invalid_new_operators_are_preflighted_even_without_a_match"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_no_match_still_validates_before_writing"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_upserts_apply_new_operators_to_equality_fields"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_upserts_apply_modifiers_to_equality_seed"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned public wire scenarios check stored BSON results, input immutability and the exact error codes represented by this source test. TinyMongo private update-helper calls are replaced with real PyMongo collection operations; diagnostic wording and private Python object identity are not a compatibility claim."
+        },
+        {
+          "source": [
+            "test_update_path_and_comparison_internal_error_edges"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_update_modifiers.py::test_public_path_edges_corresponding_to_private_helper_cases"
+          ],
+          "kind": "implementation_specific",
+          "note": "Private Python helper entry points are not shipped. Representable scalar/null/array read/write/rename path errors, missing-source noops, existing array-document writes and immutable IDs are exercised through stored BSON records. Non-string field keys, a scalar root, arbitrary object() values and an array-valued _id passed directly to helpers cannot be admitted as these stored BSON inputs; the wire test does not claim the same private invocation or diagnostic wording."
         }
       ]
     }
