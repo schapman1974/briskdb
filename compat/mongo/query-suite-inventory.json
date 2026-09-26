@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-nine locked suites is classified; 1016 reference parameter cases are not 1016 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty locked suites is classified; 1034 reference parameter cases are not 1034 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3868,6 +3868,137 @@
             "python/tests/test_upstream_complex_reads.py::test_unbounded_python_integers_reject_before_storage_or_query_fallback"
           ],
           "note": "Direct private backend results are covered at the public real-wire boundary. An injected Python _run_collection_read OverflowError and private _MISSING sentinel are not native interfaces; valid queries stay complete and unencodable integer operands reject explicitly."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_read_optimizations.py",
+      "sha256": "cdc9195776c62a7edca511384d4671575ebb5e0a0b1e69fa484626af331e96e7",
+      "reference_case_count": 18,
+      "function_count": 18,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_direct_id_hit_and_miss_use_bounded_primary_key_reads",
+            "test_sqlite_direct_id_eq_projection_count_and_cursor_bounds",
+            "test_sqlite_extended_bson_id_uses_the_bounded_primary_key_path",
+            "test_sqlite_repeated_point_reads_do_not_repeat_setup_sql"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "Original 12-row/10000-byte point workload, ObjectId hit, miss, repeated reads, exact projection/count and skip past a single match pass through real PyMongo. After reopen the same native engine reports one shard and one storage-read call for each point hit/miss, one/zero examined records and zero matcher evaluations. These are actual native record-work counters, not Python JSON decodes, SQLite statement counts or page I/O."
+        },
+        {
+          "source": [
+            "test_sqlite_regex_id_and_logical_id_filters_keep_general_read_paths"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_regex_logical_and_typed_id_queries_keep_exact_identities"
+          ],
+          "note": "Regex _id and logical $and equality filters retain exact documents and count/limit results; scalar, array, string, numeric and boolean ID distinctions are checked through both direct and explicit $eq filters."
+        },
+        {
+          "source": [
+            "test_sqlite_direct_id_keeps_typed_and_legacy_string_collisions_exact"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_regex_logical_and_typed_id_queries_keep_exact_identities",
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes",
+            "src/import/tinymongo.rs::unverifiable_legacy_container_alias_is_rejected_without_source_writes"
+          ],
+          "note": "Current BSON IDs preserve all public numeric/string/bool/array distinctions; genuine scalar legacy files require explicit import and retain numeric aliases separately from strings. The source also injects an arbitrary legacy-container-row physical alias unrelated to its array ID. Native import rejects that unverifiable alias as Unsupported without changing the source, rather than silently accepting a private Python fallback scan."
+        },
+        {
+          "source": [
+            "test_sqlite_double_checked_lifecycle_cache_rechecks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state",
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "TinyMongo _sqlite_initialized/_ready_collections/_ready_type_indexes flags and monkeypatched lock context managers do not exist in BriskDB. Public retained-handle behavior after peer drop/recreate, index metadata freshness and repeated point results are verified through native admission/catalog handling."
+        },
+        {
+          "source": [
+            "test_sqlite_initialized_collection_recovers_after_an_external_drop"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "A second real shared-root client logically drops a warmed collection. The first client's retained handle immediately sees absence, recreates only new data, rebuilds its index and survives reopen. Real PyMongo returns the wire reply {'ok': 1.0}, not TinyMongo's True."
+        },
+        {
+          "source": [
+            "test_async_sqlite_direct_id_uses_same_exact_fast_path"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_async_point_projection_count_and_bounds_after_sync_seed",
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "After a synchronous seed closes, real async PyMongo returns the exact projected hit, missing count/read and bounded empty page. The same native point engine's bounded record-work counters are checked separately; TinyMongo's Python SQL trace/decoder hooks are not imported."
+        },
+        {
+          "source": [
+            "test_sqlite_declared_index_unions_scalar_and_array_members",
+            "test_sqlite_bounded_index_read_stops_after_enough_exact_matches",
+            "test_sqlite_indexed_array_candidates_decode_only_matching_rows",
+            "test_sqlite_companion_type_index_covers_multikey_candidate_plan"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_indexed_scalar_array_union_bounds_and_native_candidate_work"
+          ],
+          "note": "Scalar/array unions, bool/number distinctions, 10000-byte bounded records and the exact single match at ID 197 of 250 array rows pass. On the same reopened root native diagnostics show an equality index-candidate plan examining exactly one BSON record. TinyMongo-specific EXPLAIN SQL text, companion _types indexes and bounded-page decoder counts are not native contracts."
+        },
+        {
+          "source": [
+            "test_sqlite_external_table_drop_rebuilds_cataloged_native_indexes",
+            "test_sqlite_rebuilds_missing_unique_and_dotted_index_storage"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state",
+            "src/storage/document/index_storage/tests.rs::ready_roots_reject_missing_or_malformed_entry_schema_without_repair",
+            "src/storage/document/enabled/index_operations/tests.rs::ready_coverage_corruption_is_rejected_without_repair"
+          ],
+          "note": "Public logical collection/index drop and recreation are supported. Native shard tables are shared authoritative storage, not disposable per-collection Python tables. Missing/malformed Ready index schema or lost/corrupt indexed records fail closed without repair; automatic reconstruction after arbitrary physical deletion is not promised."
+        },
+        {
+          "source": [
+            "test_sqlite_indexed_read_propagates_catalog_failures"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result"
+          ],
+          "note": "Actual corrupt native catalog reads return redacted terminal code 1, no cursor and degraded readiness. They are not relabelled as the source's monkeypatched DuplicateKeyError or swallowed as no results."
+        },
+        {
+          "source": [
+            "test_sqlite_indexed_huge_integer_falls_back_to_exact_python_matcher"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_unbounded_python_integers_reject_before_storage_or_query_fallback"
+          ],
+          "note": "2^100 cannot be represented as a BSON integer; real-driver inserts and filters raise OverflowError before writes rather than invoking arbitrary-precision Python storage/matching."
+        },
+        {
+          "source": [
+            "test_sqlite_find_falls_back_after_general_sql_compiler_failure"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_or_negative_exists_and_large_membership_do_not_lose_candidates"
+          ],
+          "note": "The source injects a failure into a private Python SQL compiler. Native exists/missing and OR/negative candidate results are tested directly; no private compiler fallback hook or swallowed arbitrary Rust/storage failure is promised."
         }
       ]
     }
