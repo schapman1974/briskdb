@@ -16,13 +16,15 @@ use tokio::{
 };
 use tokio_util::codec::Decoder;
 
-use super::{Request, commands, compression, decode_request, invalid, metrics, wire};
+use super::{
+    Request, client_metadata, commands, compression, decode_request, invalid, metrics, wire,
+};
 use crate::{
     BriskDb, CancellationToken, EngineState,
     document::{BsonDocument, BsonValue},
 };
 
-const MAX_CONNECTIONS: usize = 8;
+const MAX_CONNECTIONS: usize = client_metadata::MAX_CONNECTIONS;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -35,6 +37,7 @@ pub struct MongoServer {
     shutdown: CancellationToken,
     task: Option<JoinHandle<io::Result<()>>>,
     metrics: Arc<metrics::Metrics>,
+    clients: Arc<client_metadata::Registry>,
 }
 
 impl MongoServer {
@@ -64,12 +67,20 @@ impl MongoServer {
         }
         let token = shutdown.clone();
         let metrics = Arc::new(metrics::Metrics::default());
-        let task = tokio::spawn(run(listener, database.clone(), token, Arc::clone(&metrics)));
+        let clients = Arc::new(client_metadata::Registry::default());
+        let task = tokio::spawn(run(
+            listener,
+            database.clone(),
+            token,
+            Arc::clone(&metrics),
+            Arc::clone(&clients),
+        ));
         Ok(Self {
             address,
             shutdown,
             task: Some(task),
             metrics,
+            clients,
         })
     }
 
@@ -81,6 +92,13 @@ impl MongoServer {
     /// Available after close; reading them retains no engine, session or cursor.
     pub fn metrics(&self) -> super::MongoMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Redacted metadata for at most eight active handshaken connections, in
+    /// connection-ID order. An atomic registry snapshot, not a snapshot of all
+    /// engine/metrics state. Empty after close; never retains raw client strings.
+    pub fn client_metadata(&self) -> Vec<super::MongoClientMetadata> {
+        self.clients.snapshot()
     }
 
     /// Opt in to engine read-work, access-plan and shard-fanout counters. Off by
@@ -124,6 +142,7 @@ async fn run(
     database: BriskDb,
     shutdown: CancellationToken,
     metrics: Arc<metrics::Metrics>,
+    clients: Arc<client_metadata::Registry>,
 ) -> io::Result<()> {
     let executor = Arc::new(commands::Executor::new(
         database.clone(),
@@ -155,12 +174,13 @@ async fn run(
                 let executor = Arc::clone(&executor);
                 let metrics = Arc::clone(&metrics);
                 let admission = metrics.admit();
+                let clients = Arc::clone(&clients);
                 connections.spawn(async move {
                     // This slot remains held while the blocking parser is awaited,
                     // including during shutdown; malformed clients cannot grow the queue.
                     let _permit = permit;
                     let _admission = admission;
-                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics)).await {
+                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics), clients).await {
                         metrics.connection_error(error.kind());
                     }
                 });
@@ -182,8 +202,10 @@ async fn connection(
     shutdown: CancellationToken,
     executor: Arc<commands::Executor>,
     metrics: Arc<metrics::Metrics>,
+    clients: Arc<client_metadata::Registry>,
 ) -> io::Result<()> {
     let session = executor.session();
+    let mut client = clients.connection(session.id().get());
     let _cursors = executor.connection_cursors(session.id().get());
     let mut codec = compression::TransportCodec::new()?;
     let mut source = BytesMut::with_capacity(8192);
@@ -246,6 +268,7 @@ async fn connection(
             Some(Err(error)) => error.document(),
             None => dispatch(&request),
         };
+        client.observe(&request.body, &body);
         if compression::negotiated_zlib(&request, &body) {
             codec.enable_zlib();
         }

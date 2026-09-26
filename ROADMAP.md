@@ -515,7 +515,7 @@ requires an earlier dependency:
       with safe plain fallback, and real sync/async PyMongo restart coverage.
       Broader codec coverage and expanded resource/fuzz gates
       remain; this is not a completed Mongo compatibility milestone.
-    - [ ] [#170](https://github.com/schapman1974/briskdb/issues/170) and
+    - [x] [#170](https://github.com/schapman1974/briskdb/issues/170) and
       [#169](https://github.com/schapman1974/briskdb/issues/169) — standalone
       hello/isMaster, ping, buildInfo, correlated replies, and initial strict
       option validation implemented. No sessions, retryable writes, replication,
@@ -523,6 +523,12 @@ requires an earlier dependency:
       Required CI smoke exercises
       real PyMongo 4.17.0 sync/async discovery, pooling, reconnect, and explicit
       unsupported-command errors (#184).
+      Rust hosts can inspect bounded active-connection metadata through
+      `MongoServer::client_metadata()`: only a closed driver-family enum and
+      numeric version, never application/platform/OS/environment strings.
+      First successful handshakes freeze the record; disconnect, abort and
+      listener close remove it. Raw-socket, redaction, bounds/unwind and real
+      sync/async driver observations cover this final discovery checkpoint.
     - [x] [#388](https://github.com/schapman1974/briskdb/issues/388) — Python
       testing wheels now provide TinyMongo-style `briskdb.patch()` and direct
       `MongoClient`/`AsyncMongoClient` imports backed by real pinned PyMongo and

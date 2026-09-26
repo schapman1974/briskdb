@@ -4,12 +4,14 @@
 //! The standalone public codec is uncompressed; listeners separately negotiate
 //! bounded zlib transport without changing this envelope API.
 
+mod client_metadata;
 mod commands;
 mod compression;
 mod listener;
 mod metrics;
 mod wire;
 
+pub use client_metadata::{MongoClientMetadata, MongoDriverKind};
 pub use listener::MongoServer;
 pub use metrics::{
     MONGO_LATENCY_UPPER_BOUNDS_MICROS, MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoCommandKind,
