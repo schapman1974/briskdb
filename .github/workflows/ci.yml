@@ -226,6 +226,11 @@ jobs:
           cargo test --locked --no-default-features --features mongo --test mongo_wire \
           real_pymongo_async_cancellation -- --ignored --exact
 
+      - name: Require bounded Mongo resource and failure churn
+        run: |
+          cargo test --locked --no-default-features --features mongo --test mongo_wire \
+            resource_churn::bounded_resource_soak -- --ignored --exact --nocapture
+
   mongo-odm:
     name: Mongo real ODM and Talk Python applications
     runs-on: ubuntu-24.04

@@ -1020,6 +1020,11 @@ requires an earlier dependency:
       and explicit anonymous-loopback security through a non-owning live probe.
       Detected catalog/shard failures map to schema-degraded, without paths or
       hidden I/O; this is not deep integrity or authenticated network readiness.
+      Bounded raw-wire stress reacquires all 32 cursor and eight connection slots
+      after each handoff/disconnect/malformed/truncated-frame wave; the extended
+      CI tier repeats 128 waves over four engine lifetimes and rejects stale
+      cursors after reopen. Gauge/accounting checks are not allocator/RSS or
+      long-duration/power-loss/disk-full soak certification.
       Matched-row/per-shard work telemetry, exporters/engine-phase tracing, full
       governance and broader fault/soak acceptance remain open; no timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust

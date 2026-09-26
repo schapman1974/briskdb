@@ -710,6 +710,32 @@ local processes must be trusted, and non-loopback binding still fails. This is
 not readiness for exposing Mongo to a network. No admin endpoint, Python readiness
 API, automatic repair or security-policy change is added.
 
+The raw-wire resource-churn gate repeatedly fills all 32 shared native/wire cursor
+slots with find and sorted-aggregation cursors, verifies rejection of the next
+cursor, fills all eight socket slots, and verifies socket overflow rejection.
+Each wave exercises cursor handoff, owner disconnect, exhausted and abandoned
+continuations, rejected one-way reads, duplicate unacknowledged writes, unknown
+commands, malformed lengths/BSON, and truncated-frame disconnects. After every
+wave, connection/cursor ownership and command gauges must drain, exact failure
+counts must agree, and the next wave must reacquire full native capacity.
+
+The normal socket suite runs eight waves across two engine lifetimes. The explicit
+CI tier runs 128 waves across four lifetimes: 4,096 full-capacity cursor registrations
+and 1,024 admitted wave sockets, plus setup/shutdown. Every lifetime ends with a
+retained cursor/partial-frame shutdown; reopen checks unchanged records and rejects
+stale cursor IDs. Retained closed host handles must not retain the previous engine.
+Run the larger tier locally, without Python, using:
+
+```bash
+cargo test --locked --no-default-features --features mongo --test mongo_wire \
+  resource_churn::bounded_resource_soak -- --ignored --exact --nocapture
+```
+
+This is deterministic bounded resource stress, not a long-duration soak, allocator
+or RSS leak proof, throughput threshold, power-loss/disk-full drill, or replacement
+for driver cancellation, storage-corruption, security and release gates. No existing
+caps or timeouts are raised. The broader #185/#186/#187 acceptance remains open.
+
 Read-work telemetry is separately opt-in for Rust hosts:
 
 ```rust,ignore
