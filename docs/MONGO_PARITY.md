@@ -387,6 +387,24 @@ and native APIs do not implicitly opt in. Concurrent DDL retains bounded busy
 rejection; the helper does not silently retry writes. Old TinyMongo private
 catalog repair and ambiguous legacy alias ordering are not added.
 
+Local sync/async `create_index()` also rejects repeated key fields before the
+driver folds its key sequence into a mapping (code 115, no implicit namespace or
+index). Valid direct calls retain the ordinary driver path and direction metadata;
+they do not implicitly select model normalization or resolved-name reuse. The
+source-locked public advanced-index wheel regressions cover compound tuples,
+single-array multikey membership, sparse missing/null behavior, partial membership
+transitions, insert/update/upsert uniqueness, eager invalid options, and metadata
+after restart. These are candidate API scenarios, not an assertion that BriskDB
+uses TinyMongo's private SQLite JSON-expression index format.
+The companion durable-index wheel scenarios cover catalog isolation, recoverable
+drop/recreate, failed unique builds, typed/null/array keys, restart enforcement,
+single-shard mutation rollback, and four concurrent clients within listener
+admission. PyMongo's BSON key-document/cursor and direct requested-name return
+shapes are retained. Cross-shard bulk atomicity is not claimed; it follows the
+decision and fault acceptance in #74/#183. Full source-suite accounting remains
+tracked by #174/#186 rather than treating these translated scenarios as unchanged
+upstream test execution.
+
 Successful commands with reduced behavior include `briskdbIndexWarnings`, an
 ordered array of `{name, reducedBehavior}` documents (plus `skipped: true` for
 text declarations). PyMongo's `create_index()` /

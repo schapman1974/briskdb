@@ -88,7 +88,10 @@ or option conflicts. Returned real names can be passed to `drop_index`.
 
 Database/collection factories, subcollections and `with_options()` preserve these
 helpers and driver codec/read/write settings. Sessions remain unsupported. Direct
-`create_index()` and ordinary PyMongo classes are unchanged. This does not open or
+`create_index()` rejects repeated fields before PyMongo can silently collapse
+them, but otherwise retains ordinary driver behavior, including descending key
+metadata and requested return names. Ordinary PyMongo classes are unchanged.
+This does not open or
 repair old TinyMongo files, promote their private v1 catalogs, or choose an
 arbitrary index for an ambiguous field alias. Use exact names in that case.
 These additions are in the source checkout; they are not part of the published

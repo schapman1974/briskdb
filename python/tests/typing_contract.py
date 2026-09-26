@@ -15,6 +15,8 @@ def patched_client_contract(path: str) -> None:
             {"key": {"score": -1}} for _ in range(1)
         )
         print(names)
+        direct_name: str = client.app.items.create_index([("score", -1), "name"])
+        print(direct_name)
 
 
 async def async_patched_client_contract(path: str) -> None:
@@ -25,6 +27,8 @@ async def async_patched_client_contract(path: str) -> None:
                 [{"key": {"score": 1}}]
             )
             print(names)
+            direct_name: str = await client.app.items.create_index([("score", -1), "name"])
+            print(direct_name)
 
 
 def remote_contract(database: briskdb.Database, token: str) -> None:
