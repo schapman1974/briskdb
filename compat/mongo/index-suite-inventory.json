@@ -1,0 +1,554 @@
+{
+  "schema_version": 1,
+  "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
+  "purpose": "Coverage inventory, not a stored pass report. Each cited gate must run on the candidate revision. Backend parameter counts describe the reference only; implementation-specific and contract-difference entries are not unchanged upstream candidate passes.",
+  "suites": [
+    {
+      "path": "tests/test_index_models.py",
+      "sha256": "b1d69f29c5ac51a1f7fcd91aa39aaf67425f21bbf130c4091a0f40b15cb6b74a",
+      "reference_case_count": 51,
+      "function_count": 27,
+      "coverage": [
+        {
+          "source": [
+            "test_supported_duck_typed_index_model_produces_an_effective_spec",
+            "test_existing_index_spec_passes_through_unchanged"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_duck_models_and_advanced_metadata_protocol_preserve_effective_definitions"
+          ],
+          "kind": "public_scenarios",
+          "note": "Effective metadata is preserved through the supported public metadata protocol. TinyMongo IndexSpec object identity is implementation-specific; BriskDB copies inputs before wire dispatch."
+        },
+        {
+          "source": [
+            "test_plain_mapping_and_pair_sequence_are_supported_and_name_is_generated",
+            "test_compound_default_name_matches_pymongo_shape",
+            "test_batch_plan_preserves_order_and_separates_effective_specs",
+            "test_warning_emitter_uses_the_dedicated_warning_type"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_compound_generated_names_and_ordered_batch_warnings"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_index_signature_uses_keys_and_unique_options_but_not_name",
+            "test_degraded_reuse_warning_rejects_invalid_or_inequivalent_inputs"
+          ],
+          "evidence": [
+            "python/tests/test_index_models.py::test_membership_unique_and_compound_identity_are_not_weakened",
+            "src/storage/document/enabled/index_operations/tests.rs::model_reuse_requires_ready_authority_and_preserves_ids_records_and_entries"
+          ],
+          "kind": "native_equivalent",
+          "note": "Private signature and warning-helper call shapes are replaced by server-side equivalence/Ready authority and public diagnostics. Names do not define equivalence; uniqueness, ordered keys and membership do."
+        },
+        {
+          "source": [
+            "test_degraded_reuse_warning_combines_degradation_and_existing_name",
+            "test_nonunique_text_index_is_accepted_as_a_warned_noop"
+          ],
+          "evidence": [
+            "python/tests/test_index_models.py::test_mixed_models_resolve_real_names_and_reopen"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_single_field_performance_declarations_create_a_degraded_index",
+            "test_unique_descending_and_background_flags_preserve_uniqueness",
+            "test_unique_compound_sparse_and_partial_models_preserve_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_index_models_reference.py::test_source_locked_public_index_models",
+            "python/tests/test_index_models.py::test_membership_unique_and_compound_identity_are_not_weakened"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_sparse_model_preserves_membership_semantics_without_degradation",
+            "test_false_performance_flags_require_no_degradation",
+            "test_sparse_effective_spec_is_included_in_metadata"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_false_performance_flags_and_sparse_membership_do_not_emit_warnings"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_model_rejects_invalid_partial_index_option_combinations",
+            "test_unique_semantic_combinations_are_rejected",
+            "test_invalid_index_model_keys_are_rejected",
+            "test_invalid_index_model_options_are_rejected"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_all_source_invalid_key_and_option_models_reject_before_mutation"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_nonunique_compound_model_preserves_keys_and_sparse_membership",
+            "test_valid_fractional_ttl_is_acknowledged_with_a_warning"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_combined_reductions_and_fractional_ttl_report_only_effective_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_invalid_index_model_containers_are_rejected",
+            "test_batch_planner_rejects_a_noniterable",
+            "test_batch_planner_preserves_model_type_errors"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_invalid_containers_noniterables_and_late_model_types_are_eager"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_batch_planner_accepts_an_empty_batch"
+          ],
+          "evidence": [
+            "python/tests/test_index_models.py::test_eager_invalid_inputs_have_no_namespace_or_partial_builds",
+            "python/tests/test_index_models.py::test_empty_batches_do_not_reopen_closed_clients"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_warning_emitter_requires_a_batch_plan"
+          ],
+          "evidence": [
+            "src/protocol/mongo/commands/indexes/tests.rs::opt_in_model_names_preserve_slots_and_use_server_resolved_names"
+          ],
+          "kind": "implementation_specific",
+          "note": "TinyMongo emit_index_plan_warnings(IndexBatchPlan) is a private implementation helper, not a supported BriskDB API. BriskDB validates its own bounded wire reply and exposes IndexCompatibilityWarning; no public warning-emitter accepting arbitrary plan objects is claimed."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_durable_indexes.py",
+      "sha256": "1764fc987b4c99034957ee60100cc4f6c54eb217725178528316f218e742550d",
+      "reference_case_count": 108,
+      "function_count": 24,
+      "coverage": [
+        {
+          "source": [
+            "test_unique_index_and_enforcement_survive_client_restart"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_index_and_enforcement_survive_client_restart"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_index_metadata_is_collection_scoped_and_drop_persists"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_index_metadata_is_collection_scoped_and_drop_persists"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_catalog_identity_cannot_collide_across_collection_and_index_names"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_catalog_identity_cannot_collide_across_collection_and_index_names"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_drop_collection_removes_its_durable_index_catalog"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_drop_collection_removes_its_durable_index_catalog"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_unique_null_and_missing_values_share_one_key"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_null_and_missing_values_share_one_key"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_unique_scalar_types_keep_booleans_distinct_from_numbers"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_scalar_types_keep_booleans_distinct_from_numbers"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_unique_index_rejects_unsupported_value_shapes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_index_rejects_unsupported_value_shapes"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_index_creation_is_idempotent_and_rejects_conflicts"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_index_creation_is_idempotent_and_rejects_conflicts"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real PyMongo metadata cursors contain BSON key documents; missing collection reads do not create namespaces and drop_collection retains the driver's result. Portable catalog and mutation outcomes are asserted."
+        },
+        {
+          "source": [
+            "test_unique_index_rejects_existing_duplicates_without_adding_metadata"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_build_rejects_existing_duplicates_without_adding_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_unique_insert_operations_follow_single_and_bulk_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_indexes.py::test_validation_bypass_never_bypasses_id_or_secondary_uniqueness"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_unique_update_replace_and_upsert_fail_atomically"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_update_replace_and_upsert_fail_atomically_within_one_shard",
+            "tests/document_index_reads.rs::indexed_multi_update_rolls_back_the_failing_shard_and_preserves_prior_commits"
+          ],
+          "kind": "contract_difference",
+          "note": "Single-shard rollback is preserved. Cross-shard failure retains prior shard commits under the explicitly reviewed #74/#183 contract, not TinyMongo memory-style whole-operation atomicity."
+        },
+        {
+          "source": [
+            "test_unique_array_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_array_semantics_include_deduplication_overlap_and_empty_arrays"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_nested_unique_field_is_enforced",
+            "test_unique_dotted_index_rejects_array_traversal"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_nested_unique_field_is_enforced_without_array_traversal"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_legacy_equivalent_index_catalog_keeps_named_retry_idempotent",
+            "test_legacy_degraded_compound_catalog_is_promoted_on_batch_retry"
+          ],
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::strict_batch_matches_legacy_envelope_without_rewriting_identity_or_definition"
+          ],
+          "kind": "implementation_specific",
+          "note": "These tests inject TinyDB private v1 catalog rows. BriskDB does not read, repair or silently reinterpret TinyMongo files. Its own existing declaration identities and specifications remain unchanged on strict retries; incompatible declarations are not promoted."
+        },
+        {
+          "source": [
+            "test_degraded_batch_reuses_equivalent_indexes_and_preserves_unique_options",
+            "test_degraded_id_batch_reuses_the_builtin_index"
+          ],
+          "evidence": [
+            "python/tests/test_index_models.py::test_mixed_models_resolve_real_names_and_reopen"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_degraded_batch_reuses_an_earlier_batch_entry",
+            "test_concurrent_degraded_batches_plan_under_one_storage_lock"
+          ],
+          "evidence": [
+            "python/tests/test_index_models.py::test_earlier_batch_reuse_and_concurrent_whole_batches",
+            "src/storage/document/enabled/index_operations/tests.rs::model_reuse_requires_ready_authority_and_preserves_ids_records_and_entries"
+          ],
+          "kind": "native_equivalent",
+          "note": "Whole-batch planning/builds share native exclusive admission. Concurrent schema admission may return bounded Busy (112), which the test retries explicitly; TinyMongo's private Python callback is not monkeypatched."
+        },
+        {
+          "source": [
+            "test_builtin_id_index_has_fixed_options"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_builtin_id_index_has_fixed_options_and_driver_return_names"
+          ],
+          "kind": "contract_difference",
+          "note": "Direct create_index keeps stock PyMongo requested-name returns (_id_1/custom name); create_indexes compatibility returns actual _id_. Catalog authority and rejection of explicit unique options remain identical."
+        },
+        {
+          "source": [
+            "test_unsupported_index_shapes_types_and_options_leave_no_metadata"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_direct_create_index_preserves_driver_forms_options_and_directions",
+            "python/tests/test_upstream_advanced_indexes.py::test_invalid_direct_fields_and_options_leave_no_namespace",
+            "python/tests/test_upstream_index_models.py::test_all_source_invalid_key_and_option_models_reject_before_mutation"
+          ],
+          "kind": "contract_difference",
+          "note": "BriskDB deliberately supports direct descending/background declarations rejected by TinyMongo's direct helper. Invalid types/options still reject eagerly. Stock PyMongo TypeError conventions and session argument position are retained."
+        },
+        {
+          "source": [
+            "test_concurrent_unique_inserts_allow_exactly_one_writer"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_concurrent_unique_inserts_allow_exactly_one_writer"
+          ],
+          "kind": "public_scenarios",
+          "note": "Four independent clients share the real engine and race writes. One monitor and one application connection each stay inside the eight-socket cap; exactly one write succeeds."
+        },
+        {
+          "source": [
+            "test_duckdb_unique_race_across_fresh_processes"
+          ],
+          "evidence": [
+            "src/storage/document/enabled/unique/tests.rs::independent_processes_cannot_commit_the_same_unique_key"
+          ],
+          "kind": "native_equivalent",
+          "note": "The native process test exercises BriskDB's actual SQLite files and process-owned writer fences. DuckDB is not a BriskDB storage backend."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_advanced_indexes.py",
+      "sha256": "076602ea819f52c75ed74a6397660e703dc903eb64520ad51512e8f42e6ea5a9",
+      "reference_case_count": 46,
+      "function_count": 15,
+      "coverage": [
+        {
+          "source": [
+            "test_advanced_index_metadata_round_trips_through_public_apis_and_restart"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_advanced_index_metadata_round_trips_through_public_apis_and_restart"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_unique_compound_index_enforces_insert_update_and_upsert_atomically"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_compound_index_enforces_insert_update_and_upsert_atomically"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_compound_unique_keys_preserve_ordered_tuples_and_missing_values"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_compound_unique_keys_preserve_ordered_tuples_and_missing_values"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_unique_compound_index_supports_one_flat_multikey_component"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_compound_index_supports_one_flat_multikey_component"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_compound_parallel_arrays_fail_clearly_and_atomically"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_compound_parallel_arrays_fail_clearly_and_atomically"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_unique_sparse_index_skips_missing_but_indexes_explicit_null"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_sparse_index_skips_missing_but_indexes_explicit_null"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_sparse_compound_membership_uses_any_present_field_and_complete_tuple"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_sparse_compound_membership_uses_any_present_field_and_complete_tuple"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_partial_unique_membership_transitions_on_update_and_upsert"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_partial_unique_membership_transitions_on_update_and_upsert"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_partial_filter_supports_boolean_range_in_type_and_logical_predicates"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_partial_filter_supports_boolean_range_in_type_and_logical_predicates"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_invalid_advanced_index_predicates_and_options_leave_no_metadata"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_invalid_partial_options_are_eager_and_leave_no_index_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_invalid_compound_key_definitions_leave_no_metadata"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_duplicate_create_index_fields_are_not_silently_collapsed_by_driver",
+            "python/tests/test_upstream_advanced_indexes.py::test_invalid_direct_fields_and_options_leave_no_namespace",
+            "python/tests/test_upstream_advanced_indexes.py::test_direct_create_index_preserves_driver_forms_options_and_directions",
+            "src/protocol/mongo/commands/indexes/tests.rs::compatibility_preserves_validation_name_bounds_and_deadlines"
+          ],
+          "kind": "contract_difference",
+          "note": "Duplicate and empty fields reject. Direct descending fields remain supported (stock PyMongo extension beyond TinyMongo's direct helper); the local create_indexes model API normalizes them explicitly."
+        },
+        {
+          "source": [
+            "test_sqlite_materializes_compound_sparse_and_partial_native_indexes"
+          ],
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::compound_sparse_and_partial_membership_build_and_write_together",
+            "src/storage/document/enabled/index_operations/tests.rs::built_entries_follow_record_transactions_and_unindexed_changes"
+          ],
+          "kind": "native_equivalent",
+          "note": "BriskDB stores typed BSON secondary entries, not TinyMongo JSON-expression SQLite indexes/UDF names. Native tests inspect durable entries and transactional membership maintenance instead."
+        },
+        {
+          "source": [
+            "test_sqlite_compound_index_limits_decoding_before_exact_matching"
+          ],
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::equality_candidates_skip_unselected_bson_but_validate_selected_entry_binding",
+            "tests/document_index_reads.rs::indexed_mutation_selection_does_not_decode_non_candidates"
+          ],
+          "kind": "native_equivalent",
+          "note": "The actual native candidate path proves unselected BSON is not decoded and selected entry binding is validated; TinyMongo's Python JSON decoder is not part of BriskDB."
+        },
+        {
+          "source": [
+            "test_sqlite_conditional_unique_single_field_multikey_indexes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_conditional_unique_single_field_multikey_indexes"
+          ],
+          "kind": "public_scenarios",
+          "note": "Public outcomes are checked through the installed BriskDB wheel; source private plan objects are not part of this API."
+        },
+        {
+          "source": [
+            "test_index_spec_metadata_v2_preserves_advanced_definition"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_index_models.py::test_duck_models_and_advanced_metadata_protocol_preserve_effective_definitions",
+            "python/tests/test_upstream_advanced_indexes.py::test_advanced_index_metadata_round_trips_through_public_apis_and_restart"
+          ],
+          "kind": "public_scenarios",
+          "note": "Advanced metadata survives the public IndexSpec-compatible protocol and BriskDB restart; no TinyMongo private catalog serialization format is claimed."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_exact_id_semantics.py",
+      "sha256": "492ea7368478cb0ecae4cc2ed0d6108e7a4cf4377bc95c4ed0149ab8973e58b8",
+      "reference_case_count": 12,
+      "function_count": 7,
+      "coverage": [
+        {
+          "source": [
+            "test_embedded_document_equality_preserves_field_order",
+            "test_reordered_embedded_document_ids_remain_distinct",
+            "test_equivalent_embedded_document_ids_are_duplicates",
+            "test_exact_id_mutations_do_not_match_array_members",
+            "test_compound_and_logical_id_filters_keep_exact_identity",
+            "test_mapping_subclasses_share_document_id_identity",
+            "test_exact_id_operator_queries_and_parser_write_paths"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_indexes.py::test_embedded_document_equality_preserves_field_order",
+            "python/tests/test_upstream_indexes.py::test_reordered_embedded_document_ids_remain_distinct",
+            "python/tests/test_upstream_indexes.py::test_equivalent_embedded_document_ids_are_duplicates",
+            "python/tests/test_upstream_indexes.py::test_exact_id_mutations_do_not_match_array_members",
+            "python/tests/test_upstream_indexes.py::test_compound_and_logical_id_filters_keep_exact_identity",
+            "python/tests/test_upstream_indexes.py::test_mapping_subclasses_share_document_id_identity",
+            "python/tests/test_upstream_indexes.py::test_exact_id_operator_queries_and_parser_write_paths"
+          ],
+          "kind": "public_scenarios",
+          "note": "All seven public scenarios execute the real wheel. Private Python matcher-cache assertions are replaced by BriskDB's shared matcher/identity semantics and independent source-locked matcher oracles; backend variants are not counted as separate candidate passes."
+        }
+      ]
+    }
+  ]
+}

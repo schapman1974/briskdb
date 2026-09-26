@@ -740,7 +740,7 @@ requires an earlier dependency:
       All eleven planned operators and secondary-index validation are implemented;
       indexed selection, transactional entry maintenance and Ready-unique conflicts
       share the same recheck path. Broader compatibility acceptance remains.
-    - [ ] [#174](https://github.com/schapman1974/briskdb/issues/174) — shared
+    - [x] [#174](https://github.com/schapman1974/briskdb/issues/174) — shared
       index-definition validation now checks ordered distinct paths and numeric
       ascending/descending directions on controlled workers before catalog writes.
       Missing names are generated deterministically; names/specifications/fields
@@ -749,7 +749,8 @@ requires an earlier dependency:
       direction bytes. 64 source-locked valid ascending definitions verify exact
       names, key order, flags and pending metadata after restart. Independent tests
       cover descending/numeric aliases, controls and rejection atomicity. All
-      new secondary declarations start pending and enforce no uniqueness yet.
+      native declarations start pending; combined create/build publishes Ready
+      indexes, and Ready unique indexes enforce constraints across shards.
       The shared index-key generator now supplies bounded BSON-aware equality
       tuples, one-level multikey deduplication, missing/null and empty-array
       identities, and sparse/partial membership. 7,201 source-locked cases check
@@ -951,8 +952,9 @@ requires an earlier dependency:
       PyMongo behavior is unchanged. Ready-only reuse preserves ordered keys,
       unique/sparse/partial membership and durable identities. New wheel/reopen,
       concurrency-with-busy-retry, bounded-result and 144 source-locked public
-      model outcomes cover this slice. Full upstream index-suite certification
-      remains part of #174/#186; legacy private catalog repair is not claimed.
+      model outcomes cover this slice. The source-checked index inventory below
+      completes #174's bounded acceptance; the broader corpus remains #186.
+      Legacy private catalog repair is not claimed.
       The upstream durable-index audit additionally accepts the boolean
       `bypassDocumentValidation` write option as a no-op while collection
       validators remain unsupported. Insert/update/upsert/find-and-modify still
@@ -971,6 +973,12 @@ requires an earlier dependency:
       drop/recreate and retry, typed/multikey uniqueness, four-client contention,
       and explicit same-shard rollback. Driver metadata/result shapes and the
       #74/#183 cross-shard boundary remain explicit compatibility differences.
+      The source-checked inventory maps all 73 functions / 217 reference backend
+      cases from the four index suites to executable public/native evidence or
+      explicit implementation/contract rationales (59 public, 7 native equivalents,
+      3 private exclusions, 4 contract differences). These counts are not unchanged
+      candidate passes. Hashes, complete function membership, collected case counts
+      and candidate test symbols are checked; the immutable v1 contract is untouched.
     - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate

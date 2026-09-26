@@ -31,8 +31,9 @@ artifact contains `candidate-full.xml` and normalized `candidate-full.json`.
 The immutable reference report remains separate. Frozen sources, corpus,
 adapters, reference results and intentional-difference allowances are unchanged.
 Passing this frozen slice does not complete the larger TinyMongo test inventory,
-application matrices, bulk-write boundaries, security or hardening work; issues
-#174/#181/#183/#184/#186/#187/#188 retain their separate acceptance criteria.
+application matrices, security or hardening work. Index acceptance is accounted
+for separately below; the reviewed bulk-write boundary is #74/#183. Issues
+#181/#185/#186/#187/#188 retain their separate acceptance criteria.
 
 To reproduce with the frozen runner's test dependencies installed:
 
@@ -401,9 +402,36 @@ drop/recreate, failed unique builds, typed/null/array keys, restart enforcement,
 single-shard mutation rollback, and four concurrent clients within listener
 admission. PyMongo's BSON key-document/cursor and direct requested-name return
 shapes are retained. Cross-shard bulk atomicity is not claimed; it follows the
-decision and fault acceptance in #74/#183. Full source-suite accounting remains
-tracked by #174/#186 rather than treating these translated scenarios as unchanged
-upstream test execution.
+decision and fault acceptance in #74/#183.
+
+The [index-suite inventory](../compat/mongo/index-suite-inventory.json) accounts
+for every function in the four source-locked suites named by #174: 73 functions,
+expanded by TinyMongo into 217 reference cases across its backend variants.
+It maps 59 functions to public candidate scenarios, seven to native equivalents,
+three to implementation-specific exclusions, and four to explicit contract
+differences. This is a coverage map, **not 217 unchanged candidate passes**.
+The exclusions concern private warning-plan helper types and old TinyDB catalog
+injection/repair; the differences retain real PyMongo results, direct
+descending/background support, and the reviewed cross-shard commit boundary.
+Every entry names executable evidence and a rationale. The validator checks all
+four source hashes, exact function membership, collected reference case counts,
+and that the named candidate tests still exist. Missing, duplicate, unknown or
+unexplained entries fail; no frozen v1 corpus or allowance was rewritten.
+
+Installed-wheel tests exercise the portable model/durable/advanced/exact-ID
+outcomes. Native entry/probe tests replace TinyMongo-specific JSON-expression
+introspection; crash/reopen and cross-process tests check BriskDB's actual storage.
+The independent model, index-definition, key and matcher-probe oracles remain
+separate execution gates. This completes the bounded index acceptance inventory,
+not the full repository corpus under #186 or the release/security gates.
+
+To check the mapping against the pinned checkout and its isolated test interpreter:
+
+```sh
+BRISKDB_MONGO_ORACLE_SOURCE_ROOT=/path/to/locked/tinymongo \
+BRISKDB_MONGO_ORACLE_PYTHON=/path/to/oracle/bin/python \
+  python -m unittest discover -s python/tests -p test_index_suite_inventory.py -v
+```
 
 Successful commands with reduced behavior include `briskdbIndexWarnings`, an
 ordered array of `{name, reducedBehavior}` documents (plus `skipped: true` for
@@ -472,8 +500,10 @@ builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Version 20
 adds the older-writer fence for secondary uniqueness using the same entry format
-and lifecycle. Broader planner use, whole-bulk post-image parity and selector compatibility remain
-open under #174. Native
+and lifecycle. Conservative equality/membership/presence/absence/string-range
+candidate paths retain residual matching. Whole-bulk post-image transitions are
+governed by #74/#183; raw Mongo key-document/name-array drop selectors are beyond
+TinyMongo's string-selector contract. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
 preserves BSON/other Ready indexes/allocator history, and finishes on reopen after
