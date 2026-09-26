@@ -19,7 +19,34 @@ fn command(
     ))
 }
 fn stats(execution: &DocumentExecution) -> DocumentReadStats {
-    execution.read_stats().expect("opt-in counters")
+    let stats = execution.read_stats().expect("opt-in counters");
+    assert_eq!(
+        stats
+            .shard_work()
+            .map(|row| row.shard())
+            .collect::<Vec<_>>(),
+        stats.shards_read().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stats
+            .shard_work()
+            .map(|row| row.documents_examined())
+            .sum::<u64>(),
+        stats.documents_examined()
+    );
+    assert_eq!(
+        stats
+            .shard_work()
+            .map(|row| row.source_matches())
+            .sum::<u64>(),
+        stats.source_matches()
+    );
+    assert!(
+        stats
+            .shard_work()
+            .all(|row| row.source_matches() <= row.documents_examined())
+    );
+    stats
 }
 
 #[tokio::test]
@@ -47,9 +74,37 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
         matches!(scan.plan(), Some(DocumentPlan::Scatter(plan)) if plan.read_access().is_none())
     );
     let scan_matches = stats(&scan).source_matches();
+    let scan_work = stats(&scan).shard_work().collect::<Vec<_>>();
     let expected = page(scan).1;
     let expected_matches = expected.len() as u64;
     assert_eq!(scan_matches, expected_matches);
+    let mut documents_by_shard = [0_u64; 4];
+    let mut matches_by_shard = [0_u64; 4];
+    for id in 0..14 {
+        let point = call(
+            &engine,
+            &session,
+            command(
+                &namespace,
+                doc([("_id", BsonValue::Int32(id))]),
+                DocumentReadOptions::new(),
+            ),
+        )
+        .await;
+        let shard = usize::from(point.plan().unwrap().shards()[0]);
+        documents_by_shard[shard] += 1;
+        if expected
+            .iter()
+            .any(|row| row.get_first("_id") == Some(&BsonValue::Int32(id)))
+        {
+            matches_by_shard[shard] += 1;
+        }
+    }
+    for work in scan_work {
+        let shard = usize::from(work.shard());
+        assert_eq!(work.documents_examined(), documents_by_shard[shard]);
+        assert_eq!(work.source_matches(), matches_by_shard[shard]);
+    }
     build(
         &engine,
         &session,
@@ -73,6 +128,13 @@ async fn read_stats_observe_points_pruned_shards_and_index_candidate_work() {
         stats(&indexed).matcher_evaluations()
     );
     assert_eq!(stats(&indexed).source_matches(), expected_matches);
+    for work in stats(&indexed).shard_work() {
+        assert_eq!(
+            work.documents_examined(),
+            matches_by_shard[usize::from(work.shard())]
+        );
+        assert_eq!(work.source_matches(), work.documents_examined());
+    }
     assert_eq!(page(indexed).1, expected);
     let missing = call(
         &engine,
@@ -347,7 +409,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     for _ in 0..12 {
         let request = DocumentRequest::new(
             DocumentRequestId::new([2; 16]).unwrap(),
-            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 191).unwrap()),
+            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 2047).unwrap()),
             command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
         );
         assert_eq!(
@@ -361,7 +423,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     }
     let request = DocumentRequest::new(
         DocumentRequestId::new([3; 16]).unwrap(),
-        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 192).unwrap()),
+        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 2048).unwrap()),
         command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
     );
     assert_eq!(
@@ -377,7 +439,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
         .await;
         let documents = page(result).1;
         let row = 17 + encode_document(&documents[0]).unwrap().len() as u64;
-        let read = options().with_batch_byte_limit(base + 192 + row).unwrap();
+        let read = options().with_batch_byte_limit(base + 2048 + row).unwrap();
         let command = if aggregate {
             DocumentCommand::Aggregate(
                 DocumentAggregateRequest::new(

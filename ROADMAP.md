@@ -1058,8 +1058,11 @@ requires an earlier dependency:
       counts and actual request/shard fanout, including zero-read buffered pages.
       Source acceptances include repeated/lookahead reads before pagination,
       projection and pipeline stages, not unique matched or returned documents.
-      Fixed physical-ordinal counters expose request distribution, not per-shard
-      row/CPU skew. Off by default; enabled requests use bounded engine diagnostics
+      Fixed physical-ordinal counters expose request distribution and examined/
+      matched row work, including repeated reads, not CPU or physical-I/O skew.
+      Per-request native/Python shard summaries remain bounded to 64 ordinals,
+      charge a conservative 2,048-byte diagnostic budget, and retain no labels.
+      Off by default; enabled requests use bounded engine diagnostics
       without wire fields. Failed engine work, legacy count and mutations are
       excluded. Host-owned debug request spans/final events now correlate process
       session IDs, repeated wire IDs and connection-local sequences across async
@@ -1075,7 +1078,7 @@ requires an earlier dependency:
       CI tier repeats 128 waves over four engine lifetimes and rejects stale
       cursors after reopen. Gauge/accounting checks are not allocator/RSS or
       long-duration/power-loss/disk-full soak certification.
-      Per-shard work telemetry, exporters/engine-phase tracing, full
+      Per-shard timing/physical-I/O telemetry, exporters/engine-phase tracing, full
       governance and broader fault/soak acceptance remain open; no timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

@@ -297,7 +297,7 @@ impl Engine {
                                 .into_iter()
                                 .next();
                             if let Some(stats) = &fetch_stats {
-                                stats.examine(u64::from(record.is_some()));
+                                stats.examine(shard, u64::from(record.is_some()));
                             }
                             if let Some(record) = &record {
                                 validate_point_record(
@@ -321,7 +321,7 @@ impl Engine {
                                 fetch_matcher.as_deref(),
                                 &fetch_sorter,
                                 &expected.key,
-                                fetch_stats.as_deref(),
+                                fetch_stats.as_deref().map(|stats| (shard, stats)),
                                 &mut || check(cancellation, deadline),
                             )? {
                                 return Ok(None);
@@ -390,20 +390,20 @@ fn still_selected(
     matcher: Option<&DocumentMatcher>,
     sorter: &DocumentSorter,
     expected: &DocumentSortKey,
-    stats: Option<&ReadStats>,
+    stats: Option<(u16, &ReadStats)>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<bool> {
     check()?;
     if let Some(matcher) = matcher {
-        if let Some(stats) = stats {
+        if let Some((_, stats)) = stats {
             stats.match_document();
         }
         if !matcher.matches_with_check(document, check)? {
             return Ok(false);
         }
     }
-    if let Some(stats) = stats {
-        stats.source_match();
+    if let Some((shard, stats)) = stats {
+        stats.source_match(shard);
     }
     let current = sorter.key_validated_with_check(document, check)?;
     check()?;
@@ -558,6 +558,7 @@ mod tests {
         .unwrap();
         let expected = sorter.key(&original).unwrap();
         let stats = ReadStats::default();
+        stats.storage_read(5);
         for (row, predicate, selected, matches, evaluations) in [
             (document(2, true), Some(&matcher), false, 1, 1),
             (document(1, false), Some(&matcher), false, 1, 2),
@@ -570,13 +571,22 @@ mod tests {
                     predicate,
                     &sorter,
                     &expected,
-                    Some(&stats),
+                    Some((5, &stats)),
                     &mut || Ok(())
                 )
                 .unwrap(),
                 selected
             );
             assert_eq!(stats.snapshot().source_matches(), matches);
+            assert_eq!(
+                stats
+                    .snapshot()
+                    .shard_work()
+                    .next()
+                    .unwrap()
+                    .source_matches(),
+                matches
+            );
             assert_eq!(stats.snapshot().matcher_evaluations(), evaluations);
         }
         let snapshot = stats.snapshot();
@@ -585,7 +595,7 @@ mod tests {
             Some(&matcher),
             &sorter,
             &expected,
-            Some(&stats),
+            Some((5, &stats)),
             &mut || {
                 Err(EngineError::new(
                     EngineErrorKind::Cancelled,

@@ -87,7 +87,7 @@ pub use plan::{
     DocumentScatterPlan,
 };
 pub use projection::DocumentProjector;
-pub use read_stats::DocumentReadStats;
+pub use read_stats::{DocumentReadStats, DocumentShardReadStats};
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
     DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentUpsertedDocument,

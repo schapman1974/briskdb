@@ -858,7 +858,14 @@ are distinct from measured per-request shard visits: buffered aggregate output
 can read zero shards. Eight fixed fanout buckets (inclusive exported bounds
 0/1/2/4/8/16/32/64), peak fanout and 64 fixed physical-ordinal request counters
 make fanout and request distribution visible without namespace/identity labels.
-They do not measure unique matched rows, per-shard row/CPU skew, physical SQLite page or
+The fixed 64-slot `shard_documents_examined` and `shard_source_matches` arrays
+also aggregate observed read-row work by physical ordinal, including rereads.
+This exposes uneven row work separately from request distribution; zero-row
+probes and buffered pages do not fabricate row observations. All totals saturate,
+and live listener snapshots are best-effort independent atomic loads, not an
+atomic multi-counter transaction. Native/Python per-request `shard_work` reports
+only actually-read shards and charges a bounded 2,048-byte diagnostic budget.
+They do not measure unique matched rows, per-shard CPU skew, physical SQLite page or
 byte I/O, or pipeline-predicate evaluations. Enabled requests use the existing
 bounded engine diagnostics and account for their result metadata; protocol replies
 do not gain fields. Native Python/CLI metric controls, Mongo `explain`/`serverStatus`,

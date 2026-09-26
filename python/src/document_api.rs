@@ -29,6 +29,15 @@ pub(crate) fn execution_to_python(
         counters.set_item("matcher_evaluations", stats.matcher_evaluations())?;
         counters.set_item("source_matches", stats.source_matches())?;
         counters.set_item("shards_read", stats.shards_read().collect::<Vec<_>>())?;
+        let shard_work = PyList::empty(py);
+        for work in stats.shard_work() {
+            let row = PyDict::new(py);
+            row.set_item("shard", work.shard())?;
+            row.set_item("documents_examined", work.documents_examined())?;
+            row.set_item("source_matches", work.source_matches())?;
+            shard_work.append(row)?;
+        }
+        counters.set_item("shard_work", shard_work)?;
         output.set_item("read_stats", counters)?;
     }
     output.set_item(
