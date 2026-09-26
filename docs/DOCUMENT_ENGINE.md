@@ -510,7 +510,8 @@ empty shards and pruned-owner subsets do not alter output order. A shared checke
 byte budget charges each record before publishing its frontier or admitting more
 work. In-flight decoding is separately bounded by eight records and the existing
 BSON allocation limits. Point reads still use one shard directly. Refilling the
-selected frontier and sorted key-window scans remain sequential.
+selected natural-order frontier remains sequential. Sorted key-window scans
+use the same bounded coordinator and one shared heap, not per-shard heaps.
 
 Native `Count` uses the same eight-child coordinator for independent shard
 counts, including owner-pruned `_id` sets. An empty filter uses each shard's
@@ -948,9 +949,14 @@ fails and releases its cursor.
 
 Until sorted indexes are available, each bounded window rescans matching
 documents on the routed shards. A window retains at most 1024 keys and a conservative
-64-MiB heap charge (plus the current bounded input/key while considering it),
-then fetches only selected documents. Large skips can span several windows;
+64-MiB heap charge across all shards. At most eight admitted shard workers scan
+and derive keys concurrently, each under the existing BSON allocation, 8-MiB
+key, and derivation-work limits. Heap comparison/updates hold a short shared
+mutex only inside blocking workers, never across an await. All children drain
+before extracting a window; errors discard it without publishing partial rows.
+Selected documents are then refetched in global order. Large skips can span several windows;
 memory-bound or window-bound pages may be shorter than the requested batch.
+Arrival order may shorten a byte-trimmed page but cannot change its sorted prefix.
 Result byte limits apply after projection. Cancellation/deadlines cover scans,
 key derivation, heap extraction, and fetches in admitted workers. No result
 documents or SQLite leases are retained between requests. Selected rows are

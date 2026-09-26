@@ -509,8 +509,10 @@ shards concurrently, including find/getMore and distinct/aggregate source pages.
 Global ordering, pagination, owner pruning and the shared frontier byte bound
 remain authoritative. Failures cancel only local peer work, then drain started
 children before returning one error; a query failure cannot cancel a shared
-listener shutdown token. Point reads remain direct; frontier refills and sorted
-key-window scans remain sequential. See the [engine read boundaries](DOCUMENT_ENGINE.md).
+listener shutdown token. Point reads remain direct and natural-order frontier
+refills remain sequential. Sorted key-window scans now use the same eight-child
+coordinator and a single shared, bounded heap; failures discard the whole window.
+See the [engine read boundaries](DOCUMENT_ENGINE.md).
 
 The native/legacy `count` path (also used by `estimated_document_count`) runs
 independent targeted shard counts through the same eight-child coordinator,
@@ -606,9 +608,14 @@ The shared Rust `DocumentSorter` derives bounded BSON ordering keys, with
 filter, global sort, skip/limit, and projection in that order; continuations
 retain the sort key and natural-order tie-breaker. It scans the routed shards for each
 bounded top-key window until sorted indexes exist. The window holds at most
-1024 keys and a conservative 64-MiB heap charge, not all matching documents.
+1024 keys and a conservative 64-MiB heap charge shared across all shards, not all
+matching documents or a separate heap per shard. At most eight admitted shard
+workers decode/derive keys concurrently, under the existing BSON, per-key (8 MiB),
+and derivation-work limits. Selected documents are still refetched in global order.
 Large skips may require repeated scans and pages may be short at an internal
-window/memory boundary. Cursor key growth shares the existing retention quota.
+window/memory boundary. Worker arrival order can change the length of a
+memory-trimmed page, never its globally sorted prefix or stable tie-breaker.
+Cursor key growth shares the existing retention quota.
 Real-driver tests cover chained sorts, find_one, projected-away sort fields,
 compound array keys, stable ties, byte-bounded batches, and restart.
 

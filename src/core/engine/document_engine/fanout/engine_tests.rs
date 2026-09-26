@@ -6,6 +6,7 @@ use crate::document::{
 use std::time::Duration;
 
 mod counts;
+mod sorting;
 
 fn namespace() -> DocumentNamespace {
     DocumentNamespace::new("frontier", "items").unwrap()

@@ -1,4 +1,4 @@
-//! Bounded initial natural-order frontiers and scalar shard counts. Every child drains before
+//! Bounded natural-order frontiers, sorted scans, and scalar shard counts. Every child drains before
 //! the owning document operation releases its schema/session/lifecycle guards.
 
 use std::{future::Future, sync::atomic::AtomicU64};
@@ -17,7 +17,7 @@ impl Drop for CancelChildren {
 
 /// Do not cancel the caller's token on a child error: callers may share it
 /// across commands, or use their listener shutdown token as request control.
-async fn coordinate<T, F, Fut>(
+pub(super) async fn coordinate<T, F, Fut>(
     shards: Vec<u16>,
     parent: CancellationToken,
     shutdown: CancellationToken,
