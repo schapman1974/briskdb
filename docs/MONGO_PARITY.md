@@ -41,21 +41,22 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 199 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 224 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
 `test_projection.py`, `test_projection_memory.py`, `test_unset_semantics.py`,
 `test_common_api.py`, `test_collection_attributes.py`, `test_thread_safety.py`,
 `test_multi_write.py`, `test_update_operator_modifiers.py`,
-`test_array_update_modifiers.py`, `test_bson_value_types.py` and
-`test_uuid_regex.py` and `test_aggregation_basic_stages.py` suites
-(490 reference parameter cases). 136 owned wheel tests check public
+`test_array_update_modifiers.py`, `test_bson_value_types.py`,
+`test_uuid_regex.py`, `test_aggregation_basic_stages.py` and
+`test_aggregation_projection_stages.py` suites
+(555 reference parameter cases). 157 owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 490 unchanged upstream candidate passes or complete #186 certification.
+not 555 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -111,6 +112,11 @@ mixed-direction sorting, pagination position, numeric-path/parallel-array error
 precedence, result isolation and a 1,000-element shared-array sort. Non-BSON
 arguments fail driver encoding; private Python warning/helper-call counts are
 not a native API guarantee. The native sorter has its own bounded-work regression.
+Projection-stage coverage adds source/computed field ordering, nested inclusion
+and computed array shape, literals and binary subtype decoding, REMOVE semantics,
+set/addFields aliases, unset forms, validation precedence and async composition.
+Wire unsupported errors, driver key validation, tuple encoding and real PyMongo
+command-cursor types are explicitly distinguished from private Python helpers.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings

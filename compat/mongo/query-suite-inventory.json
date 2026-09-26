@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these seventeen locked suites is classified; 490 reference parameter cases are not 490 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these eighteen locked suites is classified; 555 reference parameter cases are not 555 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1669,6 +1669,228 @@
             "src/document/sorting.rs::sorting_correlates_large_compound_arrays_without_cross_product"
           ],
           "note": "The public 1000-element shared-array result is checked alongside the bounded native sorter regression. TinyMongo's monkeypatched exactly-2000 Python call count is not a native API/performance promise."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_aggregation_projection_stages.py",
+      "sha256": "632926399c1b8bb7fae3cc5adc000c3caa1ddb0c35c1e7148398ca799b2a9219",
+      "reference_case_count": 65,
+      "function_count": 25,
+      "coverage": [
+        {
+          "source": [
+            "test_project_supports_inclusion_exclusion_and_id_modes"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_project_inclusion_exclusion_and_id_modes"
+          ],
+          "note": "Inclusion, exclusion, nested specifications and ID flag modes retain exact results."
+        },
+        {
+          "source": [
+            "test_project_computes_renames_and_nested_specifications_from_input"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_project_computes_nested_renames_against_original_input"
+          ],
+          "note": "Computed ID, nested renames, literals and missing references evaluate against the original input."
+        },
+        {
+          "source": [
+            "test_project_preserves_source_order_then_appends_computed_fields"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_project_preserves_source_field_order_then_computed_order"
+          ],
+          "note": "Top-level and nested BSON field ordering is checked explicitly, not merely dict equality."
+        },
+        {
+          "source": [
+            "test_project_dotted_outputs_preserve_array_shape_and_missing_shells"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_project_dotted_outputs_preserve_array_shape_and_missing_shells"
+          ],
+          "note": "Computed dotted outputs retain recursive array shapes, scalar conversion, empty arrays and missing shells."
+        },
+        {
+          "source": [
+            "test_project_dotted_inclusion_skips_scalar_array_members",
+            "test_computed_project_keeps_include_only_branch_rules"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_project_include_only_branches_skip_scalar_array_members"
+          ],
+          "note": "Include-only branches omit scalar array elements and scalar ancestors even alongside computed branches."
+        },
+        {
+          "source": [
+            "test_literal_emits_constants_without_evaluating_its_operand"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_literal_does_not_evaluate_operand"
+          ],
+          "note": "Numeric/boolean/path/document/tuple-array literals are not evaluated as expressions; caller pipeline remains unchanged."
+        },
+        {
+          "source": [
+            "test_pipeline_binary_constants_follow_bson_generic_subtype_decoding"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_binary_pipeline_constants_keep_subtype_decoding"
+          ],
+          "note": "Generic subtype decodes as bytes while custom binary subtype is retained."
+        },
+        {
+          "source": [
+            "test_remove_is_missing_except_inside_expression_arrays_or_literal"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_remove_is_missing_except_in_arrays_or_literals"
+          ],
+          "note": "REMOVE produces missing fields/shells, null expression-array elements and literal text when explicitly quoted."
+        },
+        {
+          "source": [
+            "test_remove_field_references_also_resolve_to_missing"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_remove_suffixes_resolve_to_missing"
+          ],
+          "note": "REMOVE dotted suffixes remain missing in projection and set operations."
+        },
+        {
+          "source": [
+            "test_nested_arrays_are_not_recursively_crossed_by_field_references"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_field_references_do_not_recursively_cross_nested_arrays"
+          ],
+          "note": "Ordinary field references do not recursively traverse nested arrays."
+        },
+        {
+          "source": [
+            "test_set_and_addfields_are_aliases_and_use_the_original_input",
+            "test_set_and_addfields_accept_an_empty_noop"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_set_aliases_use_original_input_and_allow_empty_noop"
+          ],
+          "note": "Both aliases accept empty no-ops and evaluate assignments from the original input without changing stored values."
+        },
+        {
+          "source": [
+            "test_set_writes_dotted_paths_through_objects_scalars_and_arrays"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_set_dotted_paths_cross_objects_scalars_and_arrays"
+          ],
+          "note": "Nested set updates traverse objects/scalars/arrays and preserve empty containers."
+        },
+        {
+          "source": [
+            "test_set_direct_engine_normalizes_tuple_containers_to_arrays"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_tuple_containers_are_encoded_as_arrays_without_input_mutation"
+          ],
+          "note": "BriskDB has no direct Python aggregation engine helper; equivalent public BSON tuple encoding and nested-array transformations are checked without mutating caller inputs."
+        },
+        {
+          "source": [
+            "test_set_nested_specs_modify_paths_while_literal_replaces_whole_values"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_nested_set_modifies_paths_while_literal_replaces_values"
+          ],
+          "note": "Nested object specifications update paths, while literal/empty object values replace the whole value."
+        },
+        {
+          "source": [
+            "test_set_remove_deletes_leaves_and_preserves_or_creates_containers"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_set_remove_deletes_leaves_and_preserves_containers"
+          ],
+          "note": "REMOVE deletes leaves while retaining or creating shells through scalar/array paths."
+        },
+        {
+          "source": [
+            "test_unset_accepts_a_string_list_or_tuple_and_uses_exclusion_semantics"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_unset_accepts_string_list_and_tuple_with_exclusion_semantics"
+          ],
+          "note": "String/list/tuple unset forms preserve exclusion semantics including scalar array members."
+        },
+        {
+          "source": [
+            "test_projection_stage_errors_match_mongodb_before_storage_read",
+            "test_set_stage_requires_a_document_before_storage_read"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_projection_stage_errors_keep_codes_before_catalog_creation"
+          ],
+          "note": "All 30 source error cases plus both invalid set aliases retain exact Mongo codes and create no collection. Private backend-read hooks and diagnostic wording are not a public contract."
+        },
+        {
+          "source": [
+            "test_projection_stage_unsupported_features_fail_before_storage_read"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_unsupported_projection_features_fail_before_catalog_creation"
+          ],
+          "note": "All five unsupported expression/variable/numeric-path cases reject before catalog creation as wire OperationFailure code 115, not TinyMongo's custom unsupported exception."
+        },
+        {
+          "source": [
+            "test_remove_field_reference_suffixes_are_validated",
+            "test_project_validates_paths_and_expressions_before_later_mode_conflicts"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_remove_suffixes_and_earlier_expressions_validate_before_mode_conflicts"
+          ],
+          "note": "All five REMOVE suffix errors and earlier path/expression precedence cases retain exact codes before catalog creation."
+        },
+        {
+          "source": [
+            "test_projection_stage_rejects_non_string_output_fields_before_read"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_non_string_output_fields_fail_driver_encoding"
+          ],
+          "note": "Non-string BSON output keys raise PyMongo InvalidDocument during encoding rather than TinyMongo's TypeError; no collection is created."
+        },
+        {
+          "source": [
+            "test_async_projection_stages_smoke"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_projection.py::test_async_projection_stages_use_real_command_cursor"
+          ],
+          "note": "Async composition uses a real PyMongo AsyncCommandCursor and explicit ID sort; TinyMongo's cursor class and implicit natural ordering are not promised."
         }
       ]
     }
