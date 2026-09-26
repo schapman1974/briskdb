@@ -889,7 +889,7 @@ requires an earlier dependency:
       models fail eagerly; existing same-name indexes keep their enforcement.
       All-text batches match frozen memory/JSON namespace behavior, with retries
       and reopen covered. Degraded equivalent-name reuse remains a separate gap.
-    - [ ] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
+    - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate
       frontier byte budget. Physical shard positions and the existing natural-order
@@ -898,9 +898,13 @@ requires an earlier dependency:
       operation guards release; peer cancellation never poisons caller/listener
       tokens. Native/legacy counts now use the same bounded coordinator for
       per-shard scalar totals, retaining full matching and owner pruning before
-      checked summation and global skip/limit. Point reads remain direct; frontier
-      refill and sorted-window work remain sequential. Wider parallel sorted execution and fault/skew acceptance
-      remain open; no partial-page or new snapshot guarantee is introduced.
+      checked summation and global skip/limit. Sorted-window scans now share this
+      coordinator and one global 1024-key/64-MiB heap, with bounded per-worker key
+      derivation and globally ordered refetch. Tests cover bounded waves, blocked
+      peers, shard errors, deadlines, caller abort, empty/uneven shards, pagination
+      and arbitrary key arrival with memory trimming. Point reads remain direct;
+      natural frontier refill stays sequential. No partial-page or new snapshot
+      guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can now inspect payload-free listener-local Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way

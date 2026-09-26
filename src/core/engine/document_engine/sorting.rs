@@ -2,7 +2,12 @@
 //! scans matching documents again. Only keys/positions, never result documents
 //! or SQLite leases, survive a scan or a cursor continuation.
 
-use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use super::{
     DOCUMENT_RESULT_ROW_BYTES, DOCUMENT_RESULT_VALUE_BYTES, Engine, add_document_result_budget,
@@ -138,56 +143,101 @@ impl Engine {
                 .saturating_add(requested)
                 .saturating_add(1)
                 .min(MAX_WINDOW_KEYS) as usize;
-            let mut window = Window::new(capacity, MAX_WINDOW_BYTES);
-            for shard in state.source.shards(self.shard_count()) {
-                let sorter = sorter.clone();
-                let matcher = matcher.clone();
-                let after = state.sort_after.clone();
-                let stats = state.read_stats.clone();
-                window = self
-                    .run_document_shard(
-                        shard,
-                        owner,
-                        cancellation.clone(),
-                        deadline,
-                        move |storage, connection, cancellation| {
-                            let mut natural_after = None;
-                            while let Some(record) = next_matching_document(
-                                storage,
-                                connection,
-                                collection_id,
+            // One global heap, not one 64-MiB allocation per shard. Only admitted
+            // blocking workers compare keys or hold this mutex; never across an
+            // await. At most eight decodes/key derivations are in flight, each
+            // with the existing BSON/work/key limits (keys are at most 8 MiB).
+            let window = Arc::new(Mutex::new(Window::new(capacity, MAX_WINDOW_BYTES)));
+            let child_window = window.clone();
+            let engine = self.clone();
+            let scan_sorter = sorter.clone();
+            let scan_matcher = matcher.clone();
+            let after = state.sort_after.clone();
+            let stats = state.read_stats.clone();
+            super::fanout::coordinate(
+                state.source.shards(self.shard_count()).collect(),
+                cancellation.clone(),
+                self.inner.shutdown_cancel.clone(),
+                deadline,
+                move |shard, cancellation| {
+                    let engine = engine.clone();
+                    let window = child_window.clone();
+                    let sorter = scan_sorter.clone();
+                    let matcher = scan_matcher.clone();
+                    let after = after.clone();
+                    let stats = stats.clone();
+                    async move {
+                        engine
+                            .run_document_shard(
                                 shard,
-                                natural_after,
-                                matcher.as_deref(),
+                                owner,
                                 cancellation,
                                 deadline,
-                                stats.as_deref(),
-                            )? {
-                                validate_point_record(
-                                    &record,
-                                    collection_id,
-                                    shard,
-                                    record.id_key(),
-                                )?;
-                                natural_after = Some(record.natural_order());
-                                let key = sorter
-                                    .key_validated_with_check(record.document(), &mut || {
-                                        check(cancellation, deadline)
-                                    })?;
-                                let position = SortPosition {
-                                    key,
-                                    natural_order: record.natural_order(),
-                                };
-                                if after.as_ref().is_none_or(|after| position > **after) {
-                                    window.consider(Entry { position, shard })?;
-                                }
-                                check(cancellation, deadline)?;
-                            }
-                            Ok(window)
-                        },
+                                move |storage, connection, cancellation| {
+                                    let mut natural_after = None;
+                                    while let Some(record) = next_matching_document(
+                                        storage,
+                                        connection,
+                                        collection_id,
+                                        shard,
+                                        natural_after,
+                                        matcher.as_deref(),
+                                        cancellation,
+                                        deadline,
+                                        stats.as_deref(),
+                                    )? {
+                                        validate_point_record(
+                                            &record,
+                                            collection_id,
+                                            shard,
+                                            record.id_key(),
+                                        )?;
+                                        natural_after = Some(record.natural_order());
+                                        let key = sorter.key_validated_with_check(
+                                            record.document(),
+                                            &mut || check(cancellation, deadline),
+                                        )?;
+                                        let position = SortPosition {
+                                            key,
+                                            natural_order: record.natural_order(),
+                                        };
+                                        if after.as_ref().is_none_or(|after| position > **after) {
+                                            let mut window = window.lock().map_err(|_| {
+                                                EngineError::new(
+                                                    EngineErrorKind::Internal,
+                                                    "document sort window lock poisoned",
+                                                )
+                                            })?;
+                                            check(cancellation, deadline)?;
+                                            window.consider(Entry { position, shard })?;
+                                        }
+                                        check(cancellation, deadline)?;
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .await
+                    }
+                },
+            )
+            .await?;
+            // All children have drained, including on error. No partial window
+            // is published. Arrival order may shorten a byte-trimmed page, but
+            // its keys always form a global prefix with natural-order ties.
+            let window = Arc::try_unwrap(window)
+                .map_err(|_| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "document sort window still in use",
                     )
-                    .await?;
-            }
+                })?
+                .into_inner()
+                .map_err(|_| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "document sort window lock poisoned",
+                    )
+                })?;
             let truncated = window.truncated;
             // Heap ordering and BSON key comparisons run inside admission too.
             let entries = self
@@ -359,6 +409,44 @@ fn still_selected(
 mod tests {
     use super::*;
     use crate::document::{BsonValue, DocumentSorter};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_key_arrival_and_byte_trimming_always_retain_a_global_prefix(
+            input in prop::collection::vec((0u16..100, 0usize..300), 1..80),
+            capacity in 1usize..20,
+            byte_limit in 2048usize..8192,
+        ) {
+            let sorter = DocumentSorter::compile(
+                &BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap()
+            ).unwrap();
+            let entry = |index: usize, rank: u16, size: usize| Entry {
+                position: SortPosition {
+                    key: sorter.key(&BsonDocument::from_entries([
+                        ("v", BsonValue::String(format!("{rank:03}{}", "x".repeat(size))))
+                    ]).unwrap()).unwrap(),
+                    natural_order: index as u64,
+                },
+                shard: (index % 16) as u16,
+            };
+            let mut expected: Vec<_> = input.iter().enumerate()
+                .map(|(index, &(rank, size))| entry(index, rank, size)).collect();
+            expected.sort();
+            let mut window = Window::new(capacity, byte_limit);
+            for (index, &(rank, size)) in input.iter().enumerate() {
+                window.consider(entry(index, rank, size)).unwrap();
+                prop_assert!(window.bytes <= byte_limit);
+                prop_assert!(window.keys.len() <= capacity);
+            }
+            let actual = window.keys.into_sorted_vec();
+            prop_assert!(!actual.is_empty());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                prop_assert!(actual == expected);
+                prop_assert_eq!(actual.shard, expected.shard);
+            }
+        }
+    }
 
     #[test]
     fn selected_rows_are_rechecked_after_filter_or_sort_key_changes() {
