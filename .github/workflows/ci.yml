@@ -552,6 +552,25 @@ jobs:
           python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
 
+      - name: Check out locked index-model oracle
+        if: matrix.python == '3.9'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: schapman1974/tinymongo
+          ref: 53cbf44e98b8caa036163725d195fd29592e1cc0
+          path: target/tinymongo-model-source
+          persist-credentials: false
+
+      - name: Compare the installed wheel with isolated source-locked index models
+        if: matrix.python == '3.9'
+        env:
+          BRISKDB_MONGO_ORACLE_PYTHON: ${{ runner.temp }}/mongo-model-oracle/bin/python
+        run: |
+          python -m venv "${{ runner.temp }}/mongo-model-oracle"
+          "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install -r compat/mongo/v1/runner/requirements.txt
+          "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install --no-build-isolation --no-deps ./target/tinymongo-model-source
+          python -m unittest discover -s python/tests -p test_index_models_reference.py -v
+
       - name: Test and lint the native extension
         run: |
           cargo test --locked -p briskdb-python

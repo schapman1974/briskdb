@@ -196,6 +196,16 @@ pub(crate) fn execution_to_python(
             output.set_item("num_indexes_before", before)?;
             output.set_item("num_indexes_after", after)?;
         }
+        DocumentResult::IndexModelsBuilt {
+            names,
+            before,
+            after,
+        } => {
+            output.set_item("kind", "index_models_built")?;
+            output.set_item("index_names", names.into_vec())?;
+            output.set_item("num_indexes_before", before)?;
+            output.set_item("num_indexes_after", after)?;
+        }
         DocumentResult::IndexesDropped { before, after } => {
             output.set_item("kind", "indexes_dropped")?;
             output.set_item("num_indexes_before", before)?;

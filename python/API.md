@@ -59,6 +59,41 @@ Original remote connection/authentication settings are not used; no new Mongo
 semantics or TinyMongo storage backends are implied. See
 [examples and substitution boundaries](README.md#patch-pymongo-for-local-testing).
 
+### Local index-model compatibility (source builds)
+
+Collections obtained from `briskdb.MongoClient`, `AsyncMongoClient`, or a
+`briskdb.patch()` scope accept an iterable of PyMongo `IndexModel` objects,
+mapping documents, duck-typed `.document` mappings, or objects exposing the
+supported `IndexSpec.to_metadata()` shape in `create_indexes`. No TinyMongo
+package is imported or required. An empty iterable returns `[]`; batches are
+bounded to 1,000 models and existing BSON/request budgets. Inputs are copied and
+validated before mutation; a runtime build failure can retain a completed prefix.
+
+Unlike stock PyMongo, these helpers return the **actual server-resolved names**.
+Descending model keys become ascending equality keys. Hashed, TTL, background and
+text declarations retain the explicitly reduced behavior documented in
+[Mongo parity](../docs/MONGO_PARITY.md): no expiration or full-text search.
+`briskdb.mongo.IndexCompatibilityWarning` reports successful reductions, skipped
+text models and reused names. Text-only names are returned but have no catalog
+entry, following TinyMongo. Unique hashed/text/TTL models are rejected; unique
+descending/background builds retain enforcement.
+
+Equivalent-name reuse is limited to reduced models with exactly matching ordered
+keys, uniqueness, sparse membership and representation-identical partial filters.
+Planning and builds share the server's exclusive index admission, including
+earlier batch entries. Existing Pending declarations are not Ready authority.
+Concurrent schema changes may return code 112 (`WriteConflict` / busy); the helper
+does not retry arbitrary writes automatically. Normal models still report name
+or option conflicts. Returned real names can be passed to `drop_index`.
+
+Database/collection factories, subcollections and `with_options()` preserve these
+helpers and driver codec/read/write settings. Sessions remain unsupported. Direct
+`create_index()` and ordinary PyMongo classes are unchanged. This does not open or
+repair old TinyMongo files, promote their private v1 catalogs, or choose an
+arbitrary index for an ambiguous field alias. Use exact names in that case.
+These additions are in the source checkout; they are not part of the published
+alpha.7 wheel.
+
 ## Native document commands
 
 The Python wheel contains BriskDB's document engine, but each database handle

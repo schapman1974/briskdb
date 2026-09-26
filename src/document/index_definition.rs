@@ -22,6 +22,7 @@ pub(crate) enum DocumentIndexBuildDefinition {
         specification: BsonDocument,
         name: String,
         unique: bool,
+        reuse_equivalent: bool,
     },
 }
 
@@ -40,6 +41,7 @@ pub(crate) fn normalize_index_batch(
     let mut retained = 0usize;
     for index in indexes {
         check()?;
+        let reuse_equivalent = index.reuse_equivalent();
         if index.keys().len() == 1
             && index
                 .keys()
@@ -85,6 +87,7 @@ pub(crate) fn normalize_index_batch(
                 specification,
                 name,
                 unique,
+                reuse_equivalent,
             }
         });
     }

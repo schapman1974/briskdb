@@ -24,6 +24,7 @@ if pymongo.version_tuple[:3] != (4, 17, 0):
     raise ImportError("BriskDB Mongo clients currently require pymongo==4.17.0")
 
 from ._mongo_runtime import _Store, _drained, acquire
+from ._mongo_collections import Database, AsyncDatabase, IndexCompatibilityWarning
 
 ASCENDING = pymongo.ASCENDING
 DESCENDING = pymongo.DESCENDING
@@ -136,6 +137,15 @@ class MongoClient(_Client):
     def briskdb_path(self) -> Path:
         return self._briskdb_store.path
 
+    def __getitem__(self, name: str) -> Database:
+        return Database._wrap(super().__getitem__(name))
+
+    def get_database(self, *args: Any, **kwargs: Any) -> Database:
+        return Database._wrap(super().get_database(*args, **kwargs))
+
+    def get_default_database(self, *args: Any, **kwargs: Any) -> Database:
+        return Database._wrap(super().get_default_database(*args, **kwargs))
+
     def close(self) -> None:
         self._briskdb_store.check_process()
         try:
@@ -173,6 +183,15 @@ class AsyncMongoClient(_AsyncClient):
     @property
     def briskdb_path(self) -> Path:
         return self._briskdb_store.path
+
+    def __getitem__(self, name: str) -> AsyncDatabase:
+        return AsyncDatabase._wrap(super().__getitem__(name))
+
+    def get_database(self, *args: Any, **kwargs: Any) -> AsyncDatabase:
+        return AsyncDatabase._wrap(super().get_database(*args, **kwargs))
+
+    def get_default_database(self, *args: Any, **kwargs: Any) -> AsyncDatabase:
+        return AsyncDatabase._wrap(super().get_default_database(*args, **kwargs))
 
     async def close(self) -> None:
         self._briskdb_store.check_process()

@@ -176,12 +176,14 @@ fn create_batch(
         crate::document::normalize_index_batch(indexes.into_boxed_slice(), &mut || Ok(()))?;
     let migration = storage.begin_schema_migration()?;
     migration.wait_for_quiescence_blocking();
-    storage.create_document_indexes_controlled(
-        &DocumentNamespace::new("app", "items").unwrap(),
-        definitions,
-        migration,
-        OperationControl::new(None),
-    )
+    storage
+        .create_document_indexes_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            definitions,
+            migration,
+            OperationControl::new(None),
+        )
+        .map(|(before, after, _)| (before, after))
 }
 
 fn batch_index(field: &str, name: &str) -> crate::document::DocumentIndexRequest {
@@ -191,6 +193,69 @@ fn batch_index(field: &str, name: &str) -> crate::document::DocumentIndexRequest
     .unwrap()
     .with_name(name)
     .unwrap()
+}
+
+#[cfg(feature = "mongo")]
+#[test]
+fn model_reuse_requires_ready_authority_and_preserves_ids_records_and_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    let run = |storage: &Storage, indexes: Vec<crate::document::DocumentIndexRequest>| {
+        let definitions =
+            crate::document::normalize_index_batch(indexes.into_boxed_slice(), &mut || Ok(()))?;
+        let migration = storage.begin_schema_migration()?;
+        migration.wait_for_quiescence_blocking();
+        storage.create_document_indexes_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            definitions,
+            migration,
+            OperationControl::new(None),
+        )
+    };
+    let high = high_water(temp.path());
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    // An equivalent Pending index is not permission to report a successful build.
+    let error = run(
+        &storage,
+        vec![batch_index("value", "alias").with_equivalent_reuse(true)],
+    )
+    .unwrap_err();
+    assert_eq!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<DocumentIndexError>(),
+        Some(&DocumentIndexError::OptionsConflict)
+    );
+    assert_eq!(high_water(temp.path()), high);
+    let (before, after, names) = run(
+        &storage,
+        vec![
+            batch_index("value", "value"),
+            batch_index("value", "alias").with_equivalent_reuse(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!((before, after), (1, 2));
+    assert_eq!(&*names, &["value", "value"]);
+    assert_eq!(high_water(temp.path()), high);
+    let catalog = storage.document_catalog().unwrap();
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    drop(storage);
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    let (before, after, names) = run(
+        &storage,
+        vec![batch_index("value", "a_longer_requested_name").with_equivalent_reuse(true)],
+    )
+    .unwrap();
+    assert_eq!((before, after), (2, 2));
+    assert_eq!(&*names, &["value"]);
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high);
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
 }
 
 #[test]

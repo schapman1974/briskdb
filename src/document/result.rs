@@ -304,6 +304,7 @@ impl DocumentDeleteResult {
 pub enum DocumentResultKind {
     IndexBuilt,
     IndexesBuilt,
+    IndexModelsBuilt,
     IndexesDropped,
     Acknowledged,
     CollectionExists,
@@ -401,6 +402,12 @@ pub enum DocumentResult {
         before: u64,
         after: u64,
     },
+    /// Resolved names and counts from one exclusive index-model operation.
+    IndexModelsBuilt {
+        names: Box<[String]>,
+        before: u64,
+        after: u64,
+    },
     /// Ready-index counts; removal may also delete non-enforcing Pending definitions.
     IndexesDropped {
         before: u64,
@@ -430,6 +437,7 @@ impl DocumentResult {
             Self::IndexName(_) | Self::IndexReady(_) => DocumentResultKind::IndexName,
             Self::IndexBuilt { .. } => DocumentResultKind::IndexBuilt,
             Self::IndexesBuilt { .. } => DocumentResultKind::IndexesBuilt,
+            Self::IndexModelsBuilt { .. } => DocumentResultKind::IndexModelsBuilt,
             Self::IndexesDropped { .. } => DocumentResultKind::IndexesDropped,
             Self::Indexes(_) => DocumentResultKind::Indexes,
             Self::CursorKilled(_) => DocumentResultKind::CursorKilled,
@@ -488,6 +496,7 @@ impl fmt::Debug for DocumentResult {
             | Self::IndexReady(_)
             | Self::IndexBuilt { .. }
             | Self::IndexesBuilt { .. }
+            | Self::IndexModelsBuilt { .. }
             | Self::IndexesDropped { .. } => {
                 debug.field("payload", &"<redacted>");
             }
