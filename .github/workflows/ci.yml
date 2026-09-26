@@ -220,9 +220,11 @@ jobs:
       - name: Require real PyMongo discovery, documents, and restart
         env:
           BRISKDB_MONGO_WIRE_PYTHON: python
-        run: >-
-          cargo test --locked --no-default-features --features mongo --test mongo_wire
+        run: |
+          cargo test --locked --no-default-features --features mongo --test mongo_wire \
           real_pymongo_sync_async_discovery -- --ignored --exact
+          cargo test --locked --no-default-features --features mongo --test mongo_wire \
+          real_pymongo_async_cancellation -- --ignored --exact
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications

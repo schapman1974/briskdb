@@ -529,6 +529,13 @@ requires an earlier dependency:
       First successful handshakes freeze the record; disconnect, abort and
       listener close remove it. Raw-socket, redaction, bounds/unwind and real
       sync/async driver observations cover this final discovery checkpoint.
+    - [x] [#184](https://github.com/schapman1974/briskdb/issues/184) — the pinned
+      stock PyMongo 4.17.0 sync/async matrix now includes deliberate in-flight
+      async getMore cancellation, deterministic reply-delay fault injection,
+      native cursor/socket cleanup before client close, and same-client pool
+      replacement/reuse against fresh and reopened storage. No driver/response
+      rewriting or cancelled-write outcome guarantee. The explicit local test is
+      wired into the existing real-driver CI gate for final CI restoration.
     - [x] [#388](https://github.com/schapman1974/briskdb/issues/388) — Python
       testing wheels now provide TinyMongo-style `briskdb.patch()` and direct
       `MongoClient`/`AsyncMongoClient` imports backed by real pinned PyMongo and
