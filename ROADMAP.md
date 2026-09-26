@@ -953,6 +953,15 @@ requires an earlier dependency:
       concurrency-with-busy-retry, bounded-result and 144 source-locked public
       model outcomes cover this slice. Full upstream index-suite certification
       remains part of #174/#186; legacy private catalog repair is not claimed.
+      The upstream durable-index audit additionally accepts the boolean
+      `bypassDocumentValidation` write option as a no-op while collection
+      validators remain unsupported. Insert/update/upsert/find-and-modify still
+      enforce BSON, immutable IDs and all unique-index constraints; real
+      sync/async wheel regressions retain bulk prefix counts and restart state.
+      All seven public exact-ID source scenarios now also run against the
+      installed wheel, including ordered document IDs, numeric aliases, array
+      IDs, compound/logical selectors and mapping subclasses. Private Python
+      helper internals remain covered by the shared matcher oracles.
     - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate
