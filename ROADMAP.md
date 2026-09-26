@@ -962,6 +962,15 @@ requires an earlier dependency:
       installed wheel, including ordered document IDs, numeric aliases, array
       IDs, compound/logical selectors and mapping subclasses. Private Python
       helper internals remain covered by the shared matcher oracles.
+      Public advanced-index wheel regressions now exercise compound tuples,
+      conditional multikey uniqueness, sparse missing/null distinctions, partial
+      membership transitions, rollback, invalid options and restart metadata.
+      Direct local sync/async `create_index()` rejects duplicate fields before
+      PyMongo can collapse them; valid direct directions/options remain unchanged.
+      Durable-index wheel scenarios additionally cover namespace/catalog identity,
+      drop/recreate and retry, typed/multikey uniqueness, four-client contention,
+      and explicit same-shard rollback. Driver metadata/result shapes and the
+      #74/#183 cross-shard boundary remain explicit compatibility differences.
     - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate

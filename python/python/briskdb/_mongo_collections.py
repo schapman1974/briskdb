@@ -22,6 +22,29 @@ def _unsupported(message: str) -> OperationFailure:
     return OperationFailure(message, code=115)
 
 
+def _distinct_index_fields(keys: Any) -> None:
+    """Reject duplicates before PyMongo folds a key sequence into a mapping.
+
+    Leave other input validation and all ordinary index options to the driver
+    and server. In particular, do not route create_index through the model
+    compatibility path, which would change valid descending declarations.
+    """
+    if not isinstance(keys, (list, tuple)):
+        return
+    seen = set()
+    for item in keys:
+        if isinstance(item, str):
+            field = item
+        elif isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+            field = item[0]
+        else:
+            # Preserve the driver's error for malformed key-pair shapes.
+            return
+        if field in seen:
+            raise _unsupported("index fields must be distinct")
+        seen.add(field)
+
+
 def _models(indexes: Any, codec_options: Any) -> list[dict[str, Any]]:
     """Bound and copy the whole iterable before sending any mutation request."""
     models = []
@@ -142,6 +165,11 @@ class Collection(_Collection):
     def with_options(self, *args: Any, **kwargs: Any) -> Collection:
         return self._wrap(super().with_options(*args, **kwargs))
 
+    def create_index(self, keys: Any, session: Any = None, comment: Any = None,
+                     **kwargs: Any) -> str:
+        _distinct_index_fields(keys)
+        return super().create_index(keys, session=session, comment=comment, **kwargs)
+
     def create_indexes(self, indexes: Any, session: Any = None, comment: Any = None,
                        **kwargs: Any) -> list[str]:
         command, count = _command(self, indexes, session, comment, kwargs)
@@ -163,6 +191,11 @@ class AsyncCollection(_AsyncCollection):
 
     def with_options(self, *args: Any, **kwargs: Any) -> AsyncCollection:
         return self._wrap(super().with_options(*args, **kwargs))
+
+    async def create_index(self, keys: Any, session: Any = None, comment: Any = None,
+                           **kwargs: Any) -> str:
+        _distinct_index_fields(keys)
+        return await super().create_index(keys, session=session, comment=comment, **kwargs)
 
     async def create_indexes(self, indexes: Any, session: Any = None, comment: Any = None,
                              **kwargs: Any) -> list[str]:
