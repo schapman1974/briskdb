@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-one locked suites is classified; 657 reference parameter cases are not 657 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-two locked suites is classified; 671 reference parameter cases are not 671 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2215,6 +2215,134 @@
             "python/tests/test_upstream_decimal_codec_edges.py::test_nonfinite_floats_and_float_subclasses_roundtrip_natively"
           ],
           "note": "NaN, both infinities and a float subclass roundtrip through actual BSON without tagged-JSON fallback dispatch."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_async_api.py",
+      "sha256": "2b95d83cec6c7c74df67d60a713ddd8b97dfd2c4f90d77fe8a20646bc4d03137",
+      "reference_case_count": 14,
+      "function_count": 14,
+      "coverage": [
+        {
+          "source": [
+            "test_async_crud_cursor_and_client_metadata"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_async_crud_metadata_and_idempotent_close"
+          ],
+          "note": "Async CRUD, projected paging, counts, names and idempotent close use real PyMongo cursors. server_info identifies BriskDB; TinyMongo-only supports() is not exposed and closed operations reject."
+        },
+        {
+          "source": [
+            "test_async_database_listing_and_drop_database"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_database_listing_names_only_and_drop_keep_metadata_gap_explicit"
+          ],
+          "note": "Name-only listing and logical database drop work. Full statistics remain explicit #166 code-115 rejection. AsyncCommandCursor lacks TinyMongo metadata sort/skip/limit helpers; the fixture sorts returned names explicitly instead of inventing sizeOnDisk."
+        },
+        {
+          "source": [
+            "test_find_is_lazy_and_cursor_clone_has_independent_consumption"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_find_is_lazy_and_clones_execute_independent_wire_queries"
+          ],
+          "note": "Command monitoring proves no find at construction and one per independently consumed clone. PyMongo has no ordinary AsyncCursor.try_next and rejects to_list(0), unlike the locked TinyMongo helper; next exhaustion/rewind are tested."
+        },
+        {
+          "source": [
+            "test_storage_work_does_not_block_the_event_loop"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_event_loop_progresses_during_a_real_pending_insert"
+          ],
+          "note": "An event-loop ticker progresses while command monitoring reports an actual pending 256-document wire insert. This replaces TinyMongo's monkeypatched synchronous storage helper, not a claim about every CPU-bound workload."
+        },
+        {
+          "source": [
+            "test_async_clients_reject_invalid_backends_without_opening_storage"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_database_options_private_names_and_unsupported_calls",
+            "python/tests/test_upstream_client_configuration.py::test_invalid_sync_and_async_options_do_not_create_storage"
+          ],
+          "note": "Unsupported backend configuration rejects before creating the selected path. The BriskDB async constructor opens native storage synchronously after validation; TinyMongo's private lazy _state._client cache and alternate positional backend signature are not implemented."
+        },
+        {
+          "source": [
+            "test_cursor_validation_close_and_limit_zero",
+            "test_cursor_results_do_not_alias_the_cached_documents",
+            "test_cursor_initial_options_counts_and_error_paths",
+            "test_cursor_legacy_pagination_and_has_next_helpers"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_cursor_validation_pagination_and_returned_value_isolation",
+            "python/tests/test_upstream_async_api.py::test_find_is_lazy_and_clones_execute_independent_wire_queries"
+          ],
+          "note": "Modern async paging, zero/unlimited limits, negative limit, consumed-position errors, result isolation, query failures and rewind are tested. Driver bool validation is explicit: skip(True) is accepted at construction but wire-rejected with code 2, to_list(True) yields one. Buffered rows remain after close and rewind is allowed. TinyMongo count/paginate/has_next/hasNext/private _ensure_loaded cache helpers are not provided; these are API differences, not equivalent private cache behavior."
+        },
+        {
+          "source": [
+            "test_database_helpers_and_unsupported_calls"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_database_options_private_names_and_unsupported_calls",
+            "python/tests/test_upstream_async_api.py::test_modern_async_collection_mutation_index_and_bulk_surface"
+          ],
+          "note": "Database/collection names, ping, empty aggregation and unsupported serverStatus are checked. with_options returns a new real PyMongo handle, collection.drop returns None and database.drop_collection(missing) returns its code-26 reply rather than TinyMongo booleans."
+        },
+        {
+          "source": [
+            "test_remaining_supported_collection_surface"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_modern_async_collection_mutation_index_and_bulk_surface",
+            "python/tests/test_upstream_async_api.py::test_database_options_private_names_and_unsupported_calls"
+          ],
+          "note": "Modern async CRUD/find-modify/index/distinct/drop counterparts are tested, including actual IndexModel builds instead of a monkeypatched result. Native bulk_write is supported beyond this locked TinyMongo source. Removed insert/update/remove/count/collection_names aliases and TinyMongo repr/tablename conventions are not the modern PyMongo API; change streams remain rejected."
+        },
+        {
+          "source": [
+            "test_closed_handles_private_attributes_and_database_context"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_async_crud_metadata_and_idempotent_close",
+            "python/tests/test_upstream_async_api.py::test_database_options_private_names_and_unsupported_calls"
+          ],
+          "note": "Closed operations and private-name access reject. TinyMongo database_names/capabilities helpers, lazy unopened state and database async-context API are not implemented; real PyMongo database objects remain ordinary selectors and are not async context managers."
+        },
+        {
+          "source": [
+            "test_non_default_collection_options_are_rejected"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_database_options_private_names_and_unsupported_calls"
+          ],
+          "note": "A fake concern object raises driver TypeError; a valid WriteConcern(w=2) handle is accepted but its write is rejected without mutation. The frontend does not silently grant unsupported durability."
+        },
+        {
+          "source": [
+            "test_close_waits_for_inflight_operations_and_calls_can_overlap"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_cancelled_direct_client_close_drains_native_release",
+            "python/tests/test_upstream_common.py::test_shared_async_collection_serializes_competing_increments",
+            "python/tests/test_patching.py::test_cancellation_during_exit_waits_for_native_release"
+          ],
+          "note": "A bounded barrier verifies cancelled direct-client close waits for native release, then acknowledged data is reopened. Shared async competing increments are checked separately. TinyMongo's arbitrary synchronous _state.call callback/draining mechanism is private and is not an equivalent BriskDB API or a guarantee that already-pending wire calls complete successfully during shutdown."
         }
       ]
     }

@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 264 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 278 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -51,13 +51,14 @@ functions in the locked `test_query_more.py`,
 `test_array_update_modifiers.py`, `test_bson_value_types.py`,
 `test_uuid_regex.py`, `test_aggregation_basic_stages.py`,
 `test_aggregation_projection_stages.py`, `test_aggregation.py`,
-`test_decimal_coverage_edges.py` and `test_bson_codec_fast_path.py` suites
-(657 reference parameter cases). 185 owned wheel tests check public
+`test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
+`test_async_api.py` suites
+(671 reference parameter cases). 193 owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 657 unchanged upstream candidate passes or complete #186 certification.
+not 671 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -132,6 +133,13 @@ double-versus-decimal distinctions, extreme decimal IDs across reopen, invalid
 updates, nonfinite BSON roundtrips and builtin/native subclasses. TinyMongo's
 tagged JSON, Python registry/optional-dependency hooks, lazy diagnostic callbacks
 and legacy arbitrary-precision integer IDs are not native BSON interfaces.
+Async API coverage verifies lazy independent find requests with command monitoring,
+event-loop progress during an actual pending insert, modern mutation/index/bulk
+operations and cancellation-drained native release. Legacy cursor/collection
+helpers, database context managers, permanent-close semantics and metadata returns
+differ from modern PyMongo. Full database statistics remain the #166 gap; no
+TinyMongo private callback/cache or successful in-flight-call shutdown guarantee
+is claimed.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings
