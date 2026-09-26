@@ -41,20 +41,36 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 115 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 130 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
-`test_projection.py`, `test_projection_memory.py` and `test_unset_semantics.py`
-suites (259 reference parameter cases). Sixty-seven owned wheel tests check public
+`test_projection.py`, `test_projection_memory.py`, `test_unset_semantics.py`,
+`test_common_api.py`, `test_collection_attributes.py`, `test_thread_safety.py`
+and `test_multi_write.py` suites (289 reference parameter cases).
+Eighty owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 259 unchanged upstream candidate passes or complete #186 certification.
+not 289 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
+
+Common-client coverage includes sync/async dotted collection selection, private-name
+brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
+isolation, consumed cursor positions and logical database drop/reopen. Shared
+collection threads and async tasks check competing increments without retry masking.
+On Linux/macOS, six spawned local writer processes insert 50 records each and the
+reopened root must contain all 300 values and unique generated IDs. The native
+schema is prepared before overlapping roots; this is not TinyDB's concurrent
+implicit-creation policy, a cross-shard transaction or long-duration soak.
+The source's private database-object cache and exact Python lock/build counts have
+no native counterpart. Real PyMongo cursors retain buffered rows after close and
+permit rewind, unlike TinyMongo's permanent-close behavior; boolean argument
+validation also stays with the pinned driver. These differences are explicit,
+and full database statistics remain the #166 gap described below.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings
