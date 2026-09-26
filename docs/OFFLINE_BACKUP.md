@@ -101,3 +101,54 @@ the async index, rebuilds and fully validates every index, and reads all known
 rows. The test freezes the stopped-copy contract but does not claim online
 snapshot safety or certify a third-party backup product. The broader fault and
 performance evidence is in the [global-index release gate](GLOBAL_INDEX_RELEASE_GATE.md).
+
+### Mongo import, restore, and rollback drill
+
+The same stopped-copy rule applies to Mongo documents: copy the **whole BriskDB
+root**, not one logical database, collection, manifest, or shard. Closing only a
+Mongo listener is insufficient; every engine owner and process must be stopped.
+Validate the restored root through the actual data API before returning clients
+to it. Mongo `ping` alone does not establish document readiness or integrity.
+
+`tests/mongo_operating_drill.rs` creates real source-locked TinyMongo table-native
+and two-shard SQLite stores, checkpoints and closes them, then imports each into
+a new four-shard BriskDB root. An independently installed stock PyMongo client
+checks 24 BSON-rich documents and an empty collection over the real listener.
+Imported secondary definitions initially remain pending/hidden from wire index
+discovery; the drill explicitly builds them through the native engine API before
+requiring their metadata, lookup results and unique enforcement.
+
+After stopping and releasing the engine, the drill copies the entire root through
+a backup directory into a new restore directory. Relative file membership and
+content hashes must match before reopen, including the import receipt and any
+sidecars. PyMongo checks BSON bytes, indexes and uniqueness, writes only to the
+restored root, and verifies those changes after another restart. The stopped
+backup, imported root and TinyMongo source must remain byte-identical to their
+respective pre-copy/pre-import states before reopening the original source.
+A separate disposable restore with one
+missing shard must fail closed without recreating it.
+
+For rollback, the drill reopens the unchanged original TinyMongo source and
+requires the old data. **This is rollback to the pre-cutover point, not reverse
+migration or synchronization of later BriskDB writes.** Retain the stopped source
+until acceptance, and do not permit writes to both stores during cutover. If new
+writes have already been accepted by BriskDB, stop writers and preserve that root;
+returning to TinyMongo requires a separately validated reconciliation/export plan
+or explicit acceptance of losing those later changes. Do not overwrite either
+copy, open BriskDB files with TinyMongo, or point the importer at a live source.
+
+To run with the frozen TinyMongo test environment and a separate PyMongo 4.17.0
+environment (neither is a native server runtime dependency):
+
+```bash
+BRISKDB_MONGO_ORACLE_PYTHON=/path/to/reference/bin/python \
+BRISKDB_MONGO_WIRE_PYTHON=/path/to/stock-driver/bin/python \
+cargo test --locked --no-default-features --features mongo,tinymongo-import \
+  --test mongo_operating_drill -- --ignored --nocapture --test-threads=1
+```
+
+CI runs this drill explicitly with the locked source and an isolated driver
+environment. It is not online backup, cross-version upgrade/downgrade, storage
+provider durability, process/power-loss certification or the entire Mongo release
+gate. The importer remains a Rust library API; see the precise
+[source-format and import limits](DOCUMENT_STORAGE.md#tinymongo-sqlite-import).

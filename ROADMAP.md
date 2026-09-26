@@ -995,6 +995,15 @@ requires an earlier dependency:
       and arbitrary key arrival with memory trimming. Point reads remain direct;
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
+    - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
+      drill imports real locked TinyMongo table-native/two-shard SQLite stores
+      into four BriskDB shards, builds pending indexes explicitly, and checks
+      BSON, empty collections, uniqueness and post-restore writes with stock
+      PyMongo. Stopped whole-root copies preserve exact file membership/bytes;
+      incomplete restores fail closed and the unchanged original source remains
+      usable for pre-cutover rollback. This is not online backup, reverse data
+      migration, cross-version/power-loss proof or complete release acceptance;
+      comparative benchmarks and wider app/soak/security gates remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can now inspect payload-free listener-local Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way

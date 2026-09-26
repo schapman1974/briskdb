@@ -106,6 +106,16 @@ jobs:
             --json-output target/mongo-parity/report.json \
             --markdown-output target/mongo-parity/report.md
 
+      - name: Require stopped Mongo import, restore, and rollback drill
+        env:
+          BRISKDB_MONGO_ORACLE_PYTHON: python
+          BRISKDB_MONGO_WIRE_PYTHON: ${{ github.workspace }}/target/mongo-operating-driver/bin/python
+        run: |
+          python -m venv target/mongo-operating-driver
+          target/mongo-operating-driver/bin/python -m pip install pymongo==4.17.0
+          cargo +1.85.0 test --locked --no-default-features --features mongo,tinymongo-import \
+            --test mongo_operating_drill -- --ignored --nocapture --test-threads=1
+
       - name: Add Mongo parity report to summary
         if: always()
         run: |
