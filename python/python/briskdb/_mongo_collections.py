@@ -11,8 +11,10 @@ from bson import BSON
 from pymongo.errors import BulkWriteError, InvalidOperation, OperationFailure
 from pymongo.results import InsertManyResult
 from pymongo.synchronous.collection import Collection as _Collection
+from pymongo.synchronous.client_session import ClientSession
 from pymongo.synchronous.database import Database as _Database
 from pymongo.asynchronous.collection import AsyncCollection as _AsyncCollection
+from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.database import AsyncDatabase as _AsyncDatabase
 
 from . import _mongo_bulk
@@ -170,6 +172,23 @@ def _snapshot_find(cursor: Any, projection: Any) -> Any:
     return cursor
 
 
+def _validate_find_session(args: tuple[Any, ...], kwargs: dict[str, Any], session_type: Any) -> None:
+    """Reject invalid sessions before the driver partially initializes a cursor.
+
+    PyMongo 4.17's Cursor and AsyncCursor take session at find argument 20
+    (zero-based, excluding the collection). Tests lock both driver signatures.
+    Valid sessions and all other options retain normal driver validation.
+    """
+    if len(args) > 20:
+        if "session" in kwargs:
+            raise TypeError("find() got multiple values for argument 'session'")
+        session = args[20]
+    else:
+        session = kwargs.get("session")
+    if session is not None and not isinstance(session, session_type):
+        raise ValueError("session must be a matching PyMongo ClientSession or None")
+
+
 class Collection(_Collection):
     """Real PyMongo collection with opt-in local-client compatibility."""
 
@@ -184,6 +203,7 @@ class Collection(_Collection):
         return self._wrap(super().with_options(*args, **kwargs))
 
     def find(self, *args: Any, **kwargs: Any) -> Any:
+        _validate_find_session(args, kwargs, ClientSession)
         cursor = super().find(*args, **kwargs)
         return _snapshot_find(cursor, args[1] if len(args) > 1 else kwargs.get("projection"))
 
@@ -228,6 +248,7 @@ class AsyncCollection(_AsyncCollection):
         return self._wrap(super().with_options(*args, **kwargs))
 
     def find(self, *args: Any, **kwargs: Any) -> Any:
+        _validate_find_session(args, kwargs, AsyncClientSession)
         cursor = super().find(*args, **kwargs)
         return _snapshot_find(cursor, args[1] if len(args) > 1 else kwargs.get("projection"))
 
