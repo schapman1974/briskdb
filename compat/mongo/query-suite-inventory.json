@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these nineteen locked suites is classified; 642 reference parameter cases are not 642 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-one locked suites is classified; 657 reference parameter cases are not 657 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2095,6 +2095,126 @@
             "python/tests/test_upstream_aggregation_core.py::test_async_command_cursor_iteration_close_and_context_manager"
           ],
           "note": "Async real command cursors cover grouping, iteration, close, empty/alive state, context cleanup, projection and unsupported lookup. PyMongo lacks rewind; a new aggregate is checked without claiming it restores the old cursor snapshot."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_decimal_coverage_edges.py",
+      "sha256": "8d00872354806cea666c3938b30f54086c80b290cb0e304a0fe51af507fbda79",
+      "reference_case_count": 6,
+      "function_count": 6,
+      "coverage": [
+        {
+          "source": [
+            "test_sum_accumulator_falls_back_cleanly_without_decimal128"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_mixed_integer_double_sum_is_native_and_exact_for_binary_fractions"
+          ],
+          "note": "The public integer/double sum is checked in the native engine. TinyMongo's monkeypatched optional-Decimal128 fallback does not exist: this real-driver addon requires pinned PyMongo and native numerics do not dispatch to optional Python helpers."
+        },
+        {
+          "source": [
+            "test_bson_numeric_helpers_reject_invalid_values_and_missing_dependency"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_numeric_updates_reject_invalid_operands_and_preserve_decimal_infinity"
+          ],
+          "note": "Native update tests check invalid bool/string/non-BSON operands, unchanged records and Decimal128 infinity arithmetic. Private helper TypeError and simulated optional-package RuntimeError branches are not a native API."
+        },
+        {
+          "source": [
+            "test_decimal128_index_tokens_cover_zero_exact_double_and_nonfinite_values"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_unique_numeric_index_uses_exact_double_decimal_identity"
+          ],
+          "note": "Public unique indexes and indexed equality prove zero/fraction/int-double-decimal aliases and exact 1e23 versus 1E23 separation. Nonfinite indexed numbers reject with wire code 115; oversized Python integers fail BSON int64 encoding. Private string token formats are not used."
+        },
+        {
+          "source": [
+            "test_extreme_decimal128_ids_use_safe_exact_ratio_keys"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_extreme_decimal_ids_retain_exact_identity_after_reopen",
+            "src/document/key.rs::decimal_extremes_have_small_self_validating_keys"
+          ],
+          "note": "Extreme native Decimal128 IDs preserve identity/uniqueness across reopen. Native compact canonical-key tests replace TinyMongo hex-ratio/legacy physical-ID formats. Python integers above int64 cannot be stored as BSON IDs."
+        },
+        {
+          "source": [
+            "test_comparison_helpers_reject_unsupported_operands_and_comparison_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_native_comparison_rejects_non_bson_and_pull_handles_nan_array"
+          ],
+          "note": "Public pull comparison handles a NaN-containing array with a matching numeric element. Arbitrary objects fail BSON encoding; user-supplied Python comparison callables/private false-on-error hooks are not part of the native engine."
+        },
+        {
+          "source": [
+            "test_tinydb_parser_and_writes_cover_native_non_numeric_query_routes"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_native_string_range_queries_update_and_replace"
+          ],
+          "note": "Public compound/string-range queries and update/replace results are checked on native SQLite. TinyDB parse_query object construction is not a BriskDB API."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_bson_codec_fast_path.py",
+      "sha256": "c153dbc2e095b70644b54b17a0f33a341e332449fde43eefb53efcdac72d5905",
+      "reference_case_count": 9,
+      "function_count": 7,
+      "coverage": [
+        {
+          "source": [
+            "test_exact_json_builtins_do_not_consult_bson_registry",
+            "test_builtin_subclasses_still_consult_bson_registry"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_builtin_and_subclass_values_use_bson_without_tagged_json"
+          ],
+          "note": "Native wire roundtrips cover exact builtins and str/int/float/dict/list subclasses, tuple arrays and infinity. TinyMongo tagged-JSON encoding and monkeypatched Python BSON-registry dispatch counts have no native counterpart."
+        },
+        {
+          "source": [
+            "test_pymongo_native_subclasses_keep_their_bson_tags"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_native_code_and_binary_subclasses_keep_type_and_payload"
+          ],
+          "note": "Code scope and subtype-4 Binary preserve exact native BSON type/payload; internal TinyMongo JSON tags are intentionally absent."
+        },
+        {
+          "source": [
+            "test_fast_path_preserves_invalid_document_context_and_root",
+            "test_document_context_can_be_built_only_when_validation_fails"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_encoding_failures_leave_no_catalog_and_keep_caller_inputs"
+          ],
+          "note": "Nested sets/objects fail as driver InvalidDocument without implicit catalog creation, followed by a valid roundtrip. TinyMongo enriched document/path diagnostics and lazy document_context callback are codec-specific APIs that BriskDB does not expose."
+        },
+        {
+          "source": [
+            "test_fast_path_keeps_nonfinite_float_round_trips",
+            "test_nonfinite_float_subclass_uses_the_bson_aware_fallback"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_nonfinite_floats_and_float_subclasses_roundtrip_natively"
+          ],
+          "note": "NaN, both infinities and a float subclass roundtrip through actual BSON without tagged-JSON fallback dispatch."
         }
       ]
     }
