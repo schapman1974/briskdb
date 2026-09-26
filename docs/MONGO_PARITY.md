@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 468 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 487 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -59,14 +59,15 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_optimistic_inserts.py`, `test_sharded_sqlite_concurrency.py` and
 `test_sqlite_unique_update_fast_path.py`, `test_sqlite_bulk_updates.py`,
 `test_warning_attribution.py`, `test_mongo_like.py` and
-`test_bulk_insert_planning.py` and `test_storage_backends.py` suites
-(997 reference parameter cases). 264 added wheel scenarios and existing patch
+`test_bulk_insert_planning.py`, `test_storage_backends.py` and
+`test_sqlite_complex_read_candidates.py` suites
+(1,016 reference parameter cases). 270 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 997 unchanged upstream candidate passes or complete #186 certification.
+not 1,016 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -173,6 +174,15 @@ ObjectId, datetime, UUID-subtype Binary and empty collections through stock-driv
 writes and reopen. TinyMongo's own in-place migration runs only on a disposable
 copy for reference validation; the actual source remains byte-for-byte unchanged.
 This does not add DuckDB/Parquet ingestion or automatic migration on client open.
+
+Complex reads combine indexed membership, ranges and modulo with exact natural
+ordering, bounds, projection and counts across index creation/drop and reopen.
+Array candidates, mixed BSON types, embedded objects, Decimal128, negative
+remainders, int64 boundaries, regex OR branches and 900-value membership retain
+complete results. Oversized Python integers reject at BSON encoding. Physical
+Ready index/catalog damage fails closed without automatic repair or empty-result
+fallback; public logical index drops remain supported. TinyMongo's private SQL
+planner thresholds and decoder-count optimizations are not native benchmarks.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary

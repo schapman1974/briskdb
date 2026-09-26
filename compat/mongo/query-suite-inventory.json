@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-eight locked suites is classified; 997 reference parameter cases are not 997 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-nine locked suites is classified; 1016 reference parameter cases are not 1016 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3744,6 +3744,130 @@
             "python/tests/test_upstream_storage_backends.py::test_default_and_sqlite_aliases_use_native_collection_storage_and_reopen"
           ],
           "note": "TinyMongo _backend, _storage and _foldername internals are not retained. Real PyMongo rejects those attribute lookups rather than creating hidden databases/collections; native logical collections and files are unchanged and no _storage.json is created."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_complex_read_candidates.py",
+      "sha256": "a0ec316640a68d4c97a51b998ccdf684b42aa83646295d5905a6cb1a382fa753",
+      "reference_case_count": 19,
+      "function_count": 19,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_complex_and_in_range_mod_decodes_only_final_scalar_candidates",
+            "test_sqlite_complex_candidates_keep_bounds_projection_and_count_semantics",
+            "test_sqlite_complex_query_without_declared_indexes_remains_complete"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_combined_membership_range_mod_bounds_projection_and_count"
+          ],
+          "note": "The original 400-row, 1000-byte-payload conjunction has exact results, global natural-order skip/limit, projection and count before indexes, with indexes, after public index drop and after reopen. Expected IDs are calculated independently. Private Python JSON decoder counts are not native BSON-work or latency claims."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidates_preserve_array_member_matches",
+            "test_sqlite_complex_candidates_keep_mixed_scalar_types_distinct",
+            "test_sqlite_complex_candidates_restore_natural_order_before_bounds"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_array_members_and_mixed_types_keep_matches_and_natural_bounds"
+          ],
+          "note": "Original scalar/array candidates, mixed boolean/numeric/string membership and natural-first array pagination produce exact ordered results through native indexes, including de-duplicated boolean membership."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidates_preserve_safe_and_int64_numeric_boundaries"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_negative_safe_integer_and_int64_boundaries_remain_exact"
+          ],
+          "note": "Values around -(2^53-1), scalar/array negative remainders and int64 minimum versus its neighbor retain exact range/mod matches. Expected negative remainders are explicit, not inferred from the candidate engine."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidates_preserve_embedded_object_in_matches",
+            "test_sqlite_complex_candidates_preserve_decimal128_numeric_matches"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_embedded_object_and_decimal_residuals_remain_complete"
+          ],
+          "note": "Exact embedded-object membership plus range residuals and Decimal128/integer modulo residuals remain complete with declared group and numeric indexes."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidates_preserve_large_integer_matches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_unbounded_python_integers_reject_before_storage_or_query_fallback"
+          ],
+          "note": "Python 2^100 document values and filter operands exceed real BSON int64. Inserts reject before any namespace/partial write and queries raise OverflowError rather than silently switching to TinyMongo's Python arbitrary-precision fallback; existing records remain unchanged."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_unsupported_or_branch_falls_back_without_false_negatives",
+            "test_sqlite_complex_negative_only_filter_uses_safe_full_scan",
+            "test_sqlite_complex_query_falls_back_when_total_parameters_are_too_large",
+            "test_sqlite_native_filter_does_not_consult_complex_candidate_planner"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_or_negative_exists_and_large_membership_do_not_lose_candidates"
+          ],
+          "note": "OR with a regex branch, negative membership including missing fields, exists, empty membership and 900-value membership retain exact candidates. The native engine need not use TinyMongo's Python full-scan fallback, SQLite bind threshold, planner monkeypatch or decoder counts."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_query_recovers_dropped_native_index_storage"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/index_storage/tests.rs::ready_roots_reject_missing_or_malformed_entry_schema_without_repair",
+            "src/storage/document/enabled/index_operations/tests.rs::ready_coverage_corruption_is_rejected_without_repair",
+            "python/tests/test_upstream_complex_reads.py::test_combined_membership_range_mod_bounds_projection_and_count"
+          ],
+          "note": "Supported logical index drop retains complete query results. Physical Ready index schema/coverage loss is DataCorruption and fails closed without rewriting records/schema, unlike TinyMongo's automatic companion-index recreation. Native tests cover missing/malformed physical objects and damaged coverage/checksums."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_query_handles_missing_index_catalog_as_no_index",
+            "test_sqlite_complex_query_propagates_index_catalog_failures"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result",
+            "src/storage/document/index_storage/tests.rs::ready_roots_reject_missing_or_malformed_entry_schema_without_repair"
+          ],
+          "note": "A damaged native catalog returns a redacted terminal wire error with no cursor and degraded readiness, including absent collections and zero/single batches. Missing physical authority is rejected without repair. It is not treated as an empty optional TinyMongo index catalog or converted to a monkeypatched DuplicateKeyError."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidate_helper_boundaries"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_or_negative_exists_and_large_membership_do_not_lose_candidates",
+            "python/tests/test_upstream_complex_reads.py::test_array_members_and_mixed_types_keep_matches_and_natural_bounds",
+            "python/tests/test_upstream_complex_reads.py::test_negative_safe_integer_and_int64_boundaries_remain_exact",
+            "python/tests/test_upstream_complex_reads.py::test_unbounded_python_integers_reject_before_storage_or_query_fallback"
+          ],
+          "note": "Private scalar tagging, SQL/parameter generation, _MISSING and ignored residual compiler decisions are not BriskDB APIs. Public empty/duplicate membership, boolean distinctions, exact numeric residuals, invalid filter shape and BSON limits are tested without promising private SQL strings or planner sentinel values."
+        },
+        {
+          "source": [
+            "test_sqlite_complex_candidates_cover_direct_backend_and_overflow_fallback"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_combined_membership_range_mod_bounds_projection_and_count",
+            "python/tests/test_upstream_complex_reads.py::test_unbounded_python_integers_reject_before_storage_or_query_fallback"
+          ],
+          "note": "Direct private backend results are covered at the public real-wire boundary. An injected Python _run_collection_read OverflowError and private _MISSING sentinel are not native interfaces; valid queries stay complete and unencodable integer operands reject explicitly."
         }
       ]
     }
