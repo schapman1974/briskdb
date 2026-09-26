@@ -914,6 +914,24 @@ must bound its own export queues. Malformed frames that never become commands
 remain transport metrics, not fabricated request events. Engine/shard phase
 tracing and broader fault/soak acceptance remain separate #187 work.
 
+The native document storage fault tier also exercises real `SQLITE_FULL` failures
+using a connection-local `max_page_count` on owned temporary shards. Four cases
+cover insert and replacement failing either during BSON-record allocation or
+later secondary-index allocation. An earlier record/index mutation in the same
+transaction must roll back too; exact record and index bytes/checksums must match
+their pre-transaction snapshots. The unique-writer fence remains held through
+cleanup, then is reusable. Restoring the owned connection's page budget permits
+the formerly oversized write with a fresh natural-order reservation, and reopen
+verifies data plus cross-shard uniqueness enforcement.
+This bounded drill does not exhaust the host filesystem or simulate WAL/fsync
+I/O failure, process power loss, the Mongo wire error envelope or long-duration
+soak. Run it locally with:
+
+```bash
+cargo test --locked --all-features --lib \
+  storage::document::enabled::fault_tests
+```
+
 Rust hosts can inspect local document readiness without a network command:
 
 ```rust,ignore

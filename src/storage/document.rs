@@ -159,6 +159,8 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 #[cfg(feature = "documents")]
 mod enabled {
     mod candidate_sql;
+    #[cfg(test)]
+    mod fault_tests;
     mod index_metadata;
     mod index_operations;
     mod unique;

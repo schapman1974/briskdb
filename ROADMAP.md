@@ -1071,6 +1071,12 @@ requires an earlier dependency:
       construction/cleanup; valid driver session handling is unchanged. Native
       environment/storage/backend and remaining driver error differences remain
       explicit; this does not add Mongo session support.
+      A bounded native SQLite-full drill covers insert/replacement failures at
+      record and secondary-index allocation, rollback of earlier transaction
+      mutations, exact record/index snapshots, unique-fence release, same-
+      connection recovery and durable cross-shard uniqueness after reopen.
+      Host filesystem/WAL/fsync faults, wire error envelopes and longer soak
+      remain separate gates; the drill never fills the host disk.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks
