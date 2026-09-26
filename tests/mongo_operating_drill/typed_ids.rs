@@ -43,17 +43,25 @@ async fn legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_cha
         import_tinymongo_database(
             source_database,
             destination,
-            &TinyMongoImportPlan::new("app", ["legacy_integer", "legacy_double", "legacy_string"])
-                .unwrap(),
+            &TinyMongoImportPlan::new(
+                "app",
+                [
+                    "legacy_integer",
+                    "legacy_double",
+                    "legacy_string",
+                    "legacy_zero",
+                ],
+            )
+            .unwrap(),
             TinyMongoImportOptions::new(4).unwrap(),
         )
     })
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(report.documents(), 3);
-    assert_eq!(report.collections(), 3);
-    assert_eq!(report.legacy_physical_ids(), 3);
+    assert_eq!(report.documents(), 4);
+    assert_eq!(report.collections(), 4);
+    assert_eq!(report.legacy_physical_ids(), 4);
     assert_eq!(report.target_shards(), Some(4));
     assert_eq!(tree(&source), before);
     for mode in ["mutate", "reopen"] {
