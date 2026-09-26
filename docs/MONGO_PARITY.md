@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 399 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 402 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -56,14 +56,14 @@ functions in the locked `test_query_more.py`,
 `test_pymongo_dropin.py`, `test_pymongo_contract.py` and
 `test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
 `test_bson_codec.py`, `test_typed_physical_ids.py` and
-`test_sqlite_optimistic_inserts.py` suites
-(919 reference parameter cases). 239 added wheel scenarios and existing patch
+`test_sqlite_optimistic_inserts.py` and `test_sharded_sqlite_concurrency.py` suites
+(922 reference parameter cases). 242 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 919 unchanged upstream candidate passes or complete #186 certification.
+not 922 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -113,6 +113,16 @@ Private optimistic retries, SQL probe counts and externally substituted SQLite
 schemas are not BriskDB extension APIs. Real native disk-full and stale-transaction
 guards supply separate fault evidence, with rollback scoped to the affected shard
 transaction rather than a promise of whole-batch cross-shard atomicity.
+
+Spawned-writer coverage now holds a real external SQLite write lock after two
+independent BriskDB/PyMongo processes initialize: the unblocked shard commits
+first, and the other writer finishes after release. Native reopen checks exact
+rows/counts. A separate process writes deliberately invalid but uncommitted BSON
+and readers still see only committed WAL data, followed by rollback and healthy
+reopen. No test commits the damaged bytes. PyMongo/native-runtime background
+threads are intentional, unlike TinyMongo's background-thread-free client; the
+owned client does not add multiprocessing-managed worker processes. These are
+bounded local concurrency checks, not long-duration soak certification.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
