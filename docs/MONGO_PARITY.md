@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 402 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 412 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -56,14 +56,15 @@ functions in the locked `test_query_more.py`,
 `test_pymongo_dropin.py`, `test_pymongo_contract.py` and
 `test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
 `test_bson_codec.py`, `test_typed_physical_ids.py` and
-`test_sqlite_optimistic_inserts.py` and `test_sharded_sqlite_concurrency.py` suites
-(922 reference parameter cases). 242 added wheel scenarios and existing patch
+`test_sqlite_optimistic_inserts.py`, `test_sharded_sqlite_concurrency.py` and
+`test_sqlite_unique_update_fast_path.py` suites
+(933 reference parameter cases). 248 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 922 unchanged upstream candidate passes or complete #186 certification.
+not 933 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -123,6 +124,14 @@ reopen. No test commits the damaged bytes. PyMongo/native-runtime background
 threads are intentional, unlike TinyMongo's background-thread-free client; the
 owned client does not add multiprocessing-managed worker processes. These are
 bounded local concurrency checks, not long-duration soak certification.
+
+Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
+scalar conflict rollback, array-order changes with unchanged multikey entries,
+sparse/partial membership transfers, compound parent-path collisions, and exactly
+10 selected updates among 200 records. All stored rows survive native reopen.
+TinyMongo's private Python JSON decoder counters are not native Rust BSON counters;
+these scenarios do not claim its exact decode thresholds or serve as a native
+performance benchmark.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
