@@ -1228,12 +1228,16 @@ pub(super) struct Executor {
 }
 
 impl Executor {
-    pub(super) fn new(database: BriskDb, metrics: Arc<metrics::Metrics>) -> Self {
+    pub(super) fn new(
+        database: BriskDb,
+        metrics: Arc<metrics::Metrics>,
+        limits: super::MongoResourceLimits,
+    ) -> Self {
         Self {
             database,
             metrics: Arc::clone(&metrics),
             creation: Mutex::new(()),
-            cursors: Arc::new(cursors::WireCursors::new(metrics)),
+            cursors: Arc::new(cursors::WireCursors::with_limits(metrics, limits)),
         }
     }
 
@@ -2183,7 +2187,11 @@ mod deadline_tests {
             .open()
             .await
             .unwrap();
-        let executor = Executor::new(database.clone(), Arc::new(metrics::Metrics::default()));
+        let executor = Executor::new(
+            database.clone(),
+            Arc::new(metrics::Metrics::default()),
+            MongoResourceLimits::default(),
+        );
         let mut prepared = prepare(&request(0), false).unwrap().unwrap();
         prepared.deadline = Instant::now() - Duration::from_secs(1);
         let session = database.session();

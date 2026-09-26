@@ -6,11 +6,13 @@ use std::{io, time::Duration};
 ///
 /// Applies equally to its anonymous loopback connections, not authenticated
 /// users. Engine-wide limits can narrow these limits further. Socket I/O,
-/// BSON, cursor-count and other engine budgets remain independently bounded.
+/// BSON and other engine budgets remain independently bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MongoResourceLimits {
     max_connections: usize,
     command_timeout: Duration,
+    max_cursors: usize,
+    max_cursors_per_connection: usize,
 }
 
 impl MongoResourceLimits {
@@ -34,7 +36,32 @@ impl MongoResourceLimits {
         Ok(Self {
             max_connections,
             command_timeout,
+            ..Self::default()
         })
+    }
+
+    /// Narrow retained wire cursors to 1–32 per listener and 1–8 per
+    /// connection. The connection limit cannot exceed the listener limit.
+    ///
+    /// Pooled-socket handoffs must fit the receiving connection's quota.
+    /// Rejected handoffs keep the existing cursor with its previous owner.
+    /// Native engine cursor limits remain independently authoritative.
+    pub fn with_cursor_limits(
+        mut self,
+        max_cursors: usize,
+        max_cursors_per_connection: usize,
+    ) -> io::Result<Self> {
+        if !(1..=32).contains(&max_cursors)
+            || !(1..=8).contains(&max_cursors_per_connection)
+            || max_cursors_per_connection > max_cursors
+        {
+            return Err(super::invalid(
+                "Mongo cursor limits must be 1–32 per listener and 1–8 per connection, within the listener limit",
+            ));
+        }
+        self.max_cursors = max_cursors;
+        self.max_cursors_per_connection = max_cursors_per_connection;
+        Ok(self)
     }
 
     pub const fn max_connections(self) -> usize {
@@ -44,6 +71,14 @@ impl MongoResourceLimits {
     pub const fn command_timeout(self) -> Duration {
         self.command_timeout
     }
+
+    pub const fn max_cursors(self) -> usize {
+        self.max_cursors
+    }
+
+    pub const fn max_cursors_per_connection(self) -> usize {
+        self.max_cursors_per_connection
+    }
 }
 
 impl Default for MongoResourceLimits {
@@ -51,6 +86,8 @@ impl Default for MongoResourceLimits {
         Self {
             max_connections: super::client_metadata::MAX_CONNECTIONS,
             command_timeout: Duration::from_secs(15),
+            max_cursors: 32,
+            max_cursors_per_connection: 8,
         }
     }
 }
@@ -78,5 +115,37 @@ mod tests {
         let limits = MongoResourceLimits::new(1, Duration::from_nanos(1)).unwrap();
         assert_eq!(limits.max_connections(), 1);
         assert_eq!(limits.command_timeout(), Duration::from_nanos(1));
+    }
+
+    #[test]
+    fn cursor_limits_are_finite_and_cannot_raise_default_ceilings() {
+        let defaults = MongoResourceLimits::default();
+        assert_eq!(
+            (
+                defaults.max_cursors(),
+                defaults.max_cursors_per_connection()
+            ),
+            (32, 8)
+        );
+        for (total, per_connection) in [
+            (0, 1),
+            (33, 1),
+            (1, 0),
+            (32, 9),
+            (1, 2),
+            (usize::MAX, 1),
+            (32, usize::MAX),
+        ] {
+            assert!(defaults.with_cursor_limits(total, per_connection).is_err());
+        }
+        for (total, per_connection) in [(1, 1), (3, 2), (32, 8)] {
+            let limits = defaults.with_cursor_limits(total, per_connection).unwrap();
+            assert_eq!(
+                (limits.max_cursors(), limits.max_cursors_per_connection()),
+                (total, per_connection)
+            );
+            assert_eq!(limits.command_timeout(), defaults.command_timeout());
+            assert_eq!(limits.max_connections(), defaults.max_connections());
+        }
     }
 }

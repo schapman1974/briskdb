@@ -706,7 +706,8 @@ one listener without relaxing any existing ceiling:
 use briskdb::protocol::mongo::{MongoResourceLimits, MongoServer};
 use std::time::Duration;
 
-let limits = MongoResourceLimits::new(4, Duration::from_secs(3))?;
+let limits = MongoResourceLimits::new(4, Duration::from_secs(3))?
+    .with_cursor_limits(12, 3)?; // listener total, per connection
 let mut mongo = MongoServer::start_with_limits(
     &database, "127.0.0.1:0".parse()?, limits,
 ).await?;
@@ -714,7 +715,10 @@ assert_eq!(mongo.resource_limits(), limits);
 ```
 
 The immutable policy accepts 1–8 connections and a positive timeout up to 15
-seconds. `start` and daemon/Python listeners retain the existing defaults.
+seconds. Retained cursor limits may be narrowed to 1–32 per listener and 1–8 per
+connection (the latter cannot exceed the total). `start` and daemon/Python
+listeners retain the existing defaults: 8 connections, 15 seconds, 32 total
+cursors and 8 cursors per connection.
 Overflow sockets are rejected immediately, not queued. The command deadline
 starts when a complete frame is received, charges blocking-parser queue/decode
 time, and is never restarted between preparation and engine admission/execution.
@@ -725,6 +729,13 @@ retain their independent bounds. Expiry reports code 50 through existing metrics
 the policy is listener-local, not a new authenticated per-user quota. Engine,
 BSON, cursor and result limits remain independently authoritative. Per-user
 governance awaits the shared authentication/authorization work.
+
+Cursor registration and pooled-socket handoff both enforce the configured
+quotas. A rejected new cursor releases its native session; a rejected handoff
+leaves the existing cursor with its prior owner. Explicit kill, exhaustion,
+disconnect and listener shutdown reclaim quota through the existing registry.
+The code-10334 rejection and cursor metrics remain unchanged. These are retained
+wire-cursor counts, not per-user quotas or a replacement for engine-wide limits.
 
 Natural-order reads load initial source frontiers from at most eight targeted
 shards concurrently, including find/getMore and distinct/aggregate source pages.
