@@ -1011,7 +1011,12 @@ requires an earlier dependency:
       Fixed physical-ordinal counters expose request distribution, not per-shard
       row/CPU skew. Off by default; enabled requests use bounded engine diagnostics
       without wire fields. Failed engine work, legacy count and mutations are
-      excluded. Matched-row/per-shard work telemetry, exporters/tracing, readiness
+      excluded. Host-owned debug request spans/final events now correlate process
+      session IDs, repeated wire IDs and connection-local sequences across async
+      tasks/blocking workers. Fixed outcome/error classifications retain no BSON,
+      namespace, comment, credential or diagnostic payload; guards release on
+      completion/abort/unwind without installing a subscriber or export queue.
+      Matched-row/per-shard work telemetry, exporters/engine-phase tracing, readiness
       and broader fault/soak acceptance remain open; no timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

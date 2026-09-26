@@ -94,6 +94,7 @@ mongo = [
     "dep:bytes",
     "dep:flate2",
     "dep:tokio-util",
+    "dep:tracing",
     "tokio/io-util",
     "tokio/net",
 ]
