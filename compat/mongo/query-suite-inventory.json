@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these two locked suites is classified; 51 reference parameter cases are not 51 candidate passes. Private Python helpers and BSON/client representation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these three locked suites is classified; 75 reference parameter cases are not 75 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client representation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -273,6 +273,85 @@
           ],
           "kind": "implementation_specific",
           "note": "This tests identity of a caller-owned arbitrary Python default object in a private helper. No corresponding native/wire API exists; public missing/null/path behavior remains tested, not waived."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_client_read_fidelity.py",
+      "sha256": "1ba5a7f2457b6f3b5e09871c5a185f71d16db89de01d0c8be8a7dabbb281271a",
+      "reference_case_count": 24,
+      "function_count": 7,
+      "coverage": [
+        {
+          "source": [
+            "test_sync_mongo_client_materializes_documents_and_datetimes_across_backends"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_sync_recursive_read_surfaces_preserve_document_class_and_dates",
+            "python/tests/test_upstream_read_fidelity.py::test_metadata_keeps_driver_shapes_and_full_database_statistics_remain_explicit"
+          ],
+          "kind": "contract_difference",
+          "note": "Recursive user documents/datetimes are checked across read/write result surfaces. Full listDatabases statistics still fail explicitly with code 115 under #166; only nameOnly metadata is currently available. PyMongo index metadata uses a cursor of SON documents rather than TinyMongo's indexed list of plain dictionaries. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_sync_mongo_client_honors_aware_and_custom_timezone_reads"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_timezone_options_survive_persistence_and_remain_client_local"
+          ],
+          "kind": "public_scenarios",
+          "note": "The same persisted BSON milliseconds are decoded with independent UTC/custom-timezone client options after reopen. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_same_millisecond_datetime_writes_are_noops_across_backends"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_same_millisecond_updates_and_replacements_are_noops"
+          ],
+          "kind": "public_scenarios",
+          "note": "Submillisecond input changes normalize to identical BSON milliseconds, leaving update/replace modified counts zero. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_document_class_supports_mutable_mapping_classes_and_client_isolation"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_mutable_mapping_clients_are_recursive_and_do_not_share_returned_objects"
+          ],
+          "kind": "public_scenarios",
+          "note": "UserDict/OrderedDict materialize recursively through separate clients; mutating a returned object cannot mutate stored data or another client's result. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_document_class_supports_parameterized_mutable_mapping_aliases"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_parameterized_mapping_aliases_materialize_their_origin_type"
+          ],
+          "kind": "public_scenarios",
+          "note": "Both parameterized dict and UserDict aliases materialize root/nested documents as their origin types. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_document_class_supports_bson_son"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_bson_son_is_preserved_recursively"
+          ],
+          "kind": "public_scenarios",
+          "note": "SON materialization is checked recursively with BSON available, not skipped. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
+        },
+        {
+          "source": [
+            "test_async_mongo_client_matches_recursive_sync_read_fidelity"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_read_fidelity.py::test_async_recursive_codec_clone_aggregate_distinct_and_find_modify"
+          ],
+          "kind": "public_scenarios",
+          "note": "Real async PyMongo find/clone/to_list/aggregate/distinct/find-and-modify preserve recursive OrderedDict and aware datetimes. TinyMongo's five backend variants are reference coverage only; the candidate uses BriskDB's own two-shard SQLite engine, not those backends."
         }
       ]
     }
