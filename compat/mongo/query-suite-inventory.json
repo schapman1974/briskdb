@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-three locked suites is classified; 933 reference parameter cases are not 933 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-four locked suites is classified; 946 reference parameter cases are not 946 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3326,6 +3326,121 @@
             "python/tests/test_upstream_unique_updates.py::test_filtered_multi_update_keeps_unselected_rows_and_unrelated_unique_values"
           ],
           "note": "With both an unrelated unique email index and nonunique group index, the original 200-row/10-selected scenario yields exact counts and preserves every unselected row and unique value through reopen. The native candidate path uses storage index probes, but this wire scenario does not assert TinyMongo's Python decoder set or <=4-per-row threshold and is not a native performance benchmark."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_bulk_updates.py",
+      "sha256": "7f63a29ee9d39bb74c191e4ae4b28bd5824867b9c834484b57c69fcebbdf460e",
+      "reference_case_count": 13,
+      "function_count": 13,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_bulk_update_uses_one_transaction_and_executemany",
+            "test_sqlite_public_updates_use_single_backend_result_hook"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_counts_natural_first_noop_and_upsert_keep_public_result_shapes"
+          ],
+          "note": "Public one/many matched-versus-modified counts and selected/unselected post-images replace private modified-ID lists, executemany SQL text, commit/close counts and update_many_with_result monkeypatches. Native many updates commit one shard at a time, not one whole-collection Python SQLite transaction."
+        },
+        {
+          "source": [
+            "test_sqlite_exact_id_update_decodes_only_target_and_miss"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_unique_updates.py::test_point_updates_noops_misses_and_scalar_conflicts_preserve_other_rows"
+          ],
+          "note": "Exact ID hit/miss counts and unchanged unrelated documents are covered with and without indexes at 100 rows and larger. TinyMongo's Python JSON decoder invocation list is not a native Rust BSON performance counter."
+        },
+        {
+          "source": [
+            "test_sqlite_indexed_update_decodes_only_bson_matching_candidates"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_indexed_bulk_update_distinguishes_boolean_and_numeric_array_members"
+          ],
+          "note": "Indexed bulk writes distinguish scalar/array booleans from numeric one, yielding exactly two matches of each type and preserving the nonmatching row. Private decoder order/count is not claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_indexed_update_one_keeps_natural_first_match",
+            "test_sqlite_bulk_update_one_stops_after_first_noop"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_counts_natural_first_noop_and_upsert_keep_public_result_shapes"
+          ],
+          "note": "Indexed and unindexed update_one select the natural first match even when it is already a no-op; the later matching record remains unchanged until update_many. Real PyMongo reports matched=1/modified=0 instead of a private empty modified-ID list."
+        },
+        {
+          "source": [
+            "test_sqlite_targeted_update_falls_back_for_legacy_and_unsafe_candidates"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_unsupported_integer_filter_rejects_before_writes_and_safe_candidates_match",
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes"
+          ],
+          "note": "Document-valued ID and NaN misses plus safe indexed numeric updates preserve other rows. Unlike TinyMongo's direct backend call, a 10^100 integer cannot be encoded by real PyMongo and raises OverflowError before writing. Legacy physical formats require explicit import, not a private SQL-candidate fallback."
+        },
+        {
+          "source": [
+            "test_sqlite_bulk_update_validates_unique_post_image_atomically",
+            "test_sqlite_bulk_update_rolls_back_when_later_document_is_invalid"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_failure_rolls_back_one_shard_but_preserves_prior_shard_commits",
+            "tests/document_replacement.rs::update_many_validation_rolls_back_current_shard_but_preserves_prior_commits"
+          ],
+          "note": "Two actual same-shard records demonstrate full rollback for a later invalid increment and unique collision. A four-shard wire case proves earlier shard commits remain while the failing shard rolls back, followed by durable reopen. Same-shard safe failures are WriteError/DuplicateKeyError; partial multi-shard failure is terminal OperationFailure code 14, not a safe write-error continuation. TinyMongo's single-file whole-batch rollback is not promised across shards."
+        },
+        {
+          "source": [
+            "test_sqlite_bulk_update_maps_native_integrity_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_failure_rolls_back_one_shard_but_preserves_prior_shard_commits",
+            "python/tests/test_upstream_unique_updates.py::test_point_updates_noops_misses_and_scalar_conflicts_preserve_other_rows"
+          ],
+          "note": "Real unique collisions map to code 11000 and preserve the affected transaction. Private sqlite3.IntegrityError injection, raw driver message matching and Python commit/rollback counts are not exposed; wire diagnostics remain redacted."
+        },
+        {
+          "source": [
+            "test_sqlite_concurrent_clients_do_not_lose_increment_updates"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_six_shared_root_clients_keep_every_concurrent_increment",
+            "tests/mongo_wire/resource_limits.rs::expanded_connection_policy_is_bounded_and_releases_metadata_and_slots"
+          ],
+          "note": "Six retained shared-root clients perform concurrent increments over three complete lifetimes; all 18 results and the reopened count are exact without retry masking. The old eight-socket embedded policy reproduced AutoReconnect resets. The managed wheel now reserves 32 bounded slots for independent driver monitors/pools, while standalone defaults remain eight; raw-socket overflow/reuse/metadata cleanup is tested."
+        },
+        {
+          "source": [
+            "test_sqlite_public_result_hook_preserves_upsert"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_bulk_counts_natural_first_noop_and_upsert_keep_public_result_shapes"
+          ],
+          "note": "Upsert returns matched=0/modified=0, the exact supplied ID and the materialized equality fields plus update data through the real driver."
+        },
+        {
+          "source": [
+            "test_sqlite_result_hook_preserves_decimal128_quiet_nan_count"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_updates.py::test_quiet_decimal_nan_increment_reports_execution_without_changing_bid"
+          ],
+          "note": "Adding Decimal128 zero to an existing quiet NaN reports matched=1/modified=1 while preserving exact NaN BID bytes, matching the original public contract."
         }
       ]
     }

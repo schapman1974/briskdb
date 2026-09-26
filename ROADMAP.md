@@ -532,7 +532,8 @@ requires an earlier dependency:
       handshake parsing. Host-owned `MongoServer::start` explicitly binds a
       loopback-only discovery listener; defaults still enable no Mongo socket.
       Bootstrap budgets are 1 MiB messages, 512 KiB BSON documents, 4 MiB decoded
-      heap per document, eight connections, bounded sequences/batches, and an
+      heap per document, eight default connections (32 maximum; managed wheel
+      listeners select 32), bounded sequences/batches, and an
       absolute 15-second frame-read deadline. Shutdown joins connection/parser
       work without closing the borrowed engine. Opt-in `--mongo-listen` /
       `BRISKDB_MONGO_LISTEN`, `server::run_with_mongo`, and
@@ -996,9 +997,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, thirty-three query/public-client suites now
-      have complete source accounting (412 functions/933 reference cases), backed
-      by 248 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, thirty-four query/public-client suites now
+      have complete source accounting (425 functions/946 reference cases), backed
+      by 254 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1102,6 +1103,11 @@ requires an earlier dependency:
       ownership transitions, no-op/miss counts and exact filtered multi-updates
       through reopen. Private Python decoder-count thresholds are not represented
       as native Rust performance measurements.
+      Bulk-update coverage includes natural-first no-ops, indexed BSON type
+      distinctions, exact NaN counts and explicit same-shard versus partial
+      multi-shard rollback/error envelopes. Six concurrent managed clients now
+      fit a bounded 32-socket embedded listener, fixing monitor/pool contention
+      resets; standalone listeners retain their eight-connection default.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks
@@ -1122,15 +1128,16 @@ requires an earlier dependency:
       representative sustained-load evidence and complete release acceptance
       remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
-      can narrow listener-local connection caps (1–8) and command deadlines
+      can select listener-local connection caps (1–32) and narrow command deadlines
       (positive, at most 15 seconds) with immutable `MongoResourceLimits`.
       The same policy narrows retained cursors to 1–32 per listener and 1–8 per
       connection. Registrations and handoffs enforce both quotas; rejected
       handoffs preserve the original owner, rejected registrations release
       native resources, and kills/disconnects/shutdown reclaim capacity.
       Complete-frame decoding/parser queuing and engine work share an absolute
-      deadline; client maxTimeMS cannot relax it. Defaults and independent BSON,
-      cursor/result/socket limits remain unchanged; authenticated per-user quotas
+      deadline; client maxTimeMS cannot relax it. Standalone defaults and BSON,
+      cursor/result/socket limits remain unchanged; managed wheel listeners use
+      the 32-connection ceiling. Authenticated per-user quotas
       await shared security. Hosts can inspect payload-free Mongo metrics: connection
       admission/lifecycle/failures, fixed command/error-code counters, one-way
       outcomes, write/response-limit errors and bounded latency histograms.

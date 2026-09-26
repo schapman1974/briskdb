@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 412 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 425 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -57,14 +57,14 @@ functions in the locked `test_query_more.py`,
 `test_talkpython_regressions.py`, `test_sharded_sqlite_operation_atomicity.py` and
 `test_bson_codec.py`, `test_typed_physical_ids.py` and
 `test_sqlite_optimistic_inserts.py`, `test_sharded_sqlite_concurrency.py` and
-`test_sqlite_unique_update_fast_path.py` suites
-(933 reference parameter cases). 248 added wheel scenarios and existing patch
+`test_sqlite_unique_update_fast_path.py` and `test_sqlite_bulk_updates.py` suites
+(946 reference parameter cases). 254 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 933 unchanged upstream candidate passes or complete #186 certification.
+not 946 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -132,6 +132,16 @@ sparse/partial membership transfers, compound parent-path collisions, and exactl
 TinyMongo's private Python JSON decoder counters are not native Rust BSON counters;
 these scenarios do not claim its exact decode thresholds or serve as a native
 performance benchmark.
+
+Bulk-update scenarios verify matched/modified/no-op/upsert results, indexed
+boolean versus numeric array membership, and Decimal128 quiet-NaN execution
+counts with unchanged BID bytes. Same-shard invalid updates and unique conflicts
+roll back that shard; a later-shard error preserves earlier shard commits and
+returns terminal `OperationFailure`, not a safe-to-continue `WriteError`.
+Six simultaneously retained managed clients now complete concurrent increments
+across three reopen cycles. Their shared embedded listener reserves 32 sockets
+for real driver monitor/pool connections, fixing resets under the former
+eight-socket capacity; standalone listener defaults remain eight.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary
@@ -459,7 +469,7 @@ mongo.close().await?;
 database.close().await?;
 ```
 
-Rust hosts can inspect `MongoServer::client_metadata()` for at most eight active
+Rust hosts can inspect `MongoServer::client_metadata()` for at most 32 active
 connections, sorted by listener-local connection ID. The first successful modern
 or legacy handshake freezes each connection's metadata; later monitoring hellos
 cannot replace it, and an initial hello without `client` remains unrecorded.
@@ -869,11 +879,15 @@ let mut mongo = MongoServer::start_with_limits(
 assert_eq!(mongo.resource_limits(), limits);
 ```
 
-The immutable policy accepts 1–8 connections and a positive timeout up to 15
+The immutable policy accepts 1–32 connections and a positive timeout up to 15
 seconds. Retained cursor limits may be narrowed to 1–32 per listener and 1–8 per
-connection (the latter cannot exceed the total). `start` and daemon/Python
-listeners retain the existing defaults: 8 connections, 15 seconds, 32 total
-cursors and 8 cursors per connection.
+connection (the latter cannot exceed the total). `start` and daemon listeners
+retain the existing eight-connection default. The wheel's managed shared-root
+listener explicitly selects 32 slots for independent PyMongo monitor/pool
+connections. Both retain 15-second deadlines, 32 total cursors and 8 cursors per
+connection. The 32-connection ceiling remains finite; frame/document/decoded
+budgets do not change. Tests fill the expanded limit twice, reject overflow,
+and reclaim all slots and redacted metadata without affecting another listener.
 Overflow sockets are rejected immediately, not queued. The command deadline
 starts when a complete frame is received, charges blocking-parser queue/decode
 time, and is never restarted between preparation and engine admission/execution.

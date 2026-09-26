@@ -7,7 +7,7 @@ use std::{
 
 use crate::document::{BsonDocument, BsonValue};
 
-pub(super) const MAX_CONNECTIONS: usize = 8;
+pub(super) const MAX_CONNECTIONS: usize = 32;
 
 /// Untrusted driver identification, not authentication or a capability grant.
 /// Unknown names are collapsed without retaining any client-supplied string.
@@ -174,7 +174,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let success = doc([("ok", BsonValue::Double(1.0))]);
         let mut guards = Vec::new();
-        for id in 1..=12 {
+        for id in 1..=u64::try_from(MAX_CONNECTIONS + 4).unwrap() {
             let mut guard = registry.connection(id);
             guard.observe(&hello("PyMongo|c|async", "4.17.0"), &success);
             guards.push(guard);

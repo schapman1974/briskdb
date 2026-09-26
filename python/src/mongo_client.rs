@@ -2,7 +2,7 @@
 //! It shares database-close ownership, but opens no HTTP/admin/SQL ports.
 
 use super::*;
-use briskdb::protocol::mongo::MongoServer;
+use briskdb::protocol::mongo::{MongoResourceLimits, MongoServer};
 
 pub(super) struct MongoShared {
     server: Mutex<Option<MongoServer>>,
@@ -71,12 +71,19 @@ pub(super) fn start(shared: &Arc<DatabaseShared>, py: Python<'_>) -> PyResult<Mo
         let database = database_slot
             .as_ref()
             .ok_or(NativeError::Closed("database"))?;
+        // Managed clients share this listener, not their PyMongo pools. Six
+        // clients already need more than the standalone eight-socket default
+        // once their monitor and application connections are active together.
+        // Keep a fixed ceiling; message/deadline/cursor limits stay unchanged.
+        let limits =
+            MongoResourceLimits::new(32, Duration::from_secs(15)).map_err(listener_error)?;
         let listener = shared
             .runtime
             .runtime
-            .block_on(MongoServer::start(
+            .block_on(MongoServer::start_with_limits(
                 database,
                 SocketAddr::from(([127, 0, 0, 1], 0)),
+                limits,
             ))
             .map_err(listener_error)?;
         let server = Arc::new(MongoShared {

@@ -2,6 +2,66 @@ use super::*;
 use briskdb::protocol::mongo::MongoResourceLimits;
 
 #[tokio::test]
+async fn expanded_connection_policy_is_bounded_and_releases_metadata_and_slots() {
+    let (_root, database, mut normal) = setup().await;
+    assert_eq!(normal.resource_limits().max_connections(), 8);
+    let limits = MongoResourceLimits::new(32, Duration::from_secs(15)).unwrap();
+    let mut expanded =
+        MongoServer::start_with_limits(&database, "127.0.0.1:0".parse().unwrap(), limits)
+            .await
+            .unwrap();
+    for _ in 0..2 {
+        let mut peers = Vec::new();
+        for _ in 0..32 {
+            let mut peer = TcpStream::connect(expanded.address()).await.unwrap();
+            assert_eq!(
+                send_command(&mut peer, &client_metadata::hello("PyMongo", "4.17.0"))
+                    .await
+                    .get_first("ok"),
+                Some(&BsonValue::Double(1.0))
+            );
+            peers.push(peer);
+        }
+        assert_eq!(expanded.metrics().active_connections, 32);
+        assert_eq!(expanded.client_metadata().len(), 32);
+        let mut overflow = TcpStream::connect(expanded.address()).await.unwrap();
+        disconnected(&mut overflow).await;
+        assert_eq!(expanded.client_metadata().len(), 32);
+        assert_eq!(
+            send_command(&mut peers[0], &command("ping"))
+                .await
+                .get_first("ok"),
+            Some(&BsonValue::Double(1.0))
+        );
+        let mut neighbor = TcpStream::connect(normal.address()).await.unwrap();
+        assert_eq!(
+            send_command(&mut neighbor, &command("ping"))
+                .await
+                .get_first("ok"),
+            Some(&BsonValue::Double(1.0))
+        );
+        drop(peers);
+        timeout(Duration::from_secs(3), async {
+            while expanded.metrics().active_connections != 0
+                || !expanded.client_metadata().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(expanded.metrics().peak_connections, 32);
+    assert_eq!(expanded.metrics().rejected_connections, 2);
+    assert_eq!(expanded.metrics().closed_connections, 64);
+    assert_eq!(expanded.metrics().cursors.active, 0);
+    expanded.close().await.unwrap();
+    assert!(expanded.client_metadata().is_empty());
+    normal.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn narrowed_cursor_quotas_survive_rejection_handoff_and_disconnect() {
     let (_root, database, mut normal) = setup().await;
     let limits = MongoResourceLimits::default()

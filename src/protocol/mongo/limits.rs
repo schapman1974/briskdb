@@ -1,4 +1,4 @@
-//! Host-owned limits can narrow, never raise, the listener's safety ceilings.
+//! Host-owned limits stay within the listener's finite safety ceilings.
 
 use std::{io, time::Duration};
 
@@ -16,7 +16,9 @@ pub struct MongoResourceLimits {
 }
 
 impl MongoResourceLimits {
-    /// Select 1–8 connections and a positive command timeout of at most 15s.
+    /// Select 1–32 connections and a positive command timeout of at most 15s.
+    /// Standalone listeners default to eight connections; embedded clients can
+    /// explicitly reserve more space for their driver monitoring/pool sockets.
     ///
     /// The timeout covers complete-frame decoding, preparation, engine
     /// admission and execution. Discovery commands and reply delivery have
@@ -25,7 +27,7 @@ impl MongoResourceLimits {
     pub fn new(max_connections: usize, command_timeout: Duration) -> io::Result<Self> {
         if !(1..=super::client_metadata::MAX_CONNECTIONS).contains(&max_connections) {
             return Err(super::invalid(
-                "Mongo connection limit must be between 1 and 8",
+                "Mongo connection limit must be between 1 and 32",
             ));
         }
         if command_timeout.is_zero() || command_timeout > Duration::from_secs(15) {
@@ -84,7 +86,7 @@ impl MongoResourceLimits {
 impl Default for MongoResourceLimits {
     fn default() -> Self {
         Self {
-            max_connections: super::client_metadata::MAX_CONNECTIONS,
+            max_connections: 8,
             command_timeout: Duration::from_secs(15),
             max_cursors: 32,
             max_cursors_per_connection: 8,
@@ -97,13 +99,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn limits_only_narrow_the_existing_ceilings() {
+    fn limits_preserve_standalone_defaults_and_enforce_finite_ceilings() {
         assert_eq!(
             MongoResourceLimits::default(),
             MongoResourceLimits::new(8, Duration::from_secs(15)).unwrap()
         );
-        for connections in [0, 9, usize::MAX] {
+        for connections in [0, 33, usize::MAX] {
             assert!(MongoResourceLimits::new(connections, Duration::from_secs(1)).is_err());
+        }
+        for connections in [1, 8, 9, 16, 32] {
+            assert_eq!(
+                MongoResourceLimits::new(connections, Duration::from_secs(1))
+                    .unwrap()
+                    .max_connections(),
+                connections
+            );
         }
         for timeout in [
             Duration::ZERO,
