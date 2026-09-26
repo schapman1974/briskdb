@@ -996,9 +996,11 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, two original query suites now have
-      complete source accounting (38 functions/51 reference cases), backed by
-      18 installed-wheel scenario tests. Legacy cursor/index representations,
+      frozen corpus and index inventory, three query/read-fidelity suites now
+      have complete source accounting (45 functions/75 reference cases), backed
+      by 26 installed-wheel scenario tests, including recursive document classes,
+      async reads and timezone/millisecond fidelity. Legacy cursor/index
+      representations,
       non-BSON Python values and two private-helper exclusions are explicit;
       hash/membership/count/test-symbol gates reject unexplained omissions.
       These adapted scenarios are not the entire upstream corpus or unchanged

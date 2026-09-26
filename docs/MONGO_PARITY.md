@@ -41,14 +41,23 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 38 test
-functions in the locked `test_query_more.py` and
-`test_query_operator_coverage_edges.py` suites (51 reference parameter cases).
-Eighteen owned wheel tests check their public query/write/index results, Mongo
+`compat/mongo/query-suite-inventory.json` separately accounts for all 45 test
+functions in the locked `test_query_more.py`,
+`test_query_operator_coverage_edges.py` and `test_client_read_fidelity.py` suites
+(75 reference parameter cases). Twenty-six owned wheel tests check public
+query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 51 unchanged upstream candidate passes or complete #186 certification.
+not 75 unchanged upstream candidate passes or complete #186 certification.
+
+Read-fidelity checks cover recursive OrderedDict/UserDict/SON and parameterized
+mapping aliases, sync/async find/clone/projection/aggregate/distinct/find-and-modify,
+client-local timezone options, persisted BSON millisecond precision (including
+pre-epoch values), and zero modifications for same-millisecond writes. The
+reference's five storage backends are not claimed as BriskDB backends. The full
+database-statistics assertion remains an explicit #166 gap: `list_databases()`
+without `nameOnly=True` still returns code 115, not fabricated storage statistics.
 
 The inventory explicitly distinguishes modern PyMongo from TinyMongo's legacy
 cursor `.count()`/negative indexing and list-shaped index metadata. It also
