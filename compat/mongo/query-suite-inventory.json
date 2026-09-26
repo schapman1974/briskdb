@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-six locked suites is classified; 959 reference parameter cases are not 959 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirty-seven locked suites is classified; 982 reference parameter cases are not 982 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -3525,6 +3525,137 @@
             "python/tests/test_upstream_legacy_examples.py::test_original_mongo_like_examples_keep_exact_public_results"
           ],
           "note": "The original five examples run as real-wire insert/find, repeated $set, inclusion projection, update-then-read and duplicate-ID scenarios, with exact results/counts, code 11000, unchanged rejected record and durable reopen. Despite their names, the source upsert and find-and-modify examples simulate those actions with ordinary writes; this mapping does not misrepresent them as actual upsert or atomic findAndModify coverage."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_bulk_insert_planning.py",
+      "sha256": "32f0ad8d4883475d2f061a3d38b3fac4c12254b6d4245d43872950b4fc8914d0",
+      "reference_case_count": 23,
+      "function_count": 18,
+      "coverage": [
+        {
+          "source": [
+            "test_bulk_insert_planning_scales_with_documents_and_unique_indexes"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_large_unique_batches_and_late_duplicate_keep_global_error_position"
+          ],
+          "note": "The original 100-existing/2000-incoming scale is exercised through a real unique email index and nonunique index, with exact IDs and full durable post-images. A further 1000-row batch plus late duplicate checks global error position. Private index_tokens counts and monkeypatched pairwise-comparison bans are not native complexity or performance measurements."
+        },
+        {
+          "source": [
+            "test_bulk_insert_planning_preserves_bson_identity_and_unique_error_order"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_document_id_and_unique_errors_preserve_input_order_and_original_ops"
+          ],
+          "note": "Document-valued numeric ID aliases and existing/in-batch unique conflicts produce exact ordered/unordered inserted counts and source positions 0/2/3, preserving original operation objects and original BSON representation. Unlike TinyMongo's private planner, wire errors intentionally omit keyPattern/keyValue and redact key values."
+        },
+        {
+          "source": [
+            "test_bulk_insert_planning_retains_fallback_and_legacy_conflict_behavior"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_nonunique_values_and_invalid_ids_do_not_weaken_batch_validation"
+          ],
+          "note": "Arbitrary object/TypedAlias IDs and impossible already-duplicate unique-index state are private planner fixtures, not real BSON inputs. The wheel rejects unsupported IDs before the batch writes and refuses to create a unique index over existing duplicates without changing data/catalog. No private untyped fallback bucket or raw duplicate-key diagnostic contract is exposed."
+        },
+        {
+          "source": [
+            "test_engine_insert_many_uses_prevalidated_backend_hook",
+            "test_engine_insert_many_uses_optional_conflict_candidate_hook",
+            "test_engine_insert_many_candidate_hook_can_request_a_full_scan",
+            "test_sqlite_prepared_insert_internal_fallbacks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_large_unique_batches_and_late_duplicate_keep_global_error_position",
+            "python/tests/test_upstream_bulk_planning.py::test_document_id_and_unique_errors_preserve_input_order_and_original_ops",
+            "python/tests/test_upstream_insert_many.py::test_late_serialization_error_precedes_all_wire_batches",
+            "python/tests/test_upstream_insert_many.py::test_invalid_arguments_and_failing_iterables_do_not_create_collections"
+          ],
+          "note": "Fake engines, prevalidated hooks, None-to-full-scan selection, encoded-document alignment and private known-nonempty bookkeeping are not BriskDB APIs. Public all-input preflight, accepted counts/IDs, duplicate outcomes and no namespace/partial writes on malformed batches have concrete wire coverage; native storage owns validation and transaction admission."
+        },
+        {
+          "source": [
+            "test_sqlite_public_bulk_insert_queries_only_incoming_id_candidates"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_large_unique_batches_and_late_duplicate_keep_global_error_position"
+          ],
+          "note": "A batch of 1000 new rows followed by an existing ID returns exactly 1000 inserts and error index 1000 across driver batches, with all rows durable after reopen. TinyMongo SQL trace shape and Python find monkeypatches are not assertions about native query plans."
+        },
+        {
+          "source": [
+            "test_sqlite_targeted_preflight_decodes_only_matching_bson_ids"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_bulk_numeric_aliases_and_distinctions_match_bson_precision",
+            "python/tests/test_upstream_bulk_planning.py::test_document_id_and_unique_errors_preserve_input_order_and_original_ops",
+            "python/tests/test_upstream_typed_ids.py::test_numeric_string_and_boolean_ids_do_not_alias_in_logical_filters"
+          ],
+          "note": "Numeric aliases conflict while boolean/numeric values remain separate, and exact original BSON records survive rejection. Python JSON decoder counts are not native BSON decoder counters."
+        },
+        {
+          "source": [
+            "test_sqlite_unique_indexes_keep_conservative_insert_preflight"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_document_id_and_unique_errors_preserve_input_order_and_original_ops"
+          ],
+          "note": "Existing and incoming-batch unique conflicts reject with exact public counts and error positions. A Python backend find-call count is not imposed on the native index-probe implementation."
+        },
+        {
+          "source": [
+            "test_sqlite_nonunique_indexes_keep_targeted_insert_preflight"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_nonunique_values_and_invalid_ids_do_not_weaken_batch_validation",
+            "python/tests/test_upstream_bulk_planning.py::test_large_unique_batches_and_late_duplicate_keep_global_error_position"
+          ],
+          "note": "A nonunique index permits repeated values and does not weaken ID uniqueness or eager BSON validation. No private full-scan call count is claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_targeted_preflight_preserves_exact_numeric_id_duplicates",
+            "test_sqlite_targeted_preflight_keeps_distinct_numeric_ids_separate"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_bulk_numeric_aliases_and_distinctions_match_bson_precision"
+          ],
+          "note": "Zero/negative-zero and exactly representable large int/double aliases reject; bool/one and 2^53+1 versus its rounded double stay separate. Source int(1e23) and 10^23 exceed BSON int64 and real PyMongo rejects them with OverflowError before any batch record or namespace is written; Python unbounded-int storage is not promised."
+        },
+        {
+          "source": [
+            "test_sqlite_targeted_preflight_finds_legacy_negative_zero",
+            "test_sqlite_targeted_preflight_filters_legacy_key_false_positives",
+            "test_sqlite_decimal_id_uses_safe_legacy_scan_fallback"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes"
+          ],
+          "note": "Locked TinyMongo generates genuine source files; the stopped test fixture rewrites only legacy scalar physical keys. Explicit import rekeys logical BSON identities. Imported negative zero rejects positive zero while preserving its sign; imported numeric IDs reject Decimal128 aliases, and a legacy string '1' permits distinct numeric 1. Reopen and unchanged source hashes are checked. This replaces in-place legacy scans; no private fallback/probe count is claimed."
+        },
+        {
+          "source": [
+            "test_sqlite_current_decimal_id_uses_typed_key_for_numeric_alias",
+            "test_sqlite_non_enumerable_ids_use_legacy_scan_fallback"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bulk_planning.py::test_bulk_numeric_aliases_and_distinctions_match_bson_precision"
+          ],
+          "note": "Current Decimal128/integer aliases, naive/UTC datetime aliases and identical ordered document IDs reject through real bulk writes with zero inserted, index zero, code 11000 and unchanged BSON records. Native canonical keys replace private legacy full-scan heuristics."
         }
       ]
     }
