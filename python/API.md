@@ -59,6 +59,24 @@ Original remote connection/authentication settings are not used; no new Mongo
 semantics or TinyMongo storage backends are implied. See
 [examples and substitution boundaries](README.md#patch-pymongo-for-local-testing).
 
+### Local bulk-insert preflight (source builds)
+
+Local sync/async collections validate and encode the entire `insert_many()`
+iterable before sending any insert, including batches longer than the listener's
+1,000-document wire limit. An unserializable value or document above the existing
+512-KiB BSON limit therefore cannot leave an earlier wire batch committed.
+Generated IDs are assigned to the input mappings; custom type encoders run once,
+and immutable BSON snapshots are sent through the real PyMongo driver.
+
+This materializes the iterable **and its encoded bytes** in client memory.
+Ordered/unordered duplicate errors still report counts, global input indices and
+the original operation objects. Caller-supplied `RawBSONDocument` IDs remain
+omitted from `inserted_ids`, following PyMongo. Strict boolean arguments and empty
+iterables are validated before mutation. Ordinary PyMongo classes are unchanged.
+This is serialization preflight, not a batch transaction: server validation,
+cancellation, transport and storage failures can still leave earlier writes
+committed. These additions are not in the published alpha.7 wheel.
+
 ### Local index-model compatibility (source builds)
 
 Collections obtained from `briskdb.MongoClient`, `AsyncMongoClient`, or a

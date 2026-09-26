@@ -996,15 +996,20 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, three query/read-fidelity suites now
-      have complete source accounting (45 functions/75 reference cases), backed
-      by 26 installed-wheel scenario tests, including recursive document classes,
+      frozen corpus and index inventory, four query/read-fidelity/bulk suites now
+      have complete source accounting (66 functions/144 reference cases), backed
+      by 39 installed-wheel scenario tests, including recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
-      representations,
-      non-BSON Python values and two private-helper exclusions are explicit;
+      representations, non-BSON Python values and private-helper exclusions
+      are explicit;
       hash/membership/count/test-symbol gates reject unexplained omissions.
       These adapted scenarios are not the entire upstream corpus or unchanged
       source-body passes; larger inventories and fault/property tiers remain.
+      Local sync/async `insert_many` now preflights the whole iterable before
+      sending any insert, fixing partial writes on serialization errors beyond
+      a 1,000-document wire batch. Encoded snapshots preserve one-pass custom
+      codecs, input IDs and global duplicate indices; this is not a transaction
+      or a change to the intentionally redacted duplicate-key diagnostics.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks
