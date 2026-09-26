@@ -108,7 +108,37 @@ def _configuration(host: Any, port: Any, folder: Any, shards: Optional[int],
     return folder, shards
 
 
-class MongoClient(_Client):
+class _LocalStoreBinding:
+    """Bind storage after the pinned driver's option checks, before topology.
+
+    PyMongo 4.17 calls this synchronous hook in both client constructors after
+    building ClientOptions and before creating any topology or background work.
+    The placeholder URI is only parsed, never used for a network connection.
+    Keeping validation inside that constructor avoids duplicated validators,
+    warning emissions, temporary clients, monitors and option-normalization drift.
+    """
+
+    def _init_based_on_options(self, seeds: Any, srv_max_hosts: Any,
+                               srv_service_name: Any) -> None:
+        pending = self._briskdb_pending
+        if pending is not None:
+            folder, shards, shared, suffix = pending
+            store = shared if shared is not None else acquire(folder, shards)
+            self._briskdb_store = store
+            self._briskdb_release = weakref.finalize(self, store.release) if shared is None else None
+            self._briskdb_pending = None
+            host, port = store.listener.address.rsplit(":", 1)
+            # The driver's seed set is also referenced by _resolve_srv_info.
+            # Mutate it in place before TopologySettings captures the endpoint.
+            seeds.clear()
+            seeds.add((host, int(port)))
+            uri = "mongodb://" + store.listener.address + suffix
+            self._host = [uri]
+            self._init_kwargs["host"] = uri
+        super()._init_based_on_options(seeds, srv_max_hosts, srv_service_name)
+
+
+class MongoClient(_LocalStoreBinding, _Client):
     """PyMongo-compatible synchronous client owning local BriskDB storage.
 
     Use ``folder=`` (or a positional filesystem path) for persistent data.
@@ -121,11 +151,10 @@ class MongoClient(_Client):
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        store = shared if shared is not None else acquire(folder, shards)
-        self._briskdb_store = store
-        self._briskdb_release = weakref.finalize(self, store.release) if shared is None else None
+        self._briskdb_pending = (folder, shards, shared, suffix)
+        self._briskdb_release = None
         try:
-            super().__init__("mongodb://" + store.listener.address + suffix,
+            super().__init__("mongodb://127.0.0.1:1" + suffix,
                              document_class=document_class, tz_aware=tz_aware,
                              connect=connect, type_registry=type_registry, **options)
         except BaseException:
@@ -155,7 +184,7 @@ class MongoClient(_Client):
                 self._briskdb_release()
 
 
-class AsyncMongoClient(_AsyncClient):
+class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
     """Async PyMongo client; use ``async with`` or ``await client.close()``.
 
     Construction opens local storage synchronously. ``async with
@@ -168,11 +197,10 @@ class AsyncMongoClient(_AsyncClient):
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        store = shared if shared is not None else acquire(folder, shards)
-        self._briskdb_store = store
-        self._briskdb_release = weakref.finalize(self, store.release) if shared is None else None
+        self._briskdb_pending = (folder, shards, shared, suffix)
+        self._briskdb_release = None
         try:
-            super().__init__("mongodb://" + store.listener.address + suffix,
+            super().__init__("mongodb://127.0.0.1:1" + suffix,
                              document_class=document_class, tz_aware=tz_aware,
                              connect=connect, type_registry=type_registry, **options)
         except BaseException:

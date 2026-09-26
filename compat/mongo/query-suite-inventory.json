@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these four locked suites is classified; 144 reference parameter cases are not 144 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client/diagnostic differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these five locked suites is classified; 198 reference parameter cases are not 198 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -477,6 +477,106 @@
           ],
           "kind": "implementation_specific",
           "note": "TinyMongo's fallback errors module when PyMongo is absent is not applicable to the opt-in BriskDB client, which explicitly requires pinned PyMongo. The real PyMongo BulkWriteError shape is exercised; no fallback class is shipped."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_client_configuration.py",
+      "sha256": "b3d0916579b1f8055bc4b5381984ce5bd7b97a6ade706f4cadc6f9f25fb01bec",
+      "reference_case_count": 54,
+      "function_count": 17,
+      "coverage": [
+        {
+          "source": [
+            "test_connection_option_catalog_tracks_installed_pymongo_or_fallback",
+            "test_connection_option_catalog_uses_dynamic_validator_names",
+            "test_connection_option_catalog_falls_back_when_pymongo_is_missing",
+            "test_connection_option_catalog_rejects_malformed_validator_tables"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_invalid_sync_and_async_options_do_not_create_storage"
+          ],
+          "kind": "implementation_specific",
+          "note": "TinyMongo's private dynamic/fallback validator-name catalog and monkeypatches do not apply. BriskDB delegates validation to its required pinned PyMongo constructor; it does not publish that helper or a no-PyMongo replacement. Public rejection before storage is checked for both real clients."
+        },
+        {
+          "source": [
+            "test_tiny_client_honors_tinymongo_folder_alias",
+            "test_async_tiny_client_honors_tinymongo_folder_alias"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_folder_alias_persists_but_duplicate_aliases_and_foreign_backends_are_explicit",
+            "python/tests/test_upstream_client_configuration.py::test_async_default_folder_alias_and_codec_option_forms"
+          ],
+          "kind": "contract_difference",
+          "note": "The public tinymongo_folder alias is accepted by BriskDB's MongoClient/AsyncMongoClient and persists in that folder. BriskDB stores its own manifest/shards, not TinyDB app.json files, and does not expose TinyMongo private _foldername state or its separate TinyMongoClient classes."
+        },
+        {
+          "source": [
+            "test_tiny_client_accepts_matching_folder_options",
+            "test_tiny_clients_reject_conflicting_folder_options",
+            "test_tiny_client_keeps_supported_backend_options"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_folder_alias_persists_but_duplicate_aliases_and_foreign_backends_are_explicit"
+          ],
+          "kind": "contract_difference",
+          "note": "BriskDB requires a single folder option even when aliases have equal values; conflicting aliases also reject. TinyMongo-only threads/duckdb_config and foreign backends are rejected, not silently accepted or advertised as BriskDB backend implementations."
+        },
+        {
+          "source": [
+            "test_async_mongo_client_accepts_default_configuration"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_async_default_folder_alias_and_codec_option_forms"
+          ],
+          "kind": "public_scenarios",
+          "note": "The real async default client constructs and closes; BRISKDB_HOME is isolated to a temporary test root so the test cannot create user data."
+        },
+        {
+          "source": [
+            "test_pymongo_shaped_clients_validate_document_class_immediately",
+            "test_pymongo_shaped_clients_validate_datetime_options_immediately",
+            "test_pymongo_shaped_clients_reject_unknown_options_immediately"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_invalid_sync_and_async_options_do_not_create_storage",
+            "python/tests/test_upstream_client_configuration.py::test_invalid_options_do_not_open_or_recover_existing_storage"
+          ],
+          "kind": "public_scenarios",
+          "note": "Both real client constructors reject malformed document/timezone/unknown options before native acquisition. New roots stay absent and existing stores are not opened or recovered; additional cross-pool validation is covered."
+        },
+        {
+          "source": [
+            "test_pymongo_shaped_clients_treat_falsey_document_classes_as_default",
+            "test_pymongo_shaped_clients_accept_datetime_option_forms"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_falsey_document_classes_and_timezone_forms_keep_driver_semantics",
+            "python/tests/test_upstream_client_configuration.py::test_async_default_folder_alias_and_codec_option_forms"
+          ],
+          "kind": "public_scenarios",
+          "note": "All source falsey document classes and timezone input forms are checked in both sync and async clients with the driver's actual codec settings."
+        },
+        {
+          "source": [
+            "test_tiny_clients_reject_unexpected_options"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_invalid_sync_and_async_options_do_not_create_storage"
+          ],
+          "kind": "contract_difference",
+          "note": "Unknown options fail eagerly as PyMongo ConfigurationError for the public BriskDB clients; TinyMongo's separate TinyMongoClient TypeError class/message is not emulated."
+        },
+        {
+          "source": [
+            "test_pymongo_shaped_clients_keep_recognized_connection_options"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_client_configuration.py::test_valid_options_bind_only_the_actual_local_listener"
+          ],
+          "kind": "public_scenarios",
+          "note": "Retained timeout, pool, retry, appName, listener, selector and server_api options use real PyMongo validation. Remote hosts/credentials are deliberately replaced by the owned local endpoint; construction and actual database traffic verify the binding."
         }
       ]
     }

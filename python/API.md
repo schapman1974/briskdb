@@ -48,6 +48,12 @@ folder use isolated temporary SQLite roots. Creation defaults to four shards;
 reopen detects the existing layout. Same-process managed owners of one canonical
 persistent path share an engine until the last owner closes it.
 
+Driver options (including document classes, timezones, URI database names and
+pool limits) are validated before a direct client opens storage or a listener.
+Invalid options therefore do not create a new root or open/recover an existing
+one. Validation uses the pinned driver's own constructor once; successful
+clients bind to the real local endpoint before any monitor can connect.
+
 `MongoPatch` supports synchronous context/decorator and asynchronous context
 protocols. Async clients require async scopes. Only PyMongo's top-level client
 constructors change, with LIFO restoration and rejection of cross-thread/task

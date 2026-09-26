@@ -41,16 +41,16 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 66 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 83 test
 functions in the locked `test_query_more.py`,
-`test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py` and
-`test_insert_many_semantics.py` suites (144 reference parameter cases).
-Thirty-nine owned wheel tests check public
+`test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
+`test_insert_many_semantics.py` and `test_client_configuration.py` suites
+(198 reference parameter cases). Fifty owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 144 unchanged upstream candidate passes or complete #186 certification.
+not 198 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -62,6 +62,15 @@ pre-epoch values), and zero modifications for same-millisecond writes. The
 reference's five storage backends are not claimed as BriskDB backends. The full
 database-statistics assertion remains an explicit #166 gap: `list_databases()`
 without `nameOnly=True` still returns code 115, not fabricated storage statistics.
+
+Local client construction now validates driver options before acquiring storage.
+Invalid document classes, timezone options, URI database paths or pool settings
+do not create files or reopen/recover an existing root. The pinned PyMongo
+constructor is used once; sync/async clients bind their actual loopback endpoint
+before topology/background work. Regression tests also check shared patch
+ownership, valid codec forms, aliases and that no placeholder/original host is
+contacted. TinyMongo-only backend knobs and duplicate folder aliases remain
+explicitly rejected rather than silently ignored.
 
 The inventory explicitly distinguishes modern PyMongo from TinyMongo's legacy
 cursor `.count()`/negative indexing and list-shaped index metadata. It also
