@@ -264,7 +264,8 @@ members and unsafe/oversized lists fall back. Numeric aliases are deduplicated;
 complete equality probes retain their existing preference across indexes.
 A sparse compound probe is eligible only when every possible tuple has at least
 one nonnull component. Optional probe preparation exceeding its work budget also falls back;
-cancellation and integrity errors are not swallowed. There is no index hint API.
+cancellation and integrity errors are not swallowed. There is no native forced-index
+hint API; wire read hints are accepted only as documented TinyMongo-compatible no-ops.
 
 Storage selects from the root-shared Ready cache under the request's schema
 admission and binds collection/index/key values in SQLite. Candidates preserve
@@ -1076,7 +1077,10 @@ for each new output value before retaining it, not for unrelated source payloads
 Exceeded limits or cancellation fail the whole command, never return a partial
 success, and leave the session reusable. The public collector is unusable after
 any failed push. Native distinct rejects projection/sort/pagination options;
-wire hints, collation, read concern, and comments are not implemented yet.
+wire reads accept advisory/no-effect hints and opaque comments, simple binary
+collation and empty/local read concern through the adapter. They do not alter
+the shared extractor or force a native access path; stronger options fail
+explicitly. See the [wire option contract](MONGO_PARITY.md).
 
 ### Basic aggregation core
 

@@ -469,6 +469,10 @@ before storage admission. The current option contract is:
 | --- | --- |
 | `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find, aggregate, and collection/index metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
+| Read `hint` | Find/count/distinct/aggregate accept a string or BSON document as a **no-effect TinyMongo compatibility option**, not a forced-index directive. Successful raw replies include the fixed `briskdbReadWarnings` message described below. |
+| Read `comment` | Any wire-valid BSON value on find/count/distinct/aggregate/getMore; ignored, not logged, echoed or retained in cursors/metrics |
+| Read `readConcern` | Empty document or exactly `{level: "local"}`; no majority, snapshot or causal/cluster-time guarantees |
+| Read `collation` | Exactly `{locale: "simple"}` (existing binary string comparison); no locale-specific or additional collation options |
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
 | Insert `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
 | Drop/create `writeConcern` / `comment` | Same concern subset except `w: 0` is rejected; comment must be omitted or null (PyMongo's default). No replication or unacknowledged namespace mutation. Metadata discovery also accepts only omitted/null comments. |
@@ -480,9 +484,32 @@ before storage admission. The current option contract is:
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
 | Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only `batchSize` from 0 through 1000 (default 101). Basic stages plus project/set/addFields/unset; absent collection returns empty after validation. |
-| Aggregate `allowDiskUse` | Only `false`; there is no disk spill |
+| Find/aggregate `allowDiskUse` | Only `false`; there is no disk spill |
+| Find/aggregate `let` | Empty document only; command-level expression variables remain unsupported |
+| Find `tailable`, `awaitData`, `noCursorTimeout`, `allowPartialResults`, `returnKey`, `showRecordId` | Only boolean `false`, preserving existing result, expiry and all-or-error behavior |
+| Find `oplogReplay` | Boolean legacy no-op; does not enable an oplog |
 | `getMore` `batchSize` | Integer from 1 through 1000; default 101. Pages also end at the wire byte budget. |
 | Find `singleBatch` | Boolean; `true` intentionally returns only the first batch, with cursor ID zero |
+
+For example, existing PyMongo code can chain ordinary read options:
+
+```python
+rows = list(db.users.find({"active": True}, comment="team-report")
+            .hint("active_1").sort("name", 1).limit(20))
+```
+
+The hint does **not** require that index to exist or force it to be used. This
+matches TinyMongo's accepted-no-effect keyword behavior, not MongoDB's
+[forced-index hint semantics](https://www.mongodb.com/docs/manual/reference/command/find/).
+Automatic planning and full matching remain authoritative; a `$natural` hint
+does not change ordering either. Raw successful replies containing a hint add
+`briskdbReadWarnings: ["hint: accepted for TinyMongo compatibility; index selection remains automatic"]`.
+Ordinary PyMongo helpers may hide this extra reply field. Subsequent getMore
+replies do not repeat it. Neither index names/patterns nor comments are retained
+for diagnostics. PyMongo may reject malformed/empty hint arguments before a
+request reaches the server. Unknown options still fail with code 72: this is
+an explicit supported subset, not TinyMongo's blanket ignoring of arbitrary
+keyword arguments. Write/metadata option rules are unchanged.
 
 Insert commands accept up to 1000 documents per wire batch, within the advertised
 1-MiB message and 512-KiB document limits. Sequence decoding shares one 4-MiB
@@ -626,8 +653,9 @@ queries use the shared scatter matcher, with literal-ID-list shard pruning
 (empty filters use per-shard row counts).
 Concurrent writes do not have a cross-shard snapshot guarantee. Count does not
 open a cursor. Invalid queries/options fail before absent-collection handling.
-Negative legacy count limits, hints, collation, comments, and read concern are
-explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
+Negative legacy count limits remain explicitly rejected. Hints, comments,
+collation and read concern use the bounded read-option contract above.
+PyMongo `count_documents()` sends an aggregation pipeline
 ending in `$group` with a literal `_id: 1`; it now works through the shared
 aggregation core, including sync/async filtering, skip/limit, missing namespaces,
 and restart. A safe leading ID match also narrows its source shards. It inherits
@@ -656,7 +684,10 @@ is promised. Required CI compares 5,134 complete pipelines in both execution
 modes against the frozen implementation, separately from the full candidate
 command corpus. Real-driver tests cover sync/async paging, empty initial batches,
 pooled-socket handoff, byte caps, cleanup, validation and restart. Hints, comments,
-collation, read concern, sessions and other unimplemented options fail explicitly.
+collation and read concern use the read-option contract above, including the
+aggregation commands generated by PyMongo `count_documents()`. Sessions and
+other unimplemented options still fail explicitly. TinyMongo's direct aggregate
+API rejects keyword options; this wire subset additionally supports real PyMongo.
 Projection stages now share `$project`, `$set`, `$addFields`, and `$unset`, with
 `$literal`/`$ifNull`/`$size`, field references, and `$$REMOVE`. Required CI compares
 another 7,037 source-locked whole pipelines in both modes. Exact field order,

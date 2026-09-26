@@ -8,6 +8,7 @@ use std::{
 
 mod cursors;
 mod indexes;
+mod read_options;
 
 use tokio::sync::Mutex;
 
@@ -258,6 +259,7 @@ pub(super) enum Command {
 pub(super) struct Prepared {
     command: Command,
     timeout: Duration,
+    advisory_hint: bool,
 }
 
 fn observed_read_options(enabled: bool) -> DocumentReadOptions {
@@ -336,6 +338,12 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
         let mut timeout = Duration::from_secs(15);
         let mut cursor_budget = None;
         for (field, value) in request.body.iter().skip(1) {
+            if let Some(valid) = read_options::accepts(name, field, value) {
+                if !valid {
+                    return Err(CommandError::options());
+                }
+                continue;
+            }
             let valid = match field {
                 "$db" => matches!(value, BsonValue::String(_)),
                 "$readPreference" => matches!(value, BsonValue::Document(doc)
@@ -446,7 +454,6 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
                     }
                     true
                 }
-                "allowDiskUse" if name == "aggregate" => matches!(value, BsonValue::Boolean(false)),
                 "query" if name == "count" => matches!(value, BsonValue::Document(_)),
                 "key" if name == "distinct" => {
                     if !matches!(value, BsonValue::String(_)) {
@@ -1063,6 +1070,7 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
         Ok(Prepared {
             command,
             timeout: timeout - elapsed,
+            advisory_hint: request.body.get_first("hint").is_some(),
         })
     })())
 }
@@ -1241,7 +1249,7 @@ impl Executor {
         identity[12..].copy_from_slice(&1u32.to_le_bytes());
         let identity = DocumentRequestId::new(identity).expect("nonzero request identity");
         match self.run(session, identity, context, prepared.command).await {
-            Ok(reply) => reply,
+            Ok(reply) => read_options::reply(reply, prepared.advisory_hint),
             Err(error) => error.document(),
         }
     }
