@@ -945,7 +945,7 @@ requires an earlier dependency:
       limits with filtered, byte-bounded pages; Ready-index metadata shares the
       registry with bounded name/identity positions;
       no cross-shard or cross-batch snapshot is promised.
-    - [ ] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
+    - [x] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
       projection now shares one Rust transform across embedded and wire APIs.
       Inclusion/exclusion, nested/dotted paths, array traversal, `_id` rules,
       field order, and BSON fidelity are retained across cursor batches. Filters
@@ -963,13 +963,21 @@ requires an earlier dependency:
       filtering and global skip/limit, including PyMongo's sync/async
       `estimated_document_count()` and zero for absent collections. PyMongo's
       aggregation-based `count_documents()` now also works, including filtering,
-      skip/limit, absent namespaces, async calls, and restart; remaining options
-      still keep this issue open. Distinct shares one bounded BSON extractor across
+      skip/limit, absent namespaces, async calls, and restart. Distinct shares one bounded BSON extractor across
       Rust, native sync/async Python, and wire clients. Global natural-order
       reads preserve the first exact representation and charge only unique
       outputs; missing/null/array/path semantics follow 4,888 additional locked
       oracle cases. It uses no retained cursor slot, rejects whole over-budget
       results, and remains a scan implementation without snapshot semantics.
+      Wire reads now accept TinyMongo-style no-effect hints with fixed, redacted
+      `briskdbReadWarnings` diagnostics, plus opaque comments, local read concern,
+      simple binary collation and explicit no-op/default flags. Index selection
+      remains automatic; hints do not force indexes or change natural order.
+      Stock sync/async PyMongo checks cover chaining, getMore, absent namespaces,
+      untouched catalogs/documents and reopen, with source-locked TinyMongo
+      no-effect reference checks. Unknown options, stronger read guarantees,
+      locale collations, live/tailable cursors, disk spill and sessions still
+      fail explicitly rather than silently promising unsupported semantics.
     - [x] [#179](https://github.com/schapman1974/briskdb/issues/179) — shared basic
       aggregation core compiles `$match`, `$sort`, `$skip`, `$limit`, and `$count`
       eagerly and executes immutable BSON through shared stages.

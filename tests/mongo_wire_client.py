@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pymongo
+from mongo_read_options_client import sync_read_options, async_read_options
 from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure, WriteError
 
@@ -1482,8 +1483,8 @@ def distinct_smoke(uri):
         for arguments, code in [
             ({"key": 7}, 14), ({"key": Code("v")}, 14), ({"key": "v", "query": []}, 14),
             ({"key": "v", "query": {"$where": "private-data"}}, 115),
-            ({"key": "v", "hint": "_id_"}, 72), ({"key": "v", "collation": {"locale": "en"}}, 72),
-            ({"key": "v", "skip": 1}, 72), ({"key": "v", "comment": "private-data"}, 72),
+            ({"key": "v", "hint": 1}, 72), ({"key": "v", "collation": {"locale": "en"}}, 72),
+            ({"key": "v", "skip": 1}, 72),
         ]:
             for database in [client.wire_distinct, client.unwritten_distinct]:
                 try:
@@ -1534,8 +1535,8 @@ def count_smoke(uri):
             ({"query": {"$where": "private-data"}}, 115),
             ({"query": []}, 72), ({"skip": -1}, 2), ({"limit": -1}, 2),
             ({"skip": True}, 2), ({"limit": 1.5}, 2), ({"maxTimeMS": -1}, 2),
-            ({"hint": "_id_"}, 72), ({"readConcern": {"level": "majority"}}, 72),
-            ({"collation": {"locale": "en"}}, 72), ({"comment": "private-data"}, 72),
+            ({"hint": 1}, 72), ({"readConcern": {"level": "majority"}}, 72),
+            ({"collation": {"locale": "en"}}, 72),
             ({"sort": {"_id": 1}}, 72), ({"batchSize": 1}, 72),
         ]:
             for database in [client.wire_count, client.unwritten_count]:
@@ -1557,7 +1558,7 @@ def count_smoke(uri):
             assert collection.count_documents(query, maxTimeMS=10000, **options) == expected
             assert client.unwritten_count.items.count_documents(query, **options) == 0
         for options, code in [({"limit": 0}, 15958), ({"skip": -1}, 5107200),
-                              ({"hint": "_id_"}, 72), ({"comment": "private-data"}, 72)]:
+                              ({"collation": {"locale": "en"}}, 72)]:
             for target in [collection, client.unwritten_count.items]:
                 try:
                     target.count_documents({}, **options)
@@ -1674,8 +1675,8 @@ def aggregation_smoke(uri):
             ([{"$group": {"_id": None, "private.path": {"$sum": 1}}}], {}, 40235),
             ([{"$group": {"_id": None, "private": {"$first": "$$REMOVE"}}}], {}, 115),
             ([{"$group": {"_id": None, "private": {"$avg": []}}}], {}, 40237),
-            ([], {"allowDiskUse": True}, 72), ([], {"hint": "_id_"}, 72),
-            ([], {"comment": "private"}, 72), ([], {"readConcern": {"level": "local"}}, 72),
+            ([], {"allowDiskUse": True}, 72), ([], {"hint": 1}, 72),
+            ([], {"readConcern": {"level": "majority"}}, 72),
             ([], {"cursor": []}, 14), ([], {"cursor": {"unknown": 1}}, 72),
             ([], {"cursor": {"batchSize": -1}}, 2),
         ]:
@@ -3194,6 +3195,8 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_operator_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_find_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
+    sync_read_options(sys.argv[1], sys.argv[2] == "reopened")
+    asyncio.run(asyncio.wait_for(async_read_options(sys.argv[1]), timeout=20))
     count_checkpoint_smoke(sys.argv[1])
     asyncio.run(asyncio.wait_for(async_count_checkpoint_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

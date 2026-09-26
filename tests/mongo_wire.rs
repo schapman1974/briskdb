@@ -505,6 +505,12 @@ async fn real_pymongo_counts() {
     assert_driver_restart("/tests/mongo_count_client.py").await;
 }
 
+#[tokio::test]
+#[ignore = "focused local read-option checks; also included in the full real-driver gate"]
+async fn real_pymongo_read_options() {
+    assert_driver_restart("/tests/mongo_read_options_client.py").await;
+}
+
 async fn assert_driver_restart(script: &'static str) {
     let (root, database, mut server) = setup().await;
     server.set_read_metrics_enabled(true);
