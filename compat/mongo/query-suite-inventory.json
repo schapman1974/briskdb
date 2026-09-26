@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-six locked suites is classified; 740 reference parameter cases are not 740 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-seven locked suites is classified; 766 reference parameter cases are not 766 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2734,6 +2734,56 @@
             "python/tests/test_upstream_driver_contract.py::test_invalid_async_find_sessions_never_construct_driver_cursors"
           ],
           "note": "All 13 source fake-session forms reject without catalog mutations. Local sync/async find/find_one now reject invalid keyword/positional/falsey sessions before driver cursor construction, avoiding unraisable cleanup errors. Other ordinary driver paths retain AttributeError/ValueError and empty-batch TypeError; genuine sessions retain driver ConfigurationError on this no-session server, not TinyMongo's eager custom exception."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_talkpython_regressions.py",
+      "sha256": "a7e681a58397221cde39108970a3ae745e1ccaf547f212ae36e7fb5f1dfdbe51",
+      "reference_case_count": 26,
+      "function_count": 8,
+      "coverage": [
+        {
+          "source": ["test_implicit_ids_are_objectids_across_every_write_path"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_generated_objectids_cover_insert_and_every_upsert_path"],
+          "note": "Single/batch inserts and single/multi/replacement upserts generate six unique ObjectIds which remain queryable after text reconstruction. Native sharded SQLite replaces the source's memory/TinyDB/SQLite variants."
+        },
+        {
+          "source": ["test_explicit_string_generator_and_core_fallback_remain_available"],
+          "kind": "contract_difference",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_explicit_hex_string_ids_do_not_need_a_private_id_generator"],
+          "note": "Explicit 32-character hexadecimal string IDs roundtrip unchanged. BriskDB does not export TinyMongo generate_id or provide its monkeypatchable no-BSON fallback allocator; the Mongo addon requires PyMongo/BSON and generated IDs are ObjectIds. This is not a pass of the private fallback branch."
+        },
+        {
+          "source": ["test_invalid_write_payload_fails_even_without_a_matching_document"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_invalid_no_match_updates_reject_before_collection_creation"],
+          "note": "Unencodable sets in update_one/update_many/replace_one reject with BSON InvalidDocument even without matches and leave the native catalog empty; TinyMongo's diagnostic enrichment is not promised."
+        },
+        {
+          "source": ["test_datetime_and_object_id_sort_in_both_directions"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_datetime_and_objectid_sort_in_both_directions"],
+          "note": "The original shuffled values sort by datetime and ObjectId in both directions through native multi-shard wire queries, not insertion order."
+        },
+        {
+          "source": ["test_binary_sort_uses_mongodb_length_subtype_and_byte_order"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_binary_sort_orders_length_subtype_and_unsigned_bytes"],
+          "note": "All five original binary length/subtype/unsigned-byte boundaries sort in both directions over the native backend."
+        },
+        {
+          "source": ["test_mixed_naive_and_aware_datetimes_sort_as_utc", "test_compound_sort_uses_datetime_to_break_ties"],
+          "kind": "native_equivalent",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_mixed_timezone_and_compound_date_sorting"],
+          "note": "Naive/aware inputs order by their UTC instant in both directions; original compound group/date tie-breaking returns 3,1,2,4."
+        },
+        {
+          "source": ["test_unsupported_sort_type_warns_once_per_field_and_type"],
+          "kind": "contract_difference",
+          "evidence": ["python/tests/test_upstream_talkpython_regressions.py::test_python_only_date_sort_inputs_reject_before_mutation"],
+          "note": "TinyMongo can construct a cursor from arbitrary Python date objects and warn once when sorting. Native PyMongo cursors contain server BSON; date is unencodable and rejects the whole local insert batch before mutation. There is no warning-based Python-object sorter or matching warning-count claim."
         }
       ]
     }
