@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fourteen locked suites is classified; 362 reference parameter cases are not 362 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifteen locked suites is classified; 406 reference parameter cases are not 406 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1228,6 +1228,196 @@
           ],
           "kind": "contract_difference",
           "note": "Wire failures preserve existing records and reject invalid increments with code 14 even without a match. Unsupported operators surface as real PyMongo WriteError rather than TinyMongo's private TinyMongoNotSupportedError hierarchy; no cross-document transaction claim."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_bson_value_types.py",
+      "sha256": "a5a871d41e079a26640c6c3b3df3cc059050383706af91776bedec8f245c2a02",
+      "reference_case_count": 44,
+      "function_count": 18,
+      "coverage": [
+        {
+          "source": [
+            "test_tm037_logical_timestamp_clock_and_copy_boundaries"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_zero_timestamp_stamping_preserves_id_nested_values_and_inputs",
+            "src/core/engine/document_engine.rs::server_timestamp_clock_is_monotonic_across_backward_time_rollover_and_exhaustion",
+            "src/core/engine/document_engine.rs::concurrent_server_timestamp_allocations_are_unique_without_a_global_test_clock"
+          ],
+          "kind": "native_equivalent",
+          "note": "Isolated native atomic-clock tests cover repeated/backward seconds, rollover, terminal exhaustion and 512 concurrent unique allocations. Wire tests cover direct-zero stamping while preserving IDs, nested values and inputs. TinyMongo monkeypatch globals, Python object identity for private no-op helpers and optional _TIMESTAMP=None are not native APIs."
+        },
+        {
+          "source": [
+            "test_tm037_ordered_and_unordered_batches_consume_expected_increments"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_batch_timestamps_preserve_error_inputs_with_explicit_reservation_gaps"
+          ],
+          "kind": "contract_difference",
+          "note": "Ordered/unordered stored results, original error-operation identity and monotonic timestamps are checked. BriskDB reserves stamps during full-batch native preflight: an unattempted ordered tail can leave extra timestamp gaps (same-second first/after delta 3 here, versus TinyMongo's per-attempt delta 2). Exact monkeypatched wall-clock values and identical allocation counts are not claimed."
+        },
+        {
+          "source": [
+            "test_tm037_invalid_insert_does_not_advance_clock_or_replace_error_document"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_invalid_insert_never_reaches_timestamp_assignment_or_storage"
+          ],
+          "kind": "contract_difference",
+          "note": "Driver BSON encoding rejects the invalid record before any write or clock allocation. The next valid record is monotonic and same-second allocations remain adjacent. TinyMongo's InvalidDocument.document identity/enriched diagnostic context is not a guaranteed PyMongo wire-client error surface."
+        },
+        {
+          "source": [
+            "test_tm035_codec_uses_exact_tags_and_round_trips_types"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_native_bson_roundtrips_bounds_timestamps_and_nested_code"
+          ],
+          "kind": "implementation_specific",
+          "note": "BriskDB stores native BSON rather than exporting TinyMongo's private tagged-JSON codec. Exact native BSON bytes and returned types for bounds, timestamp and JavaScript are checked; TinyMongo JSON tag output is not claimed."
+        },
+        {
+          "source": [
+            "test_tm035_codec_round_trips_nested_scoped_code_exactly"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_native_bson_roundtrips_bounds_timestamps_and_nested_code"
+          ],
+          "kind": "implementation_specific",
+          "note": "Nested scoped JavaScript, timestamp, bounds and plain JavaScript preserve exact native BSON and Python types. TinyMongo's private JSON envelope layout is not the native storage/serialization API."
+        },
+        {
+          "source": [
+            "test_tm035_codec_preserves_malformed_tags_as_user_data"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_json_codec_tag_lookalikes_are_ordinary_native_bson_documents"
+          ],
+          "kind": "implementation_specific",
+          "note": "All 20 malformed tag lookalikes round-trip as ordinary user BSON. The runtime does not invoke TinyMongo's private JSON decoder; this is not an offline tagged-JSON import claim."
+        },
+        {
+          "source": [
+            "test_tm035_decode_explains_optional_dependency"
+          ],
+          "evidence": [
+            "python/tests/test_documents.py::test_sql_only_use_does_not_import_or_require_bson"
+          ],
+          "kind": "implementation_specific",
+          "note": "TinyMongo monkeypatches individual optional private codec classes. BriskDB has no such tagged-JSON codec globals: SQL-only wheel operation without bson/pymongo and explicit failure when requesting document conversion without bson are checked by an isolated import-blocking process. Mongo clients require the pinned PyMongo extra."
+        },
+        {
+          "source": [
+            "test_tm035_registry_identity_equality_and_subclass_precedence"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_identity_distinguishes_timestamps_code_strings_scopes_and_scope_order"
+          ],
+          "kind": "native_equivalent",
+          "note": "Public equality filters and distinct compare encoded BSON identity, distinguishing timestamps, bounds, strings, JavaScript, scoped code and scope order. TinyMongo private registry keys/spec names/hashes are not exposed."
+        },
+        {
+          "source": [
+            "test_tm035_registry_uses_the_complete_supported_bson_sort_order"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_whole_value_push_sort_uses_complete_bson_type_order"
+          ],
+          "kind": "native_equivalent",
+          "note": "All 15 type ranks are exercised via whole-value push sorting and exact encoded BSON, not field-sort array-minimum semantics. Private Python registry tuple ranks are not an exposed API."
+        },
+        {
+          "source": [
+            "test_tm035_native_regex_preserves_its_python_representation"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_native_regex_decodes_as_bson_regex_not_a_python_pattern"
+          ],
+          "kind": "contract_difference",
+          "note": "Native Python regex insertion round-trips as PyMongo bson.Regex with the same pattern/flags, not TinyMongo's re.Pattern reconstruction. The driver representation difference is asserted explicitly."
+        },
+        {
+          "source": [
+            "test_tm035_public_read_preserves_unscoped_code_type"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_native_bson_roundtrips_bounds_timestamps_and_nested_code"
+          ],
+          "kind": "public_scenarios",
+          "note": "OrderedDict reads preserve unscoped Code type and scope=None, as well as scoped/nested counterparts."
+        },
+        {
+          "source": [
+            "test_tm035_code_is_not_accepted_as_a_rename_destination"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_is_not_a_string_for_commands_or_index_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Code rename destinations are rejected with WriteError code 2 without record changes."
+        },
+        {
+          "source": [
+            "test_tm035_code_is_not_accepted_as_an_aggregation_count_field"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_is_not_a_string_for_commands_or_index_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Code count output fields are rejected with code 40156, preserving the original data."
+        },
+        {
+          "source": [
+            "test_tm035_code_is_not_accepted_as_an_index_name"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_is_not_a_string_for_commands_or_index_metadata"
+          ],
+          "kind": "contract_difference",
+          "note": "Code index names are rejected with real PyMongo OperationFailure, not TinyMongo's custom unsupported exception hierarchy; no index/catalog change is allowed."
+        },
+        {
+          "source": [
+            "test_tm035_code_index_fields_are_rejected_before_catalog_writes"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_is_not_a_string_for_commands_or_index_metadata"
+          ],
+          "kind": "contract_difference",
+          "note": "Scalar and paired Code index fields fail with the pinned driver's TypeError, not TinyMongo's custom unsupported exception. Existing records and index metadata are unchanged."
+        },
+        {
+          "source": [
+            "test_tm035_code_is_not_treated_as_a_distinct_or_drop_index_name"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_is_not_a_string_for_commands_or_index_metadata"
+          ],
+          "kind": "public_scenarios",
+          "note": "Both commands reject Code values with code 14, preserving the selected index and data."
+        },
+        {
+          "source": [
+            "test_tm035_code_is_not_treated_as_a_cursor_sort_field"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_code_cursor_sort_fields_fail_without_changing_records"
+          ],
+          "kind": "public_scenarios",
+          "note": "Scalar, paired and find-keyword Code sort fields all raise TypeError through the local real-driver cursor path."
+        },
+        {
+          "source": [
+            "test_tm035_invalid_scoped_code_value_keeps_rich_write_context"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_bson_values.py::test_invalid_scoped_code_is_rejected_before_any_write"
+          ],
+          "kind": "contract_difference",
+          "note": "Nested non-BSON scope values raise InvalidDocument and never write a record. BriskDB retains the driver's error surface, not TinyMongo's enriched collection/ID/path message or error.document identity."
         }
       ]
     }
