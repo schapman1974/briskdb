@@ -1075,7 +1075,7 @@ requires an earlier dependency:
       executions in a separate real-endpoint job and rejects missing, duplicated,
       substituted, skipped or failed cases. The broader TinyMongo inventory,
       application suites and operational acceptance criteria remain open.
-    - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
+    - [x] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
       `$group` supports literal/field/computed keys, recursive structured BSON identity, and
       all eight planned accumulators across Rust, sync/async native Python, and
       PyMongo. It retains bounded states in established global input order,
@@ -1088,8 +1088,14 @@ requires an earlier dependency:
       memory/BSON limits, cancellation, byte paging, cleanup, and restart.
       All 30 frozen group-accumulator sync/async executions now pass against
       the real four-shard candidate, including empty-input setup via delete-many.
-      Partial-shard accumulator-state merging and
-      full candidate-corpus acceptance remain open. No disk spill or snapshot.
+      Pipelines beginning with a group now use bounded shard-local states for
+      integer-literal sums and first/last/min/max, merging exact totals and
+      global input positions before the remaining stages. All states share the
+      same memory/input/work quotas; failed children drain before cleanup.
+      Dynamic/rounded sums, averages, push/set accumulators and preceding stages
+      retain the ordered stream. No rounded shard totals, disk spill or snapshot.
+      The complete frozen 456-execution command corpus is required independently;
+      the broader source inventory and release acceptance remain separate issues.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

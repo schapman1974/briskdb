@@ -18,6 +18,9 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STEPS: usize = 4_000_000;
 const ROW_BYTES: usize = 96;
 
+mod partial;
+pub(crate) use partial::{DocumentPartialAggregation, DocumentPartialBudget};
+
 enum Stage {
     Match(DocumentMatcher),
     Sort(DocumentSorter),

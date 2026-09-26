@@ -708,8 +708,17 @@ for integer result-type/overflow boundaries versus the frozen reference and
 MongoDB. Real-driver tests cover structured/numeric results, byte paging,
 whole-group size/memory rejection, no partial group replies, cleanup and restart.
 Group keys use the existing expression subset without `$$REMOVE`/`$$ROOT` variables.
-Partial-shard accumulator merging, additional expressions, and full
-candidate-corpus acceptance remain open.
+Pipelines beginning with `$group` can now merge shard-local exact states for
+integer-literal `$sum` and `$first`/`$last`/`$min`/`$max`. Group/key encounter order
+and equal-extremum representations use global source positions, not worker
+arrival order. All child states and final merging share memory/input/work quotas;
+at most eight shard tasks run, and failure/cancellation drains all of them.
+Dynamic or rounded sums, `$avg`, `$push`, `$addToSet`, and pipelines with preceding
+stages retain the original ordered executor. These are optimization fallbacks,
+not unsupported queries. No frozen source, expectation, or adapter was changed.
+All 456 frozen command executions are an independent required gate. The complete
+TinyMongo source inventory, additional expressions and release acceptance are
+separate from this bounded grouping contract.
 
 Mongo `delete` now supports filtered `delete_one`/`delete_many`, ordered and
 unordered selector batches, array and OP_MSG sequence forms, indexed validation

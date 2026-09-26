@@ -6,6 +6,7 @@ use crate::document::{
 use std::time::Duration;
 
 mod counts;
+mod grouping;
 mod sorting;
 
 fn namespace() -> DocumentNamespace {

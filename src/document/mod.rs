@@ -30,6 +30,7 @@ mod update;
 mod value;
 
 pub use aggregation::{DocumentAggregationStream, DocumentAggregator};
+pub(crate) use aggregation::{DocumentPartialAggregation, DocumentPartialBudget};
 pub(crate) use catalog::validate_namespace;
 pub use catalog::{
     DOCUMENT_CATALOG_VERSION, DOCUMENT_INDEX_FORMAT_VERSION, DOCUMENT_SCHEMA_VERSION,

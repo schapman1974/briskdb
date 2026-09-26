@@ -132,6 +132,13 @@ pub(super) struct Sum {
 }
 
 impl Sum {
+    pub(super) fn from_integer(integer: i128) -> Self {
+        Self {
+            integer,
+            ..Self::default()
+        }
+    }
+
     pub fn add(&mut self, value: &BsonValue) {
         if value.canonical_number().is_none() {
             return;

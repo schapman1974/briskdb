@@ -4,6 +4,8 @@ use super::*;
 use crate::document::{DocumentAggregateRequest, DocumentAggregator, DocumentRequestId};
 use std::collections::VecDeque;
 
+mod partial;
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_document_aggregate(
@@ -23,15 +25,14 @@ impl Engine {
         }
         let storage = self.inner.database.storage.clone();
         let lookup = namespace.clone();
-        let (collection_id, source, runner) = self
+        let (collection_id, source, runner, partial) = self
             .run_document_storage_task(
                 cancellation.clone(),
                 deadline,
                 move |cancellation, control| {
                     let runner = DocumentAggregator::compile_with_check(&pipeline, &mut || {
                         ensure_document_cpu_active(cancellation, &control)
-                    })?
-                    .into_stream();
+                    })?;
                     // Compile every stage first. The original leading match
                     // stays in the runner; only physical shard selection moves
                     // into the source, never filtering ahead of its work budget.
@@ -47,7 +48,17 @@ impl Engine {
                         Arc::clone(&control),
                     )?;
                     ensure_document_cpu_active(cancellation, &control)?;
-                    Ok((require_collection(collection)?.id(), source, runner))
+                    let (runner, partial) = if runner.can_partition() {
+                        (None, Some(Arc::new(runner.into_partial())))
+                    } else {
+                        (Some(runner.into_stream()), None)
+                    };
+                    Ok((
+                        require_collection(collection)?.id(),
+                        source,
+                        runner,
+                        partial,
+                    ))
                 },
             )
             .await?;
@@ -64,7 +75,8 @@ impl Engine {
             remaining: None,
             batch_byte_limit: options.batch_byte_limit(),
             aggregation: Some(AggregateCursor {
-                runner: Some(runner),
+                runner,
+                partial,
                 pending: VecDeque::new(),
                 bytes: 0,
                 source_exhausted: false,
@@ -156,6 +168,27 @@ impl Engine {
                 documents.push(row.document);
                 continue;
             }
+            if let Some(plan) = aggregate.partial.take() {
+                let output = self
+                    .read_partial_groups(owner, state, plan, cancellation.clone(), deadline)
+                    .await?;
+                aggregate = self
+                    .run_document_storage_task(
+                        cancellation.clone(),
+                        deadline,
+                        move |cancellation, control| {
+                            let mut check = || ensure_document_cpu_active(cancellation, &control);
+                            for document in output {
+                                push_output(&mut aggregate, document, &mut check)?;
+                            }
+                            aggregate.source_exhausted = true;
+                            check()?;
+                            Ok(aggregate)
+                        },
+                    )
+                    .await?;
+                continue;
+            }
             let Some(runner) = aggregate.runner.as_ref() else {
                 break;
             };
@@ -216,7 +249,9 @@ impl Engine {
                 )
                 .await?;
         }
-        let has_more = aggregate.runner.is_some() || !aggregate.pending.is_empty();
+        let has_more = aggregate.runner.is_some()
+            || aggregate.partial.is_some()
+            || !aggregate.pending.is_empty();
         state.batch_byte_limit = byte_limit;
         state.aggregation = Some(aggregate);
         Ok((documents, has_more))
