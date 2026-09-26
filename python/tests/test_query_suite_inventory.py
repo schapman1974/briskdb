@@ -17,7 +17,7 @@ INVENTORY = ROOT / "compat/mongo/query-suite-inventory.json"
 
 class QuerySuiteInventoryTests(unittest.TestCase):
     def test_query_inventory_names_every_function_and_real_candidate_tests(self):
-        validate_inventory(json.loads(INVENTORY.read_text()), expected_scope=(17, 199, 490))
+        validate_inventory(json.loads(INVENTORY.read_text()), expected_scope=(18, 224, 555))
 
     def test_query_inventory_rejects_omitted_duplicated_or_unexplained_source(self):
         original = json.loads(INVENTORY.read_text())
@@ -32,7 +32,7 @@ class QuerySuiteInventoryTests(unittest.TestCase):
             data = deepcopy(original)
             change(data)
             with self.assertRaises(ValueError):
-                validate_inventory(data, expected_scope=(17, 199, 490))
+                validate_inventory(data, expected_scope=(18, 224, 555))
 
     @unittest.skipUnless(os.environ.get("BRISKDB_MONGO_ORACLE_SOURCE_ROOT")
                          and os.environ.get("BRISKDB_MONGO_ORACLE_PYTHON"),
@@ -40,7 +40,7 @@ class QuerySuiteInventoryTests(unittest.TestCase):
     def test_query_source_hash_membership_and_reference_parameter_counts(self):
         data = json.loads(INVENTORY.read_text())
         source = Path(os.environ["BRISKDB_MONGO_ORACLE_SOURCE_ROOT"]).resolve()
-        validate_inventory(data, source, expected_scope=(17, 199, 490))
+        validate_inventory(data, source, expected_scope=(18, 224, 555))
         command = [os.environ["BRISKDB_MONGO_ORACLE_PYTHON"], "-m", "pytest",
                    "--collect-only", "-qq", "-o", "addopts="]
         command.extend(suite["path"] for suite in data["suites"])
