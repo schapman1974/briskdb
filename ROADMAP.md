@@ -997,9 +997,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, forty query/public-client suites now
-      have complete source accounting (505 functions/1,034 reference cases), backed
-      by 275 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, forty-one query/public-client suites now
+      have complete source accounting (516 functions/1,046 reference cases), backed
+      by 278 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1126,6 +1126,10 @@ requires an earlier dependency:
       record examined in a 250-row indexed-array workload. Retained handles
       observe peer logical drop/recreate; unverifiable legacy aliases reject
       without source writes.
+      Routed mutations now explicitly prove natural-first behavior across
+      reversed physical shard order, unique owner preservation, native point
+      update routing, grouped deletes and public per-document insert commits.
+      Private prepared-batch/connection-proxy differences stay explicit.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks
