@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these eight locked suites is classified; 259 reference parameter cases are not 259 candidate passes. Private helpers/backend hooks/SQL traces, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twelve locked suites is classified; 289 reference parameter cases are not 289 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -829,6 +829,129 @@
           ],
           "kind": "public_scenarios",
           "note": "Async unset results, no-op counts and exact post-images survive reopening the native store; no claim of implementing the reference's five Python backends."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_common_api.py",
+      "sha256": "9ba6e51d1c512d3637da3e7013e6371e9e017f40e910e3d8e1b1f91eb932aa55",
+      "reference_case_count": 14,
+      "function_count": 9,
+      "coverage": [
+        {
+          "source": [
+            "test_client_lists_and_drops_file_database",
+            "test_client_lists_and_drops_named_memory_database",
+            "test_client_drops_local_parquet_database_directory"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_common.py::test_database_handles_logical_drop_and_explicit_statistics_gap"
+          ],
+          "kind": "contract_difference",
+          "note": "Public logical names/handles/drop/reopen and unaffected neighbor databases are exercised. Full list_databases statistics remain an explicit code-115 gap under #166; nameOnly=True is supported, not fabricated sizeOnDisk/empty fields. Modern list_database_names replaces the removed database_names alias. BriskDB shares native shard files; TinyDB JSON, named-memory and Parquet-directory deletion/zero-size assertions are not its layout or backend contracts."
+        },
+        {
+          "source": ["test_find_one_and_delete_honors_sort_and_projection"],
+          "evidence": ["python/tests/test_upstream_common.py::test_find_one_and_delete_honors_sort_projection_and_missing_selection"],
+          "kind": "public_scenarios",
+          "note": "Public sorted selection, projection, deletion and missing-match results are checked through the installed wheel; three reference backends are not three candidate backends."
+        },
+        {
+          "source": ["test_distinct_index_information_and_cursor_lifecycle"],
+          "evidence": ["python/tests/test_upstream_common.py::test_distinct_index_metadata_and_modern_cursor_lifecycle"],
+          "kind": "contract_difference",
+          "note": "Distinct/index metadata, lazy reads, clone/negative limit, partial to_list, rewind and exhaustion are covered. BriskDB exports its warning as briskdb.mongo.IndexCompatibilityWarning. Pinned real PyMongo cursors retain buffered rows after close and allow rewind; TinyMongo's permanent-close rejection and strict boolean cursor-argument behavior are not promised. No TinyMongo cursor replacement or private cache is installed."
+        },
+        {
+          "source": ["test_iterating_cursor_preserves_consumed_position"],
+          "evidence": ["python/tests/test_upstream_common.py::test_iterating_a_wire_cursor_preserves_consumed_position"],
+          "kind": "public_scenarios",
+          "note": "Consumed position and repeat exhaustion are tested using real one-row wire batches, not a standalone TinyMongo in-memory cursor constructor."
+        },
+        {
+          "source": ["test_find_and_modify_honors_before_after_upsert_sort_and_projection"],
+          "evidence": ["python/tests/test_upstream_common.py::test_find_modify_before_after_upsert_sort_projection_and_validation"],
+          "kind": "public_scenarios",
+          "note": "Old/new images, sorted updates, projection, update/replacement upserts and invalid return_document values are exercised without replacing driver methods."
+        },
+        {
+          "source": ["test_file_crud_read_modify_write_paths_take_an_outer_collection_lock"],
+          "evidence": [
+            "python/tests/test_upstream_common.py::test_shared_collection_concurrent_writes_do_not_lose_updates",
+            "python/tests/test_upstream_common.py::test_find_one_and_delete_honors_sort_projection_and_missing_selection",
+            "python/tests/test_upstream_common.py::test_find_modify_before_after_upsert_sort_projection_and_validation"
+          ],
+          "kind": "implementation_specific",
+          "note": "TinyDB's monkeypatched _acquire_collection_lock counts (three/two Python acquisitions) do not exist in the native SQLite engine. Public mutations and competing writes are exercised separately; they are not evidence for identical private lock counts or cross-shard transactions."
+        },
+        {
+          "source": ["test_update_many_supports_embedded_document_ids"],
+          "evidence": ["python/tests/test_upstream_common.py::test_update_many_with_embedded_ids_persists"],
+          "kind": "public_scenarios",
+          "note": "Embedded-document ID mutation counts and exact stored identity are checked after reopening native storage."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_collection_attributes.py",
+      "sha256": "3301ed2c8ac78fba77893d0e0496921a9aed1f4cdaffb6e2c427fe8704a107ab",
+      "reference_case_count": 10,
+      "function_count": 2,
+      "coverage": [
+        {
+          "source": ["test_collection_attributes_select_dotted_children_across_backends"],
+          "evidence": ["python/tests/test_upstream_common.py::test_dotted_children_private_names_and_typo_errors_are_driver_compatible"],
+          "kind": "public_scenarios",
+          "note": "Dotted children, bracket/private-name access, separate namespaces and typo errors are checked, plus local input snapshots and reopen. Error classes match; messages name real PyMongo types rather than TinyMongo types. Reference backend variants are not BriskDB backends."
+        },
+        {
+          "source": ["test_async_collection_attributes_select_dotted_children_across_backends"],
+          "evidence": ["python/tests/test_upstream_common.py::test_dotted_children_keep_async_reads_names_and_input_snapshots"],
+          "kind": "public_scenarios",
+          "note": "The corresponding async dotted-child, private-name, independent read and typo behavior is tested with the real PyMongo async client; message class names and backend variants remain as above."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_thread_safety.py",
+      "sha256": "c9c881bdffa3c8670d000f2f29321f96b48ded018cc9a7c62ea8d723acbca4eb",
+      "reference_case_count": 5,
+      "function_count": 3,
+      "coverage": [
+        {
+          "source": ["test_concurrent_first_database_access_reuses_one_cached_handle"],
+          "evidence": ["python/tests/test_upstream_common.py::test_concurrent_database_selection_keeps_public_identity_not_a_private_cache"],
+          "kind": "implementation_specific",
+          "note": "TinyMongo's private _databases cache, monkeypatched constructor count and same-object identity are not PyMongo's handle model. Eight synchronized selectors check equivalent logical handles, one owning client, no implicit catalog writes and visibility through every selected collection instead. This does not claim a shared Python object cache."
+        },
+        {
+          "source": ["test_compatibility_concern_documents_are_not_shared"],
+          "evidence": ["python/tests/test_upstream_common.py::test_concern_documents_are_independent_snapshots"],
+          "kind": "public_scenarios",
+          "note": "Mutating returned read/write concern dictionaries cannot mutate later snapshots or another concern view."
+        },
+        {
+          "source": ["test_shared_collection_builds_its_table_inside_the_write_lock"],
+          "evidence": [
+            "python/tests/test_upstream_common.py::test_shared_collection_concurrent_writes_do_not_lose_updates",
+            "python/tests/test_upstream_common.py::test_shared_async_collection_serializes_competing_increments"
+          ],
+          "kind": "native_equivalent",
+          "note": "Real competing update_one/update_many/replace_one operations on one shared collection check matched counts and no lost increments; async competitors are also covered. TinyMongo's build_table monkeypatch/single-build-call assertion has no native counterpart. These are bounded single-record tests, not global atomicity or a sustained soak claim."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_multi_write.py",
+      "sha256": "a752a84e19cbb729d0c0f867fb891408f7ebd22f16bfca4294458b4c3b91640a",
+      "reference_case_count": 1,
+      "function_count": 1,
+      "coverage": [
+        {
+          "source": ["test_multi_writer_stress"],
+          "evidence": ["python/tests/test_upstream_common.py::test_six_spawned_writers_preserve_every_acknowledged_document"],
+          "kind": "contract_difference",
+          "note": "On supported Linux/macOS shared-root lock hosts, six spawned processes each own a BriskDB client/listener and insert 50 generated-ID records; parent checks all exit codes, exact 300 values/unique IDs after reopen, with bounded joins and owned-child cleanup. Other platforms explicitly skip this host-dependent test. Unlike TinyDB implicit creation, schema is created before overlapping native roots because shared-root DDL admission is explicitly separate. No inherited native runtime, retry masking, unbounded soak or cross-process schema-creation claim."
         }
       ]
     }
