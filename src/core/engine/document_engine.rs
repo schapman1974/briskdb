@@ -60,8 +60,8 @@ const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
 const DOCUMENT_READ_ACCESS_BYTES: u64 = 32;
-// Four counters, bounded shard bookkeeping, and at most 64 u16 shard IDs.
-const DOCUMENT_READ_STATS_BYTES: u64 = 192;
+// Aggregate counters, shard IDs and at most 64 bounded per-shard row summaries.
+const DOCUMENT_READ_STATS_BYTES: u64 = 2048;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
 const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
@@ -1763,7 +1763,7 @@ impl Engine {
                                 cancellation,
                             )?;
                             if let Some(stats) = &stats {
-                                stats.examine(u64::from(record.is_some()));
+                                stats.examine(shard, u64::from(record.is_some()));
                             }
                             Ok((id_key, record))
                         },
@@ -1776,7 +1776,7 @@ impl Engine {
                     return Ok((Vec::new(), false));
                 };
                 if let Some(stats) = &state.read_stats {
-                    stats.source_match();
+                    stats.source_match(shard);
                 }
                 // Sorting validates the original value even when skip removes
                 // this point result; array-key errors must not be hidden.
@@ -2121,7 +2121,7 @@ fn next_matching_document(
             return Ok(None);
         };
         if let Some(stats) = stats {
-            stats.examine(1);
+            stats.examine(shard, 1);
         }
         if let Some(matcher) = matcher {
             if let Some(stats) = stats {
@@ -2133,7 +2133,7 @@ fn next_matching_document(
             }
         }
         if let Some(stats) = stats {
-            stats.source_match();
+            stats.source_match(shard);
         }
         check()?;
         return Ok(Some(record));

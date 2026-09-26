@@ -99,13 +99,28 @@ pub(super) struct CursorState {
     pub read_stats: Option<Arc<ReadStats>>,
 }
 
-#[derive(Default)]
 pub(super) struct ReadStats {
     storage_reads: AtomicU64,
     documents_examined: AtomicU64,
     matcher_evaluations: AtomicU64,
     source_matches: AtomicU64,
     shard_mask: AtomicU64,
+    documents_by_shard: [AtomicU64; 64],
+    matches_by_shard: [AtomicU64; 64],
+}
+
+impl Default for ReadStats {
+    fn default() -> Self {
+        Self {
+            storage_reads: AtomicU64::new(0),
+            documents_examined: AtomicU64::new(0),
+            matcher_evaluations: AtomicU64::new(0),
+            source_matches: AtomicU64::new(0),
+            shard_mask: AtomicU64::new(0),
+            documents_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
+            matches_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 impl ReadStats {
@@ -118,15 +133,17 @@ impl ReadStats {
         self.shard_mask.fetch_or(1_u64 << shard, Ordering::Relaxed);
     }
 
-    pub fn examine(&self, documents: u64) {
+    pub fn examine(&self, shard: u16, documents: u64) {
         Self::add(&self.documents_examined, documents);
+        Self::add(&self.documents_by_shard[usize::from(shard)], documents);
     }
     pub fn match_document(&self) {
         Self::add(&self.matcher_evaluations, 1);
     }
 
-    pub fn source_match(&self) {
+    pub fn source_match(&self, shard: u16) {
         Self::add(&self.source_matches, 1);
+        Self::add(&self.matches_by_shard[usize::from(shard)], 1);
     }
 
     fn add(counter: &AtomicU64, value: u64) {
@@ -142,6 +159,8 @@ impl ReadStats {
             self.matcher_evaluations.load(Ordering::Relaxed),
             self.source_matches.load(Ordering::Relaxed),
             self.shard_mask.load(Ordering::Relaxed),
+            std::array::from_fn(|i| self.documents_by_shard[i].load(Ordering::Relaxed)),
+            std::array::from_fn(|i| self.matches_by_shard[i].load(Ordering::Relaxed)),
         )
     }
 }
@@ -563,14 +582,15 @@ mod tests {
         counters.storage_read(0);
         counters.storage_read(63);
         counters.storage_read(63);
-        counters.examine(u64::MAX);
-        counters.examine(1);
+        counters.examine(63, u64::MAX);
+        counters.examine(63, 1);
         counters.match_document();
         counters
             .source_matches
             .store(u64::MAX - 1, Ordering::Relaxed);
-        counters.source_match();
-        counters.source_match();
+        counters.matches_by_shard[63].store(u64::MAX - 1, Ordering::Relaxed);
+        counters.source_match(63);
+        counters.source_match(63);
         let snapshot = state.finish_read_stats().unwrap();
         assert!(state.read_stats.is_none());
         assert_eq!(snapshot.storage_reads(), 3);
@@ -578,7 +598,42 @@ mod tests {
         assert_eq!(snapshot.matcher_evaluations(), 1);
         assert_eq!(snapshot.source_matches(), u64::MAX);
         assert_eq!(snapshot.shards_read().collect::<Vec<_>>(), vec![0, 63]);
+        assert_eq!(
+            snapshot
+                .shard_work()
+                .map(|row| (row.shard(), row.documents_examined(), row.source_matches()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (63, u64::MAX, u64::MAX)]
+        );
         assert!(state.finish_read_stats().is_none());
+    }
+
+    #[test]
+    fn read_stats_attribute_concurrent_rows_to_all_64_shards_without_labels() {
+        let counters = ReadStats::default();
+        std::thread::scope(|scope| {
+            for worker in 0_u16..8 {
+                let counters = &counters;
+                scope.spawn(move || {
+                    for n in 0..128 {
+                        let shard = worker * 8 + n % 8;
+                        counters.storage_read(shard);
+                        counters.examine(shard, 3);
+                        counters.source_match(shard);
+                    }
+                });
+            }
+        });
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.storage_reads(), 1024);
+        assert_eq!(snapshot.documents_examined(), 3072);
+        assert_eq!(snapshot.source_matches(), 1024);
+        assert_eq!(snapshot.shard_work().count(), 64);
+        for (shard, row) in snapshot.shard_work().enumerate() {
+            assert_eq!(row.shard(), shard as u16);
+            assert_eq!(row.documents_examined(), 48);
+            assert_eq!(row.source_matches(), 16);
+        }
     }
 
     #[test]

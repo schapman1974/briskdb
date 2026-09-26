@@ -77,21 +77,31 @@ class PythonDocumentApiTests(unittest.TestCase):
                         session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": identity % 3})
                     self.assertNotIn("read_stats", session.find(DATABASE, COLLECTION))
                     result = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True)
-                    self.assertEqual(result["read_stats"], {"storage_reads": 16, "documents_examined": 12, "matcher_evaluations": 12, "source_matches": 4, "shards_read": [0, 1, 2, 3]})
+                    self.assertEqual({k: v for k, v in result["read_stats"].items() if k != "shard_work"}, {"storage_reads": 16, "documents_examined": 12, "matcher_evaluations": 12, "source_matches": 4, "shards_read": [0, 1, 2, 3]})
+                    by_shard = [{"shard": i, "documents_examined": 0, "source_matches": 0} for i in range(4)]
+                    for identity in range(12):
+                        located = session.find(DATABASE, COLLECTION, {"_id": identity})
+                        shard = located["plan"]["shards"][0]
+                        by_shard[shard]["documents_examined"] += 1
+                        by_shard[shard]["source_matches"] += int(identity % 3 == 1)
+                    self.assertEqual(result["read_stats"]["shard_work"], by_shard)
                     self.assertNotIn("read_access", result["plan"])
                     session.create_built_index(DATABASE, COLLECTION, {"v": 1})
                     indexed = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True, plan_diagnostics=True)
                     self.assertEqual(indexed["read_stats"]["documents_examined"], 4)
                     self.assertEqual(indexed["read_stats"]["source_matches"], 4)
+                    self.assertEqual(indexed["read_stats"]["shard_work"], [{"shard": row["shard"], "documents_examined": row["source_matches"], "source_matches": row["source_matches"]} for row in by_shard])
                     self.assertEqual(indexed["documents"], result["documents"])
                     point = session.find(DATABASE, COLLECTION, {"_id": 1}, execution_stats=True)
                     self.assertEqual(point["read_stats"]["storage_reads"], 1)
                     self.assertEqual(point["read_stats"]["matcher_evaluations"], 0)
                     self.assertEqual(point["read_stats"]["source_matches"], 1)
+                    self.assertEqual(point["read_stats"]["shard_work"], [{"shard": point["plan"]["shards"][0], "documents_examined": 1, "source_matches": 1}])
                     self.assertEqual(point["read_stats"]["shards_read"], point["plan"]["shards"])
                     first = session.find(DATABASE, COLLECTION, batch_size=0, execution_stats=True)
                     self.assertEqual(first["read_stats"]["storage_reads"], 0)
                     self.assertEqual(first["read_stats"]["source_matches"], 0)
+                    self.assertEqual(first["read_stats"]["shard_work"], [])
                     next_page = session.get_more(DATABASE, COLLECTION, first["cursor_id"], batch_size=1, execution_stats=True)
                     self.assertGreater(next_page["read_stats"]["storage_reads"], 0)
                     last = session.get_more(DATABASE, COLLECTION, next_page["cursor_id"])
@@ -110,6 +120,11 @@ class PythonDocumentApiTests(unittest.TestCase):
                     self.assertEqual(len(filtered["documents"]), 4)
                     self.assertEqual(filtered["read_stats"]["source_matches"], filtered["read_stats"]["documents_examined"])
                     self.assertGreaterEqual(filtered["read_stats"]["source_matches"], 12)
+                    for execution in (result, indexed, point, first, next_page, distinct, aggregate, skipped, filtered):
+                        observed = execution["read_stats"]
+                        self.assertEqual([row["shard"] for row in observed["shard_work"]], observed["shards_read"])
+                        for field in ("documents_examined", "source_matches"):
+                            self.assertEqual(sum(row[field] for row in observed["shard_work"]), observed[field])
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.find(DATABASE, COLLECTION, execution_stats=True, max_result_bytes=1)
 

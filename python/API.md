@@ -196,13 +196,20 @@ or `distinct` adds `result["read_stats"]` in either API style:
 result = session.find("app", "notes", {"tag": "work"},
                       plan_diagnostics=True, execution_stats=True)
 print(result["plan"], result["read_stats"])
+for shard in result["read_stats"]["shard_work"]:
+    print(shard["shard"], shard["documents_examined"], shard["source_matches"])
 ```
 
 The counters are `storage_reads` (point/candidate record-read calls, including
 misses), `documents_examined` (stored BSON records received before filtering or
 projection), `matcher_evaluations` (full source-matcher evaluations),
 `source_matches` (record observations accepted by the source predicate), and
-`shards_read` (distinct physical shards where those calls ran). Lookahead and
+`shards_read` (distinct physical shards where those calls ran). `shard_work`
+contains at most 64 dictionaries with `shard`, `documents_examined` and
+`source_matches`, ordered by physical ordinal for actually-read shards.
+Empty probes have zero rows; buffered output has an empty list. It exposes
+row-work distribution without namespace labels, not CPU or physical I/O skew.
+Lookahead and
 sorting rescans count again; these are not distinct-document counts. Source
 matches include unfiltered reads and direct-ID hits before sort-position
 rechecks, projection, skip/limit and pipeline stages, not final output rows. Buffered
@@ -210,8 +217,9 @@ aggregation output can have zero source reads on a later page. Pipeline
 predicates, catalog queries, index-entry work and SQLite pages/bytes are not
 measured by these counters. Each request starts from zero; repeat the flag on
 each continuation. Empty initial batches do zero record reads. This independent
-option works with exact-ID points too and adds a fixed conservative 192-byte
-logical result-budget charge (covering up to 64 shard IDs). Counters saturate at
+option works with exact-ID points too and adds a fixed conservative 2,048-byte
+logical result-budget charge (covering up to 64 shard IDs and row-work summaries;
+previously 192 bytes for aggregate-only statistics). Counters saturate at
 `u64::MAX`; failed requests return no snapshot. Defaults allocate no collector
 and keep existing output unchanged. This is a native diagnostic API, not MongoDB
 `explain`/`executionStats`; counts, mutations and catalog reads do not expose it.

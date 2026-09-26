@@ -79,12 +79,18 @@ class DocumentCollectionInfo(TypedDict):
     placement: DocumentPlacementInfo
     indexes: List[DocumentIndexInfo]
 
+class DocumentShardReadStats(TypedDict):
+    shard: int
+    documents_examined: int
+    source_matches: int
+
 class DocumentReadStats(TypedDict):
     storage_reads: int
     documents_examined: int
     matcher_evaluations: int
     source_matches: int
     shards_read: List[int]
+    shard_work: List[DocumentShardReadStats]
 
 class DocumentExecutionDiagnostics(TypedDict, total=False):
     read_stats: DocumentReadStats

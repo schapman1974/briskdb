@@ -395,14 +395,20 @@ record-read call counts, BSON documents examined, source-matcher evaluations,
 observation accepted by the source predicate, including direct-ID hits and
 unfiltered reads, before sort-position rechecks, projection, skip/limit and
 pipeline stages. It is not a unique-document or returned-row count.
-Exact-ID, pruned-shard, natural,
+`shard_work()` adds examined/matched observations for each actually-read physical
+shard, sorted by ordinal, including zero-row empty probes; buffered pages have
+no entries. Two fixed 64-slot arrays preserve the bounded native `Copy` snapshot
+without namespace labels or per-record state. These are row-work counters, not
+CPU or physical page/byte measurements. Exact-ID, pruned-shard, natural,
 sorted, distinct and aggregation source reads share the collector. Lookahead
 and repeated sorting/source reads count again, including sorted-output refetches
 and their matcher rechecks; buffered aggregation pages can
 correctly report zero source work. Pipeline predicates, catalog/index-entry
 work and physical SQLite rows/pages/bytes are excluded. Each requested page
 starts fresh, detaches the collector before cursor retention, and charges a
-fixed conservative 192 bytes in output limits/page packing. Unrequested reads
+fixed conservative 2,048 bytes in output limits/page packing, including up to
+64 per-shard summaries (previously 192 bytes for aggregate-only statistics).
+Unrequested reads
 allocate no collector or update counters. Failed/aborted requests return no
 snapshot; counters saturate rather than wrap. This does not change filtering,
 routing, transaction boundaries or MongoDB wire explain support.

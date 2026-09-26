@@ -40,6 +40,11 @@ pub struct MongoReadMetrics {
     /// Read requests touching each fixed physical shard ordinal, not row counts.
     /// Ordinals are shared across namespaces; no identity becomes a label.
     pub shard_requests: [u64; 64],
+    /// Examined BSON record observations per physical ordinal, including rereads.
+    pub shard_documents_examined: [u64; 64],
+    /// Source predicate acceptances per physical ordinal, including rereads.
+    /// This is row-work distribution, not CPU, bytes or unique-result skew.
+    pub shard_source_matches: [u64; 64],
 }
 
 pub(super) struct ReadCounters {
@@ -58,6 +63,8 @@ pub(super) struct ReadCounters {
     peak_shards: AtomicU64,
     fanout: [AtomicU64; 8],
     shards: [AtomicU64; 64],
+    shard_documents: [AtomicU64; 64],
+    shard_matches: [AtomicU64; 64],
 }
 
 impl Default for ReadCounters {
@@ -78,6 +85,8 @@ impl Default for ReadCounters {
             peak_shards: AtomicU64::new(0),
             fanout: std::array::from_fn(|_| AtomicU64::new(0)),
             shards: std::array::from_fn(|_| AtomicU64::new(0)),
+            shard_documents: std::array::from_fn(|_| AtomicU64::new(0)),
+            shard_matches: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -112,8 +121,11 @@ impl ReadCounters {
             add(&self.planned_shards, plan.shards().len() as u64);
         }
         let mut visits = 0;
-        for shard in stats.shards_read() {
-            add(&self.shards[usize::from(shard)], 1);
+        for work in stats.shard_work() {
+            let shard = usize::from(work.shard());
+            add(&self.shards[shard], 1);
+            add(&self.shard_documents[shard], work.documents_examined());
+            add(&self.shard_matches[shard], work.source_matches());
             visits += 1;
         }
         add(&self.shard_visits, visits);
@@ -142,6 +154,8 @@ impl ReadCounters {
             peak_shards_read: get(&self.peak_shards),
             fanout_buckets: std::array::from_fn(|i| get(&self.fanout[i])),
             shard_requests: std::array::from_fn(|i| get(&self.shards[i])),
+            shard_documents_examined: std::array::from_fn(|i| get(&self.shard_documents[i])),
+            shard_source_matches: std::array::from_fn(|i| get(&self.shard_matches[i])),
         }
     }
 }

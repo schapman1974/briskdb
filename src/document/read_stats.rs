@@ -10,6 +10,8 @@ pub struct DocumentReadStats {
     matcher_evaluations: u64,
     source_matches: u64,
     shard_mask: u64,
+    documents_by_shard: [u64; 64],
+    matches_by_shard: [u64; 64],
 }
 
 impl DocumentReadStats {
@@ -19,6 +21,8 @@ impl DocumentReadStats {
         matcher_evaluations: u64,
         source_matches: u64,
         shard_mask: u64,
+        documents_by_shard: [u64; 64],
+        matches_by_shard: [u64; 64],
     ) -> Self {
         Self {
             storage_reads,
@@ -26,6 +30,8 @@ impl DocumentReadStats {
             matcher_evaluations,
             source_matches,
             shard_mask,
+            documents_by_shard,
+            matches_by_shard,
         }
     }
 
@@ -57,5 +63,41 @@ impl DocumentReadStats {
     /// Distinct physical shards on which a record-read call actually ran.
     pub fn shards_read(&self) -> impl Iterator<Item = u16> + '_ {
         (0_u16..64).filter(|shard| self.shard_mask & (1_u64 << shard) != 0)
+    }
+
+    /// Per-physical-shard row observations, in ascending ordinal order, only
+    /// for shards actually read. Empty probes have zero rows; buffered output
+    /// has no entries. Repeated reads retain the same semantics as the totals.
+    /// This measures read-row distribution, not CPU time or SQLite page I/O.
+    pub fn shard_work(&self) -> impl Iterator<Item = DocumentShardReadStats> + '_ {
+        self.shards_read().map(|shard| DocumentShardReadStats {
+            shard,
+            documents_examined: self.documents_by_shard[usize::from(shard)],
+            source_matches: self.matches_by_shard[usize::from(shard)],
+        })
+    }
+}
+
+/// Bounded, payload-free row observations for one physical shard ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentShardReadStats {
+    shard: u16,
+    documents_examined: u64,
+    source_matches: u64,
+}
+
+impl DocumentShardReadStats {
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+
+    /// BSON records observed before source filtering; repeated reads count again.
+    pub const fn documents_examined(&self) -> u64 {
+        self.documents_examined
+    }
+
+    /// Source predicate acceptances before pagination/projection/pipeline output.
+    pub const fn source_matches(&self) -> u64 {
+        self.source_matches
     }
 }

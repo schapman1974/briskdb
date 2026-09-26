@@ -120,6 +120,11 @@ def sync_contract(path: str) -> None:
         examined: int = measured["read_stats"]["documents_examined"]
         read_shards: List[int] = measured["read_stats"]["shards_read"]
         print(examined, read_shards)
+        for shard_work in measured["read_stats"]["shard_work"]:
+            ordinal: int = shard_work["shard"]
+            observed: int = shard_work["documents_examined"]
+            accepted: int = shard_work["source_matches"]
+            print(ordinal, observed, accepted)
     if diagnostic_plan is not None and "read_access" in diagnostic_plan:
         access = diagnostic_plan["read_access"]
         if access["kind"] == "index_candidates":
@@ -210,6 +215,13 @@ async def async_contract(path: str) -> None:
     aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1, plan_diagnostics=True, execution_stats=True))["documents"]
     print(aggregated)
     projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}, plan_diagnostics=True, execution_stats=True))["documents"]
+    measured = await session.find("app", "typed", execution_stats=True)
+    if "read_stats" in measured:
+        for shard_work in measured["read_stats"]["shard_work"]:
+            ordinal: int = shard_work["shard"]
+            observed: int = shard_work["documents_examined"]
+            accepted: int = shard_work["source_matches"]
+            print(ordinal, observed, accepted)
     continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1, plan_diagnostics=True, execution_stats=True))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     deleted_many: int = (await session.delete_many("app", "typed", {}))["deleted_count"]

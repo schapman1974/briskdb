@@ -43,6 +43,16 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     assert!(observed.representation_eq(&plain));
     let scan = server.metrics().reads;
     assert_eq!(
+        scan.shard_documents_examined.iter().sum::<u64>(),
+        scan.documents_examined
+    );
+    assert_eq!(
+        scan.shard_source_matches.iter().sum::<u64>(),
+        scan.source_matches
+    );
+    assert!(scan.shard_documents_examined[2..].iter().all(|n| *n == 0));
+    assert!(scan.shard_source_matches[2..].iter().all(|n| *n == 0));
+    assert_eq!(
         (
             scan.executions,
             scan.storage_reads,
@@ -68,6 +78,16 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     )
     .await;
     let point = server.metrics().reads;
+    assert_eq!(
+        point.shard_documents_examined.iter().sum::<u64>()
+            - scan.shard_documents_examined.iter().sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        point.shard_source_matches.iter().sum::<u64>()
+            - scan.shard_source_matches.iter().sum::<u64>(),
+        1
+    );
     assert_eq!(point.point_plans, 1);
     assert_eq!(point.storage_reads - scan.storage_reads, 1);
     assert_eq!(point.documents_examined - scan.documents_examined, 1);
@@ -96,6 +116,16 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
             .representation_eq(&plain)
     );
     let indexed = server.metrics().reads;
+    for shard in 0..64 {
+        assert_eq!(
+            indexed.shard_documents_examined[shard] - point.shard_documents_examined[shard],
+            scan.shard_source_matches[shard]
+        );
+        assert_eq!(
+            indexed.shard_source_matches[shard] - point.shard_source_matches[shard],
+            scan.shard_source_matches[shard]
+        );
+    }
     assert_eq!(indexed.index_candidate_plans, 1);
     assert_eq!(indexed.documents_examined - point.documents_examined, 2);
     assert_eq!(indexed.matcher_evaluations - point.matcher_evaluations, 2);
@@ -115,6 +145,16 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
             .representation_eq(&plain)
     );
     let sorted = server.metrics().reads;
+    for shard in 0..64 {
+        assert_eq!(
+            sorted.shard_documents_examined[shard] - indexed.shard_documents_examined[shard],
+            2 * scan.shard_source_matches[shard]
+        );
+        assert_eq!(
+            sorted.shard_source_matches[shard] - indexed.shard_source_matches[shard],
+            2 * scan.shard_source_matches[shard]
+        );
+    }
     // The indexed key window reads two matches, then output fetches recheck both.
     assert_eq!(
         sorted.index_candidate_plans - indexed.index_candidate_plans,
@@ -193,6 +233,8 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     );
     assert_eq!(empty.fanout_buckets[0], 1);
     assert_eq!(empty.source_matches, 0);
+    assert_eq!(empty.shard_documents_examined, [0; 64]);
+    assert_eq!(empty.shard_source_matches, [0; 64]);
     server.set_read_metrics_enabled(false);
     assert_eq!(
         live_cursor_id(&send_command(&mut stream, &cursor_more("read_metrics", id, 1)).await),
@@ -231,6 +273,14 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     assert_eq!(buffered.output_items - aggregated.output_items, 6);
     assert_eq!(buffered.storage_reads, aggregated.storage_reads);
     assert_eq!(buffered.source_matches, aggregated.source_matches);
+    assert_eq!(
+        buffered.shard_documents_examined,
+        aggregated.shard_documents_examined
+    );
+    assert_eq!(
+        buffered.shard_source_matches,
+        aggregated.shard_source_matches
+    );
     assert_eq!(buffered.shard_visits, aggregated.shard_visits);
     assert_eq!(buffered.fanout_buckets[0] - aggregated.fanout_buckets[0], 1);
     let values = send_command(
@@ -256,6 +306,14 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     );
     assert_eq!(distinct.shard_visits - buffered.shard_visits, 2);
     assert_eq!(distinct.source_matches - buffered.source_matches, 13);
+    assert_eq!(
+        distinct.shard_documents_examined.iter().sum::<u64>(),
+        distinct.documents_examined
+    );
+    assert_eq!(
+        distinct.shard_source_matches.iter().sum::<u64>(),
+        distinct.source_matches
+    );
     // Stale continuations do not fabricate successful read work.
     assert_eq!(
         send_command(&mut stream, &cursor_more("read_metrics", id, 1000))
