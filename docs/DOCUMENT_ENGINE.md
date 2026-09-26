@@ -249,8 +249,9 @@ Pending declarations participate in conflict checks and matching ones are built.
 The ascending built-in ID request is a no-op with actual Ready counts; descending
 ID creation is unsupported. The older singleton declaration/build APIs retain
 their existing permissive naming behavior.
-Broader planner candidates, whole-bulk post-image uniqueness and selector compatibility
-remain open under #174/#183. Ready-index discovery is
+Broader planner candidates and selector compatibility remain open under #178/#174.
+Whole-bulk post-image uniqueness is not promised by the alpha transaction policy.
+Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 ### Equality index candidates
@@ -419,8 +420,33 @@ This is **per-record/per-shard enforcement**, not globally atomic bulk updates.
 Earlier shard/input commits can survive a later conflict. A multi-update whose
 eventual post-image is unique can still fail if an intermediate key belongs to
 another record (for example, shifting unique values `[1, 2]` to `[2, 3]`). The
-locked TinyMongo backends disagree here; sharded whole-post-image parity and a
-crash-safe cross-shard coordinator remain issue #183.
+locked TinyMongo backends disagree here: the memory backend accepts that shift,
+whereas SQLite and same-shard sqlite-sharded reject it and preserve the old image.
+The source-locked `test_mongo_write_boundaries.py` records that distinction without
+changing the frozen corpus or its allowances. BriskDB retains incremental unique
+validation and shard-local rollback, not a new cross-shard coordinator, in line
+with the [#74 decision](../ROADMAP.md#cross-shard-transaction-policy--alpha-decision-74).
+
+The #183 process-death matrix terminates immediately before and after **every**
+commit in a six-input insert and four-shard update-many/delete-many (28 crash
+positions). Inputs deliberately interleave physical shards; one shard is empty
+and others have unequal record counts. Reopen checks exact BSON/natural order,
+Ready unique and multikey index queries for both removed and surviving keys,
+and released writer/pool/schema resources. Stable-ID unordered insert replay
+reports duplicate indices for committed inputs; a version-filtered update retry
+changes only remaining records; repeated deletion removes only survivors. A
+second replay and another reopen verify records and indexes remain consistent.
+These are application-controlled reconciliation patterns, **not** Mongo retryable
+writes, request-ID deduplication, or a safe replay promise for arbitrary `$inc`.
+
+Existing tests separately cover concurrent independent-process unique writers,
+known rollback versus prior-shard commits in native/wire errors, ordered/unordered
+insert errors, cancellation and failed commit/rollback. Together they establish
+the selected non-atomic contract: successful replies have exact committed counts;
+indexed errors only certify their documented scope; command failures or lost
+replies never imply global rollback or carry fabricated partial counts. Abrupt
+process exit does not simulate power loss or every filesystem fault; broader
+filesystem fault injection, soak and release drills remain #68/#185/#187.
 
 `DocumentIndexKeyGenerator` generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
@@ -708,7 +734,7 @@ with scope `One`, with one current record/post-image retained at a time.
 On validation, cancellation, or storage failure, the current shard rolls back;
 earlier committed shards remain changed. There is no cross-shard snapshot or
 all-or-nothing transaction, nor a claim of MongoDB's individual-document failure
-boundary or frozen TinyMongo's collection-wide validation boundary. Successful
+boundary or a uniform collection-wide validation boundary across TinyMongo backends. Successful
 final commits are not reclassified by late cancellation. A runtime failure is
 certified as having no committed document changes only after an explicit
 rollback succeeds and earlier shards reported zero modifications (earlier

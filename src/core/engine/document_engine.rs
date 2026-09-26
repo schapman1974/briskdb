@@ -23,6 +23,8 @@ mod metadata;
 mod single_mutation;
 mod sorting;
 mod update_many;
+#[cfg(test)]
+mod write_recovery;
 mod write_transaction;
 
 use write_transaction::write_transaction;
