@@ -331,11 +331,49 @@ fallback entries and request controls apply. An unbounded OR branch, regex
 membership or unsupported value cannot silently disappear from the union.
 Public single-equality inference and aggregate source accounting are unchanged.
 
+Necessary string `$gt`/`$gte`/`$lt`/`$lte` predicates can now filter entries of a
+single-component Ready index before BSON decoding. Direct fields and positive
+ANDs select **one** necessary bound, never intersecting independent array-member
+matches. The SQL binds the encoded bound and fallback marker, guards the versioned
+single-string frame, and compares only its UTF-8 payload as a BLOB. Length prefixes,
+numeric encodings and SQLite text coercion do not define order. NUL, unequal-length
+and non-ASCII strings retain the matcher's ordering. Multikey candidates are grouped
+before pagination, and fallback records remain included for the full matcher.
+Sparse indexes are safe because a string match requires presence; partial indexes
+still require the existing independent membership proof. Equality/finite candidates
+remain preferred. Numeric and other non-string ranges, compound ranges, unproven
+OR/NOT/elemMatch and partial implications retain existing scans/other proven probes.
+No index format changes or new JSON shadow representation are required.
+
+This is a **candidate-entry filter**, not an ordered B-tree range seek or index-only
+read: SQLite can walk nonmatching entries, while BriskDB avoids fetching/decoding
+their BSON. Existing natural-order streaming, checksum checks, cursor-page authority,
+request limits, cancellation and atomic index maintenance remain in force. Unit/SQL
+properties cover arbitrary Unicode/multikey inputs and no false negatives; native
+and real-driver comparisons cover reads, mutations, restart, index churn and
+corruption. The manual `string_range_candidate_benchmark` records timing and actual
+BSON-examination counts on a same-root scan/index comparison.
+
+Local evidence (2026-09-26, macOS ARM64, Cargo dev profile): three independent
+same-root trials, each with 1,000 documents, 4-KiB payloads, four shards, one warmup
+and ten measured finds per path. Raw total microseconds:
+
+| Trial | 10-match scan | 10-match indexed | No-match scan | No-match indexed |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 1,236,385 | 518,672 | 1,186,448 | 473,400 |
+| 2 | 1,323,236 | 516,914 | 1,216,873 | 476,140 |
+| 3 | 1,225,570 | 532,212 | 1,230,285 | 489,461 |
+
+Every trial asserted identical result cardinality and reduced BSON examinations
+from 10,000 to 100 (selective) or zero (no match). These are local debug-build
+measurements demonstrating this candidate-filter benefit, not release throughput,
+physical-I/O counts, a cross-platform threshold or a substitute for #185.
+
 Native find, get-more, distinct and aggregation can opt into payload-free
 read-plan diagnostics with `DocumentReadOptions::with_plan_diagnostics(true)`
 (Python: `plan_diagnostics=True`). `DocumentScatterPlan::read_access()` then
 reports `DocumentReadAccess::IndexCandidates` with a numeric index identity,
-proof kind and finite key count, or `Scan` with an unfiltered/no-ready-index/
+proof kind and key count (one bound for `StringRange`), or `Scan` with an unfiltered/no-ready-index/
 no-safe-probe/probe-work-limit/aggregation-input reason. The selector is shared
 with actual reads and runs under that request's schema admission, cancellation
 and deadline. It retains no probe authority between cursor pages. Defaults and
@@ -346,7 +384,8 @@ are exposed. These are planned access paths, not measured row/shard visits,
 SQLite I/O or index-only reads. Aggregation preserves its routed source scan
 and pipeline work accounting. Counts and find-and-modify reject this native
 option; catalog commands have no data access path. MongoDB `explain` and actual
-SQLite-level execution counters remain separate work under #178.
+SQLite-level execution counters remain separate work from these native planner
+diagnostics; no Mongo `explain` response or physical-page accounting is implied.
 
 `DocumentReadOptions::with_execution_stats(true)` independently enables native
 per-request `DocumentExecution::read_stats()` (`execution_stats=True` /

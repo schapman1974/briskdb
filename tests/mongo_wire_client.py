@@ -9,6 +9,7 @@ from datetime import datetime
 
 import pymongo
 from mongo_read_options_client import sync_read_options, async_read_options
+from mongo_range_client import string_range_smoke, async_string_range_smoke
 from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure, WriteError
 
@@ -3123,6 +3124,8 @@ async def async_smoke(uri):
 if __name__ == "__main__":
     assert pymongo.version == "4.17.0", "use the pinned real-driver version"
     reopened = len(sys.argv) > 2 and sys.argv[2] == "reopened"
+    string_range_smoke(sys.argv[1], reopened)
+    asyncio.run(asyncio.wait_for(async_string_range_smoke(sys.argv[1], reopened), timeout=20))
     compression_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_compression_smoke(sys.argv[1], reopened), timeout=20))
     id_in_routing_smoke(sys.argv[1], reopened)

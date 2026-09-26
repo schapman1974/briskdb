@@ -59,6 +59,11 @@ pub(crate) struct DocumentIndexProbe {
 pub(crate) enum DocumentIndexSelection {
     Keys(Vec<Vec<u8>>),
     SparseEntries,
+    StringRange {
+        key: Vec<u8>,
+        greater: bool,
+        inclusive: bool,
+    },
 }
 
 impl DocumentIndexProbe {
@@ -79,6 +84,7 @@ impl DocumentIndexProbe {
             key_count: match &self.selection {
                 DocumentIndexSelection::Keys(keys) => keys.len(),
                 DocumentIndexSelection::SparseEntries => 0,
+                DocumentIndexSelection::StringRange { .. } => 1,
             },
         }
     }
@@ -257,6 +263,19 @@ impl DocumentIndexPreparation {
             }
         }
         // Exact equality and finite membership retain priority across indexes.
+        for index in &self.indexes {
+            if let Some(selection) = index
+                .generator
+                .string_range_with_budget(matcher, &mut budget)?
+            {
+                return Ok(Some(DocumentIndexProbe {
+                    collection_id: self.collection_id,
+                    index_id: index.id,
+                    selection,
+                    kind: DocumentCandidateKind::StringRange,
+                }));
+            }
+        }
         // A sparse presence proof scans every entry of the selected index, not
         // an empty equality list or a retained cross-request catalog snapshot.
         for index in &self.indexes {

@@ -52,6 +52,22 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_string_range_plan_and_reduced_bson_reads_survive_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            for reopened in (False, True):
+                with briskdb.open(root, shards=4, documents=True) as database:
+                    with database.session() as session:
+                        if not reopened:
+                            session.create_collection(DATABASE, COLLECTION)
+                            for identity in range(20):
+                                session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": f"k{identity:02}"})
+                            session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                        result = session.find(DATABASE, COLLECTION, {"v": {"$gte": "k17"}}, plan_diagnostics=True, execution_stats=True)
+                        self.assertEqual([row["_id"] for row in result["documents"]], [17, 18, 19])
+                        access = result["plan"]["read_access"]
+                        self.assertEqual((access["kind"], access["candidate_kind"], access["key_count"]), ("index_candidates", "string_range", 1))
+                        self.assertEqual(result["read_stats"]["documents_examined"], 3)
+
     def test_opt_in_execution_stats_measure_reads_and_index_work(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:

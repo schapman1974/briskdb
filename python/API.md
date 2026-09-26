@@ -110,8 +110,11 @@ print(result["plan"])  # routing shards plus the selected access path
 ```
 
 An index candidate path contains `kind="index_candidates"`, a numeric `index_id`,
-`candidate_kind` (`equality`, `necessary_finite`, `logical_finite` or
-`sparse_presence`) and `key_count` (zero for sparse-entry scanning). A scan has
+`candidate_kind` (`equality`, `necessary_finite`, `logical_finite`,
+`string_range` or `sparse_presence`) and `key_count` (one bound for string ranges,
+zero for sparse-entry scanning). String ranges filter single-component index
+entries before BSON reads; they are not ordered B-tree seeks or numeric coercions.
+A scan has
 `kind="scan"` and `reason`: `unfiltered`, `no_ready_index`, `no_safe_probe`,
 `probe_work_limit` or `aggregation_input`. No filter values, encoded keys or
 index names are returned. Exact-ID point plans keep their existing shape.

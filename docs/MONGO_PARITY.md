@@ -913,8 +913,12 @@ negatives. Direct/positive-conjunctive complete scalar tuples use bound BDIK
 probes, preserve natural paging and still run the full matcher. Unproven partial indexes,
 sparse all-null tuples and unsupported/incomplete shapes scan. Native/real-driver
 tests compare filters, sorting, count/distinct, index drop/recreation between
-batches, write maintenance and reopened results. This does not close #174 or
-#178: bulk-policy decisions, broader candidate forms and final acceptance remain open.
+batches, write maintenance and reopened results. #178's bounded candidate scope
+also includes the membership/existence/logical/partial/string-range proofs below,
+native diagnostics, and local scan-versus-index benchmarks. Further optimizations
+are not required for query correctness: unproven forms use the full matcher scan.
+Broader index API compatibility remains #174; bulk boundaries are documented in
+#74/#183 and full-inventory/release acceptance remains #186/#185.
 
 Ready-index candidates also support necessary positive literal `$in` lists,
 including complete compound tuples and residual predicates under `$and`.
@@ -971,7 +975,19 @@ implications remain deliberately unproven and scan. The full matcher, fallback
 records, work/cancellation limits and fresh Ready authority remain mandatory.
 The public single-equality helper and frozen corpus are unchanged. Native
 scan/read-counter differentials and sync/async PyMongo restart fixtures verify
-selection, index churn and membership-changing writes; this is not range support.
+selection, index churn and membership-changing writes. This partial-membership
+proof does not infer stronger ranges.
+
+String ranges now add one necessary single-component index-entry filter for
+`$gt`, `$gte`, `$lt` and `$lte`. Bound parameters compare UTF-8 payload bytes only,
+with equality-frame/type guards and unconditional fallback-entry inclusion;
+length prefixes and numeric encodings are never treated as sort keys. Independent
+array predicates are not intersected. Sparse membership follows necessary string
+presence; partial membership still needs its separate proof. Numeric/non-string,
+compound and unproven logical ranges retain scans/other proven probes. The full
+matcher remains authoritative. Native diagnostics report `string_range`, and
+record counters/benchmarks distinguish avoided BSON reads from physical SQLite
+work. This is not a JSON coercion, B-tree range seek or Mongo `explain` capability.
 
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.

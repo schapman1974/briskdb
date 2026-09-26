@@ -30,6 +30,30 @@ pub(super) fn sparse() -> String {
     grouped("")
 }
 
+pub(super) fn string_range(greater: bool, inclusive: bool) -> String {
+    let operator = match (greater, inclusive) {
+        (true, false) => ">",
+        (true, true) => ">=",
+        (false, false) => "<",
+        (false, true) => "<=",
+    };
+    // BDIK v1: 12-byte tuple header, value tag, 4-byte component length.
+    // BBKY v1 string: 8-byte header, string tag, 4-byte UTF-8 length, payload.
+    // Compare ONLY the string payload as BLOB bytes, never the equality frame,
+    // its length prefix or SQLite's text/numeric coercions. Valid UTF-8 byte
+    // order equals the authoritative string order, including NUL/non-ASCII.
+    // The header/tag guards restrict this to a single string component. Tests
+    // pin these offsets against real encoder output. BDIF always remains a
+    // candidate. All runtime values are parameters; only the fixed operator is
+    // selected here. This is an entry filter, not an ordered B-tree range seek.
+    grouped(&format!(
+        " AND (e.index_key = ?6 OR (
+            substr(e.index_key, 1, 13) = substr(?5, 1, 13)
+            AND substr(e.index_key, 18, 9) = substr(?5, 18, 9)
+            AND substr(e.index_key, 31) {operator} substr(?5, 31)))"
+    ))
+}
+
 fn grouped(key_filter: &str) -> String {
     // CROSS JOIN keeps the document natural-order range as the outer loop even
     // after ANALYZE. An index-first join can materialize every matching entry in
@@ -237,3 +261,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "candidate_sql/range_tests.rs"]
+mod range_tests;

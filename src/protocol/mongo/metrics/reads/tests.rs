@@ -31,6 +31,7 @@ fn read_metrics_classify_plans_without_retaining_payloads_or_counting_unobserved
         DocumentCandidateKind::NecessaryFinite,
         DocumentCandidateKind::LogicalFinite,
         DocumentCandidateKind::SparsePresence,
+        DocumentCandidateKind::StringRange,
     ] {
         counters.observe(&execution(
             Some(DocumentPlan::Scatter(scatter.clone().with_read_access(
@@ -65,7 +66,7 @@ fn read_metrics_classify_plans_without_retaining_payloads_or_counting_unobserved
             snapshot.scan_plans,
             snapshot.unclassified_plans
         ),
-        (8, 1, 4, 1, 2)
+        (9, 1, 5, 1, 2)
     );
     assert_eq!(
         (
@@ -74,14 +75,14 @@ fn read_metrics_classify_plans_without_retaining_payloads_or_counting_unobserved
             snapshot.matcher_evaluations,
             snapshot.output_items
         ),
-        (56, 40, 24, 8)
+        (63, 45, 27, 9)
     );
     assert_eq!(
         (snapshot.planned_shard_targets, snapshot.shard_visits),
-        (19, 10)
+        (22, 12)
     );
-    assert_eq!(snapshot.fanout_buckets, [2, 2, 4, 0, 0, 0, 0, 0]);
-    assert_eq!(&snapshot.shard_requests[..3], &[4, 1, 5]);
+    assert_eq!(snapshot.fanout_buckets, [2, 2, 5, 0, 0, 0, 0, 0]);
+    assert_eq!(&snapshot.shard_requests[..3], &[5, 1, 6]);
     assert!(snapshot.shard_requests[3..].iter().all(|count| *count == 0));
     assert!(!format!("{snapshot:?}").contains("private"));
 }
