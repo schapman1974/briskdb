@@ -17,6 +17,16 @@ deadline, and result limits that may narrow the engine defaults. The returned
 the selected point or scatter plan. Reusing an identity helps correlate logs;
 it does not make a write idempotent.
 
+The [alpha transaction policy](../ROADMAP.md#cross-shard-transaction-policy--alpha-decision-74)
+keeps general distributed transactions unsupported. Document commands require a
+ready session and cannot join a caller's SQL transaction. Inserts commit per input;
+many-scope updates/deletes commit per targeted shard. The detailed failure rules
+below remain authoritative: earlier commits can survive a later failure, and
+global unique enforcement is not whole-batch atomicity. A disconnect/crash after
+commit but before delivery can leave an unknown outcome; a repeated request ID
+does not deduplicate it. Stable IDs or application-level conditional updates can
+help reconcile/retry, but there is no generic exactly-once or retryable-write promise.
+
 ## Embedded facade
 
 With the `documents` feature, the listener-free API adds these exact methods:

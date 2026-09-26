@@ -34,3 +34,10 @@ multi-shard reads, cross-shard writes, generated-key allocation, DDL,
 savepoints, transaction modes, and isolation-level options are rejected inside
 this initial explicit transaction boundary. Use predicates that identify one
 registered shard key throughout the transaction.
+
+The [alpha transaction policy](../ROADMAP.md#cross-shard-transaction-policy--alpha-decision-74)
+retains this boundary; it does not enable a general distributed coordinator.
+Mongo/document multi-shard commands have a separate per-input/per-shard commit
+contract and cannot participate in a SQL transaction. Their earlier committed
+work is not rolled back by a later shard failure. Operation-specific schema or
+global-index coordinators do not extend this explicit transaction contract.

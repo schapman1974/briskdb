@@ -58,14 +58,46 @@ compatibility matrix.
 - A transaction that touches one shard is atomic and durable according to the
   configured SQLite synchronous mode.
 - Reads or writes with an exact shard key visit one shard.
-- Multi-shard writes are rejected unless an operation explicitly opts into a
-  later, documented coordination mode.
+- General multi-shard SQL writes are rejected unless an operation explicitly
+  uses a documented operation-specific coordinator. Mongo/document batches have
+  their own non-atomic per-input/per-shard commit contract, not a distributed transaction.
 - Scatter reads merge committed results from several shards but do not provide
   a cross-file atomic snapshot in the first release.
 - Schema changes are versioned, journaled, and applied to every shard. A
   partially completed migration is visible and resumable.
 - The routing hash algorithm, key encoding, virtual-bucket count, and shard map
   are persisted and versioned in the manifest.
+
+### Cross-shard transaction policy — alpha decision (#74)
+
+Retain explicit rejection of general multi-file transactions. The current
+protocol-neutral engine already pins SQL transactions to one shard and rejects
+different-shard work before it mutates data. This policy applies to embedded
+and wire callers alike; adapters must not bypass it or simulate rollback with
+compensating writes.
+
+Document batches are a separate, explicitly non-atomic command surface: inserts
+commit per input, and update-many/delete-many commit per targeted shard. A failed
+later input/shard can leave earlier commits intact. A successful global unique
+check and its writer fence protect key ownership, not whole-batch atomicity;
+transient collisions can reject an otherwise unique eventual image. Schema and
+specialized global-index coordinators likewise do not authorize arbitrary
+cross-shard transactions. See the [document commit boundaries](docs/DOCUMENT_ENGINE.md).
+
+Cancellation, disconnect or process death after commit but before delivery can
+leave an unknown outcome. Mongo logical sessions/retryable writes are not
+advertised; document request IDs are correlation IDs, not idempotency receipts.
+Reconcile by stable document identity before retrying uncertain work. Eligible
+SQL receipt-backed writes retain only their existing, separately documented
+idempotency contract. No cross-shard snapshot, generic exactly-once behavior,
+new on-disk format, or new transaction capability is introduced by this decision.
+
+A future general coordinator requires a separate design and explicit capability:
+durable intent/decision records, fencing, bounded prepared resources, deterministic
+recovery of every participant/decision boundary, unknown-outcome reconciliation,
+retry deduplication, upgrade/backup rules and crash proofs. It is not a prerequisite
+for the documented non-atomic Mongo command surface. #183 must independently prove
+that surface's failure, retry, concurrency and recovery boundaries before closure.
 
 ## Target architecture
 
@@ -407,8 +439,10 @@ diagnose BriskDB using tested procedures.
   machine: copy, catch up, cut over map generation, verify, and retire source.
 - [ ] Make clients detect/retry stale routing generations internally.
 - [ ] Add a resumable offline reshard tool before attempting online movement.
-- [ ] Decide whether cross-shard writes remain unsupported or warrant a durable
-  transaction coordinator; do not imply atomicity without crash proofs.
+- [x] [#74](https://github.com/schapman1974/briskdb/issues/74) — retain the existing
+  single-shard explicit transaction boundary for the alpha. No general distributed
+  transaction coordinator is enabled. Mongo's additional fault/retry acceptance
+  remains tracked independently in #183.
 - [ ] Long-running soak, concurrency, filesystem fault, upgrade/downgrade, and
   compatibility suites.
 - [ ] Publish performance methodology and results against unsharded SQLite and
@@ -1053,9 +1087,10 @@ requires an earlier dependency:
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
-12. [ ] **Decide and implement the cross-shard transaction boundary.** Either
-    retain explicit rejection or add a crash-proven durable coordinator without
-    implying unsupported atomicity.
+12. [x] **Retain the single-shard transaction boundary (#74).** General distributed
+    transactions remain unsupported for the alpha. Existing operation-specific
+    coordinators and document batches keep only their documented guarantees;
+    the decision does not close #183's additional Mongo crash/retry gates.
 13. [ ] **Implement MySQL support.** Add the listener, wire lifecycle, prepared
     statements, type and error mapping, transactions, security, and real-client
     conformance after the higher-priority frontends are stable.
