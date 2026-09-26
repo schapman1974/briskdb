@@ -35,6 +35,12 @@ application matrices, security or hardening work. Index acceptance is accounted
 for separately below; the reviewed bulk-write boundary is #74/#183. Issues
 #181/#185/#186/#187/#188 retain their separate acceptance criteria.
 
+The [stopped Mongo import/backup/restore and rollback drill](OFFLINE_BACKUP.md#mongo-import-restore-and-rollback-drill)
+separately verifies real TinyMongo SQLite sources, four-shard BriskDB import,
+explicit index builds, stock PyMongo reads/writes across restore, and an unchanged
+original source for pre-cutover rollback. It does not provide online backup or
+reverse migration of writes made after cutover.
+
 To reproduce with the frozen runner's test dependencies installed:
 
 ```sh
