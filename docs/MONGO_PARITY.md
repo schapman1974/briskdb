@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 186 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 199 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -49,13 +49,13 @@ functions in the locked `test_query_more.py`,
 `test_common_api.py`, `test_collection_attributes.py`, `test_thread_safety.py`,
 `test_multi_write.py`, `test_update_operator_modifiers.py`,
 `test_array_update_modifiers.py`, `test_bson_value_types.py` and
-`test_uuid_regex.py` suites (449 reference parameter cases).
-125 owned wheel tests check public
+`test_uuid_regex.py` and `test_aggregation_basic_stages.py` suites
+(490 reference parameter cases). 136 owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 449 unchanged upstream candidate passes or complete #186 certification.
+not 490 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -104,6 +104,13 @@ collections; malformed regex cstrings fail during driver encoding. PyMongo's
 lazy query evaluation and lack of TinyMongo's private regex-only preflight and
 Remote SQL unique-value rejection hooks are explicit. Native UUID/subtype-4
 binary uniqueness and recursive numeric/boolean distinct identity are tested.
+
+Basic aggregation source coverage checks stage validation before catalog creation,
+integral numeric arguments and int64 bounds, count/projection composition,
+mixed-direction sorting, pagination position, numeric-path/parallel-array error
+precedence, result isolation and a 1,000-element shared-array sort. Non-BSON
+arguments fail driver encoding; private Python warning/helper-call counts are
+not a native API guarantee. The native sorter has its own bounded-work regression.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings

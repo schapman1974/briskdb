@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these sixteen locked suites is classified; 449 reference parameter cases are not 449 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these seventeen locked suites is classified; 490 reference parameter cases are not 490 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1546,6 +1546,129 @@
             "python/tests/test_upstream_regex_values.py::test_distinct_deduplicates_recursive_numeric_identity_but_rejects_non_bson_objects"
           ],
           "note": "Recursive numeric identity deduplicates 1/1.0 while preserving bool separation. Arbitrary Python equality objects returned by a mocked TinyMongo collection cannot enter native BSON and are rejected by the driver. Representative numeric encoding/order is not promised across native shard traversal."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_aggregation_basic_stages.py",
+      "sha256": "4422ab5942e64954c16ad886ee59ee3d1b0263cebf27655fe5a21c4765bd03f6",
+      "reference_case_count": 41,
+      "function_count": 13,
+      "coverage": [
+        {
+          "source": [
+            "test_invalid_stage_arguments_fail_before_collection_storage_is_opened"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_invalid_stage_arguments_reject_before_catalog_creation"
+          ],
+          "note": "All 29 source argument cases reject before implicit catalog creation. BSON-serializable arguments retain exact server codes; non-string keys and out-of-int64 integers instead fail driver encoding as InvalidDocument/OverflowError. Private storage-open hooks are not exposed."
+        },
+        {
+          "source": [
+            "test_sort_meta_expression_is_rejected_before_collection_storage_is_opened"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_sort_meta_rejects_before_catalog_creation"
+          ],
+          "note": "Unsupported metadata sorting rejects without catalog creation through a real PyMongo OperationFailure, not TinyMongo's custom unsupported exception/message."
+        },
+        {
+          "source": [
+            "test_integral_numeric_arguments_are_normalized_without_mutating_pipeline"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_integral_numeric_arguments_preserve_pipeline"
+          ],
+          "note": "Integral float sort/skip/limit arguments produce the expected page without changing the caller pipeline."
+        },
+        {
+          "source": [
+            "test_skip_and_limit_accept_signed_64_bit_upper_bound"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_pagination_accepts_int64_maximum"
+          ],
+          "note": "Signed-int64 maximum skip/limit are accepted. An explicit ID sort avoids promising shard-natural ordering."
+        },
+        {
+          "source": [
+            "test_count_can_feed_later_stages_and_is_empty_on_empty_input"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_count_is_empty_on_empty_input_and_feeds_projection"
+          ],
+          "note": "Empty counts emit no row; filtered counts feed later projection."
+        },
+        {
+          "source": [
+            "test_compound_sort_is_deterministic_and_does_not_mutate_documents"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_compound_sort_is_deterministic_and_results_are_isolated"
+          ],
+          "note": "Mixed-direction compound sorting is deterministic with an explicit ID tiebreaker, and mutations of returned nested values do not alter stored documents."
+        },
+        {
+          "source": [
+            "test_sort_rejects_ambiguous_numeric_array_path_with_mongodb_code",
+            "test_parallel_array_error_precedes_ambiguous_numeric_path_error"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_parallel_array_error_precedes_numeric_path_ambiguity"
+          ],
+          "note": "Native aggregation preserves code 16746 for ambiguous numeric paths and code 2 precedence for parallel arrays."
+        },
+        {
+          "source": [
+            "test_skip_and_limit_apply_at_their_pipeline_positions"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_skip_and_limit_apply_at_pipeline_positions"
+          ],
+          "note": "Two sorts around skip/limit preserve pipeline-stage ordering."
+        },
+        {
+          "source": [
+            "test_aggregation_sort_warns_once_for_each_unsupported_field_type",
+            "test_cursor_order_compatibility_helper_warns_and_handles_sort_direction"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_non_bson_sort_values_fail_encoding_not_private_python_warnings",
+            "python/tests/test_upstream_aggregation_basic.py::test_missing_scalar_and_array_sort_paths_use_native_min_max"
+          ],
+          "note": "TinyMongo's direct Python aggregation/cursor helpers warn on arbitrary non-BSON values. Those private hooks do not exist in the native engine; date/object inputs fail driver encoding. Public ascending/descending array min/max is checked separately, not a claim to reproduce private warning counts."
+        },
+        {
+          "source": [
+            "test_shared_sort_helpers_cover_missing_scalar_and_array_path_edges"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_missing_scalar_and_array_sort_paths_use_native_min_max",
+            "python/tests/test_upstream_aggregation_basic.py::test_non_bson_sort_values_fail_encoding_not_private_python_warnings"
+          ],
+          "note": "Public aggregate sorting checks scalar ancestors, out-of-bounds numeric paths, and array min/max. Native sort keys are not the private Python tuple representation; arbitrary objects cannot be encoded."
+        },
+        {
+          "source": [
+            "test_compound_sort_joins_large_shared_arrays_without_cartesian_work"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_aggregation_basic.py::test_compound_sort_handles_large_shared_array",
+            "src/document/sorting.rs::sorting_correlates_large_compound_arrays_without_cross_product"
+          ],
+          "note": "The public 1000-element shared-array result is checked alongside the bounded native sorter regression. TinyMongo's monkeypatched exactly-2000 Python call count is not a native API/performance promise."
         }
       ]
     }
