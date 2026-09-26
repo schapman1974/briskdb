@@ -997,9 +997,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, thirty-nine query/public-client suites now
-      have complete source accounting (487 functions/1,016 reference cases), backed
-      by 270 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, forty query/public-client suites now
+      have complete source accounting (505 functions/1,034 reference cases), backed
+      by 275 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1121,6 +1121,11 @@ requires an earlier dependency:
       Complex-read candidates cover exact combined filters, array/BSON/numeric
       boundaries, natural bounds/counts and broad membership. Physical index/
       catalog damage remains fail-closed, not an implicit repair or empty result.
+      Point/indexed reads add exact sync/async outcomes and native work counters:
+      one point shard/probe, zero or one examined records, and one matching
+      record examined in a 250-row indexed-array workload. Retained handles
+      observe peer logical drop/recreate; unverifiable legacy aliases reject
+      without source writes.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks

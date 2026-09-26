@@ -4272,6 +4272,32 @@ mod tests {
     }
 
     #[test]
+    fn unverifiable_legacy_container_alias_is_rejected_without_source_writes() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("app.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        create_collection(&connection, "users", false);
+        connection
+            .execute(
+                "INSERT INTO users VALUES (?1, ?2)",
+                params![
+                    "legacy-container-row",
+                    r#"{"_id":[1,2],"kind":"legacy-container"}"#,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            read_tinymongo_source(&path, &plan(&["users"]))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn legacy_scalar_spellings_follow_tinymongo_numeric_and_binary_identity() {
         assert_eq!(provable_python_float_text(1.0).as_deref(), Some("1.0"));
         assert_eq!(provable_python_float_text(1e20), None);
