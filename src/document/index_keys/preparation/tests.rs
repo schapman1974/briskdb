@@ -234,6 +234,39 @@ fn sparse_presence_is_explicit_and_loses_to_later_finite_key_probes() {
 }
 
 #[test]
+fn string_range_is_explicit_and_keeps_global_finite_key_preference() {
+    let preparation = DocumentIndexPreparation::compile(&collection([
+        secondary(2, keys()),
+        secondary(3, doc([("other", BsonValue::Int32(1))])),
+    ]))
+    .unwrap();
+    let mut query = doc([(
+        "v",
+        BsonValue::Document(doc([("$gt", BsonValue::from("a"))])),
+    )]);
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 2);
+    assert!(matches!(
+        probe.read_access(),
+        DocumentReadAccess::IndexCandidates {
+            kind: DocumentCandidateKind::StringRange,
+            key_count: 1,
+            ..
+        }
+    ));
+    query.push("other", BsonValue::Int32(3)).unwrap();
+    let probe = preparation
+        .equality_probe_with_check(&DocumentMatcher::compile(&query).unwrap(), &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 3);
+    assert_eq!(probe_keys(&probe).len(), 1);
+}
+
+#[test]
 fn nonunique_storage_fallback_is_separate_from_strict_and_unique_keys() {
     let ordinary = storage_preparation(false, keys());
     let unique = storage_preparation(true, keys());

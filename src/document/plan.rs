@@ -17,6 +17,8 @@ pub enum DocumentCandidateKind {
     NecessaryFinite,
     LogicalFinite,
     SparsePresence,
+    /// One necessary string bound on a single-component Ready index.
+    StringRange,
 }
 
 /// Why this source uses natural-order scanning instead of a secondary probe.
@@ -42,7 +44,8 @@ pub enum DocumentReadAccess {
     IndexCandidates {
         index_id: DocumentIndexId,
         kind: DocumentCandidateKind,
-        /// Zero for a sparse-entry scan; otherwise the finite probe-key count.
+        /// Zero for a sparse-entry scan, one for a string-range bound, otherwise
+        /// the finite equality probe-key count. Not a measured row count.
         key_count: usize,
     },
 }

@@ -16,6 +16,7 @@ mod membership;
 mod preparation;
 mod presence;
 mod probe;
+mod range;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
 pub use preparation::{
     DocumentIndexPreparation, MAX_DOCUMENT_PREPARED_INDEXES, PreparedDocumentIndexEntries,

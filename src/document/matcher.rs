@@ -14,6 +14,7 @@ use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 mod index_alternatives;
 mod index_partial;
+mod index_range;
 mod pull;
 mod regex_compat;
 mod upsert;

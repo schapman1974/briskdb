@@ -33,6 +33,8 @@ mod membership;
 mod partial;
 #[path = "document_index_reads/presence.rs"]
 mod presence;
+#[path = "document_index_reads/range.rs"]
+mod range;
 #[path = "document_index_reads/read_stats.rs"]
 mod read_stats;
 

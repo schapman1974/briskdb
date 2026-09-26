@@ -839,8 +839,9 @@ requires an earlier dependency:
       write maintenance and index churn across cursor requests are covered.
       Unproven partial indexes, sparse all-null tuples and unsupported/incomplete shapes
       fall back to scans. Source-locked comparisons cover 201,349 matcher
-      evaluations with no excluded true matches. Broader predicates and final
-      planner acceptance remain open under #174/#178.
+      evaluations with no excluded true matches. #178's additional predicate
+      proofs, diagnostics and benchmark acceptance are described below;
+      broader index API compatibility remains #174.
       Necessary positive `$in` lists now derive bounded complete compound tuples:
       at most 128 scalar members per list, 128 distinct tuples and 1 MiB of encoded
       keys per probe. Existing equality probes keep priority. Bound SQL candidates
@@ -874,6 +875,16 @@ requires an earlier dependency:
       counters, scan differentials, churn/membership-changing mutations and
       sync/async PyMongo restart fixtures cover the private planner extension;
       frozen public equality inference and index formats remain unchanged.
+      Necessary string ranges now filter single-component Ready entries using
+      bound UTF-8 payload comparisons, never equality-frame byte order or SQL
+      numeric coercion. One bound preserves independent multikey matches; fallback
+      records and authoritative matching stay mandatory. Sparse and independently
+      proven partial membership are supported. Numeric/compound/unproven ranges
+      retain safe scans/other proven probes. SQL Unicode/multikey properties,
+      cancellation, native read/write/restart/churn/corruption checks, real-driver
+      scan differentials and same-root benchmarks validate this #178 slice.
+      It avoids BSON decoding, not all index-entry traversal; no format change,
+      ordered range seek, JSON shadow or Mongo explain claim is introduced.
       Native Rust and sync/async Python reads now offer opt-in, payload-free
       access-path diagnostics: candidate proof/index identity/key count or a
       conservative scan reason, freshly selected on each cursor page. Default
@@ -886,7 +897,9 @@ requires an earlier dependency:
       request-local counters; lookahead/rescans count again, buffered output
       can report zero source reads, and cursors retain no collector. Default
       execution/output is unchanged. These are not SQLite page/byte counters
-      or MongoDB executionStats; final corpus and benchmark acceptance remains.
+      or MongoDB executionStats. #178's local candidate benchmarks and exact
+      frozen contract pass are separate from #186's full inventory and #185's
+      release-performance acceptance.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

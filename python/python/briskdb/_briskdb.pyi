@@ -38,7 +38,7 @@ class DocumentScanAccess(TypedDict):
 
 class DocumentIndexAccess(TypedDict):
     kind: Literal["index_candidates"]
-    candidate_kind: Literal["equality", "necessary_finite", "logical_finite", "sparse_presence"]
+    candidate_kind: Literal["equality", "necessary_finite", "logical_finite", "sparse_presence", "string_range"]
     index_id: int
     key_count: int
 

@@ -2217,6 +2217,9 @@ mod enabled {
                     Some(candidate_sql::membership(keys.len()))
                 }
                 Some(DocumentIndexSelection::SparseEntries) => Some(candidate_sql::sparse()),
+                Some(DocumentIndexSelection::StringRange {
+                    greater, inclusive, ..
+                }) => Some(candidate_sql::string_range(*greater, *inclusive)),
                 _ => None,
             };
             let sql = if let Some(sql) = grouped_sql.as_deref() {
@@ -2242,6 +2245,16 @@ mod enabled {
                     sqlite_limit,
                     probe.index_id().get() as i64,
                 ]),
+                Some((probe, DocumentIndexSelection::StringRange { key, .. })) => {
+                    statement.query(params![
+                        to_sqlite_id(collection_id)?,
+                        after_natural_order,
+                        sqlite_limit,
+                        probe.index_id().get() as i64,
+                        key,
+                        crate::document::NON_UNIQUE_FALLBACK_KEY,
+                    ])
+                }
                 Some((probe, DocumentIndexSelection::Keys(keys))) if keys.len() > 1 => {
                     use rusqlite::types::{ToSqlOutput, ValueRef};
                     // Borrow the existing encoded keys; do not make another
