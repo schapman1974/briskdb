@@ -5,44 +5,14 @@ update/path helpers. Exact provenance and helper-only exclusions live in the
 existing query suite inventory.
 """
 
-from copy import deepcopy
-import tempfile
 import unittest
 
 from pymongo.errors import WriteError
 
-import briskdb
+from _modifier_harness import ModifierHarness
 
 
-class UpstreamUpdateModifierTests(unittest.TestCase):
-    def setUp(self):
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        self.client = briskdb.MongoClient(root.name, shards=2)
-        self.addCleanup(self.client.close)
-        self.items = self.client.app.items
-
-    def apply(self, original, update):
-        before = deepcopy(original)
-        operation = deepcopy(update)
-        self.items.replace_one({"_id": original["_id"]}, original, upsert=True)
-        result = self.items.update_one({"_id": original["_id"]}, update)
-        self.assertEqual(result.matched_count, 1)
-        self.assertEqual(original, before)
-        self.assertEqual(update, operation)
-        return self.items.find_one({"_id": original["_id"]})
-
-    def reject(self, original, update, code):
-        before = deepcopy(original)
-        operation = deepcopy(update)
-        self.items.replace_one({"_id": original["_id"]}, original, upsert=True)
-        with self.assertRaises(WriteError) as caught:
-            self.items.update_one({"_id": original["_id"]}, update)
-        self.assertEqual(caught.exception.code, code)
-        self.assertEqual(self.items.find_one({"_id": original["_id"]}), before)
-        self.assertEqual(original, before)
-        self.assertEqual(update, operation)
-
+class UpstreamUpdateModifierTests(ModifierHarness, unittest.TestCase):
     def test_min_max_bson_order_preserves_equal_numeric_representation(self):
         result = self.apply(
             {"_id": 1, "low": "text", "high": 1, "equal": 1.0, "values": [2]},

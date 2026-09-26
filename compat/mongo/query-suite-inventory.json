@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these thirteen locked suites is classified; 320 reference parameter cases are not 320 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fourteen locked suites is classified; 362 reference parameter cases are not 362 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -1110,6 +1110,124 @@
           ],
           "kind": "implementation_specific",
           "note": "Private Python helper entry points are not shipped. Representable scalar/null/array read/write/rename path errors, missing-source noops, existing array-document writes and immutable IDs are exercised through stored BSON records. Non-string field keys, a scalar root, arbitrary object() values and an array-valued _id passed directly to helpers cannot be admitted as these stored BSON inputs; the wire test does not claim the same private invocation or diagnostic wording."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_array_update_modifiers.py",
+      "sha256": "a28a8a49473e9a826a05b66cd6c103a0a15db003a3bd931a75b1e99daa8d8cca",
+      "reference_case_count": 42,
+      "function_count": 11,
+      "coverage": [
+        {
+          "source": [
+            "test_push_rejects_malformed_modifier_documents"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_push_rejects_malformed_modifiers_before_mutation"
+          ],
+          "kind": "contract_difference",
+          "note": "BSON-serializable modifier failures retain code 2 and do not mutate the record. A non-string $sort field key fails as PyMongo InvalidDocument during encoding, not TinyMongo's direct-helper WriteError. Diagnostic message regexes are not a compatibility promise."
+        },
+        {
+          "source": [
+            "test_add_to_set_rejects_malformed_modifier_documents"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_add_to_set_rejects_malformed_modifiers"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_push_sort_uses_recursive_whole_value_bson_order"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_push_sort_compares_whole_recursive_bson_and_document_fields"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_add_to_set_uses_bson_equality_and_creates_missing_empty_array"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_add_to_set_uses_bson_equality_and_initializes_an_empty_array"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_pull_supports_query_operators_documents_logical_queries_and_exact_arrays"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_exact_arrays_document_queries_logical_queries_and_type_brackets"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_pull_supports_in_nin_regex_options_and_elem_match"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_membership_regex_and_elem_match"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_pull_and_push_use_mongodb_path_and_non_array_errors"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_push_missing_numeric_sparse_paths_and_nonarray_errors"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_pull_all_uses_literal_bson_equality_and_validates_operands"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_all_literal_bson_equality_and_operand_validation"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_pull_rejects_unsupported_or_malformed_queries"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_rejects_malformed_and_unsupported_predicates"
+          ],
+          "kind": "contract_difference",
+          "note": "All BSON-serializable malformed/unsupported predicates must raise a PyMongo WriteError without record changes. A Python set operand cannot cross BSON and instead raises InvalidDocument during driver encoding. TinyMongo private-helper diagnostics are intentionally not a byte/message-regex contract."
+        },
+        {
+          "source": [
+            "test_pull_rejects_top_level_not_like_mongodb"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_rejects_top_level_not_with_code_two"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned collection operations check persisted BSON results, representation-sensitive numeric/boolean and document-order behavior where relevant, input immutability and source-asserted error codes. TinyMongo private updater calls are replaced by real wire updates; private helper identity and diagnostic strings are not claimed."
+        },
+        {
+          "source": [
+            "test_invalid_updates_are_preflighted_and_atomic_even_without_a_match"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_preflight_and_numeric_failures_cannot_partially_write"
+          ],
+          "kind": "contract_difference",
+          "note": "Wire failures preserve existing records and reject invalid increments with code 14 even without a match. Unsupported operators surface as real PyMongo WriteError rather than TinyMongo's private TinyMongoNotSupportedError hierarchy; no cross-document transaction claim."
         }
       ]
     }
