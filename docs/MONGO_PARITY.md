@@ -495,7 +495,7 @@ before storage admission. The current option contract is:
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
 | Insert `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
 | Drop/create `writeConcern` / `comment` | Same concern subset except `w: 0` is rejected; comment must be omitted or null (PyMongo's default). No replication or unacknowledged namespace mutation. Metadata discovery also accepts only omitted/null comments. |
-| `bypassDocumentValidation` | Only `false` |
+| `bypassDocumentValidation` | Boolean no-op for insert/update/find-and-modify: user collection validators are not supported; BSON validation, immutable IDs, indexes and resource checks still apply |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
 | Count `query` / `skip` / `limit` | Shared BSON matcher with global skip/limit; nonnegative integers, zero limit unbounded; absent collection returns zero |
 | Distinct `key` / `query` | BSON string key and optional document filter; shared identity and global encounter order, absent collection returns an empty values array |

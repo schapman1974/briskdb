@@ -395,6 +395,63 @@ async fn one_way_requests_do_not_emit_replies() {
 }
 
 #[tokio::test]
+async fn validation_bypass_requires_booleans_and_does_not_enable_validators() {
+    let doc = |entries| BsonDocument::from_entries(entries).unwrap();
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    for verb in ["insert", "update", "findAndModify"] {
+        for invalid in [
+            BsonValue::Null,
+            BsonValue::Int32(1),
+            BsonValue::from("true"),
+            BsonValue::Array(vec![]),
+        ] {
+            let reply = send_command(
+                &mut stream,
+                &doc(vec![
+                    (verb, BsonValue::from("absent")),
+                    ("bypassDocumentValidation", invalid),
+                    ("$db", BsonValue::from("wire")),
+                ]),
+            )
+            .await;
+            assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(72)));
+        }
+    }
+    let reply = send_command(
+        &mut stream,
+        &doc(vec![
+            ("create", BsonValue::from("absent")),
+            (
+                "validator",
+                BsonValue::Document(doc(vec![("required", BsonValue::Boolean(true))])),
+            ),
+            ("$db", BsonValue::from("wire")),
+        ]),
+    )
+    .await;
+    assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(72)));
+    let reply = send_command(
+        &mut stream,
+        &doc(vec![
+            ("listCollections", BsonValue::Int32(1)),
+            ("nameOnly", BsonValue::Boolean(true)),
+            ("$db", BsonValue::from("wire")),
+        ]),
+    )
+    .await;
+    let Some(BsonValue::Document(cursor)) = reply.get_first("cursor") else {
+        panic!("cursor")
+    };
+    assert_eq!(
+        cursor.get_first("firstBatch"),
+        Some(&BsonValue::Array(vec![]))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn bad_length_is_fatal_and_shutdown_closes_partial_connections() {
     let (_root, database, mut server) = setup().await;
     let mut malformed = TcpStream::connect(server.address()).await.unwrap();
@@ -1841,7 +1898,7 @@ async fn rejected_data_commands_and_missing_reads_do_not_create_collections() {
     let document = BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap();
     for (field, value) in [
         ("ordered", BsonValue::Int32(0)),
-        ("bypassDocumentValidation", BsonValue::Boolean(true)),
+        ("bypassDocumentValidation", BsonValue::from("true")),
         ("txnNumber", BsonValue::Int64(1)),
         (
             "writeConcern",

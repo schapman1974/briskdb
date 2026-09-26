@@ -374,7 +374,10 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
                     matches!(value, BsonValue::Boolean(_))
                 }
                 "bypassDocumentValidation" if matches!(name, "insert" | "update") => {
-                    matches!(value, BsonValue::Boolean(false))
+                    // Collection validators are not implemented/accepted, so
+                    // either boolean is a no-op. This never bypasses BSON,
+                    // immutable IDs, uniqueness, or shared engine checks.
+                    matches!(value, BsonValue::Boolean(_))
                 }
                 "writeConcern" if matches!(name, "insert" | "delete" | "update") => {
                     valid_write_concern(value)
@@ -429,7 +432,7 @@ pub(super) fn prepare(request: &Request, read_metrics: bool) -> Option<Result<Pr
                     matches!(value, BsonValue::Document(_) | BsonValue::Array(_))
                 }
                 "bypassDocumentValidation" if name == "findAndModify" => {
-                    matches!(value, BsonValue::Boolean(false))
+                    matches!(value, BsonValue::Boolean(_))
                 }
                 "nameOnly" | "authorizedCollections" if name == "listCollections" => {
                     matches!(value, BsonValue::Boolean(_))
