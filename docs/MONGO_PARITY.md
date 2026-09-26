@@ -110,6 +110,25 @@ BRISKDB_MONGO_TALKPYTHON_REPORT_DIR=target/mongo-talkpython \
   -- --ignored --exact --nocapture
 ```
 
+### Real-driver cancellation checkpoint
+
+The real-wire gate also deliberately cancels an in-flight stock PyMongo 4.17.0
+async `getMore`, on fresh and reopened storage. A bounded loopback test proxy
+forwards original packets unchanged and holds one actual server reply. Native
+metrics prove that the server owns a cursor before cancellation and that the
+disconnected socket/cursor drain before the client may close its cursor or reuse
+its pool. The same client then reconnects, queries and counts the unchanged data.
+No driver method, frozen adapter or command/result is rewritten. A reply-delivery
+stall is not evidence that cancellation interrupted SQLite mid-execution, and
+this read-only test makes no cancelled-write rollback/commit-outcome promise.
+Python and Rust process/protocol deadlines bound both success and failure paths.
+
+```sh
+BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
+  --features mongo --test mongo_wire real_pymongo_async_cancellation \
+  -- --ignored --exact --nocapture
+```
+
 ## Current wire checkpoint
 
 The daemon accepts `--mongo-listen SOCKET_ADDR|disabled` and

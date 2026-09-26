@@ -15,6 +15,8 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
+#[path = "mongo_wire/cancellation.rs"]
+mod cancellation;
 #[path = "mongo_wire/client_metadata.rs"]
 mod client_metadata;
 #[path = "mongo_wire/metrics.rs"]
@@ -483,6 +485,12 @@ async fn finite_connection_cap_rejects_overflow() {
 #[ignore = "requires pinned PyMongo; CI runs this explicitly with BRISKDB_MONGO_WIRE_PYTHON"]
 async fn real_pymongo_sync_async_discovery() {
     assert_driver_restart("/tests/mongo_wire_client.py").await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned stock PyMongo; CI runs this explicitly"]
+async fn real_pymongo_async_cancellation() {
+    cancellation::run().await;
 }
 
 #[tokio::test]
