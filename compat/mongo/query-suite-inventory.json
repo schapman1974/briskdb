@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-eight locked suites is classified; 772 reference parameter cases are not 772 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-nine locked suites is classified; 874 reference parameter cases are not 874 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2832,6 +2832,191 @@
           "kind": "native_equivalent",
           "evidence": ["python/tests/test_upstream_shard_atomicity.py::test_locked_shard_does_not_block_an_independent_exact_id_write"],
           "note": "A spawned process holds a real SQLite BEGIN IMMEDIATE lock on one owned shard. A monitored wire update stays pending while another shard's exact-ID update completes; releasing the lock lets the first finish, and both persist after reopen. A separate process avoids shared-process POSIX locks and separate SQLite-build bookkeeping. This is a storage-lock boundary test, not TinyMongo's private post-update pause hook or long-duration soak."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_bson_codec.py",
+      "sha256": "9f957c64c00bb246b72f0716b3533884a01169ef8fcace32a4e27583ac07dd14",
+      "reference_case_count": 102,
+      "function_count": 39,
+      "coverage": [
+        {
+          "source": [
+            "test_invalid_document_matches_tinymongo_bson_and_pymongo_hierarchies",
+            "test_invalid_document_reports_nested_path_and_write_context",
+            "test_invalid_document_bounds_the_offending_value_representation"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_invalid_document_keeps_the_pinned_driver_exception_contract"
+          ],
+          "note": "Invalid values reject before catalog mutation with the pinned driver's bson/pymongo InvalidDocument alias, not PyMongoError/BriskDBError/TypeError. TinyMongo's extra inheritance, path/write-context enrichment and bounded offending-value repr are not reproduced; the driver can retain long representations."
+        },
+        {
+          "source": [
+            "test_codec_round_trips_nested_object_ids_and_canonical_datetimes",
+            "test_canonical_datetime_supports_aware_and_requested_timezone_results",
+            "test_extended_values_round_trip_through_public_backends"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_nested_ids_dates_and_requested_timezone_survive_reopen"
+          ],
+          "note": "Nested ObjectIds and dates roundtrip/reopen with exact UTC millisecond normalization and requested timezone decoding. Native SQLite replaces the source's memory/TinyDB/SQLite/DuckDB/Parquet variants; no private JSON codec is used."
+        },
+        {
+          "source": [
+            "test_codec_tags_are_valid_readable_json",
+            "test_json_backend_persists_readable_tags"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_nested_ids_dates_and_requested_timezone_survive_reopen",
+            "python/tests/test_upstream_bson_codec.py::test_json_tag_shapes_and_legacy_plain_json_remain_literal_bson"
+          ],
+          "note": "BriskDB persists native SQLite/BSON, not readable app.json or TinyMongo tagged JSON. The owned root has manifest.sqlite and no app.json, while user tag-shaped documents remain literal values. This is not format interchange or a JSON-backend pass."
+        },
+        {
+          "source": [
+            "test_codec_canonicalizes_legacy_aware_datetime_tags",
+            "test_codec_preserves_malformed_decimal128_tags",
+            "test_codec_preserves_malformed_uuid_tags",
+            "test_codec_preserves_malformed_regex_tags",
+            "test_codec_loads_legacy_plain_json_without_changing_it",
+            "test_codec_preserves_unknown_exact_tag_mappings",
+            "test_codec_preserves_malformed_escaped_mapping_tags",
+            "test_codec_escapes_user_mappings_that_look_like_internal_tags",
+            "test_internal_tag_shaped_mapping_round_trips_through_public_storage",
+            "test_codec_preserves_malformed_binary_tags",
+            "test_malformed_nonfinite_float_tag_is_preserved"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_json_tag_shapes_and_legacy_plain_json_remain_literal_bson"
+          ],
+          "note": "Valid/legacy/malformed tag-shaped mappings and explicitly parsed plain JSON store as ordinary BSON documents, with no internal escape/tag interpretation. All BSON-encodable original malformed payload shapes are included; the source's 2^100 regex-flag integer rejects at the Int64 wire boundary without mutation. Legacy aware datetime tags are not implicitly decoded to dates."
+        },
+        {
+          "source": [
+            "test_codec_canonicalizes_pre_epoch_datetimes_without_float_rounding",
+            "test_storage_equality_uses_canonical_bson_datetime_milliseconds",
+            "test_bson_type_registry_normalizes_naive_and_aware_dates_to_utc"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_datetime_identity_uses_signed_utc_milliseconds",
+            "python/tests/test_upstream_read_fidelity.py::test_same_millisecond_updates_and_replacements_are_noops"
+          ],
+          "note": "Public native equality, no-op writes and exact negative milliseconds replace private canonicalizer/sort-key calls; aware/naive instants in the same millisecond match."
+        },
+        {
+          "source": [
+            "test_codec_round_trips_exact_decimal128_bid_values"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_decimal_bid_binary_subtypes_and_uuid_options_preserve_wire_values"
+          ],
+          "note": "All five original finite/signed-zero/NaN/sNaN/infinity Decimal128 BID payloads roundtrip byte-exactly through native BSON, not tagged hex JSON."
+        },
+        {
+          "source": [
+            "test_codec_round_trips_uuid_without_pymongo_specific_state"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_decimal_bid_binary_subtypes_and_uuid_options_preserve_wire_values"
+          ],
+          "note": "UUID objects require the real driver's explicit standard representation; an unspecified reader receives subtype-4 Binary instead. TinyMongo's state-free private UUID JSON codec is not exported."
+        },
+        {
+          "source": [
+            "test_codec_round_trips_regex_representation_pattern_and_flags"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_regex_representation_and_encoding_errors_follow_the_driver"
+          ],
+          "note": "All four original Python/BSON string/byte pattern forms retain their wire pattern and flags but decode as bson.Regex with a string pattern, not the exact original Python Pattern or bytes representation."
+        },
+        {
+          "source": [
+            "test_bson_regex_decode_explains_optional_dependency",
+            "test_uuid_and_native_regex_decode_without_optional_bson",
+            "test_decimal128_decode_explains_optional_dependency",
+            "test_object_id_decode_explains_optional_dependency",
+            "test_generic_binary_decodes_without_optional_bson",
+            "test_nonzero_binary_subtype_explains_optional_dependency"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_patching.py::test_import_and_scope_construction_do_not_require_pymongo",
+            "python/tests/test_documents.py::test_sql_only_use_does_not_import_or_require_bson"
+          ],
+          "note": "These monkeypatch TinyMongo private optional BSON classes and exercise its independent JSON decoder. BriskDB SQL/import remains usable without the Mongo extra, but entering a Mongo patch scope requires briskdb[pymongo] before native acquisition. No optional-UUID/regex/binary JSON decoder or matching private hook is claimed."
+        },
+        {
+          "source": [
+            "test_codec_rejects_regex_patterns_bson_cannot_encode"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_regex_representation_and_encoding_errors_follow_the_driver"
+          ],
+          "note": "NUL and invalid-UTF8 byte patterns reject before mutation; the pinned driver uses InvalidDocument and InvalidStringData respectively, rather than TinyMongo's uniformly enriched InvalidDocument."
+        },
+        {
+          "source": [
+            "test_codec_round_trips_native_binary_values_as_bytes",
+            "test_codec_round_trips_bson_binary_subtypes",
+            "test_binary_subclass_is_encoded_before_native_bytes",
+            "test_binary_values_round_trip_through_public_backends"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_decimal_bid_binary_subtypes_and_uuid_options_preserve_wire_values",
+            "python/tests/test_upstream_bson_codec.py::test_large_binary_document_reopens_and_bytearray_requires_conversion",
+            "python/tests/test_upstream_bson_codec.py::test_opaque_uuid_values_remain_queryable_and_unreadable_replies_are_bounded",
+            "src/protocol/mongo/wire.rs::uuid_reply_widths_are_checked_without_narrowing_opaque_input",
+            "tests/mongo_wire/uuid_widths.rs::opaque_uuid_inputs_remain_queryable_and_unsafe_replies_keep_socket_usable",
+            "tests/mongo_wire/uuid_widths.rs::uuid_reply_errors_reclaim_initial_and_continuation_cursors"
+          ],
+          "note": "Generic bytes, 16-byte subtype 3/4 and subtype 128 values, a binary ID and the original 100-KB nested blob persist/reopen; bytearray requires explicit bytes conversion. The source's seven-byte subtype-3 private-codec value cannot be decoded by the real PyMongo C decoder. Opaque input and projected queries remain supported; only replies recursively containing non-16-byte subtype 3/4 return bounded code-22 errors, reclaim cursors and keep sockets usable. Find-and-modify can commit before its returned image is rejected; response rejection is not rollback. Generic native opaque-binary codec/storage remains unchanged."
+        },
+        {
+          "source": [
+            "test_binary_values_require_python_filter_comparison"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_binary_and_numeric_equality_preserve_bson_subtypes",
+            "python/tests/test_upstream_bson_codec.py::test_decimal_bid_binary_subtypes_and_uuid_options_preserve_wire_values",
+            "python/tests/test_upstream_regex_values.py::test_regex_predicates_and_explicit_equality_keep_distinct_meanings"
+          ],
+          "note": "TinyMongo's private contains_extended_value flag selects Python comparison versus backend SQL. BriskDB uses its native typed BSON matcher; public binary/numeric/UUID/regex matching is tested, and bytearray remains an input difference."
+        },
+        {
+          "source": [
+            "test_nonfinite_floats_use_strict_json_tags"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_nonfinite_doubles_and_legacy_binary_length_order_use_native_bson"
+          ],
+          "note": "NaN and signed infinities retain native BSON doubles. There is no strict-JSON tag encoding layer or corresponding JSON text claim."
+        },
+        {
+          "source": [
+            "test_bson_type_registry_uses_mongodb_scalar_order_and_subclass_precedence"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_bson_codec.py::test_nonfinite_doubles_and_legacy_binary_length_order_use_native_bson",
+            "python/tests/test_upstream_bson_values.py::test_whole_value_push_sort_uses_complete_bson_type_order",
+            "python/tests/test_upstream_bson_registry.py::test_binary_and_numeric_equality_preserve_bson_subtypes"
+          ],
+          "note": "Public native ordering and boolean/numeric identity replace private tuple-key layout checks. Legacy binary subtype 2 includes its four-byte framing in the length-first ordering; Binary subclasses retain subtype before generic bytes handling."
         }
       ]
     }

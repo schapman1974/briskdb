@@ -996,9 +996,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, twenty-eight query/public-client suites now
-      have complete source accounting (339 functions/772 reference cases), backed
-      by 224 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, twenty-nine query/public-client suites now
+      have complete source accounting (378 functions/874 reference cases), backed
+      by 232 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1077,6 +1077,14 @@ requires an earlier dependency:
       connection recovery and durable cross-shard uniqueness after reopen.
       Host filesystem/WAL/fsync faults, wire error envelopes and longer soak
       remain separate gates; the drill never fills the host disk.
+      Main codec scenarios expose an additional reply safety boundary: UUID
+      subtype payloads other than 16 bytes return bounded code-22 errors instead
+      of PyMongo-unreadable replies. Opaque writes, filters and projections remain
+      compatible; rejected batches release cursors and keep sockets usable.
+      Reply rejection does not roll back already committed mutations.
+      The generic native opaque-binary format remains unchanged; JSON codecs,
+      dependency fallbacks and driver exception/representation differences are
+      explicitly mapped rather than counted as identical behavior.
     - [ ] [#185](https://github.com/schapman1974/briskdb/issues/185) — operating
       drill imports real locked TinyMongo table-native/two-shard SQLite stores
       into four BriskDB shards, builds pending indexes explicitly, and checks

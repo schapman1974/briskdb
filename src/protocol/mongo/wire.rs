@@ -55,6 +55,22 @@ fn document(bytes: &[u8]) -> io::Result<BsonDocument> {
     .map_err(|_| invalid("invalid or over-budget Mongo BSON document"))
 }
 
+// Opaque binary widths remain valid native/input values. Only replies need
+// this additional constraint: PyMongo's C decoder requires 128-bit UUIDs.
+pub(super) fn valid_uuid_widths(document: &BsonDocument) -> bool {
+    document.iter().all(|(_, value)| valid_uuid_value(value))
+}
+
+fn valid_uuid_value(value: &BsonValue) -> bool {
+    match value {
+        BsonValue::Binary(value) if matches!(value.subtype(), 3 | 4) => value.bytes().len() == 16,
+        BsonValue::Document(value) => valid_uuid_widths(value),
+        BsonValue::Array(values) => values.iter().all(valid_uuid_value),
+        BsonValue::JavaScript(value) => value.scope().is_none_or(valid_uuid_widths),
+        _ => true,
+    }
+}
+
 fn int32(bytes: &[u8]) -> io::Result<i32> {
     let prefix = bytes
         .get(..4)
@@ -390,6 +406,55 @@ mod tests {
         let mut frame = message(0);
         frame.response_to = 1;
         assert!(decode_request(frame).is_err());
+    }
+
+    #[test]
+    fn uuid_reply_widths_are_checked_without_narrowing_opaque_input() {
+        use crate::document::{BsonBinary, BsonJavaScript, decode_document};
+        for subtype in [0, 2, 3, 4, 128] {
+            for length in [0, 1, 7, 15, 16, 17] {
+                let binary = BsonValue::Binary(BsonBinary::new(subtype, vec![0; length]));
+                let nested = BsonDocument::from_entries([("value", binary.clone())]).unwrap();
+                let shapes = [
+                    binary,
+                    BsonValue::Document(nested.clone()),
+                    BsonValue::Array(vec![BsonValue::Document(nested.clone())]),
+                    BsonValue::JavaScript(BsonJavaScript::with_scope("return value;", nested)),
+                ];
+                for value in shapes {
+                    let body = BsonDocument::from_entries([
+                        ("ping", BsonValue::Int32(1)),
+                        ("$db", BsonValue::from("admin")),
+                        ("probe", value),
+                    ])
+                    .unwrap();
+                    let raw = encode_document(&body).unwrap();
+                    // Native opaque-binary storage retains its existing policy.
+                    assert!(decode_document(&raw).unwrap().representation_eq(&body));
+                    let expected = !matches!(subtype, 3 | 4) || length == 16;
+                    assert_eq!(
+                        super::super::commands::validate_response(&body).is_ok(),
+                        expected
+                    );
+                    let mut frame = message(0);
+                    let mut payload = BytesMut::new();
+                    payload.put_u32_le(0);
+                    payload.put_u8(0);
+                    payload.extend_from_slice(&raw);
+                    frame.payload = payload.freeze();
+                    assert!(decode_request(frame).is_ok());
+
+                    let mut frame = message(0);
+                    let mut payload = BytesMut::from(frame.payload.as_ref());
+                    payload.put_u8(1);
+                    payload.put_i32_le((4 + 10 + raw.len()) as i32);
+                    payload.extend_from_slice(b"documents\0");
+                    payload.extend_from_slice(&raw);
+                    frame.payload = payload.freeze();
+                    assert!(decode_request(frame).is_ok());
+                }
+            }
+        }
     }
 
     #[test]
