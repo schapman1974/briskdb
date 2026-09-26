@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these five locked suites is classified; 198 reference parameter cases are not 198 candidate passes. Private Python helpers, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these eight locked suites is classified; 259 reference parameter cases are not 259 candidate passes. Private helpers/backend hooks/SQL traces, backend variants, open metadata gaps and BSON/client/diagnostic/configuration differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -577,6 +577,258 @@
           ],
           "kind": "public_scenarios",
           "note": "Retained timeout, pool, retry, appName, listener, selector and server_api options use real PyMongo validation. Remote hosts/credentials are deliberately replaced by the owned local endpoint; construction and actual database traffic verify the binding."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_projection.py",
+      "sha256": "b71ce138c6d902668fbeefa7c7afbaa2510f34f5c9fa07d48ff8fd9dd99265da",
+      "reference_case_count": 34,
+      "function_count": 13,
+      "coverage": [
+        {
+          "source": [
+            "test_projection_inclusion_sequences_and_id_rules"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_inclusion_sequences_and_id_rules"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned installed-wheel scenarios exercise the public behavior through real PyMongo. This is an adapted scenario, not unchanged execution of TinyMongo's private implementation."
+        },
+        {
+          "source": [
+            "test_projection_exclusion_nested_paths_and_id_rules",
+            "test_nested_inclusion_merges_siblings_and_projects_arrays"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_nested_inclusion_exclusion_and_scalar_array_branches"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned installed-wheel scenarios exercise the public behavior through real PyMongo. This is an adapted scenario, not unchanged execution of TinyMongo's private implementation."
+        },
+        {
+          "source": [
+            "test_nested_id_projection_follows_regular_path_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_nested_id_paths_and_missing_results"
+          ],
+          "kind": "native_equivalent",
+          "note": "Private projector calls are replaced by real stored scalar/embedded IDs and missing-query results; an absent stored _id is not reproduced because insertion creates one."
+        },
+        {
+          "source": [
+            "test_projection_is_applied_after_sort_and_on_every_cursor_access"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_sort_projection_index_access_and_returned_values_are_independent"
+          ],
+          "kind": "contract_difference",
+          "note": "Sorting uses complete source fields before projection. Modern PyMongo indexing requires an unevaluated clone; TinyMongo's post-iteration integer/string indexing and current-record interface are not emulated."
+        },
+        {
+          "source": [
+            "test_projection_works_with_index_fast_path_and_is_mutation_safe"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_sort_projection_index_access_and_returned_values_are_independent",
+            "python/tests/test_upstream_projection.py::test_projection_matches_scan_index_sorted_and_reopened_paths"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned installed-wheel scenarios exercise the public behavior through real PyMongo. This is an adapted scenario, not unchanged execution of TinyMongo's private implementation."
+        },
+        {
+          "source": [
+            "test_empty_projection_filter_alias_and_capability"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_inclusion_sequences_and_id_rules"
+          ],
+          "kind": "contract_difference",
+          "note": "Empty mappings/sequences and filter aliases return complete public documents. TinyMongo-only parent.database metadata and its capabilities dictionary are not BriskDB client interfaces."
+        },
+        {
+          "source": [
+            "test_invalid_projection_combinations_raise_operation_failure",
+            "test_unsupported_projection_expressions_fail_clearly"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_projection_error_codes_and_unsupported_forms"
+          ],
+          "kind": "public_scenarios",
+          "note": "All eleven source conflict/code cases and seven unsupported expressions are checked against both existing and absent namespaces; invalid requests create no collection."
+        },
+        {
+          "source": [
+            "test_projection_requires_a_mapping_or_string_field_sequence",
+            "test_invalid_projection_paths_raise_operation_failure"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_driver_projection_container_and_path_errors_remain_explicit"
+          ],
+          "kind": "contract_difference",
+          "note": "Local clients reject a bare string projection instead of silently treating it as characters. Non-string/NUL BSON field names fail with driver InvalidDocument rather than a private-helper TypeError/OperationFailure; other malformed containers/paths fail explicitly."
+        },
+        {
+          "source": [
+            "test_projector_handles_nested_arrays_and_scalar_branches",
+            "test_projector_exclusion_skips_missing_and_scalar_branches"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_nested_inclusion_exclusion_and_scalar_array_branches",
+            "python/tests/test_upstream_projection.py::test_nested_id_paths_and_missing_results"
+          ],
+          "kind": "native_equivalent",
+          "note": "Nested array/scalar/missing-branch projection is checked through actual stored documents. The private project_document(None, spec) branch is represented by public find_one returning None, not claimed as the same implementation."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_projection_memory.py",
+      "sha256": "3615b1bd6792946ef8c60373b1cc1195412ce32a0f5ada2f4a5abf21a35193c3",
+      "reference_case_count": 17,
+      "function_count": 17,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_projection_scan_preserves_filter_sort_and_nested_semantics",
+            "test_sqlite_indexed_sorted_find_and_projected_filtered_skip"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_projection_matches_scan_index_sorted_and_reopened_paths"
+          ],
+          "kind": "public_scenarios",
+          "note": "The same projection/filter/sort/skip outcomes are exercised before indexing, after index creation and after reopening BriskDB's own sharded store."
+        },
+        {
+          "source": [
+            "test_sqlite_id_only_projection_keeps_lossless_identifier_types"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_bson_identifier_projection_preserves_types_and_array_routes"
+          ],
+          "kind": "contract_difference",
+          "note": "BSON-supported scalar, binary, embedded and array identifiers retain values and routes. Python 2**80 cannot cross BSON Int64 and fails before mutation; it is not claimed as a stored unbounded Python integer."
+        },
+        {
+          "source": [
+            "test_async_sqlite_projection_sweep_and_chained_sort"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_async_projection_sorted_ids_and_unset_noops_survive_reopen"
+          ],
+          "kind": "public_scenarios",
+          "note": "Owned installed-wheel scenarios exercise the public behavior through real PyMongo. This is an adapted scenario, not unchanged execution of TinyMongo's private implementation."
+        },
+        {
+          "source": [
+            "test_sqlite_projection_scan_falls_back_after_sql_compilation_error",
+            "test_sqlite_bounded_and_count_fallbacks_after_compiler_error"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_projection_matches_scan_index_sorted_and_reopened_paths",
+            "python/tests/test_upstream_projection.py::test_single_result_count_and_filtered_windows_agree"
+          ],
+          "kind": "implementation_specific",
+          "note": "These inject failures into TinyMongo's private Python SQL compiler and inspect its private ID projector. BriskDB has neither hook; public scan/index/projection/count outcomes are covered, not a reproduced injected compiler branch."
+        },
+        {
+          "source": [
+            "test_projection_hook_is_optional_for_third_party_backends",
+            "test_projected_legacy_backend_reloads_complete_rows_before_sorting",
+            "test_legacy_bounded_backend_without_projected_window_hook",
+            "test_sqlite_subclass_legacy_projection_override_keeps_three_arg_hook"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_projection_matches_scan_index_sorted_and_reopened_paths",
+            "python/tests/test_upstream_projection.py::test_cursor_windows_clones_rewind_and_close_preserve_results"
+          ],
+          "kind": "implementation_specific",
+          "note": "Fake third-party Python backend classes, legacy hook signatures and override call counts do not apply to BriskDB's native storage architecture. Public projected sorting/windows are tested without claiming those hooks or plugin compatibility."
+        },
+        {
+          "source": [
+            "test_sqlite_single_result_paths_push_limit_into_payload_scan"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_single_result_count_and_filtered_windows_agree",
+            "python/tests/test_upstream_projection.py::test_lazy_filter_and_projection_inputs_are_frozen_per_cursor",
+            "python/tests/test_upstream_projection.py::test_async_filter_projection_snapshot_clone_and_driver_results"
+          ],
+          "kind": "native_equivalent",
+          "note": "Single-result and exact-ID outcomes plus the source's mutated-after-find query isolation are checked. Local sync/async wrappers freeze nested filter/projection mappings. Private SQLite SQL strings/decode counts are not portable; native bounded work has separate engine/wire metrics tests."
+        },
+        {
+          "source": [
+            "test_sqlite_python_filtered_limit_stops_after_first_match",
+            "test_sqlite_native_count_does_not_read_payloads",
+            "test_sqlite_python_filtered_count_streams_exact_documents"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_single_result_count_and_filtered_windows_agree",
+            "src/core/engine/document_engine/fanout/engine_tests/counts.rs::plain_and_filtered_counts_admit_two_bounded_waves_before_global_skip_limit"
+          ],
+          "kind": "native_equivalent",
+          "note": "Public first-match/filter/window/count results and bounded native count fanout are checked. BriskDB may use different physical reads and has no Python JSON decoder/SQL trace hook; exact source SQL/decode counts are not asserted."
+        },
+        {
+          "source": [
+            "test_sqlite_cursor_window_reconfiguration_and_sort_precedence"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_cursor_windows_clones_rewind_and_close_preserve_results"
+          ],
+          "kind": "contract_difference",
+          "note": "Skip/limit/sort/clone/rewind/close/alive behavior is covered. Empty iteration is used instead of TinyMongo-only has_next/hasNext helpers; modern PyMongo cursor behavior remains explicit."
+        },
+        {
+          "source": [
+            "test_async_sqlite_single_result_and_count_pushdown"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_async_projection_sorted_ids_and_unset_noops_survive_reopen"
+          ],
+          "kind": "native_equivalent",
+          "note": "Async public single-result, bounded list and count behavior survives reopening. The source's Python decoder monkeypatch and exact pushdown counts are implementation-specific and not reproduced."
+        },
+        {
+          "source": [
+            "test_sqlite_id_projection_materially_reduces_public_sweep_peak_memory"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_client_heap_projection_and_bounded_reads_avoid_full_materialization"
+          ],
+          "kind": "native_equivalent",
+          "note": "The same 64 x 100KB public-read comparison checks Python-client tracemalloc peaks and exact projected/count/first/full results. This measures the client heap only, not Rust allocations, engine RSS or sustained-load memory bounds."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_unset_semantics.py",
+      "sha256": "246dbb06b2515c56fda1dffd473b5d18b33d1e17ad00d640f11ecbe489e293a1",
+      "reference_case_count": 10,
+      "function_count": 2,
+      "coverage": [
+        {
+          "source": [
+            "test_unset_removes_top_level_and_nested_fields_on_embedded_backends"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_unset_top_level_nested_missing_and_noop_counts_persist"
+          ],
+          "kind": "public_scenarios",
+          "note": "Top-level/nested/missing fields, single/multi matched/modified counts, no-op repetitions and restart persistence are tested in BriskDB; TinyMongo's five backend variants are not BriskDB backends."
+        },
+        {
+          "source": [
+            "test_async_unset_has_the_same_embedded_backend_semantics"
+          ],
+          "evidence": [
+            "python/tests/test_upstream_projection.py::test_async_projection_sorted_ids_and_unset_noops_survive_reopen"
+          ],
+          "kind": "public_scenarios",
+          "note": "Async unset results, no-op counts and exact post-images survive reopening the native store; no claim of implementing the reference's five Python backends."
         }
       ]
     }
