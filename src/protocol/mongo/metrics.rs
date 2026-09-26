@@ -404,9 +404,10 @@ impl Metrics {
             kind,
             started,
             completed: false,
+            trace: None,
         }
     }
-    fn error_code(&self, document: &BsonDocument) {
+    fn error_code(&self, document: &BsonDocument) -> Option<i32> {
         let code = match document.get_first("code") {
             Some(BsonValue::Int32(code)) => Some(*code),
             Some(BsonValue::Int64(code)) => i32::try_from(*code).ok(),
@@ -416,8 +417,10 @@ impl Metrics {
             code.and_then(|code| ERROR_CODES.iter().position(|known| *known == code))
         {
             add(&self.error_codes[index], 1);
+            Some(ERROR_CODES[index])
         } else {
             add(&self.other_codes, 1);
+            None
         }
     }
 }
@@ -449,9 +452,32 @@ pub(super) struct CommandGuard {
     kind: MongoCommandKind,
     started: Instant,
     completed: bool,
+    trace: Option<super::events::RequestTrace>,
 }
 
 impl CommandGuard {
+    pub(super) fn with_correlation(
+        mut self,
+        connection_id: u64,
+        wire_request_id: i32,
+        sequence: u64,
+    ) -> Self {
+        self.trace = Some(super::events::RequestTrace::new(
+            self.kind,
+            connection_id,
+            wire_request_id,
+            sequence,
+        ));
+        self
+    }
+
+    fn record_error(&mut self, document: &BsonDocument) {
+        let code = self.metrics.error_code(document);
+        if let Some(trace) = &mut self.trace {
+            trace.error(code);
+        }
+    }
+
     pub(super) fn complete(mut self, body: &BsonDocument, suppressed: bool) {
         let success = matches!(body.get_first("ok"), Some(BsonValue::Double(value)) if *value == 1.0)
             || matches!(
@@ -460,22 +486,27 @@ impl CommandGuard {
             );
         let mut failed = !success;
         if failed {
-            self.metrics.error_code(body);
+            self.record_error(body);
         }
+        let mut write_errors = 0;
         if let Some(BsonValue::Array(errors)) = body.get_first("writeErrors") {
             failed |= !errors.is_empty();
+            write_errors = errors.len() as u64;
             add(&self.metrics.write_errors, errors.len() as u64);
             for error in errors {
                 if let BsonValue::Document(error) = error {
-                    self.metrics.error_code(error);
+                    self.record_error(error);
                 } else {
                     add(&self.metrics.other_codes, 1);
+                    if let Some(trace) = &mut self.trace {
+                        trace.error(None);
+                    }
                 }
             }
         }
         if let Some(BsonValue::Document(error)) = body.get_first("writeConcernError") {
             failed = true;
-            self.metrics.error_code(error);
+            self.record_error(error);
         }
         let counters = &self.metrics.commands[self.kind as usize];
         add(&counters.completed, 1);
@@ -486,6 +517,9 @@ impl CommandGuard {
             add(&counters.suppressed, 1);
         }
         self.completed = true;
+        if let Some(trace) = &mut self.trace {
+            trace.complete(failed, write_errors, suppressed);
+        }
     }
 }
 
@@ -501,5 +535,8 @@ impl Drop for CommandGuard {
         let bucket = latency_bucket(micros);
         add(&counters.latency[bucket], 1);
         counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(trace) = self.trace.take() {
+            trace.finish(micros);
+        }
     }
 }

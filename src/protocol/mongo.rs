@@ -7,6 +7,7 @@
 mod client_metadata;
 mod commands;
 mod compression;
+mod events;
 mod listener;
 mod metrics;
 mod wire;

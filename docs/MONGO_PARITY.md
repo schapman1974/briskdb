@@ -650,8 +650,35 @@ commands, from complete frame through reply construction; socket framing and
 delivery are excluded. Live snapshots sample atomics separately; accounting
 identities are meaningful after drain, not during concurrent updates. Totals
 saturate, gauges are admission-bounded, close retains final counters, and a new
-listener starts at zero. This is not a Prometheus endpoint, correlated tracing,
-or completion of the broader #187 hardening gate.
+listener starts at zero. Metrics remain separate from the request tracing below;
+this is not a Prometheus endpoint or completion of the broader #187 hardening gate.
+
+Decoded requests also have debug-level `mongo.command` spans and one final
+structured event on the `briskdb::mongo` tracing target. Hosts own their subscriber
+and exporter; opening a library listener installs neither a global logger nor an
+export queue. The daemon's existing `RUST_LOG` filter can include
+`briskdb::mongo=debug`. A listener retains the subscriber active when it starts,
+including across connection tasks and blocking reply workers.
+
+Events contain only the process-unique frontend `connection_id`, client-supplied
+numeric `wire_request_id`, connection-local `sequence`, fixed command family,
+`completed`/`failed`/`aborted` outcome, first classified error code/category,
+write-error count, response-suppression flag and elapsed microseconds. Repeated
+wire IDs are distinguished by the sequence; none of these fields authenticates
+a caller. Unknown commands/codes become `other`; code zero with category `none`
+or `other` is not a Mongo error code. Namespaces, documents, query/update/filter
+values, comments, credentials, paths, client metadata and error text are never
+recorded. Identities are event fields, not metric labels.
+
+The same final-outcome boundary as metrics applies: completion is not proof of
+socket delivery or a globally committed write. Spans start after preparation;
+the explicit elapsed field includes preparation from the complete frame. Guard
+drop emits an aborted outcome after releasing its in-flight gauge, including on worker
+unwind. There is at most one live request guard per admitted connection; the host
+must bound its own export queues. Malformed frames that never become commands
+remain transport metrics, not fabricated request events. Engine/shard phase
+tracing, readiness/security diagnostics and broader fault/soak acceptance remain
+separate #187 work.
 
 Read-work telemetry is separately opt-in for Rust hosts:
 
@@ -687,7 +714,7 @@ They do not measure matched rows, per-shard row/CPU skew, physical SQLite page o
 byte I/O, or pipeline-predicate evaluations. Enabled requests use the existing
 bounded engine diagnostics and account for their result metadata; protocol replies
 do not gain fields. Native Python/CLI metric controls, Mongo `explain`/`serverStatus`,
-exporters, correlated tracing and broader #187 acceptance remain separate work.
+exporters, engine/shard phase tracing and broader #187 acceptance remain separate work.
 
 Projection uses the shared engine transform after filtering; projected fields
 retain BSON types and stored field order. The same projection persists across

@@ -15,6 +15,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::codec::Decoder;
+use tracing::instrument::WithSubscriber;
 
 use super::{
     Request, client_metadata, commands, compression, decode_request, invalid, metrics, wire,
@@ -68,13 +69,16 @@ impl MongoServer {
         let token = shutdown.clone();
         let metrics = Arc::new(metrics::Metrics::default());
         let clients = Arc::new(client_metadata::Registry::default());
-        let task = tokio::spawn(run(
-            listener,
-            database.clone(),
-            token,
-            Arc::clone(&metrics),
-            Arc::clone(&clients),
-        ));
+        let task = tokio::spawn(
+            run(
+                listener,
+                database.clone(),
+                token,
+                Arc::clone(&metrics),
+                Arc::clone(&clients),
+            )
+            .with_current_subscriber(),
+        );
         Ok(Self {
             address,
             shutdown,
@@ -183,7 +187,7 @@ async fn run(
                     if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics), clients).await {
                         metrics.connection_error(error.kind());
                     }
-                });
+                }.with_current_subscriber());
             }
         }
     }
@@ -210,6 +214,7 @@ async fn connection(
     let mut codec = compression::TransportCodec::new()?;
     let mut source = BytesMut::with_capacity(8192);
     let mut response_id = 0i32;
+    let mut sequence = 0u64;
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
@@ -242,6 +247,9 @@ async fn connection(
             source.extend_from_slice(&chunk[..read]);
         };
         response_id = response_id.wrapping_add(1);
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("Mongo request sequence exhausted"))?;
         let started = Instant::now();
         let compressed = frame.is_compressed();
         let read_metrics = metrics.read_metrics_enabled();
@@ -255,10 +263,12 @@ async fn connection(
         })
         .await
         .map_err(|_| io::Error::other("Mongo parser task failed"))??;
-        let observed = metrics.command(
-            request.body.iter().next().map_or("", |(name, _)| name),
-            started,
-        );
+        let observed = metrics
+            .command(
+                request.body.iter().next().map_or("", |(name, _)| name),
+                started,
+            )
+            .with_correlation(session.id().get(), request.request_id, sequence);
         let body = match prepared {
             Some(Ok(prepared)) => {
                 executor
