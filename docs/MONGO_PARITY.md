@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 308 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 325 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -52,14 +52,15 @@ functions in the locked `test_query_more.py`,
 `test_uuid_regex.py`, `test_aggregation_basic_stages.py`,
 `test_aggregation_projection_stages.py`, `test_aggregation.py`,
 `test_decimal_coverage_edges.py`, `test_bson_codec_fast_path.py` and
-`test_async_api.py`, `test_bson_registry_hardening.py` and `test_patching.py` suites
-(707 reference parameter cases). 204 added wheel scenarios and existing patch
+`test_async_api.py`, `test_bson_registry_hardening.py`, `test_patching.py`,
+`test_pymongo_dropin.py` and `test_pymongo_contract.py` suites
+(740 reference parameter cases). 212 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 707 unchanged upstream candidate passes or complete #186 certification.
+not 740 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -152,6 +153,14 @@ exclusion, shared data and awaited cleanup tests. Explicit SQLite scopes without
 a folder stay temporary, unlike TinyMongo's default persistent path; async
 clients require `async with`. Unsupported older PyMongo versions reject before
 engine acquisition, without changing constructors or retaining patch state.
+Drop-in application coverage exercises both the BriskDB import alias and actual
+PyMongo constructors inside a patch scope, including index/query/update/upsert
+results and native folder/environment selection. `BRISKDB_HOME` and native
+SQLite files do not emulate TinyMongo's environment/JSON layout or backend plugins.
+Invalid sync/async find sessions now reject before PyMongo constructs a partial
+cursor; positional/keyword and falsey invalid objects are checked. `None` and
+genuine session objects retain driver handling. Other fake-session operations
+retain driver-specific errors, and this does not enable server sessions.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings

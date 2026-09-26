@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-four locked suites is classified; 707 reference parameter cases are not 707 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these twenty-six locked suites is classified; 740 reference parameter cases are not 740 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -2599,6 +2599,141 @@
             "python/tests/test_patching.py::test_unsupported_pymongo_version_rejects_before_engine_acquisition"
           ],
           "note": "BriskDB explicitly pins PyMongo 4.17.0, including its async client implementation; older sync-only drivers are outside the supported contract. An isolated older-version probe rejects before engine acquisition or constructor mutation and proves clean recovery with the supported driver."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_pymongo_dropin.py",
+      "sha256": "39ce2eb6dd1ea29842ce11737723d90455f509cdf68b249c63369b4fe7ab5506",
+      "reference_case_count": 6,
+      "function_count": 6,
+      "coverage": [
+        {
+          "source": [
+            "test_import_tinymongo_as_pymongo_dropin_subset",
+            "test_pymongo_sort_constants_are_exposed"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_import_alias_exposes_sort_constants_and_public_crud"
+          ],
+          "note": "import briskdb as pymongo exposes the sort constants and real local-client CRUD/index/sorted query results without TinyMongo runtime code."
+        },
+        {
+          "source": [
+            "test_mongo_client_ignores_uri_and_uses_configured_local_folder",
+            "test_mongo_client_keeps_plain_path_as_storage_folder"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_local_folder_and_environment_configuration_do_not_use_tinydb_files"
+          ],
+          "note": "URI-shaped and plain-path construction select native local storage. briskdb_path/manifest.sqlite replace TinyMongo private _foldername and app.json layout; those storage formats are not interchangeable."
+        },
+        {
+          "source": [
+            "test_mongo_client_uses_env_folder_for_network_target"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_local_folder_and_environment_configuration_do_not_use_tinydb_files"
+          ],
+          "note": "BriskDB's environment setting is BRISKDB_HOME, not TINYMONGO_HOME. Host/port-shaped construction retains local data and metadata under that explicit native folder."
+        },
+        {
+          "source": [
+            "test_network_target_detection_branches"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_local_folder_and_environment_configuration_do_not_use_tinydb_files"
+          ],
+          "note": "Public list/IP/IPv6/URI-shaped hosts remain local when a native folder is selected. TinyMongo private host-classification/default-path helpers are not exported; BriskDB's documented default and environment selection differ."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_pymongo_contract.py",
+      "sha256": "d58637fc66f6d7b579eeb19bfe676d8c10f65eb52193ff4ec931eb3faa5c9b2d",
+      "reference_case_count": 27,
+      "function_count": 11,
+      "coverage": [
+        {
+          "source": [
+            "test_pymongo_shaped_application_code_can_run_with_tinymongo"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_stock_pymongo_application_runs_inside_native_patch_scope"
+          ],
+          "note": "The application CRUD/index/filter/update/metadata scenario runs with actual pymongo.MongoClient under the supported BriskDB patch scope. server_info identifies BriskDB, and the entire pymongo module is not replaced in sys.modules."
+        },
+        {
+          "source": [
+            "test_client_database_listing_and_server_info",
+            "test_list_database_names_returns_empty_for_missing_folder"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_stock_pymongo_application_runs_inside_native_patch_scope",
+            "python/tests/test_upstream_driver_contract.py::test_local_folder_and_environment_configuration_do_not_use_tinydb_files"
+          ],
+          "note": "Native version metadata, empty names and persistent logical names/collections are checked. database_names is a removed legacy alias; mutating TinyMongo private _foldername and expecting a missing JSON directory is not a native API. Native constructors open their validated storage root eagerly."
+        },
+        {
+          "source": [
+            "test_delete_one_missing_document_returns_zero",
+            "test_noop_update_distinguishes_matched_and_modified_counts"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_noop_counts_and_single_multi_replacement_upserts"
+          ],
+          "note": "Missing deletion returns zero; a matched no-op reports matched=1 and modified=0."
+        },
+        {
+          "source": [
+            "test_update_and_replace_upserts",
+            "test_update_many_upsert_creates_one_document"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_noop_counts_and_single_multi_replacement_upserts"
+          ],
+          "note": "Single/multi/replacement upserts return IDs and correct counts. Equality-seeded dotted fields are retained while range predicates are not inserted. Native SQLite replaces the source's TinyDB/SQLite backend variants."
+        },
+        {
+          "source": [
+            "test_backend_capabilities_are_explicit",
+            "test_object_storage_capabilities_are_conservative"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_backend_and_unsupported_calls_keep_native_boundaries"
+          ],
+          "note": "TinyMongo's TinyDB/DuckDB/Parquet/S3 backend plugins and capabilities()/supports() introspection are not implemented by this native SQLite/PyMongo surface. Unsupported backends reject before creating storage; named database selectors are not misrepresented as capability methods."
+        },
+        {
+          "source": [
+            "test_unsupported_features_fail_loudly"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_backend_and_unsupported_calls_keep_native_boundaries"
+          ],
+          "note": "Change streams, serverStatus, lookup and nonlocal write concerns reject. Native bulk_write and descending equality-index declarations are supported beyond this source's older unsupported expectations; no ordered index scan is implied. Driver exception classes differ from TinyMongo's custom errors."
+        },
+        {
+          "source": [
+            "test_session_options_are_rejected"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_driver_contract.py::test_fake_session_options_reject_without_native_mutations",
+            "python/tests/test_upstream_driver_contract.py::test_invalid_find_sessions_never_reach_driver_cursor_construction",
+            "python/tests/test_upstream_driver_contract.py::test_invalid_async_find_sessions_never_construct_driver_cursors"
+          ],
+          "note": "All 13 source fake-session forms reject without catalog mutations. Local sync/async find/find_one now reject invalid keyword/positional/falsey sessions before driver cursor construction, avoiding unraisable cleanup errors. Other ordinary driver paths retain AttributeError/ValueError and empty-batch TypeError; genuine sessions retain driver ConfigurationError on this no-session server, not TinyMongo's eager custom exception."
         }
       ]
     }
