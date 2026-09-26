@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 251 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 264 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -50,13 +50,14 @@ functions in the locked `test_query_more.py`,
 `test_multi_write.py`, `test_update_operator_modifiers.py`,
 `test_array_update_modifiers.py`, `test_bson_value_types.py`,
 `test_uuid_regex.py`, `test_aggregation_basic_stages.py`,
-`test_aggregation_projection_stages.py` and `test_aggregation.py` suites
-(642 reference parameter cases). 175 owned wheel tests check public
+`test_aggregation_projection_stages.py`, `test_aggregation.py`,
+`test_decimal_coverage_edges.py` and `test_bson_codec_fast_path.py` suites
+(657 reference parameter cases). 185 owned wheel tests check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 642 unchanged upstream candidate passes or complete #186 certification.
+not 657 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -126,6 +127,11 @@ TinyMongo clone/rewind methods, and fake/unsupported sessions use driver errors.
 TinyMongo-specific `capabilities()`/`supports()` client introspection is not
 implemented: those names remain PyMongo database selectors. That API difference
 is recorded explicitly, not counted as equivalent introspection or full parity.
+Decimal/codec edge coverage checks exact numeric unique-index aliases,
+double-versus-decimal distinctions, extreme decimal IDs across reopen, invalid
+updates, nonfinite BSON roundtrips and builtin/native subclasses. TinyMongo's
+tagged JSON, Python registry/optional-dependency hooks, lazy diagnostic callbacks
+and legacy arbitrary-precision integer IDs are not native BSON interfaces.
 
 Local sync/async client `find()` calls now snapshot caller-owned filters and
 projections after driver option validation. Later mutations of those mappings
