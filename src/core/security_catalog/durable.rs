@@ -134,6 +134,33 @@ impl DurableSecurityCatalog {
         edit: impl FnOnce(&mut SecurityCatalog) -> EngineResult<T>,
     ) -> EngineResult<T> {
         self.refresh()?;
+        self.update_current(edit)
+    }
+
+    /// Authorization and the write's expected revision must come from the same
+    /// refresh. A second refresh between these steps could accept a revocation
+    /// while retaining a stale permission decision. A peer racing after this
+    /// check causes CAS failure, never automatic callback replay.
+    pub(crate) fn update_authorized<T>(
+        &mut self,
+        principal: &Principal,
+        requirements: &[(Action, Resource)],
+        edit: impl FnOnce(&mut SecurityCatalog) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        self.refresh()?;
+        self.catalog.authorize_all(
+            principal,
+            requirements
+                .iter()
+                .map(|(action, resource)| (*action, resource)),
+        )?;
+        self.update_current(edit)
+    }
+
+    fn update_current<T>(
+        &mut self,
+        edit: impl FnOnce(&mut SecurityCatalog) -> EngineResult<T>,
+    ) -> EngineResult<T> {
         let mut candidate = SecurityCatalog::from_record(self.catalog.to_record()?.as_bytes())?;
         let result = edit(&mut candidate)?;
         self.catalog.validate_successor(&candidate)?;

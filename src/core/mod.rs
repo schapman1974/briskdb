@@ -26,6 +26,8 @@ pub mod security_catalog;
 mod session;
 mod stream;
 mod types;
+#[cfg(feature = "auth-scram")]
+pub mod user_management;
 pub(crate) mod worker;
 
 pub use catalog::{

@@ -51,10 +51,11 @@ impl Engine {
 
     /// Open an activated root with its matching durable authority. Unlike
     /// ordinary startup this never initializes an unbound root or missing store.
-    /// Only explicitly authenticated document commands are currently supported;
+    /// Only explicitly authenticated document and typed user commands are supported;
     /// SQL and anonymous sessions fail closed. The standalone Mongo TLS adapter
     /// can authenticate document clients; other adapters still reject this mode.
-    /// Rust host administration is trusted, not a wire user-management API.
+    /// Arbitrary Rust-host catalog edits remain trusted; typed user commands
+    /// separately require current realm privileges.
     pub async fn open_authenticated(
         root: impl AsRef<Path>,
         requested_shards: u16,
@@ -126,7 +127,51 @@ impl Engine {
             .await
     }
 
+    /// Execute a typed user command under the caller's current realm privileges.
+    /// The permission snapshot and durable compare-and-swap share one revision;
+    /// a competing catalog edit rejects the write rather than replaying it.
+    /// Password derivation runs only after authorization on a bounded worker.
+    /// Cancellation before admission skips the edit; once blocking work starts,
+    /// a cancelled/timed-out request may still commit. Never retry automatically.
+    pub async fn execute_user_management(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        command: super::super::user_management::UserManagementCommand,
+    ) -> EngineResult<()> {
+        let mut operation = self.operation_lifecycle(context.clone())?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        let requirements = command.requirements()?;
+        operation.check_before_start()?;
+        let result = self
+            .security_call_with_context(context, move |authority| {
+                authority
+                    .update_authorized(&principal, &requirements, |catalog| command.apply(catalog))
+            })
+            .await;
+        operation.finish(result)
+    }
+
     async fn security_call<T, F>(&self, work: F) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut DurableSecurityCatalog) -> EngineResult<T> + Send + 'static,
+    {
+        self.security_call_with_context(RequestContext::new(), work)
+            .await
+    }
+
+    async fn security_call_with_context<T, F>(
+        &self,
+        context: RequestContext,
+        work: F,
+    ) -> EngineResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut DurableSecurityCatalog) -> EngineResult<T> + Send + 'static,
@@ -137,7 +182,7 @@ impl Engine {
                 "engine security is not enabled",
             )
         })?;
-        let mut operation = self.operation_lifecycle(RequestContext::new())?;
+        let mut operation = self.operation_lifecycle(context)?;
         let permit = operation.wait_pending(self.inner.workers.acquire()).await?;
         operation.check_before_start()?;
         let lease = operation.take_lease();

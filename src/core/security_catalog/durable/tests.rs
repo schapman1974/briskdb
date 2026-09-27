@@ -271,6 +271,73 @@ fn uncertain_commit_fences_admission_until_a_fresh_incarnation_is_opened() {
 }
 
 #[test]
+fn authorized_edits_bind_permission_and_compare_and_swap_to_one_revision() {
+    let mut f = Fixture::new();
+    let principal = f.login();
+    let mut peer = f.peer();
+    let user = f.user.clone();
+    let role = f.role.clone();
+    let requirements = [(Action::ReadData, fixtures::target())];
+    let mut calls = 0;
+    let result = f
+        .authority
+        .update_authorized(&principal, &requirements, |candidate| {
+            calls += 1;
+            candidate.drop_user(&user)?;
+            let (revision, mut revoked) = peer.load()?.into_parts();
+            revoked.replace_role(&role, Policy::default())?;
+            peer.replace(revision, &revoked)?;
+            Ok(())
+        });
+    assert_eq!(
+        result.unwrap_err().kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    assert_eq!(calls, 1);
+    assert!(!f.authority.is_fenced());
+    let result = f
+        .authority
+        .update_authorized(&principal, &requirements, |_| {
+            calls += 1;
+            Ok(())
+        });
+    assert_eq!(
+        result.unwrap_err().kind(),
+        EngineErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        calls, 1,
+        "revoked authority must not execute or replay an edit"
+    );
+    assert_eq!(peer.load().unwrap().into_parts().1.user_count(), 1);
+}
+
+#[test]
+fn denied_authorized_edit_never_evaluates_callback_or_changes_bytes() {
+    let mut f = Fixture::new();
+    let principal = f.login();
+    let before = fs::read(&f.path).unwrap();
+    for requirements in [vec![], vec![(Action::DeleteData, fixtures::target())]] {
+        let result =
+            f.authority
+                .update_authorized(&principal, &requirements, |_| -> EngineResult<()> {
+                    panic!("unauthorized callback executed")
+                });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            EngineErrorKind::PermissionDenied
+        );
+        assert_eq!(f.authority.revision(), 1);
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+    }
+    let requirements = [(Action::ReadData, fixtures::target())];
+    f.authority
+        .update_authorized(&principal, &requirements, |_| Ok(()))
+        .unwrap();
+    assert_eq!(f.authority.revision(), 2);
+}
+
+#[test]
 fn changed_contents_at_the_same_revision_fence_even_with_a_valid_record_checksum() {
     let mut f = Fixture::new();
     let principal = f.login();
