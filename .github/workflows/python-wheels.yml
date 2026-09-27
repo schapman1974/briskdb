@@ -291,6 +291,8 @@ jobs:
           "$(brew --prefix python@3.14)/bin/python3.14" -m venv "$RUNNER_TEMP/briskdb-remote-host"
           "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m pip install --no-index --only-binary=:all: dist/*.whl
           "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m unittest discover -s python/tests -p test_remote_sqlite.py -v
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m pip install -r python/test-requirements.txt
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m unittest discover -s python/tests -p test_http_tls_server.py -v
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

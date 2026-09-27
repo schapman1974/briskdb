@@ -197,7 +197,15 @@ class UpstreamAsyncApiTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(AttributeError):
                 handle.__getattr__("_missing")
         self.assertFalse(callable(self.client.capabilities))
-        with self.assertRaises(TypeError):
+        # CPython 3.9 reports AttributeError for a missing __aenter__; newer
+        # versions report TypeError. Match the interpreter's ordinary-object
+        # rejection, not a version-specific exception chosen by BriskDB.
+        try:
+            async with object():
+                self.fail("ordinary object unexpectedly became an async context manager")
+        except (TypeError, AttributeError) as error:
+            missing_context_error = type(error)
+        with self.assertRaises(missing_context_error):
             async with self.client.context:
                 self.fail("PyMongo database unexpectedly became an async context manager")
         self.assertEqual(await database.command("ping"), {"ok": 1.0})
