@@ -41,6 +41,15 @@ data-directory copy. In-place downgrade is unsupported. Use the
 [storage-format contract](docs/STORAGE_FORMAT.md) for exact supported migration
 paths and restore the complete backup if rollback is required.
 
+Unreleased Rust builds with `auth-scram` also offer explicit offline security-root
+activation and authenticated engine startup. This initial opt-in surface enforces
+document-command and cursor privileges with durable user/role revocation. It is
+not Mongo network authentication: existing listeners and SQL/admin paths reject
+secured engines until their admission paths are implemented. Ordinary local and
+Python APIs are unchanged. See the [architecture contract](docs/ARCHITECTURE.md#authenticated-document-engine-unreleased-opt-in-rust-api)
+before activating a root; activation requires closing every handle and retaining
+a consistent backup that includes the private `security.sqlite` credential store.
+
 ## Earlier changes in this development cycle
 
 Logical document database-name discovery now uses the shared engine through

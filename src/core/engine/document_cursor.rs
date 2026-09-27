@@ -377,6 +377,45 @@ impl std::fmt::Debug for CursorRegistry {
 }
 
 impl CursorRegistry {
+    #[cfg(feature = "auth-scram")]
+    pub fn security_requirements(
+        &self,
+        owner: ConnectionOwner,
+        namespace: &DocumentNamespace,
+        id: DocumentCursorId,
+    ) -> EngineResult<
+        Vec<(
+            crate::core::authorization::Action,
+            crate::core::authorization::Resource,
+        )>,
+    > {
+        use super::security::document::{database, object};
+        use crate::core::authorization::Action;
+        let mut inner = self.0.lock().map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "cursor registry is unavailable",
+            )
+        })?;
+        prune(&mut inner, Instant::now());
+        let entry = inner
+            .entries
+            .get(&id)
+            .filter(|entry| entry.owner == owner && &entry.namespace == namespace)
+            .ok_or_else(|| DocumentCursorError::NotFound.into_engine_error())?;
+        match entry
+            .state
+            .as_ref()
+            .ok_or_else(|| DocumentCursorError::InUse.into_engine_error())?
+        {
+            RetainedCursorState::Documents(_) => object(namespace, &[Action::ReadData]),
+            RetainedCursorState::Collections(_) => {
+                database(namespace.database(), Action::ListObjects)
+            }
+            RetainedCursorState::Indexes(_) => object(namespace, &[Action::ListIndexes]),
+        }
+    }
+
     pub fn insert(
         self: &Arc<Self>,
         owner: ConnectionOwner,

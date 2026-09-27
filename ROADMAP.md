@@ -433,13 +433,14 @@ database under differential/property tests.
   failure fencing with crash recovery tests. Replacements preserve user-ID and
   credential-generation history, rejecting stale/reused identities before writes.
   Manifest v22 reserves a checksummed store-ID binding, fences older binaries,
-  and rejects ordinary startup for bound roots on every feature surface. No public
-  activation/authenticated-startup API exists yet. A durable authority now refreshes
+  and rejects ordinary startup for bound roots on every feature surface. A durable authority now refreshes
   before every proof/admission, publishes edits only after commit, preserves live
   identities across valid revisions and fences read/uncertain-write failures.
-  Provisioning/root-store linkage, engine/session integration and listener
-  enforcement are still outstanding; these foundations do not enable network
-  authentication or RBAC.
+  Explicit offline root activation and authenticated Rust-engine startup now bind
+  that authority to immutable sessions and enforce document-command/cursor privileges.
+  Unsupported SQL/admin/protocol entry points fail closed in this opt-in mode.
+  Mongo SCRAM conversations, built-in roles/user commands, Python/daemon wiring,
+  relational/admin admission and listener authentication remain outstanding.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and

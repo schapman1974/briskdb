@@ -82,6 +82,9 @@ struct Connector {
 /// Build a dedicated router. Bind loopback and publish only this listener
 /// through a trusted HTTPS reverse proxy; do not expose the admin listener.
 pub fn router(engine: Engine, config: Config) -> Result<Router, &'static str> {
+    if engine.security_enabled() {
+        return Err("SQLite remote authentication for security-bound engines is not implemented");
+    }
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| "SQLite remote instance entropy unavailable")?;
     let state = Connector {

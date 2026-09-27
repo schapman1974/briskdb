@@ -4,6 +4,8 @@
 mod document_cursor;
 #[cfg(feature = "documents")]
 mod document_engine;
+#[cfg(feature = "auth-scram")]
+mod security;
 #[cfg(feature = "documents")]
 pub(crate) use document_cursor::DocumentCursorOwner;
 
@@ -389,6 +391,8 @@ struct EngineInner {
     active_idempotency_keys: Arc<ActiveIdempotencyKeys>,
     shutdown_cancel: CancellationToken,
     shutdown_gate: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "auth-scram")]
+    security: Option<Arc<std::sync::Mutex<super::security_catalog::DurableSecurityCatalog>>>,
     #[cfg(feature = "documents")]
     document_cursors: Arc<document_cursor::CursorRegistry>,
     #[cfg(feature = "experimental-vtab")]
@@ -638,6 +642,8 @@ impl Engine {
                 active_idempotency_keys: Arc::new(ActiveIdempotencyKeys::default()),
                 shutdown_cancel: CancellationToken::new(),
                 shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(feature = "auth-scram")]
+                security: None,
                 #[cfg(feature = "documents")]
                 document_cursors: Arc::new(document_cursor::CursorRegistry::default()),
                 #[cfg(feature = "experimental-vtab")]
@@ -765,6 +771,7 @@ impl Engine {
         parameters: &[Value],
         explicit_routing_key: Option<&[u8]>,
     ) -> EngineResult<BoundStatementPlan> {
+        self.require_unsecured_operation()?;
         let _schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let cancellation = CancellationToken::new();
         self.plan_bound_statement_admitted(
@@ -1030,6 +1037,34 @@ impl Engine {
     }
 
     fn operation(&self, context: RequestContext) -> EngineResult<Operation> {
+        self.require_unsecured_operation()?;
+        self.operation_lifecycle(context)
+    }
+
+    fn require_unsecured_operation(&self) -> EngineResult<()> {
+        if self.security_enabled() {
+            return Err(EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "this operation has no authenticated admission path",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this engine requires authenticated, operation-specific admission.
+    /// Existing listener adapters do not support this mode yet and must reject it.
+    pub fn security_enabled(&self) -> bool {
+        #[cfg(feature = "auth-scram")]
+        {
+            self.inner.security.is_some()
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        {
+            false
+        }
+    }
+
+    fn operation_lifecycle(&self, context: RequestContext) -> EngineResult<Operation> {
         let lease = self.inner.lifecycle.try_acquire()?;
         let cancellation = context.cancellation_token();
         let now = Instant::now();

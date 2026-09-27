@@ -88,13 +88,21 @@ impl Engine {
         request: DocumentRequest,
     ) -> EngineResult<DocumentExecution> {
         let (request_id, context, command) = request.into_parts();
-        let mut operation = self.operation(context)?;
+        let mut operation = self.operation_lifecycle(context)?;
         if session.owner != self.inner.id {
             return operation.finish(Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 "the session belongs to a different engine",
             )));
         }
+        #[cfg(feature = "auth-scram")]
+        if let Err(error) = operation
+            .wait_pending(self.authorize_document(session, &command))
+            .await
+        {
+            return operation.finish(Err(error));
+        }
+        operation.check_before_start()?;
         let result = match command {
             DocumentCommand::BuildIndex(request) => {
                 let (namespace, name, options) = request.into_parts();

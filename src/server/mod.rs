@@ -662,6 +662,9 @@ impl AttachedServer {
         config: ListenerConfig,
         prepared: PreparedOptions,
     ) -> anyhow::Result<Self> {
+        if database.engine().security_enabled() {
+            anyhow::bail!("configured listeners do not support security-bound engines yet");
+        }
         let PreparedOptions {
             postgres: security,
             data_router,
