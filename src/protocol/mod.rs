@@ -9,3 +9,5 @@ pub mod mongo;
 pub mod postgres;
 #[cfg(feature = "http")]
 pub mod sqlite_remote;
+#[cfg(feature = "transport-tls")]
+pub(crate) mod tls;

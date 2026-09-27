@@ -419,7 +419,10 @@ database under differential/property tests.
 - [ ] User/role catalog, password hashing, credential rotation, and least-
   privilege authorization for data/schema/admin operations.
 - [ ] TLS configuration and reload for every listener; safe non-loopback startup
-  defaults.
+  defaults. PostgreSQL now consumes an internal, independently selectable
+  `transport-tls` identity loader with caller-selected ALPN, PEM validation and
+  Unix key-permission checks. This #65/#188 foundation does not add reload or
+  enable Mongo TLS/authentication; Mongo still refuses non-loopback binds.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined
