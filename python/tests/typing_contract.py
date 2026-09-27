@@ -7,6 +7,7 @@ import briskdb
 
 
 def server_reload_contract(server: briskdb.Server) -> None:
+    server.reload_mongo_tls(tls_cert=Path("server.crt"), tls_key="server.key", timeout_ms=5000)
     server.reload_postgres_security(
         tls_cert=Path("server.crt"), tls_key="server.key", user="briskdb",
         password_file=Path("password"), timeout_ms=5000,
@@ -15,6 +16,8 @@ def server_reload_contract(server: briskdb.Server) -> None:
 
 
 async def async_server_reload_contract(server: briskdb.AsyncServer) -> None:
+    await server.reload_mongo_tls(tls_cert="server.crt", tls_key=Path("server.key"),
+                                 cancellation=briskdb.CancellationToken())
     await server.reload_postgres_security(
         tls_cert=Path("server.crt"), tls_key="server.key", user="briskdb",
         password_file="password", timeout_ms=5000,

@@ -405,8 +405,25 @@ Async hosts use the same keywords with `await db.serve(...)` and stock
 `AsyncMongoClient` with the same TLS options. Encrypted Mongo can coexist with
 PostgreSQL TLS/SCRAM or authenticated SQLite remote, without sharing credentials.
 TLS authenticates the server only: Mongo remains anonymous and loopback-only,
-and must not be publicly proxied. Managed `briskdb.patch()` clients are unchanged;
-Mongo reload through Python is not yet available.
+and must not be publicly proxied. Managed `briskdb.patch()` clients are unchanged.
+
+### Reload Mongo TLS (unreleased)
+
+An already-encrypted attached listener can replace its certificate/key without
+rebinding. Within the `serve()` context above:
+
+```python
+server.reload_mongo_tls(tls_cert="./next.crt", tls_key="./next.key", timeout_ms=5_000)
+# With AsyncServer: await server.reload_mongo_tls(...)
+```
+
+Fresh connections must trust the new certificate; admitted connections and
+pending handshakes keep their original identity. Invalid replacements leave the
+active identity unchanged. Optional `cancellation=` and `timeout_ms=` apply while
+queued and preparing, with a final check before publication; asyncio task
+cancellation signals the native token. They cannot undo a completed publication.
+This does not upgrade a plaintext listener, authenticate users, revoke existing
+sessions, change PostgreSQL's identity, or remove Mongo's loopback restriction.
 
 ### Handle and process ownership
 

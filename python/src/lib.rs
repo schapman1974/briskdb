@@ -1129,6 +1129,22 @@ struct Server {
 
 #[pymethods]
 impl Server {
+    /// Reload already-encrypted Mongo; admitted sockets retain their old identity.
+    #[pyo3(signature = (*, tls_cert, tls_key, timeout_ms=None, cancellation=None))]
+    fn reload_mongo_tls(
+        &self,
+        py: Python<'_>,
+        tls_cert: PathBuf,
+        tls_key: PathBuf,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<()> {
+        let config = MongoTlsConfig::new(tls_cert, tls_key);
+        let context = request_context(timeout_ms, cancellation)?;
+        let shared = Arc::clone(&self.shared);
+        run_native(py, move || shared.reload_mongo_tls_native(config, context))
+    }
+
     /// Reload this already-secure PostgreSQL listener; existing sessions retain
     /// their original identity. File I/O and derivation run without the GIL.
     #[pyo3(signature = (*, tls_cert, tls_key, user, password_file, timeout_ms=None, cancellation=None))]

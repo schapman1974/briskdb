@@ -5,9 +5,23 @@ use std::{future::Future, sync::TryLockError, time::Duration};
 use briskdb::{EngineError, EngineErrorKind, RequestContext};
 
 use super::{
-    PostgresSecurityConfig, ServerShared,
+    MongoTlsConfig, PostgresSecurityConfig, ServerShared,
     error::{NativeError, NativeResult, listener_error},
 };
+
+enum ReloadIdentity {
+    Postgres(PostgresSecurityConfig),
+    Mongo(MongoTlsConfig),
+}
+
+impl ReloadIdentity {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Postgres(_) => "PostgreSQL security",
+            Self::Mongo(_) => "Mongo TLS",
+        }
+    }
+}
 
 impl ServerShared {
     pub(crate) fn reload_security_native(
@@ -15,9 +29,27 @@ impl ServerShared {
         config: PostgresSecurityConfig,
         context: RequestContext,
     ) -> NativeResult<()> {
+        self.reload_identity_native(ReloadIdentity::Postgres(config), context)
+    }
+
+    pub(crate) fn reload_mongo_tls_native(
+        &self,
+        config: MongoTlsConfig,
+        context: RequestContext,
+    ) -> NativeResult<()> {
+        self.reload_identity_native(ReloadIdentity::Mongo(config), context)
+    }
+
+    fn reload_identity_native(
+        &self,
+        config: ReloadIdentity,
+        context: RequestContext,
+    ) -> NativeResult<()> {
+        let label = config.label();
         self.runtime.runtime.block_on(controlled(
             &context,
             self.reload_serialized(config, &context),
+            label,
         ))
     }
 
@@ -28,7 +60,7 @@ impl ServerShared {
     #[allow(clippy::await_holding_lock)]
     async fn reload_serialized(
         &self,
-        config: PostgresSecurityConfig,
+        config: ReloadIdentity,
         context: &RequestContext,
     ) -> NativeResult<()> {
         let slot = loop {
@@ -40,19 +72,29 @@ impl ServerShared {
             tokio::time::sleep(Duration::from_millis(1)).await;
         };
         let server = slot.as_ref().ok_or(NativeError::Closed("server"))?;
-        server
-            .reload_postgres_security_with_context(config, context.clone())
-            .await
-            .map_err(|error| match error.downcast::<EngineError>() {
-                Ok(error) => NativeError::Engine(error),
-                Err(error) => listener_error(error),
-            })
+        let result = match config {
+            ReloadIdentity::Postgres(config) => {
+                server
+                    .reload_postgres_security_with_context(config, context.clone())
+                    .await
+            }
+            ReloadIdentity::Mongo(config) => {
+                server
+                    .reload_mongo_tls_with_context(config, context.clone())
+                    .await
+            }
+        };
+        result.map_err(|error| match error.downcast::<EngineError>() {
+            Ok(error) => NativeError::Engine(error),
+            Err(error) => listener_error(error),
+        })
     }
 }
 
 async fn controlled<T>(
     context: &RequestContext,
     operation: impl Future<Output = NativeResult<T>>,
+    label: &'static str,
 ) -> NativeResult<T> {
     let cancellation = context.cancellation_token();
     // A Tokio timer may first yield Pending even for a just-expired instant.
@@ -60,7 +102,7 @@ async fn controlled<T>(
     if cancellation.is_cancelled() {
         return Err(EngineError::new(
             EngineErrorKind::Cancelled,
-            "PostgreSQL security reload was cancelled before completion",
+            format!("{label} reload was cancelled before completion"),
         )
         .into());
     }
@@ -70,7 +112,7 @@ async fn controlled<T>(
     {
         return Err(EngineError::new(
             EngineErrorKind::DeadlineExceeded,
-            "PostgreSQL security reload deadline elapsed",
+            format!("{label} reload deadline elapsed"),
         )
         .into());
     }
@@ -84,10 +126,10 @@ async fn controlled<T>(
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(EngineError::new(
-            EngineErrorKind::Cancelled, "PostgreSQL security reload was cancelled before completion",
+            EngineErrorKind::Cancelled, format!("{label} reload was cancelled before completion"),
         ).into()),
         _ = deadline => Err(EngineError::new(
-            EngineErrorKind::DeadlineExceeded, "PostgreSQL security reload deadline elapsed",
+            EngineErrorKind::DeadlineExceeded, format!("{label} reload deadline elapsed"),
         ).into()),
         result = operation => result,
     }
@@ -139,16 +181,23 @@ mod tests {
                 "unused.password",
             )
             .unwrap();
-            let context = RequestContext::new()
-                .with_timeout(Duration::from_millis(10))
-                .unwrap();
-            let result = worker_shared.reload_security_native(config, context);
-            done.send(matches!(result, Err(NativeError::Engine(error)) if error.kind() == EngineErrorKind::DeadlineExceeded)).unwrap();
+            for identity in [
+                ReloadIdentity::Postgres(config),
+                ReloadIdentity::Mongo(MongoTlsConfig::new("unused.crt", "unused.key")),
+            ] {
+                let context = RequestContext::new()
+                    .with_timeout(Duration::from_millis(10))
+                    .unwrap();
+                let result = worker_shared.reload_identity_native(identity, context);
+                done.send(matches!(result, Err(NativeError::Engine(error)) if error.kind() == EngineErrorKind::DeadlineExceeded)).unwrap();
+            }
         });
-        let result = finished.recv_timeout(Duration::from_secs(5));
+        let first = finished.recv_timeout(Duration::from_secs(5));
+        let second = finished.recv_timeout(Duration::from_secs(5));
         drop(held);
         worker.join().unwrap();
-        assert!(result.unwrap());
+        assert!(first.unwrap());
+        assert!(second.unwrap());
         shared.close_native().unwrap();
         shared.runtime.runtime.block_on(db.close()).unwrap();
     }
@@ -165,10 +214,14 @@ mod tests {
             ),
         ] {
             let polled = AtomicBool::new(false);
-            let result = controlled(&context, async {
-                polled.store(true, Ordering::SeqCst);
-                Ok(())
-            })
+            let result = controlled(
+                &context,
+                async {
+                    polled.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                "test",
+            )
             .await;
             assert!(matches!(result, Err(NativeError::Engine(error)) if error.kind() == kind));
             assert!(!polled.load(Ordering::SeqCst));
@@ -188,11 +241,15 @@ mod tests {
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = tokio::sync::oneshot::channel::<()>();
             let token = context.cancellation_token();
-            let operation = controlled(&context, async {
-                started.send(()).unwrap();
-                wait.await.unwrap();
-                Ok(())
-            });
+            let operation = controlled(
+                &context,
+                async {
+                    started.send(()).unwrap();
+                    wait.await.unwrap();
+                    Ok(())
+                },
+                "test",
+            );
             let trigger = async {
                 ready.await.unwrap();
                 if cancel {
@@ -209,7 +266,7 @@ mod tests {
             assert!(release.send(()).is_err());
         }
         assert_eq!(
-            controlled(&RequestContext::new(), async { Ok(17) })
+            controlled(&RequestContext::new(), async { Ok(17) }, "test")
                 .await
                 .unwrap(),
             17

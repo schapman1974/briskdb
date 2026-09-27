@@ -538,6 +538,14 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
   `FailedPreconditionError`; anonymous/closing listeners and invalid material
   raise `OperationalError`; cancellation/deadline use their typed request errors.
   This does not secure Mongo/HTTP or revoke existing sessions.
+- Unreleased: `Server.reload_mongo_tls(*, tls_cert, tls_key, timeout_ms=None,
+  cancellation=None) -> None` and the equivalent awaited `AsyncServer` method
+  replace the identity of an already-encrypted Mongo listener. Paths accept
+  `str` or `PathLike[str]`. The same queued/preparation controls, publication
+  semantics and typed errors above apply; plaintext or absent Mongo raises
+  `OperationalError`. Each admitted socket, including a pending handshake,
+  retains its original identity. Mongo remains anonymous and loopback-only;
+  PostgreSQL's identity is independent.
 - Database close first drains every attached server, then stops the engine.
 
 Data HTTP, administration HTTP, and unauthenticated PostgreSQL accept only
@@ -573,8 +581,8 @@ Pass `tls=True, tlsCAFile="./ca.crt"` to stock `pymongo.MongoClient` or
 `AsyncMongoClient`, using a hostname present in the server certificate. Never
 disable certificate/hostname verification. TLS proves the server's identity;
 Mongo remains anonymous and **loopback-only**, with no inherited PostgreSQL or
-SQLite-remote credentials. No Mongo reload method or managed-patch TLS behavior
-is added. PostgreSQL and SQLite remote still require separate Python serve handles;
+SQLite-remote credentials. Managed-patch TLS behavior is unchanged.
+PostgreSQL and SQLite remote still require separate Python serve handles;
 either can coexist with encrypted Mongo.
 
 ## Results and errors
