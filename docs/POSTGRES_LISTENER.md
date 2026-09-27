@@ -323,6 +323,17 @@ AWS-LC or dependency-owned extended type adapters. Production framing is contain
 not accept or return dependency types. The adapter uses BriskDB's catalog,
 session lifecycle, fixed SQLSTATE table, and safe messages.
 
+Certificate/key loading now lives in BriskDB's internal shared transport module,
+selected independently with `transport-tls` and included by `postgres`.
+The existing `tls` feature remains a compatibility alias for `postgres`.
+The shared loader uses the same ring-backed Rustls stack, validates PEM files
+and Unix private-key permissions, retains certificate bytes for SCRAM channel
+binding, and takes ALPN values from its caller. It opens no socket and does not
+authenticate users. PostgreSQL still selects `postgresql` ALPN and retains its
+existing TLS/SCRAM configuration and non-loopback checks. This is groundwork
+for issues #65/#188, not certificate reload, a shared user/role catalog, or Mongo
+TLS/authentication; Mongo remains anonymous-loopback-only.
+
 TLS keys, certificates, plaintext passwords, and derived SCRAM material are
 process configuration only; none is written to the BriskDB data root. The
 password file is read into bounded memory, converted to a random-salted SCRAM

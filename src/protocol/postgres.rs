@@ -10,9 +10,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt,
-    fs::{self, File},
-    io::{self, BufReader},
+    fmt, fs, io,
     ops::ControlFlow,
     path::{Path, PathBuf},
     pin::Pin,
@@ -21,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+use super::tls::{
+    contextual_io_error, load_server_identity, validate_private_file, validate_regular_file,
+};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use futures::{Sink, SinkExt, StreamExt, stream};
@@ -61,10 +62,7 @@ use pgwire::{
             PasswordMessageFamily, SecretKey, Startup,
         },
     },
-    tokio::{
-        server::{MaybeTls, PgWireMessageServerCodec, process_error, process_message},
-        tokio_rustls::{TlsAcceptor, rustls},
-    },
+    tokio::server::{MaybeTls, PgWireMessageServerCodec, process_error, process_message},
 };
 use sqlparser::{
     ast::{
@@ -78,6 +76,9 @@ use tokio::{
     net::TcpStream,
     sync::Mutex as AsyncMutex,
 };
+use tokio_rustls::TlsAcceptor;
+#[cfg(test)]
+use tokio_rustls::rustls;
 use tokio_util::codec::Framed;
 
 use crate::{
@@ -98,7 +99,6 @@ const MAX_STARTUP_NAME_BYTES: usize = 63;
 const MAX_EXTENDED_NAME_BYTES: usize = 63;
 const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
 const MAX_FRONTEND_MESSAGE_LENGTH: usize = MAX_PARSED_SQL_BYTES + 5;
-const MAX_TLS_PEM_BYTES: u64 = 1_048_576;
 const MAX_PASSWORD_FILE_BYTES: u64 = 1_026;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 const SSL_REQUEST_CODE: i32 = 80_877_103;
@@ -174,91 +174,18 @@ impl SecurityConfig {
 
     pub(crate) fn load(&self) -> io::Result<LoadedSecurity> {
         validate_regular_file(
-            &self.certificate,
-            "PostgreSQL TLS certificate",
-            MAX_TLS_PEM_BYTES,
-        )?;
-        validate_regular_file(
-            &self.private_key,
-            "PostgreSQL TLS private key",
-            MAX_TLS_PEM_BYTES,
-        )?;
-        validate_regular_file(
             &self.password_file,
             "PostgreSQL password file",
             MAX_PASSWORD_FILE_BYTES,
         )?;
-        validate_private_file(&self.private_key, "PostgreSQL TLS private key")?;
         validate_private_file(&self.password_file, "PostgreSQL password file")?;
 
-        let certificate_pem = fs::read(&self.certificate).map_err(|error| {
-            contextual_io_error(
-                error,
-                format!(
-                    "failed to read PostgreSQL TLS certificate {}",
-                    self.certificate.display()
-                ),
-            )
-        })?;
-        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                contextual_io_error(
-                    error,
-                    format!(
-                        "failed to parse PostgreSQL TLS certificate {}",
-                        self.certificate.display()
-                    ),
-                )
-            })?;
-        if certificates.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "PostgreSQL TLS certificate {} contains no certificates",
-                    self.certificate.display()
-                ),
-            ));
-        }
-
-        let key_file = File::open(&self.private_key).map_err(|error| {
-            contextual_io_error(
-                error,
-                format!(
-                    "failed to read PostgreSQL TLS private key {}",
-                    self.private_key.display()
-                ),
-            )
-        })?;
-        let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-            .map_err(|error| {
-                contextual_io_error(
-                    error,
-                    format!(
-                        "failed to parse PostgreSQL TLS private key {}",
-                        self.private_key.display()
-                    ),
-                )
-            })?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "PostgreSQL TLS private key {} contains no supported private key",
-                        self.private_key.display()
-                    ),
-                )
-            })?;
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("PostgreSQL TLS certificate and private key are invalid: {error}"),
-                )
-            })?;
-        tls.alpn_protocols = vec![b"postgresql".to_vec()];
+        let tls = load_server_identity(
+            &self.certificate,
+            &self.private_key,
+            "PostgreSQL",
+            &[b"postgresql"],
+        )?;
 
         let mut password = fs::read(&self.password_file).map_err(|error| {
             contextual_io_error(
@@ -321,8 +248,8 @@ impl SecurityConfig {
         );
 
         let loaded = LoadedSecurity {
-            tls_acceptor: TlsAcceptor::from(Arc::new(tls)),
-            certificate_pem: certificate_pem.into(),
+            tls_acceptor: TlsAcceptor::from(tls.config),
+            certificate_pem: tls.certificate_pem,
             credentials: Arc::new(ScramCredentials {
                 user: self.user.clone(),
                 salt,
@@ -407,70 +334,6 @@ impl AuthSource for ScramCredentials {
         };
         Ok(Password::new(Some(salt.clone()), password.clone()))
     }
-}
-
-fn contextual_io_error(error: io::Error, message: String) -> io::Error {
-    io::Error::new(error.kind(), format!("{message}: {error}"))
-}
-
-fn validate_regular_file(path: &Path, label: &str, maximum_bytes: u64) -> io::Result<()> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{label} {} is not a regular file", path.display()),
-        ));
-    }
-    if metadata.len() > maximum_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{label} {} exceeds the {maximum_bytes}-byte limit",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o037 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{label} {} must not be group-writable or accessible by other users (mode is {mode:03o})",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    let _ = metadata;
-    Ok(())
 }
 
 #[derive(Clone, Copy)]

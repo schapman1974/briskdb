@@ -38,12 +38,14 @@ postgres = [
     "dep:bytes",
     "dep:futures",
     "dep:pgwire",
-    "dep:rustls-pemfile",
+    "transport-tls",
     "pgwire/server-api-ring",
     "dep:tokio-util",
     "tokio/io-util",
     "tokio/net",
 ]
+# Shared transport identity loading; does not open a listener or authenticate users.
+transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 # Compatibility alias for the PostgreSQL transport-security surface. The
 # adapter always includes TLS and SCRAM so a downstream listener cannot compile
 # an accidentally insecure non-loopback configuration.
@@ -143,6 +145,7 @@ sqlparser = { version = "=0.62.0", default-features = false, features = ["std", 
 # both this repository and downstream consumers until that graph is corrected.
 psm = "=0.1.28"
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { version = "0.1", optional = true }
