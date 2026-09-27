@@ -1367,6 +1367,32 @@ certification. Returned Rust records zeroize their owned buffers; SQLite's page
 cache, journal, file storage and library-internal copies are not erased or
 encrypted by this component. Protect the directory and backups accordingly.
 
+`core::security_catalog::DurableSecurityCatalog` now owns one validated store
+and couples durable revisions to a live catalog incarnation. It refreshes from
+one SQLite snapshot before **each** authentication phase or permission admission;
+permissions are never served from a cached fallback after a read failure. Valid
+successors preserve the incarnation while rechecking current user IDs, credential
+generations and roles. A role change affects retained principals on their next
+admission; rotation/drop invalidates the affected identities and pending proofs.
+An explicit reopen creates a new incarnation and invalidates all prior principals.
+
+Trusted administration edits a detached copy, validates lineage, and performs
+revision-checked persistence before infallible in-memory publication. Callback
+errors/panics and validation failures publish nothing. Conflicts do not replay
+the callback; the next admission refreshes the winning revision. Principals
+created from a detached edit or another authority never acquire this authority's
+identity. Read/history errors and uncertain writes fence the authority until
+explicit reopen. A zeroizing, redacted fingerprint also detects changed contents
+at an unchanged observed revision; it is not an anti-forgery or fresh-process
+anti-rollback mechanism. Admission observes the loaded revision; peer changes
+after that snapshot affect subsequent admissions, not already-admitted work.
+
+These methods perform blocking I/O and require exclusive Rust access. Hosts
+must serialize them on blocking workers and still derive complete operation
+requirements, bind root/store identity, and enforce session/cursor ownership.
+This wrapper is not yet installed in engine sessions or network listeners and
+does not activate a manifest binding or validate a wire-level SCRAM conversation.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`
