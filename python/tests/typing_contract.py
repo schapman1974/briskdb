@@ -124,7 +124,10 @@ def sync_contract(path: str) -> None:
             ordinal: int = shard_work["shard"]
             observed: int = shard_work["documents_examined"]
             accepted: int = shard_work["source_matches"]
-            print(ordinal, observed, accepted)
+            elapsed_nanos: int = shard_work["storage_read_nanos"]
+            print(ordinal, observed, accepted, elapsed_nanos)
+        total_storage_nanos: int = measured["read_stats"]["storage_read_nanos"]
+        print(total_storage_nanos)
     if diagnostic_plan is not None and "read_access" in diagnostic_plan:
         access = diagnostic_plan["read_access"]
         if access["kind"] == "index_candidates":
@@ -221,7 +224,10 @@ async def async_contract(path: str) -> None:
             ordinal: int = shard_work["shard"]
             observed: int = shard_work["documents_examined"]
             accepted: int = shard_work["source_matches"]
-            print(ordinal, observed, accepted)
+            elapsed_nanos: int = shard_work["storage_read_nanos"]
+            print(ordinal, observed, accepted, elapsed_nanos)
+        total_storage_nanos: int = measured["read_stats"]["storage_read_nanos"]
+        print(total_storage_nanos)
     continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1, plan_diagnostics=True, execution_stats=True))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     deleted_many: int = (await session.delete_many("app", "typed", {}))["deleted_count"]

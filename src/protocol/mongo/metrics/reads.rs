@@ -19,6 +19,10 @@ pub struct MongoReadMetrics {
     pub executions: u64,
     /// Record-read calls, including misses and repeated lookahead/rescans.
     pub storage_reads: u64,
+    /// Summed elapsed nanoseconds inside record-read storage calls, including
+    /// BSON decoding, misses and rereads. Parallel calls overlap. Excludes
+    /// admission/catalog/matcher/result work; not query wall time or CPU/I/O time.
+    pub storage_read_nanos: u64,
     pub documents_examined: u64,
     /// Source matcher evaluations, not pipeline predicates or matched rows.
     pub matcher_evaluations: u64,
@@ -45,11 +49,15 @@ pub struct MongoReadMetrics {
     /// Source predicate acceptances per physical ordinal, including rereads.
     /// This is row-work distribution, not CPU, bytes or unique-result skew.
     pub shard_source_matches: [u64; 64],
+    /// Storage-call elapsed nanoseconds by fixed physical ordinal, with the
+    /// same scope as `storage_read_nanos`; no namespace/identity labels.
+    pub shard_storage_read_nanos: [u64; 64],
 }
 
 pub(super) struct ReadCounters {
     executions: AtomicU64,
     storage_reads: AtomicU64,
+    storage_nanos: AtomicU64,
     documents: AtomicU64,
     matchers: AtomicU64,
     matches: AtomicU64,
@@ -65,6 +73,7 @@ pub(super) struct ReadCounters {
     shards: [AtomicU64; 64],
     shard_documents: [AtomicU64; 64],
     shard_matches: [AtomicU64; 64],
+    shard_storage_nanos: [AtomicU64; 64],
 }
 
 impl Default for ReadCounters {
@@ -72,6 +81,7 @@ impl Default for ReadCounters {
         Self {
             executions: AtomicU64::new(0),
             storage_reads: AtomicU64::new(0),
+            storage_nanos: AtomicU64::new(0),
             documents: AtomicU64::new(0),
             matchers: AtomicU64::new(0),
             matches: AtomicU64::new(0),
@@ -87,6 +97,7 @@ impl Default for ReadCounters {
             shards: std::array::from_fn(|_| AtomicU64::new(0)),
             shard_documents: std::array::from_fn(|_| AtomicU64::new(0)),
             shard_matches: std::array::from_fn(|_| AtomicU64::new(0)),
+            shard_storage_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -98,6 +109,7 @@ impl ReadCounters {
         };
         add(&self.executions, 1);
         add(&self.storage_reads, stats.storage_reads());
+        add(&self.storage_nanos, stats.storage_read_nanos());
         add(&self.documents, stats.documents_examined());
         add(&self.matchers, stats.matcher_evaluations());
         add(&self.matches, stats.source_matches());
@@ -126,6 +138,7 @@ impl ReadCounters {
             add(&self.shards[shard], 1);
             add(&self.shard_documents[shard], work.documents_examined());
             add(&self.shard_matches[shard], work.source_matches());
+            add(&self.shard_storage_nanos[shard], work.storage_read_nanos());
             visits += 1;
         }
         add(&self.shard_visits, visits);
@@ -141,6 +154,7 @@ impl ReadCounters {
         MongoReadMetrics {
             executions: get(&self.executions),
             storage_reads: get(&self.storage_reads),
+            storage_read_nanos: get(&self.storage_nanos),
             documents_examined: get(&self.documents),
             matcher_evaluations: get(&self.matchers),
             source_matches: get(&self.matches),
@@ -156,6 +170,7 @@ impl ReadCounters {
             shard_requests: std::array::from_fn(|i| get(&self.shards[i])),
             shard_documents_examined: std::array::from_fn(|i| get(&self.shard_documents[i])),
             shard_source_matches: std::array::from_fn(|i| get(&self.shard_matches[i])),
+            shard_storage_read_nanos: std::array::from_fn(|i| get(&self.shard_storage_nanos[i])),
         }
     }
 }

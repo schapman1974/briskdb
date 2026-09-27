@@ -25,6 +25,7 @@ pub(crate) fn execution_to_python(
     if let Some(stats) = read_stats {
         let counters = PyDict::new(py);
         counters.set_item("storage_reads", stats.storage_reads())?;
+        counters.set_item("storage_read_nanos", stats.storage_read_nanos())?;
         counters.set_item("documents_examined", stats.documents_examined())?;
         counters.set_item("matcher_evaluations", stats.matcher_evaluations())?;
         counters.set_item("source_matches", stats.source_matches())?;
@@ -35,6 +36,7 @@ pub(crate) fn execution_to_python(
             row.set_item("shard", work.shard())?;
             row.set_item("documents_examined", work.documents_examined())?;
             row.set_item("source_matches", work.source_matches())?;
+            row.set_item("storage_read_nanos", work.storage_read_nanos())?;
             shard_work.append(row)?;
         }
         counters.set_item("shard_work", shard_work)?;

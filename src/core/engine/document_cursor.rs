@@ -107,6 +107,7 @@ pub(super) struct ReadStats {
     shard_mask: AtomicU64,
     documents_by_shard: [AtomicU64; 64],
     matches_by_shard: [AtomicU64; 64],
+    storage_nanos_by_shard: [AtomicU64; 64],
 }
 
 impl Default for ReadStats {
@@ -119,6 +120,7 @@ impl Default for ReadStats {
             shard_mask: AtomicU64::new(0),
             documents_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
             matches_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
+            storage_nanos_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -131,6 +133,33 @@ impl ReadStats {
     pub fn storage_read(&self, shard: u16) {
         Self::add(&self.storage_reads, 1);
         self.shard_mask.fetch_or(1_u64 << shard, Ordering::Relaxed);
+    }
+
+    /// The disabled path neither reads the clock nor allocates a timer.
+    pub(super) fn observe_storage_read<T>(
+        stats: Option<&Self>,
+        shard: u16,
+        read: impl FnOnce() -> T,
+    ) -> T {
+        let Some(stats) = stats else {
+            return read();
+        };
+        stats.storage_read(shard);
+        let timer = StorageReadTimer {
+            stats,
+            shard,
+            started: Instant::now(),
+        };
+        let result = read();
+        drop(timer);
+        result
+    }
+
+    fn storage_duration(&self, shard: u16, elapsed: Duration) {
+        Self::add(
+            &self.storage_nanos_by_shard[usize::from(shard)],
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        );
     }
 
     pub fn examine(&self, shard: u16, documents: u64) {
@@ -162,6 +191,22 @@ impl ReadStats {
             std::array::from_fn(|i| self.documents_by_shard[i].load(Ordering::Relaxed)),
             std::array::from_fn(|i| self.matches_by_shard[i].load(Ordering::Relaxed)),
         )
+        .with_storage_read_nanos(std::array::from_fn(|i| {
+            self.storage_nanos_by_shard[i].load(Ordering::Relaxed)
+        }))
+    }
+}
+
+struct StorageReadTimer<'a> {
+    stats: &'a ReadStats,
+    shard: u16,
+    started: Instant,
+}
+
+impl Drop for StorageReadTimer<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .storage_duration(self.shard, self.started.elapsed());
     }
 }
 
@@ -582,6 +627,9 @@ mod tests {
         counters.storage_read(0);
         counters.storage_read(63);
         counters.storage_read(63);
+        counters.storage_duration(0, Duration::from_nanos(17));
+        counters.storage_duration(63, Duration::MAX);
+        counters.storage_duration(63, Duration::from_nanos(1));
         counters.examine(63, u64::MAX);
         counters.examine(63, 1);
         counters.match_document();
@@ -594,6 +642,14 @@ mod tests {
         let snapshot = state.finish_read_stats().unwrap();
         assert!(state.read_stats.is_none());
         assert_eq!(snapshot.storage_reads(), 3);
+        assert_eq!(snapshot.storage_read_nanos(), u64::MAX);
+        assert_eq!(
+            snapshot
+                .shard_work()
+                .map(|row| row.storage_read_nanos())
+                .collect::<Vec<_>>(),
+            vec![17, u64::MAX]
+        );
         assert_eq!(snapshot.documents_examined(), u64::MAX);
         assert_eq!(snapshot.matcher_evaluations(), 1);
         assert_eq!(snapshot.source_matches(), u64::MAX);
@@ -618,6 +674,7 @@ mod tests {
                     for n in 0..128 {
                         let shard = worker * 8 + n % 8;
                         counters.storage_read(shard);
+                        counters.storage_duration(shard, Duration::from_nanos(17));
                         counters.examine(shard, 3);
                         counters.source_match(shard);
                     }
@@ -626,6 +683,7 @@ mod tests {
         });
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.storage_reads(), 1024);
+        assert_eq!(snapshot.storage_read_nanos(), 1024 * 17);
         assert_eq!(snapshot.documents_examined(), 3072);
         assert_eq!(snapshot.source_matches(), 1024);
         assert_eq!(snapshot.shard_work().count(), 64);
@@ -633,7 +691,41 @@ mod tests {
             assert_eq!(row.shard(), shard as u16);
             assert_eq!(row.documents_examined(), 48);
             assert_eq!(row.source_matches(), 16);
+            assert_eq!(row.storage_read_nanos(), 16 * 17);
         }
+    }
+
+    #[test]
+    fn storage_read_timing_preserves_values_errors_unwind_and_disabled_path() {
+        let counters = ReadStats::default();
+        // No collector means the arbitrary shard is never indexed or counted.
+        assert_eq!(ReadStats::observe_storage_read(None, u16::MAX, || 42), 42);
+        let value = ReadStats::observe_storage_read(Some(&counters), 7, || {
+            assert_eq!(counters.snapshot().storage_reads(), 1);
+            assert_eq!(counters.snapshot().storage_read_nanos(), 0);
+            42
+        });
+        assert_eq!(value, 42);
+        let first = counters.snapshot();
+        assert!(first.storage_read_nanos() > 0);
+        let error: Result<(), &str> =
+            ReadStats::observe_storage_read(Some(&counters), 7, || Err("sentinel"));
+        assert_eq!(error, Err("sentinel"));
+        let failed = counters.snapshot();
+        assert_eq!(failed.storage_reads(), 2);
+        assert!(failed.storage_read_nanos() >= first.storage_read_nanos());
+        assert!(
+            std::panic::catch_unwind(|| {
+                ReadStats::observe_storage_read(Some(&counters), 63, || panic!("sentinel"));
+            })
+            .is_err()
+        );
+        let unwound = counters.snapshot();
+        assert_eq!(unwound.storage_reads(), 3);
+        assert_eq!(unwound.shards_read().collect::<Vec<_>>(), vec![7, 63]);
+        assert!(unwound.shard_work().all(|row| row.storage_read_nanos() > 0));
+        // Private counters can record failed work; failed engine requests still
+        // return no public snapshot and cannot contribute listener metrics.
     }
 
     #[test]

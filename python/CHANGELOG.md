@@ -1,5 +1,14 @@
 # Python changelog
 
+## Unreleased
+
+- Native document `execution_stats=True` now reports total and per-shard
+  `storage_read_nanos` in both synchronous and asyncio results. These are
+  overlapping elapsed storage-call times, including SQLite execution and BSON
+  decoding, not total query latency or physical I/O/CPU measurements. Defaults
+  remain off. Opt-in diagnostics now charge 4,096 logical result bytes instead
+  of 2,048 to account for the additional bounded per-shard fields.
+
 ## 0.1.0-alpha.7 — 2026-09-24
 
 Python distribution version: `0.1.0a7`. Install the optional pinned PyMongo
