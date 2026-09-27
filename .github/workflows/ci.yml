@@ -372,7 +372,7 @@ jobs:
           cargo test --locked --no-default-features --features listeners,mongo-tls,tokio/rt-multi-thread \
             --lib server::options::tests -- --include-ignored
 
-      - name: Require real daemon Mongo TLS configuration, clients and restart
+      - name: Require real daemon TLS configuration, reload, clients and restart
         env:
           BRISKDB_MONGO_WIRE_PYTHON: python
         run: |

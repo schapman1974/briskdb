@@ -371,6 +371,8 @@ mongo_tls_key=...)` in sync/async Python. Use stock PyMongo with `tls=True` and
 Rust hosts select `mongo-tls`; see the [Rust TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
 The daemon can also opt into TLS with `--features mongo-tls` and paired
 `--mongo-tls-cert` / `--mongo-tls-key`; see [daemon TLS setup](docs/MONGO_PARITY.md#encrypted-daemon-mongo-unreleased).
+Unix daemons can opt into `--reload-on-sighup` for configured Mongo/PostgreSQL
+identity rotation; see the [reload contract](docs/POSTGRES_LISTENER.md#daemon-security-reload-unreleased).
 TLS still leaves Mongo anonymous and loopback-only. Plaintext remains the default;
 managed `briskdb.patch()` clients retain their existing plaintext local transport.
 
