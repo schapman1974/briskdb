@@ -383,6 +383,9 @@ membership commands and credential-free account inspection. This is not enabled 
 installing the wheel or setting the TLS flags above. See
 [authenticated Mongo setup](docs/MONGO_PARITY.md#authenticated-rust-mongo-unreleased)
 for the one-way provisioning boundary and a stock PyMongo login example.
+Hosts can explicitly provision [database-local `read`/`readWrite` profiles](docs/MONGO_PARITY.md#explicit-readreadwrite-profiles-unreleased)
+and assign them through the supported user commands. Profiles are not automatic
+built-ins and never overwrite existing custom roles.
 
 ### Use existing PyMongo code with the BriskDB wheel
 

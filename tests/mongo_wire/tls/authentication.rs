@@ -18,6 +18,9 @@ mod capture {
 #[path = "authentication/users.rs"]
 mod users;
 
+#[path = "authentication/data_roles.rs"]
+mod data_roles;
+
 fn assert_audit_fields(events: &[capture::Fields]) {
     let mut connections = std::collections::BTreeMap::new();
     let mut identities = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
@@ -53,7 +56,12 @@ fn assert_audit_fields(events: &[capture::Fields]) {
             state => panic!("unexpected secured audit state: {state}"),
         }
     }
-    assert!(identities.len() >= 4);
+    assert!(
+        identities.len() >= 4,
+        "expected four independently authenticated accounts; got {} identities across {} command events: {identities:?}",
+        identities.len(),
+        events.len()
+    );
     assert!(
         identities.values().any(|sockets| sockets.len() > 1),
         "pooling must correlate one user across sockets"

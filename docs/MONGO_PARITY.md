@@ -797,7 +797,8 @@ document/schema/metadata actions require explicit current privileges. Adapter
 commands with collection-existence probes also require `ListObjects`; implicit
 creation needs `CreateObject` and `CreateDatabase`, upserts need `InsertData`,
 and returning mutations need `ReadData`. Domain-wide database-name discovery is
-not yet filtered to the user's grants. Built-in Mongo roles are not implemented.
+not yet filtered to the user's grants. Automatic built-in Mongo role resolution
+is not implemented.
 Trusted hosts can use `Scope::non_system_document_collections(db)` when preparing
 flat data-role policies: it excludes `system.*` and the reserved `local.replset.*`
 namespace, with explicit exact grants for exceptions such as `system.js`.
@@ -807,6 +808,50 @@ database-wide grants keep their behavior. See the [security-catalog encoding bou
 before using a new scope with older authenticated hosts.
 Permission checks also precede empty/missing-collection shortcuts and implicit
 namespace creation; the eventual engine operation refreshes authority again.
+
+#### Explicit read/readWrite profiles (unreleased)
+
+The trusted Rust host can atomically install BriskDB's supported subset of Mongo's
+database-local [data roles](https://www.mongodb.com/docs/manual/reference/built-in-roles/):
+
+```rust,ignore
+database.engine().update_security_catalog(|catalog| {
+    catalog.provision_mongo_data_roles("app")
+}).await?;
+```
+
+The same method works on an offline `SecurityCatalog` before provisioning a root.
+It creates exactly `app.read` and `app.readWrite`, with no accounts or memberships.
+An existing name (even with identical permissions), invalid database or insufficient
+role capacity rejects the whole pair without edits. Profiles count toward the
+1,024-role cap, remain explicitly stored flat roles, and trusted hosts may replace
+or drop them. They are not automatically created by startup, `createUser` or a
+grant command. Existing custom roles are never overwritten or broadened.
+
+`read` permits collection listing, reads and index inspection in exactly `app`.
+`readWrite` adds CRUD, collection creation/drop and index creation/drop. Both
+cover non-system collections plus exactly `system.js`; other `system.*` names
+and `local.replset.*` are denied. BriskDB's exact database-connect permission is
+included in both; exact database-creation authority is included in `readWrite`
+because creating a collection can create its logical database. Neither grants
+database deletion, global database-name listing, SQL access or user/role/server
+administration. Unsupported Mongo operations remain unsupported, including
+server-side JavaScript execution despite the `system.js` data exception.
+
+After host provisioning, an account administrator with `CreateUser` in `accounts`
+and `GrantRole` in `app` can assign the ordinary role descriptor over TLS:
+
+```python
+operator.accounts.command("createUser", "app_writer", pwd=password,
+                          roles=[{"role": "readWrite", "db": "app"}])
+```
+
+Use `authSource="accounts"` for that user's connection. Existing authorized
+`grantRolesToUser`/`revokeRolesFromUser` also work with these names and apply to
+already-open pools/cursors on the next permission admission. Other built-in
+roles, inheritance and automatic built-in-name protection are not claimed.
+`MongoDataRole::Read.policy("app")` / `ReadWrite.policy("app")` also construct
+the same explicit policy without mutating a catalog.
 
 Security contract:
 
@@ -833,7 +878,7 @@ Security contract:
   removal and revocation affect subsequent work, not already-admitted operations.
 - Trusted hosts administer the catalog through `update_security_catalog`; the
   scoped user commands below use separate authorized engine paths. Broader
-  user/role administration, built-in roles, durable audit retention, full fault/soak
+  user/role administration, automatic built-in roles, durable audit retention, full fault/soak
   acceptance and Python/daemon/composed-host configuration remain separate work.
 
 Local gates include real PyMongo 4.17.0 sync/async SCRAM with verified TLS and zlib,

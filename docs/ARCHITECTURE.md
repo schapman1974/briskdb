@@ -1311,6 +1311,16 @@ custom grants retain their original coverage; this new scope does not silently
 change or narrow previously assigned policies. It supplies the reserved-namespace
 boundary needed for future built-in data roles, not automatic built-in roles.
 
+`security_catalog::MongoDataRole` constructs the supported database-local `read`
+and `readWrite` policies from this scope, an exact `system.js` exception, and
+separate database-connect/list/create permissions. Trusted
+`SecurityCatalog::provision_mongo_data_roles` inserts both named profiles atomically;
+either collision or insufficient capacity preserves the entire prior catalog.
+It neither assigns users nor creates a logical database. These remain ordinary
+bounded stored roles that a trusted host can change/drop, not virtual/protected
+built-ins. Existing custom names are never replaced; no implicit administrator
+or globally listed databases are added. See the [profile contract and examples](MONGO_PARITY.md#explicit-readreadwrite-profiles-unreleased).
+
 Records containing this scope use `BRKSEC02` and a version-2 checksum domain;
 scope tag 5 carries its bounded database name. All other catalogs retain their
 exact v1 representation and checksum. V1 may not contain the new scope, and a

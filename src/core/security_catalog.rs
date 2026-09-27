@@ -24,9 +24,11 @@ use super::{
 };
 
 mod durable;
+mod mongo_data_roles;
 mod record;
 mod user_info;
 pub use durable::DurableSecurityCatalog;
+pub use mongo_data_roles::MongoDataRole;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
 pub use user_info::{MAX_USER_INFO_SELECTORS, UserInfo, UserInfoRequest};
 
