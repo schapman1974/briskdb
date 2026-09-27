@@ -106,6 +106,31 @@ def sync_checks():
         denied(lambda: writer.other.items.find_one())
         denied(lambda: writer.list_database_names())
         denied(lambda: writer.admin.command("createUser", "bypass", pwd="password", roles=[]), 59)
+        # Metadata/creation grants cannot authorize empty data results or let a
+        # rejected write implicitly create a collection before its real check.
+        metadata = Raw()
+        try:
+            metadata.login("metadata")
+            for body in [
+                dict(find="items", batchSize=0, singleBatch=True),
+                dict(find="missing", batchSize=0, singleBatch=True),
+                dict(aggregate="missing", pipeline=[], cursor={}),
+                dict(count="missing"),
+                dict(distinct="missing", key="value"),
+                dict(delete="missing", deletes=[dict(q={}, limit=1)]),
+                dict(update="missing", updates=[dict(q={}, u={"$set": {"a": 1}})]),
+                dict(update="missing", updates=[dict(q={}, u={"$set": {"a": 1}}, upsert=True)]),
+                dict(findAndModify="missing", query={}, remove=True),
+                dict(findAndModify="missing", query={}, update={"$set": {"a": 1}}),
+                dict(insert="missing", documents=[{"_id": 1}]),
+                dict(createIndexes="missing", indexes=[dict(key={"a": 1}, name="a_1")]),
+                dict(listIndexes="missing"),
+            ]:
+                reply = metadata.command(body, "app")
+                assert reply.get("code") == 13, (body, reply)
+            assert set(writer.app.list_collection_names()) == {"items"}
+        finally:
+            metadata.close()
     for name in ["bob", "a,b=c"]:
         with pymongo.MongoClient(URI, **options(name)) as reader:
             assert len(list(reader.app.items.find({}).batch_size(2))) == 15

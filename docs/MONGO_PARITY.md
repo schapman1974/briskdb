@@ -796,6 +796,8 @@ commands with collection-existence probes also require `ListObjects`; implicit
 creation needs `CreateObject` and `CreateDatabase`, upserts need `InsertData`,
 and returning mutations need `ReadData`. Domain-wide database-name discovery is
 not yet filtered to the user's grants. Built-in Mongo roles are not implemented.
+Permission checks also precede empty/missing-collection shortcuts and implicit
+namespace creation; the eventual engine operation refreshes authority again.
 
 Security contract:
 

@@ -1357,6 +1357,24 @@ impl Executor {
             .map_err(Into::into)
     }
 
+    async fn authorize_early(
+        &self,
+        session: &Session,
+        context: &RequestContext,
+        command: &DocumentCommand,
+    ) -> Result<()> {
+        #[cfg(feature = "auth-scram")]
+        if self.secured() {
+            self.database
+                .engine()
+                .preflight_document_authorization(session, command, context.clone())
+                .await?;
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        let _ = (session, context, command);
+        Ok(())
+    }
+
     async fn exists(
         &self,
         session: &Session,
@@ -1444,17 +1462,12 @@ impl Executor {
                 warnings,
                 model_names,
             }) => {
-                self.ensure_collection(session, identity, &context, request.namespace())
+                let namespace = request.namespace().clone();
+                let command = DocumentCommand::CreateIndexes(request);
+                self.authorize_early(session, &context, &command).await?;
+                self.ensure_collection(session, identity, &context, &namespace)
                     .await?;
-                match self
-                    .call(
-                        session,
-                        identity,
-                        &context,
-                        DocumentCommand::CreateIndexes(request),
-                    )
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::IndexesBuilt { before, after } => {
                         Ok(indexes::reply(before, after, warnings))
                     }
@@ -1559,6 +1572,7 @@ impl Executor {
                 }
             }
             Command::FindAndChange(command) => {
+                self.authorize_early(session, &context, &command).await?;
                 let namespace = match &command {
                     DocumentCommand::FindOneAndReplace(request) => request.namespace(),
                     DocumentCommand::FindOneAndUpdate(request) => request.namespace(),
@@ -1610,21 +1624,13 @@ impl Executor {
                 ]))
             }
             Command::FindAndDelete(request) => {
-                let value = if !self
-                    .exists(session, identity, &context, request.namespace())
-                    .await?
-                {
+                let namespace = request.namespace().clone();
+                let command = DocumentCommand::FindOneAndDelete(request);
+                self.authorize_early(session, &context, &command).await?;
+                let value = if !self.exists(session, identity, &context, &namespace).await? {
                     None
                 } else {
-                    match self
-                        .call(
-                            session,
-                            identity,
-                            &context,
-                            DocumentCommand::FindOneAndDelete(request),
-                        )
-                        .await?
-                    {
+                    match self.call(session, identity, &context, command).await? {
                         DocumentResult::Document(value) => value,
                         _ => {
                             return Err(CommandError::new(
@@ -1668,6 +1674,7 @@ impl Executor {
                     let result = match update {
                         Err(error) => Err(error),
                         Ok(update) => {
+                            self.authorize_early(session, &context, &update).await?;
                             safe_statement_error = !matches!(&update, DocumentCommand::Update(request) if request.scope() == DocumentMutationScope::Many);
                             let namespace = match &update {
                                 DocumentCommand::Replace(request) => request.namespace(),
@@ -1790,18 +1797,15 @@ impl Executor {
                             continue;
                         }
                     };
-                    if !self
-                        .exists(session, identity, &context, delete.namespace())
-                        .await?
-                    {
+                    let namespace = delete.namespace().clone();
+                    let command = DocumentCommand::Delete(delete);
+                    self.authorize_early(session, &context, &command).await?;
+                    if !self.exists(session, identity, &context, &namespace).await? {
                         continue;
                     }
                     // Operational failures can follow committed shard writes.
                     // Abort instead of claiming an exact count or retrying them.
-                    match self
-                        .call(session, identity, &context, DocumentCommand::Delete(delete))
-                        .await?
-                    {
+                    match self.call(session, identity, &context, command).await? {
                         DocumentResult::Delete(result) => {
                             count = count
                                 .checked_add(
@@ -1830,12 +1834,12 @@ impl Executor {
                 Ok(body)
             }
             Command::Insert(insert) => {
-                self.ensure_collection(session, identity, &context, insert.namespace())
+                let namespace = insert.namespace().clone();
+                let command = DocumentCommand::Insert(insert);
+                self.authorize_early(session, &context, &command).await?;
+                self.ensure_collection(session, identity, &context, &namespace)
                     .await?;
-                match self
-                    .call(session, identity, &context, DocumentCommand::Insert(insert))
-                    .await
-                {
+                match self.call(session, identity, &context, command).await {
                     Ok(DocumentResult::Insert(result)) => {
                         let mut body = fields([
                             ("ok", BsonValue::Double(1.0)),
@@ -1875,24 +1879,16 @@ impl Executor {
                 }
             }
             Command::Distinct(distinct) => {
-                if !self
-                    .exists(session, identity, &context, distinct.namespace())
-                    .await?
-                {
+                let namespace = distinct.namespace().clone();
+                let command = DocumentCommand::Distinct(distinct);
+                self.authorize_early(session, &context, &command).await?;
+                if !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("values", BsonValue::Array(Vec::new())),
                     ]));
                 }
-                match self
-                    .call(
-                        session,
-                        identity,
-                        &context,
-                        DocumentCommand::Distinct(distinct),
-                    )
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::Distinct(values) => Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("values", BsonValue::Array(values.into_vec())),
@@ -1905,19 +1901,16 @@ impl Executor {
                 }
             }
             Command::Count(count) => {
-                if !self
-                    .exists(session, identity, &context, count.namespace())
-                    .await?
-                {
+                let namespace = count.namespace().clone();
+                let command = DocumentCommand::Count(count);
+                self.authorize_early(session, &context, &command).await?;
+                if !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("n", BsonValue::Int64(0)),
                     ]));
                 }
-                match self
-                    .call(session, identity, &context, DocumentCommand::Count(count))
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::Count(count) => Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         (
@@ -1944,18 +1937,7 @@ impl Executor {
                     Command::ListCollections(..) | Command::ListIndexes(..)
                 );
                 let direct_find = matches!(&command, Command::Find(..));
-                if let Command::ListIndexes(request, _) = &command {
-                    if !self
-                        .exists(session, identity, &context, request.namespace())
-                        .await?
-                    {
-                        return Err(CommandError::new(
-                            26,
-                            "NamespaceNotFound",
-                            "collection does not exist",
-                        ));
-                    }
-                }
+                let list_indexes = matches!(&command, Command::ListIndexes(..));
                 let (namespace, command, single_batch, empty_single_batch, budget) = match command {
                     Command::Find(find, single_batch, budget) => {
                         let namespace = find.namespace().clone();
@@ -1991,6 +1973,16 @@ impl Executor {
                     ),
                     _ => unreachable!("cursor command"),
                 };
+                if !direct_find || empty_single_batch {
+                    self.authorize_early(session, &context, &command).await?;
+                }
+                if list_indexes && !self.exists(session, identity, &context, &namespace).await? {
+                    return Err(CommandError::new(
+                        26,
+                        "NamespaceNotFound",
+                        "collection does not exist",
+                    ));
+                }
                 // A normal find already resolves its collection inside the
                 // admitted engine command and verified manifest snapshot. Do
                 // not execute a second catalog command just to check absence.

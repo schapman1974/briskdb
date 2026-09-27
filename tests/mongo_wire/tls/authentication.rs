@@ -74,6 +74,17 @@ async fn secured() -> (tempfile::TempDir, BriskDb) {
             ]),
         )
         .unwrap();
+    catalog
+        .create_role(
+            name("metadata"),
+            policy(&[
+                Action::ConnectDatabase,
+                Action::ListObjects,
+                Action::CreateObject,
+                Action::CreateDatabase,
+            ]),
+        )
+        .unwrap();
     let credential = ScramSha256Verifier::from_password_with_iterations(PASSWORD, 4096).unwrap();
     catalog
         .create_user(name("alice"), credential.clone(), [name("writer")])
@@ -82,7 +93,10 @@ async fn secured() -> (tempfile::TempDir, BriskDb) {
         .create_user(name("bob"), credential.clone(), [name("reader")])
         .unwrap();
     catalog
-        .create_user(name("a,b=c"), credential, [name("reader")])
+        .create_user(name("a,b=c"), credential.clone(), [name("reader")])
+        .unwrap();
+    catalog
+        .create_user(name("metadata"), credential, [name("metadata")])
         .unwrap();
     Engine::provision_security(root.path(), 2, catalog)
         .await

@@ -7,6 +7,31 @@ use crate::{
 type Requirements = Vec<(Action, Resource)>;
 
 impl Engine {
+    /// Wire adapters sometimes return an empty result without executing the
+    /// document command, or create a namespace before executing a write. Check
+    /// the real command's requirements before either optimization. Execution
+    /// still rechecks current authority; this is not a reusable admission token.
+    #[cfg(feature = "mongo")]
+    pub(crate) async fn preflight_document_authorization(
+        &self,
+        session: &Session,
+        command: &DocumentCommand,
+        context: RequestContext,
+    ) -> EngineResult<()> {
+        let mut operation = self.operation_lifecycle(context)?;
+        if session.owner != self.inner.id {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "the session belongs to a different engine",
+            )));
+        }
+        let result = operation
+            .wait_pending(self.authorize_document(session, command))
+            .await;
+        operation.check_before_start()?;
+        operation.finish(result)
+    }
+
     pub(in crate::core::engine) async fn authorize_document(
         &self,
         session: &Session,
