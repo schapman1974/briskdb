@@ -509,12 +509,8 @@ impl CommandGuard {
         wire_request_id: i32,
         sequence: u64,
     ) -> Self {
-        self.trace = Some(super::events::RequestTrace::new(
-            self.kind,
-            connection_id,
-            wire_request_id,
-            sequence,
-        ));
+        self.trace =
+            super::events::RequestTrace::new(self.kind, connection_id, wire_request_id, sequence);
         self
     }
 

@@ -65,9 +65,17 @@ impl RequestTrace {
         connection_id: u64,
         wire_request_id: i32,
         sequence: u64,
-    ) -> Self {
-        Self {
-            dispatch: tracing::dispatcher::get_default(Clone::clone),
+    ) -> Option<Self> {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        // The locked tracing dependency can cache "never" from an unsubscribed
+        // first call when exactly one other host dispatcher is registered. Do
+        // not touch these callsites without a subscriber. Metrics still run;
+        // subscribed hosts retain their own normal level/interest filtering.
+        if dispatch.is::<tracing::subscriber::NoSubscriber>() {
+            return None;
+        }
+        Some(Self {
+            dispatch,
             span: tracing::debug_span!(
                 target: "briskdb::mongo", "mongo.command",
                 connection_id, wire_request_id, sequence, command = command.name(),
@@ -83,7 +91,7 @@ impl RequestTrace {
             write_errors: 0,
             suppressed: false,
             authentication: AuditContext::default(),
-        }
+        })
     }
 
     #[cfg(feature = "auth-scram")]
