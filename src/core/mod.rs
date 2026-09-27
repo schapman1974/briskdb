@@ -5,6 +5,7 @@
 
 #[cfg(feature = "auth-scram")]
 pub mod authentication;
+pub mod authorization;
 mod catalog;
 mod control;
 mod engine;

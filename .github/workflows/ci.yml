@@ -542,6 +542,13 @@ jobs:
             exit 1
           fi
 
+      - name: Test shared permission decisions with core only
+        if: matrix.surface == 'core'
+        run: |
+          cargo test --locked --no-default-features --features tokio/rt-multi-thread \
+            --lib core::authorization
+          cargo test --locked --no-default-features --doc core::authorization
+
       - name: Test shared SCRAM without networking adapters
         if: matrix.surface == 'auth-scram'
         run: |

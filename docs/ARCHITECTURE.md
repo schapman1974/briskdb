@@ -1217,6 +1217,38 @@ integrity, and atomic updates. Exporting a record writes no files or manifest
 version. Debug output is redacted; owned secret buffers/records zeroize on drop,
 without promising erasure of caller or cryptographic/normalization-library copies.
 
+### Shared permission-decision foundation (unreleased)
+
+The always-available `core::authorization` module defines bounded, immutable
+permission decisions without enabling an engine or listener policy. A trusted
+caller must resolve the current catalog roles, identify every protected resource,
+and finish authorization before execution. Durable user/role storage, principal
+binding, revocation/admission policy and enforcement still remain under #64/#188.
+
+`Action` names one of 26 explicit data, schema/index, identity/role or server
+operations. Unknown action codes and incompatible action/scope pairs are rejected.
+No action implies another: data reads do not grant writes, metadata, role changes
+or server administration. Relational tables and document collections are separate
+data domains, and both are separate from security realms and the server. Broad
+data grants never cover identity management or server administration.
+
+`Resource` holds an exact domain/database/object identity, with bounded canonical
+SQL catalog names or case-sensitive UTF-8 document names. Components stay separate:
+there is no glob, prefix, case folding, Unicode normalization or concatenated-name
+alias. `Scope::exact` covers only its exact resource; `Scope::database` includes
+that database's objects, `all_databases` stays within one data domain, and
+`all_security_realms` grants only explicitly named identity/role actions.
+
+`Policy` denies by default and holds at most 256 distinct positive privileges.
+Construction bounds input before deduplication, including duplicate/infinite
+iterators. Combining up to 64 already-bounded flat role policies deduplicates
+overlaps and rejects oversized unions without mutating any source policy. There
+is no inherited role graph or superuser shortcut. Multi-resource authorization
+requires every requested privilege; empty or over-256 requirement lists fail
+closed. Debug output and diagnostics omit database, object and realm names.
+These are reusable decision primitives, not a claim that current sessions enforce
+RBAC or that Mongo authentication is ready. No on-disk format or defaults change.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`
