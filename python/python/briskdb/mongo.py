@@ -23,7 +23,7 @@ except ImportError as error:
 if pymongo.version_tuple[:3] != (4, 17, 0):
     raise ImportError("BriskDB Mongo clients currently require pymongo==4.17.0")
 
-from ._mongo_runtime import _Store, _drained, acquire
+from ._mongo_runtime import _Store, _check_process, _drained, acquire
 from ._mongo_collections import Database, AsyncDatabase, IndexCompatibilityWarning
 
 ASCENDING = pymongo.ASCENDING
@@ -148,6 +148,7 @@ class MongoClient(_LocalStoreBinding, _Client):
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
                  *, folder: Any = None, shards: Optional[int] = None, **kwargs: Any) -> None:
+        _check_process()
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
@@ -201,6 +202,7 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
                  *, folder: Any = None, shards: Optional[int] = None, **kwargs: Any) -> None:
+        _check_process()
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)

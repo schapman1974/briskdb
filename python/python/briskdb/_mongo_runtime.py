@@ -17,6 +17,14 @@ _stores: dict[Path, _Store] = {}
 _pid = os.getpid()
 
 
+def _check_process() -> None:
+    # Never acquire an inherited lock to decide whether a fork was safe: its
+    # owning thread may no longer exist, even when the store registry is empty.
+    # A fresh spawned interpreter owns its own marker, locks and native runtime.
+    if os.getpid() != _pid:
+        raise RuntimeError("BriskDB Mongo state cannot be inherited after fork; use multiprocessing spawn")
+
+
 async def _drained(awaitable: Any) -> Any:
     """Finish owned cleanup/startup even if its caller is cancelled repeatedly."""
     task = asyncio.ensure_future(awaitable)
@@ -78,12 +86,8 @@ class _Store:
 
 
 def acquire(folder: Any, shards: Optional[int]) -> _Store:
-    global _pid
+    _check_process()
     with _lock:
-        if os.getpid() != _pid:
-            if _stores:
-                raise RuntimeError("BriskDB Mongo clients require multiprocessing spawn, not inherited engines")
-            _pid = os.getpid()
         if shards is not None and (type(shards) is not int or not 2 <= shards <= 64):
             raise ValueError("shards must be an integer between 2 and 64")
         temporary = folder is None
