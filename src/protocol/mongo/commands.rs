@@ -10,6 +10,8 @@ mod cursors;
 mod indexes;
 mod read_options;
 #[cfg(feature = "auth-scram")]
+mod user_info;
+#[cfg(feature = "auth-scram")]
 mod users;
 
 use tokio::sync::Mutex;
@@ -247,6 +249,8 @@ fn metadata_read_options(body: &BsonDocument) -> Result<DocumentReadOptions> {
 pub(super) enum Command {
     #[cfg(feature = "auth-scram")]
     UserManagement(crate::core::user_management::UserManagementCommand),
+    #[cfg(feature = "auth-scram")]
+    UserInfo(crate::core::security_catalog::UserInfoRequest),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -298,6 +302,10 @@ pub(super) fn prepare_with_limits(
     limits: super::MongoResourceLimits,
 ) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
+    #[cfg(feature = "auth-scram")]
+    if name == "usersInfo" {
+        return Some(user_info::prepare(request, started, limits));
+    }
     #[cfg(feature = "auth-scram")]
     if users::is_command(name) {
         return Some(users::prepare(request, started, limits));
@@ -1444,6 +1452,18 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::UserInfo(request) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                let users = self
+                    .database
+                    .engine()
+                    .user_info(session, context, request)
+                    .await?;
+                Ok(user_info::reply(users))
+            }
             #[cfg(feature = "auth-scram")]
             Command::UserManagement(command) => {
                 if !self.secured() {

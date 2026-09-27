@@ -1433,6 +1433,19 @@ Queued cancellation/deadlines skip the edit; after blocking work starts the resu
 can be uncertain and must not trigger automatic retries. Rotation and deletion
 invalidate retained identities; role changes affect subsequent admission.
 
+`Engine::user_info(session, context, UserInfoRequest)` separately reads public
+account names and assigned role references, never verifier material. Exact
+self-inspection needs a current principal but no `ViewUsers` grant; every other
+requested account requires that action on its realm, even if absent. One-realm
+listing always requires the grant. The authority refresh and permission checks
+precede lookup, so a mixed forbidden selection cannot partially reveal records.
+Selectors are bounded to 64 before deduplication; an empty exact selection still
+validates the principal. Canonical realm/name ordering and row/byte limits apply.
+Metadata accounting charges a 64-byte envelope, 256 bytes plus twice the account
+name/realm lengths per row, and 128 bytes plus role name/realm lengths per
+membership. This is conservative logical accounting, not BSON size or RSS.
+Read-only inspection does not update the catalog revision or write credentials.
+
 Every document command derives its complete requirements before metadata/data
 work. Database-specific commands require `ConnectDatabase`; reads, mutations,
 schema/index operations and metadata discovery have distinct privileges. An

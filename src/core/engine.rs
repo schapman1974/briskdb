@@ -1066,7 +1066,8 @@ impl Engine {
     }
 
     /// Whether this engine requires authenticated, operation-specific admission.
-    /// Existing listener adapters do not support this mode yet and must reject it.
+    /// Only explicitly integrated adapters may accept this mode; ordinary
+    /// adapters must reject it rather than falling back to anonymous sessions.
     pub fn security_enabled(&self) -> bool {
         #[cfg(feature = "auth-scram")]
         {

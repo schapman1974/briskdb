@@ -825,7 +825,7 @@ Security contract:
   roles and credential generations are refreshed at each engine admission; rotation,
   removal and revocation affect subsequent work, not already-admitted operations.
 - Trusted hosts administer the catalog through `update_security_catalog`; the
-  five scoped user commands below use a separate authorized engine path. Broader
+  scoped user commands below use separate authorized engine paths. Broader
   user/role administration, built-in roles, durable audit retention, full fault/soak
   acceptance and Python/daemon/composed-host configuration remain separate work.
 
@@ -862,7 +862,7 @@ references. Account commands cannot target `local`. Passwords are bounded to
 `digestPassword` must be `true`; write concern must be omitted, `{}` or `{w: 1}`.
 Unknown/duplicate fields, unacknowledged writes, SHA-1, pre-digested passwords,
 custom data, authentication restrictions, comments, role-array replacement in
-`updateUser`, role-definition commands and `usersInfo` are unsupported. Catalog
+`updateUser` and role-definition commands are unsupported. Catalog
 existence/conflict errors currently use BriskDB's generic wire error mapping,
 not every MongoDB administration-specific error code.
 
@@ -876,6 +876,38 @@ to subsequent operations, including on pooled sockets. Timeouts/disconnects
 after blocking work starts can have an uncertain commit outcome: do not blindly
 retry. Local tests cover these boundaries with real PyMongo and engine-level
 concurrent-revocation, restart, cancellation and redaction checks.
+
+`usersInfo` returns credential-free account metadata with the same current
+authority checks. A current authenticated user can inspect itself; inspecting
+another name (including a missing one) needs `ViewUsers` on that account's realm.
+Listing an entire realm always needs that grant, even when it is empty or
+contains only the caller. All selected realms are authorized before any lookup:
+
+```python
+# A logged-in accounts/reader can inspect its own assigned roles.
+print(client.accounts.command("usersInfo", "reader")["users"])
+# An operator with ViewUsers on accounts can list that realm.
+print(operator.accounts.command("usersInfo", 1)["users"])
+```
+
+Selectors may be a string, `{user: "reader", db: "accounts"}`, an array of up to
+64 string/object references, or integer `1` for the current realm. Duplicates
+are removed; results use realm/name order and omit authorized missing names.
+An empty array returns no accounts but still requires a current login. The
+returned fields are `_id`, `user`, `db`, `roles` and `mechanisms`; no internal
+account ID/`userId` UUID, credential generation, salt, hash, proof or password is
+returned. Self-inspection fails after credential rotation or account removal,
+and role updates appear on subsequent requests.
+
+`showCredentials`, `showPrivileges` and `showAuthenticationRestrictions` may be
+omitted or `false` only. `showCustomData` accepts a boolean, but no custom data is
+stored; `filter` may be omitted or empty only. Credential export is deliberately
+unavailable even to an administrator. All-realms selection, expanded privileges,
+nonempty filters, comments and unknown/duplicate fields are rejected. Shared
+engine/session ownership, cancellation/deadlines and conservative metadata
+row/byte limits apply, followed by the normal wire response-size limit. This
+subset is tested with synchronous and asynchronous PyMongo; it is not the full
+MongoDB account-inspection surface.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -1508,13 +1540,13 @@ pipeline; this does not replace its matching, pagination or grouping semantics.
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task
-failures, 31 fixed command families, 32 fixed error codes plus an unknown-code
+failures, 32 fixed command families, 32 fixed error codes plus an unknown-code
 counter, write-error occurrences and response-size rejections. Command counters
 separate started, in-flight, completed, failed, aborted and deliberately suppressed
 one-way responses. Unknown command names share `Other`; namespaces, query values,
 identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
-(including their rejected outcomes), and the five user-management commands.
+(including their rejected outcomes), five user-management commands and `usersInfo`.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can
 span multiple commands.
