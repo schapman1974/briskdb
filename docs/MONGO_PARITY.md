@@ -1743,6 +1743,42 @@ operator validation, regex boundaries, and numeric families. This separate
 matcher matrix does not mark the full frozen candidate command corpus as passed.
 The broader #167 consumer/dialect conformance work remains open.
 
+## Update property and fuzz checks
+
+The document updater has four shrinkable property tests (256 generated cases
+each): checked Int64 arithmetic/overflow, ordered array-operation sequences,
+nested set/unset idempotence with exact unrelated BSON retention, and error or
+cancellation atomicity. Generated values include arbitrary double/Decimal128
+encodings and bounded nested documents/arrays. These tests run in the ordinary
+native unit suite; they compare arithmetic and array results with independent
+models, not with a second call to the same updater.
+
+The `document_update` libFuzzer target accepts a BSON envelope with `update` and
+`document` fields. Every input also exercises all eleven supported update
+operators without needing a valid envelope. It checks deterministic compilation
+and execution, callback cancellation, immutable ID representation, BSON round
+trips and unchanged input/specification bytes. Input and generated arrays are
+bounded. This complements the BSON, comparison, matcher, projection, sorting,
+distinct and aggregation targets; it does not establish long-running fault-soak
+or a complete differential/release certification.
+
+```sh
+cargo test --locked --all-features --lib document::update::properties
+cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+cargo install cargo-fuzz --version 0.13.2 --locked
+rustup toolchain install nightly --profile minimal
+cargo +nightly fuzz run document_update -- \
+  -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -seed=186463
+```
+
+Keep a failing artifact and reproduce it before reducing it. For an actual
+failure, `cargo +nightly fuzz tmin document_update <artifact-path>` minimizes the
+input; rerun the resulting artifact with `cargo +nightly fuzz run
+document_update <minimized-artifact-path>`. Promote confirmed minimal failures
+to deterministic native regressions. Property tests use proptest's shrinking and
+failure-seed persistence. These mechanisms do not substitute for minimizing
+cross-implementation differential mismatches, which remains a separate gate.
+
 ## Reproducible public-client performance comparison
 
 `scripts/mongo_benchmark.py` runs the same checked synchronous workloads in isolated
