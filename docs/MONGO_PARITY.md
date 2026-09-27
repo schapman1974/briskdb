@@ -961,6 +961,34 @@ row/byte limits apply, followed by the normal wire response-size limit. This
 subset is tested with synchronous and asynchronous PyMongo; it is not the full
 MongoDB account-inspection surface.
 
+`rolesInfo` similarly returns bounded metadata for stored flat roles. A current
+user may inspect a directly assigned role without `ViewRoles`; every other
+selected name, including missing names, requires `ViewRoles` on that role's
+realm. Listing an entire realm always requires the realm grant. Permissions
+are refreshed before looking up any selected roles, and removing an assignment
+removes that inspection right on the next request.
+
+```python
+# Read one's assigned, host-provisioned role.
+print(client.app.command("rolesInfo", "read")["roles"])
+# An operator with ViewRoles on app can list its stored roles.
+print(operator.app.command("rolesInfo", 1)["roles"])
+```
+
+Selectors are a string, `{role: "read", db: "app"}`, at most 64 string/object
+references, or integer `1` for the current realm. Duplicates are removed before
+realm/name-ordered output; authorized missing roles are omitted. An empty array
+still validates the current login. Replies contain `_id`, `role`, `db`,
+`isBuiltin: false`, `roles: []` and `inheritedRoles: []`: all current catalog
+roles, including the explicitly provisioned data profiles, are stored flat
+roles, not protected/automatic built-ins. No policy/credential export or
+inheritance is implied. `showPrivileges`, `showAuthenticationRestrictions` and
+`showBuiltinRoles` accept only omitted/`false`; expanded forms, comments,
+filters, unknown/duplicate fields and all-realm selection are unsupported.
+Normal engine ownership/lifecycle, metadata row/byte limits and wire response
+limits apply. Sync/async PyMongo, durable refresh/reopen, membership revocation,
+credential rotation and queued cancellation are covered by local tests.
+
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
 
@@ -1592,7 +1620,7 @@ pipeline; this does not replace its matching, pagination or grouping semantics.
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task
-failures, 32 fixed command families, 32 fixed error codes plus an unknown-code
+failures, 33 fixed command families, 32 fixed error codes plus an unknown-code
 counter, write-error occurrences and response-size rejections. Command counters
 separate started, in-flight, completed, failed, aborted and deliberately suppressed
 one-way responses. Unknown command names share `Other`; namespaces, query values,

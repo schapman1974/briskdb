@@ -11,6 +11,11 @@ def managed():
     return pymongo.MongoClient(URI, **config)
 
 
+def role_metadata(name, database="app"):
+    return {"_id": f"{database}.{name}", "role": name, "db": database,
+            "isBuiltin": False, "roles": [], "inheritedRoles": []}
+
+
 def checks():
     with pymongo.MongoClient(URI, **options("profile_writer")) as writer, \
          pymongo.MongoClient(URI, **options("profile_reader")) as reader:
@@ -34,6 +39,9 @@ def checks():
             assert set(reader[database].items.distinct("n")) == {2, 3, 4, 11}
             assert reader[database]["system.js"].find_one()["_id"] == "script"
             assert "items" in reader[database].list_collection_names()
+            assert reader[database].command("rolesInfo", "read")["roles"] == [role_metadata("read", database)]
+            denied(lambda: reader[database].command("rolesInfo", "readWrite"))
+            denied(lambda: reader[database].command("rolesInfo", 1))
             for operation in [
                 lambda: reader[database].items.insert_one({"_id": 99}),
                 lambda: reader[database].items.update_one({}, {"$set": {"n": 99}}),
@@ -66,26 +74,43 @@ def checks():
             denied(lambda: client.app.command("usersInfo", 1))
 
     with pymongo.MongoClient(URI, **options("profile_operator")) as operator:
+        assert operator.app.command("rolesInfo", 1)["roles"] == [role_metadata("read"), role_metadata("readWrite")]
+        assert operator.app.command("rolesInfo", ["read", "read", "missing"])["roles"] == [role_metadata("read")]
+        assert operator.admin.command("rolesInfo", {"role": "read", "db": "app"})["roles"] == [role_metadata("read")]
+        assert operator.admin.command("rolesInfo", "profile_operator")["roles"] == [role_metadata("profile_operator", "admin")]
+        denied(lambda: operator.admin.command("rolesInfo", 1))
+        denied(lambda: operator.app.command("rolesInfo", ["read", {"role": "missing", "db": "other"}]))
+        for fields in [dict(showPrivileges=True), dict(showPrivileges="asUserFragment"),
+                       dict(showBuiltinRoles=True), dict(showAuthenticationRestrictions=True),
+                       dict(comment="private-role-comment")]:
+            denied(lambda fields=fields: operator.app.command("rolesInfo", 1, **fields), 72)
         operator.accounts.command("createUser", "profile_managed", pwd=PASSWORD,
                                   roles=[{"role": "read", "db": "app"}])
         with managed() as user:
             assert user.app.items.count_documents({}) == 5
+            assert user.app.command("rolesInfo", "read")["roles"] == [role_metadata("read")]
+            assert user.app.command("rolesInfo", [])["roles"] == []
             denied(lambda: user.app.items.insert_one({"_id": 8}))
             operator.accounts.command("grantRolesToUser", "profile_managed", roles=[{"role": "readWrite", "db": "app"}])
             user.app.items.insert_one({"_id": 8})
+            assert user.app.command("rolesInfo", ["readWrite", "read"])["roles"] == [role_metadata("read"), role_metadata("readWrite")]
             operator.accounts.command("revokeRolesFromUser", "profile_managed", roles=[{"role": "readWrite", "db": "app"}])
             denied(lambda: user.app.items.insert_one({"_id": 9}))
+            denied(lambda: user.app.command("rolesInfo", "readWrite"))
             cursor = user.app.items.find().batch_size(1)
             next(cursor)
             operator.accounts.command("revokeRolesFromUser", "profile_managed", roles=[{"role": "read", "db": "app"}])
             denied(lambda: next(cursor))
             denied(lambda: user.app.items.find_one())
+            denied(lambda: user.app.command("rolesInfo", "read"))
             assert user.accounts.command("usersInfo", "profile_managed")["users"][0]["roles"] == []
             cursor.close()
 
 
 async def async_checks():
     async with pymongo.AsyncMongoClient(URI, **options("profile_reader")) as reader:
+        assert (await reader.app.command("rolesInfo", "read", showPrivileges=False,
+                                         showBuiltinRoles=False, showAuthenticationRestrictions=False))["roles"] == [role_metadata("read")]
         assert (await reader.app.items.find_one({"_id": 0}))["n"] == 11
         try:
             await reader.app.items.insert_one({"_id": 100})

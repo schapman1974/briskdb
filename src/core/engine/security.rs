@@ -194,6 +194,33 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Inspect stored flat-role names under current membership/realm authority.
+    /// Directly assigned roles are visible; other names and realm listings need
+    /// ViewRoles. This does not export policies, inheritance or credentials.
+    pub async fn role_info(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        request: super::super::security_catalog::RoleInfoRequest,
+    ) -> EngineResult<Vec<super::super::security_catalog::RoleInfo>> {
+        let mut operation = self.operation_lifecycle(context.clone())?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        let limits = operation.result_limits;
+        operation.check_before_start()?;
+        let result = self
+            .security_call_with_context(context, move |authority| {
+                authority.role_info(&principal, &request, limits)
+            })
+            .await;
+        operation.finish(result)
+    }
+
     async fn security_call_with_context<T, F>(
         &self,
         context: RequestContext,

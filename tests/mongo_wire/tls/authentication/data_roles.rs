@@ -14,6 +14,7 @@ async fn real_pymongo_provisioned_read_readwrite_profiles_enforce_least_privileg
             let grants = [
                 (Action::CreateUser, "accounts"),
                 (Action::ViewUsers, "accounts"),
+                (Action::ViewRoles, "app"),
                 (Action::GrantRole, "app"),
                 (Action::RevokeRole, "app"),
             ]

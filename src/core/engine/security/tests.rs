@@ -8,6 +8,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 
 #[cfg(feature = "documents")]
 mod non_system;
+mod role_info;
 mod user_info;
 mod user_management;
 
