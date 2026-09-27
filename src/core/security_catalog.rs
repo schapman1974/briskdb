@@ -21,6 +21,9 @@ use super::{
     authorization::{Action, MAX_POLICY_ROLES, Policy, Resource},
 };
 
+mod record;
+pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
+
 pub const MAX_SECURITY_USERS: usize = 1_024;
 pub const MAX_SECURITY_ROLES: usize = 1_024;
 pub const MAX_SECURITY_NAME_BYTES: usize = 128;
@@ -148,6 +151,9 @@ impl fmt::Debug for ScramAuthentication {
 /// catalog.create_user(SecurityName::new("app", "alice")?,
 ///     ScramSha256Verifier::from_password("example provisioning password")?, [role])?;
 /// assert_eq!(catalog.user_count(), 1);
+/// let record = catalog.to_record()?; // Sensitive; storage must protect this.
+/// let restored = SecurityCatalog::from_record(record.as_bytes())?;
+/// assert_eq!(restored.user_count(), 1);
 /// // Provisioning alone enables no listener authentication or engine policy.
 /// # Ok::<_, briskdb::EngineError>(())
 /// ```

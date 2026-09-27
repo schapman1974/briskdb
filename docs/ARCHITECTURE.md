@@ -1292,6 +1292,25 @@ engine/session ownership, cursor authorization and adapter enforcement remain
 under #64/#188. Debug and error output redact names, proofs and credential
 material. No manifest upgrade, default security policy or wheel behavior changes.
 
+The catalog also exports/restores an explicit `BRKSEC01` binary record for the
+future storage boundary. Export is deterministic, includes only the salted
+verifiers (not passwords), and sizes the output before a single secret-bearing
+allocation. Owned record buffers zeroize on drop; caller-owned input/copies are
+not erased. The record's BLAKE3 checksum detects accidental corruption, **not
+forgery, rollback or wrong-root substitution**. It is not encrypted. File access,
+atomic publication, root binding, freshness and downgrade protection still need
+storage integration; exporting a record writes no files and changes no manifest.
+
+Restore rejects unknown versions/actions/tags, incompatible grants, malformed
+UTF-8/names, duplicate names/grants/user IDs/memberships, missing role references,
+invalid credential costs, zero/non-monotonic identity counters, oversized counts
+or resolved unions, truncation and trailing bytes. A 128 MiB whole-record bound
+is checked before hashing/allocation; nested counts and lengths are checked
+before their allocations. Numeric tags are explicit, not Rust enum discriminants;
+actions retain their exact stable codes. All parse failures have a fixed redacted
+diagnostic. A successful restore creates a fresh catalog incarnation: old
+principals and pending attempts cannot carry over, even with identical contents.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`
