@@ -8265,7 +8265,9 @@ mod tests {
                 .unwrap();
             assert_eq!(before, after);
             release_shared_root_peer(peer, &release);
-            if cfg!(feature = "documents") {
+            // An empty legacy catalog needs only the metadata upgrade. An
+            // explicit in-progress index recovery requires document support.
+            if legacy || cfg!(feature = "documents") {
                 drop(Storage::open(temp.path(), 2).unwrap());
                 assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
             } else {
