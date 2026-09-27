@@ -207,7 +207,7 @@ jobs:
           BRISKDB_MONGO_ORACLE_PYTHON: python
         run: >-
           cargo +1.85.0 test --locked --no-default-features --features documents
-          --test mongo_matcher_reproducer source_backed_fault_injection
+          --test mongo_matcher_reproducer --test mongo_projection_reproducer source_backed_
           -- --ignored --nocapture
 
       - name: Generate full reference-only Mongo parity report

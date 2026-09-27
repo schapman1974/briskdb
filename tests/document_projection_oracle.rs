@@ -1,16 +1,18 @@
 #![cfg(feature = "documents")]
 
-use std::{error::Error, process::Command};
+use std::{path::PathBuf, process::Command};
 
-use briskdb::document::{
-    BsonValue, DocumentProjector, DocumentQueryError, decode_document, encode_document,
-};
+use briskdb::document::{BsonValue, decode_document, encode_document};
+
+#[path = "support/mongo_matcher_reproducer.rs"]
+mod reproducer;
+use reproducer::Surface;
 
 #[test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 fn projection_matches_the_locked_tinymongo_oracle() {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
-    let output = Command::new(python)
+    let output = Command::new(&python)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/document_projection_oracle.py"
@@ -29,31 +31,24 @@ fn projection_matches_the_locked_tinymongo_oracle() {
         let length = i32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let case = decode_document(&bytes[..length]).unwrap();
         bytes = &bytes[length..];
-        let Some(BsonValue::Document(spec)) = case.get_first("projection") else {
-            panic!("projection");
-        };
         let Some(BsonValue::Document(document)) = case.get_first("document") else {
             panic!("document");
         };
         let before = encode_document(document).unwrap();
-        let actual =
-            DocumentProjector::compile(spec).and_then(|projector| projector.project(document));
-        if let Some(BsonValue::Int32(expected)) = case.get_first("error") {
-            let error = actual.expect_err(&format!("case {count}: {spec:?}"));
-            let code = error
-                .source()
-                .and_then(|source| source.downcast_ref::<DocumentQueryError>())
-                .map(|error| error.mongo_code());
-            assert_eq!(code, Some(*expected), "case {count}: {spec:?}: {error:?}");
-        } else {
-            let Some(BsonValue::Document(expected)) = case.get_first("result") else {
-                panic!("result");
-            };
-            let actual = actual.unwrap_or_else(|error| panic!("case {count}: {spec:?}: {error:?}"));
-            assert_eq!(
-                encode_document(&actual).unwrap(),
-                encode_document(expected).unwrap(),
-                "case {count}: {spec:?} against {document:?}"
+        let expected = Surface::Projection.expected(&case).unwrap();
+        let actual = Surface::Projection.candidate(&case);
+        if actual != expected {
+            let directory = std::env::var_os("BRISKDB_MONGO_REPRO_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("target/mongo-parity/reproducers")
+                });
+            let artifact = Surface::Projection.save_mismatch(&python, &case, &directory, |case| {
+                Surface::Projection.candidate(case)
+            });
+            panic!(
+                "projection case {count}: expected {expected:?}, got {actual:?}; reproducer: {artifact:?}; original: {case:?}"
             );
         }
         assert_eq!(encode_document(document).unwrap(), before);
