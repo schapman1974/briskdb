@@ -15,6 +15,93 @@ fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocu
 }
 
 #[test]
+fn first_unsubscribed_request_cannot_poison_host_tracing() {
+    const CHILD: &str = "BRISKDB_TRACE_FIRST_CALL_CHILD";
+    const VERIFIED: &str = "BRISKDB_TRACE_FIRST_CALL_VERIFIED";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        // Callsite interest is process-global. Other tests registering subscribers
+        // or priming the same callsites would hide this startup ordering defect.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "protocol::mongo::events::tests::first_unsubscribed_request_cannot_poison_host_tracing",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(VERIFIED),
+            "the child regression must actually execute"
+        );
+        return;
+    }
+
+    let capture = Capture::default();
+    // Register exactly one subscriber, but do not install it on this thread yet.
+    let dispatch = tracing::Dispatch::new(capture.clone());
+    let metrics = Arc::new(Metrics::default());
+    assert!(tracing::dispatcher::get_default(|dispatch| {
+        dispatch.is::<tracing::subscriber::NoSubscriber>()
+    }));
+    metrics
+        .command("ping", Instant::now())
+        .with_correlation(1, 1, 1)
+        .complete(&doc([("ok", BsonValue::Int32(1))]), false);
+
+    let guard = tracing::dispatcher::with_default(&dispatch, || {
+        metrics
+            .command("find", Instant::now())
+            .with_correlation(2, 1, 1)
+    });
+    let worker_metrics = Arc::clone(&metrics);
+    std::thread::spawn(move || {
+        // A second unsubscribed command must not steal or suppress the host's
+        // completion, which deliberately runs off the originating thread.
+        worker_metrics
+            .command("ping", Instant::now())
+            .with_correlation(1, 2, 2)
+            .complete(&doc([("ok", BsonValue::Int32(1))]), false);
+        guard.complete(&doc([("ok", BsonValue::Int32(1))]), false);
+    })
+    .join()
+    .unwrap();
+    tracing::dispatcher::with_default(&dispatch, || {
+        drop(
+            metrics
+                .command("find", Instant::now())
+                .with_correlation(2, 2, 2),
+        );
+    });
+    let captured = capture.0.lock().unwrap();
+    assert_eq!(
+        (
+            captured.spans.len(),
+            captured.events.len(),
+            captured.live.len()
+        ),
+        (2, 2, 0)
+    );
+    assert_eq!(captured.events[0]["outcome"], "completed");
+    assert_eq!(captured.events[1]["outcome"], "aborted");
+    for (index, event) in captured.events.iter().enumerate() {
+        assert_eq!(event["connection_id"], "2");
+        assert_eq!(event["sequence"], (index + 1).to_string());
+    }
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.command(MongoCommandKind::Ping).completed, 2);
+    assert_eq!(snapshot.command(MongoCommandKind::Find).completed, 1);
+    assert_eq!(snapshot.command(MongoCommandKind::Find).aborted, 1);
+    println!("{VERIFIED}");
+}
+
+#[test]
 fn command_events_keep_only_bounded_correlation_and_final_outcomes() {
     let capture = Capture::default();
     let metrics = Arc::new(Metrics::default());

@@ -1409,6 +1409,9 @@ requires an earlier dependency:
       tasks/blocking workers. Fixed outcome/error classifications retain no BSON,
       namespace, comment, credential or diagnostic payload; guards release on
       completion/abort/unwind without installing a subscriber or export queue.
+      Unsubscribed requests skip trace callsites without changing metrics, preventing
+      first-call cache poisoning of a concurrently subscribed host. Fresh-process
+      regression covers the ordering and cross-thread completion/abort behavior.
       Authentication/user-management command families and code 18 now have fixed
       metrics categories. Authenticated tracing adds opaque listener-local account
       correlation and credential generations without raw names or per-user metric

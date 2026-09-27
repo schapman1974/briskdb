@@ -1639,6 +1639,12 @@ and exporter; opening a library listener installs neither a global logger nor an
 export queue. The daemon's existing `RUST_LOG` filter can include
 `briskdb::mongo=debug`. A listener retains the subscriber active when it starts,
 including across connection tasks and blocking reply workers.
+Commands with no subscriber skip trace construction/emission entirely while
+retaining normal metrics. This also prevents an unsubscribed listener's first
+request from initializing the locked tracing dependency's shared callsite cache
+in a way that suppresses another host's subscribed events. A fresh-process
+regression covers this startup order, worker-thread completion and abort cleanup;
+it neither installs a global subscriber nor changes host filter policy.
 
 Events contain only the process-unique frontend `connection_id`, client-supplied
 numeric `wire_request_id`, connection-local `sequence`, fixed command family,
