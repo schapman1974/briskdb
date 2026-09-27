@@ -3,6 +3,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio_rustls::TlsAcceptor;
@@ -51,7 +52,7 @@ impl MongoTlsConfig {
         self.handshake_timeout
     }
 
-    pub(super) fn load(&self) -> io::Result<TlsAcceptor> {
+    pub(super) fn load(&self) -> io::Result<LoadedTls> {
         // Mongo clients use direct TLS and do not require a PostgreSQL ALPN.
         let identity = crate::protocol::tls::load_server_identity(
             &self.certificate,
@@ -59,6 +60,35 @@ impl MongoTlsConfig {
             "Mongo",
             &[],
         )?;
-        Ok(TlsAcceptor::from(identity.config))
+        Ok(LoadedTls {
+            acceptor: TlsAcceptor::from(identity.config),
+            handshake_timeout: self.handshake_timeout,
+        })
+    }
+}
+
+/// One immutable handshake generation; never publish its fields separately.
+#[derive(Clone)]
+pub(super) struct LoadedTls {
+    pub acceptor: TlsAcceptor,
+    pub handshake_timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(super) struct ReloadableTls(tokio::sync::watch::Sender<Arc<LoadedTls>>);
+
+impl ReloadableTls {
+    pub fn new(identity: LoadedTls) -> Self {
+        let (current, _) = tokio::sync::watch::channel(Arc::new(identity));
+        Self(current)
+    }
+
+    pub fn snapshot(&self) -> Arc<LoadedTls> {
+        self.0.borrow().clone()
+    }
+
+    pub fn replace(&self, identity: LoadedTls) {
+        // Old connections retain their immutable Arc; no watch borrow crosses await.
+        drop(self.0.send_replace(Arc::new(identity)));
     }
 }

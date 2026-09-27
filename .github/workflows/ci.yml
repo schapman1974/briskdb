@@ -362,6 +362,8 @@ jobs:
             tls:: -- --skip real_pymongo
           cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
             tls::real_pymongo_sync_async_tls_validation_and_crud -- --ignored --exact
+          cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
+            tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications

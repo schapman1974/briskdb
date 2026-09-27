@@ -3,6 +3,9 @@ use briskdb::protocol::mongo::{MongoResourceLimits, MongoSecurityMode, MongoTlsC
 use std::{fs, path::Path, sync::Arc};
 use tokio_rustls::{TlsConnector, rustls};
 
+#[path = "tls/reload.rs"]
+mod reload;
+
 const CERT: &[u8] = include_bytes!("../fixtures/postgres-tls/server.crt");
 const KEY: &[u8] = include_bytes!("../fixtures/postgres-tls/server.key");
 
