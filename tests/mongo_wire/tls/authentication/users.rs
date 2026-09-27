@@ -14,6 +14,7 @@ async fn real_pymongo_user_management_enforces_scopes_rotation_and_atomic_role_u
                     (Action::CreateUser, "accounts"),
                     (Action::DropUser, "accounts"),
                     (Action::RotateCredentials, "accounts"),
+                    (Action::ViewUsers, "accounts"),
                     (Action::GrantRole, "admin"),
                     (Action::RevokeRole, "admin"),
                 ]

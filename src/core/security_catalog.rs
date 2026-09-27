@@ -25,8 +25,10 @@ use super::{
 
 mod durable;
 mod record;
+mod user_info;
 pub use durable::DurableSecurityCatalog;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
+pub use user_info::{MAX_USER_INFO_SELECTORS, UserInfo, UserInfoRequest};
 
 pub const MAX_SECURITY_USERS: usize = 1_024;
 pub const MAX_SECURITY_ROLES: usize = 1_024;

@@ -446,6 +446,10 @@ database under differential/property tests.
   membership grants/revocations now derive realm permissions in the shared engine,
   authorize before hashing, and bind authorization to the durable write revision.
   Mongo exposes the corresponding five commands with strict option validation.
+  Credential-free `usersInfo` now supports exact/self and one-realm lookup,
+  checking all requested realms before account existence, refreshing authority
+  per request and enforcing metadata row/byte budgets. Credential export,
+  expanded privileges and all-realm enumeration remain unsupported.
   Payload-free Mongo tracing now distinguishes authentication/user-command
   outcomes and correlates immutable accounts across pooled sockets with
   listener-scoped keyed labels and explicit credential generations. Failed

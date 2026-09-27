@@ -167,6 +167,33 @@ impl Engine {
             .await
     }
 
+    /// Inspect credential-free account metadata under current realm privileges.
+    /// Exact self-inspection is allowed; listing a realm or another account
+    /// requires ViewUsers. Lifecycle, session ownership and result limits apply.
+    pub async fn user_info(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        request: super::super::security_catalog::UserInfoRequest,
+    ) -> EngineResult<Vec<super::super::security_catalog::UserInfo>> {
+        let mut operation = self.operation_lifecycle(context.clone())?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        let limits = operation.result_limits;
+        operation.check_before_start()?;
+        let result = self
+            .security_call_with_context(context, move |authority| {
+                authority.user_info(&principal, &request, limits)
+            })
+            .await;
+        operation.finish(result)
+    }
+
     async fn security_call_with_context<T, F>(
         &self,
         context: RequestContext,

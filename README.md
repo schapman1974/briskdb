@@ -378,8 +378,8 @@ managed `briskdb.patch()` clients retain their existing plaintext local transpor
 
 Unreleased standalone **Rust hosts** can now opt into an activated security root
 with `mongo-tls,auth-scram`: verified TLS, Mongo SCRAM-SHA-256, current
-document permissions, identity-bound pooled cursors and scoped user/password/role
-membership commands. This is not enabled by
+document permissions, identity-bound pooled cursors, scoped user/password/role
+membership commands and credential-free account inspection. This is not enabled by
 installing the wheel or setting the TLS flags above. See
 [authenticated Mongo setup](docs/MONGO_PARITY.md#authenticated-rust-mongo-unreleased)
 for the one-way provisioning boundary and a stock PyMongo login example.

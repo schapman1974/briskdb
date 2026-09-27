@@ -66,6 +66,7 @@ pub enum MongoCommandKind {
     DropUser,
     GrantRolesToUser,
     RevokeRolesFromUser,
+    UsersInfo,
     Other,
 }
 
@@ -101,6 +102,7 @@ impl MongoCommandKind {
         Self::DropUser,
         Self::GrantRolesToUser,
         Self::RevokeRolesFromUser,
+        Self::UsersInfo,
         Self::Other,
     ];
 
@@ -136,6 +138,7 @@ impl MongoCommandKind {
             "dropUser" => Self::DropUser,
             "grantRolesToUser" => Self::GrantRolesToUser,
             "revokeRolesFromUser" => Self::RevokeRolesFromUser,
+            "usersInfo" => Self::UsersInfo,
             _ => Self::Other,
         }
     }
@@ -173,6 +176,7 @@ impl MongoCommandKind {
             Self::DropUser => "dropUser",
             Self::GrantRolesToUser => "grantRolesToUser",
             Self::RevokeRolesFromUser => "revokeRolesFromUser",
+            Self::UsersInfo => "usersInfo",
             Self::Other => "other",
         }
     }
