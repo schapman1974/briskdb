@@ -1835,11 +1835,11 @@ document_update <minimized-artifact-path>`. Promote confirmed minimal failures
 to deterministic native regressions. Property tests use proptest's shrinking and
 failure-seed persistence. These mechanisms do not substitute for minimizing
 cross-implementation differential mismatches; the reducer below adds that support
-for filters and projections, while other differential surfaces remain separate work.
+for filters, projections and field updates, while other differential surfaces remain separate work.
 
-### Matcher and projection differential reproducers
+### Matcher, projection and update differential reproducers
 
-The full source-locked matcher and projection matrices save confirmed mismatches under
+The full source-locked matcher, projection and field-update matrices save confirmed mismatches under
 `target/mongo-parity/reproducers` (override with `BRISKDB_MONGO_REPRO_DIR`). It keeps
 the original before trying BSON field/array deletions. Every probe recomputes the
 reference result with the isolated, source-hash-checked interpreter and must retain
@@ -1851,7 +1851,7 @@ reduction fails or becomes unstable. Budget exhaustion is recorded explicitly;
 deletion reduction is not a claim of globally minimal input.
 
 Artifacts retain exact input/reference BSON, source commit, original candidate
-outcome summary and probe metadata. Projection outcomes are compared byte-for-byte
+outcome summary and probe metadata. Projection/update outcomes are compared byte-for-byte
 during reduction (including field order and BSON numeric representations); their
 saved candidate summary uses byte length and BLAKE3, not an unbounded debug dump.
 They are atomically published without overwriting existing files, and
@@ -1869,14 +1869,27 @@ BRISKDB_MONGO_ORACLE_PYTHON=/path/to/locked-oracle/bin/python \
 BRISKDB_MONGO_REPLAY_BSON=/path/to/projection-reproducer.bson \
 cargo test --locked --all-features --test mongo_projection_reproducer \
   replay_saved_projection_case -- --exact --ignored --nocapture
+
+BRISKDB_MONGO_ORACLE_PYTHON=/path/to/locked-oracle/bin/python \
+BRISKDB_MONGO_REPLAY_BSON=/path/to/update-reproducer.bson \
+cargo test --locked --all-features --test mongo_update_reproducer \
+  replay_saved_update_case -- --exact --ignored --nocapture
 ```
 
 Replay refreshes the reference result, rejects changed expectations and checks
-the current native matcher/projector. Passing one saved case is diagnostic evidence,
+the current native matcher/projector/updater. Passing one saved case is diagnostic evidence,
 not a full-matrix pass. Source-backed fault-injection self-tests deliberately
 use wrong callbacks to exercise reduction, stale-expectation rejection, actual
 subprocess replay, original retention and non-overwrite behavior; it does not
 claim a real BriskDB mismatch.
+
+Update reduction retains an `_id` and a nonempty operator document because the
+unchanged reference helper requires them. Missing IDs, replacement/empty update
+documents and non-operator names are rejected before probing. It does not expand
+the 30,489-case matrix's documented per-operator intersection, rewrite intentional
+TinyMongo/native differences, or claim upsert/replacement coverage. Native update,
+mutation and embedded matcher errors retain their distinct Mongo codes; source
+failure still preserves the confirmed original rather than accepting a stale result.
 
 The existing CI workflow also has an opt-in `mongo_fuzz` dispatch input. Once CI
 is re-enabled, selecting it runs every declared fuzz target with AddressSanitizer

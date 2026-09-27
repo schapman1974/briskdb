@@ -56,6 +56,22 @@ def main():
         (bson_types, "a4b070ef1937b82f740ddb0c07279f4128d95ae3e75ba63ebec9e2068cdc9973"),
     ]:
         assert hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() == digest
+    if sys.argv[1:] == ["--evaluate-one"]:
+        raw = sys.stdin.buffer.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("update diagnostic input exceeds 64 KiB")
+        case = BSON(raw).decode()
+        document, update = case.get("document"), case.get("update")
+        if (not isinstance(document, dict) or "_id" not in document
+                or not isinstance(update, dict) or not update
+                or not all(key.startswith("$") for key in update)):
+            raise ValueError("update diagnostic requires _id and a nonempty operator document")
+        # Re-evaluate unchanged helpers; never reuse the supplied expected result.
+        # Diagnostic probes do not expand the full matrix's per-operator contract.
+        emit(document, update)
+        return
+    if sys.argv[1:]:
+        raise ValueError("unknown update oracle mode")
     values = [None, False, True, 0, -1, Int64(1), Int64(2**63 - 1),
               1.0, -0.0, float("nan"), Decimal128("NaN"), Decimal128("0E-6000"),
               "$literal", "", [], [1, {"x": 2}], {"x": Int64(1)},

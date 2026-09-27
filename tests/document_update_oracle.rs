@@ -1,16 +1,17 @@
 #![cfg(feature = "documents")]
 
-use briskdb::document::{
-    BsonValue, DocumentMutationError, DocumentQueryError, DocumentUpdateError, DocumentUpdater,
-    decode_document, encode_document,
-};
-use std::{error::Error, process::Command};
+use briskdb::document::{BsonValue, decode_document, encode_document};
+use std::{path::PathBuf, process::Command};
+
+#[path = "support/mongo_matcher_reproducer.rs"]
+mod reproducer;
+use reproducer::Surface;
 
 #[test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 fn field_updates_match_locked_oracle() {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
-    let output = Command::new(python)
+    let output = Command::new(&python)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/document_update_oracle.py"
@@ -32,38 +33,21 @@ fn field_updates_match_locked_oracle() {
         let Some(BsonValue::Document(document)) = case.get_first("document") else {
             panic!("document")
         };
-        let Some(BsonValue::Document(update)) = case.get_first("update") else {
-            panic!("update")
-        };
         let before = encode_document(document).unwrap();
-        let result = DocumentUpdater::compile(update).and_then(|updater| updater.apply(document));
-        if let Some(BsonValue::Int32(expected)) = case.get_first("error") {
-            let error = result.unwrap_err();
-            let actual = error
-                .source()
-                .and_then(|e| e.downcast_ref::<DocumentUpdateError>())
-                .map(|e| e.mongo_code())
-                .or_else(|| {
-                    error
-                        .source()
-                        .and_then(|e| e.downcast_ref::<DocumentMutationError>())
-                        .map(|e| e.mongo_code())
-                })
-                .or_else(|| {
-                    error
-                        .source()
-                        .and_then(|e| e.downcast_ref::<DocumentQueryError>())
-                        .map(|e| e.mongo_code())
+        let expected = Surface::Update.expected(&case).unwrap();
+        let actual = Surface::Update.candidate(&case);
+        if actual != expected {
+            let directory = std::env::var_os("BRISKDB_MONGO_REPRO_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("target/mongo-parity/reproducers")
                 });
-            assert_eq!(actual, Some(*expected), "case {count}: {error}");
-        } else {
-            let Some(BsonValue::Document(expected)) = case.get_first("result") else {
-                panic!("result")
-            };
-            assert_eq!(
-                encode_document(&result.unwrap_or_else(|e| panic!("case {count}: {e}"))).unwrap(),
-                encode_document(expected).unwrap(),
-                "case {count}"
+            let artifact = Surface::Update.save_mismatch(&python, &case, &directory, |case| {
+                Surface::Update.candidate(case)
+            });
+            panic!(
+                "update case {count}: expected {expected:?}, got {actual:?}; reproducer: {artifact:?}; original: {case:?}"
             );
         }
         assert_eq!(encode_document(document).unwrap(), before);

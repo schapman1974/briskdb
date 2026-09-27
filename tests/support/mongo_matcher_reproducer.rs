@@ -12,8 +12,8 @@ use std::{
 };
 
 use briskdb::document::{
-    BsonDocument, BsonValue, DocumentMatcher, DocumentProjector, DocumentQueryError,
-    decode_document, encode_document,
+    BsonDocument, BsonValue, DocumentMatcher, DocumentMutationError, DocumentProjector,
+    DocumentQueryError, DocumentUpdateError, DocumentUpdater, decode_document, encode_document,
 };
 
 pub const SOURCE_COMMIT: &str = "53cbf44e98b8caa036163725d195fd29592e1cc0";
@@ -31,6 +31,7 @@ pub enum Outcome {
 pub enum Surface {
     Matcher,
     Projection,
+    Update,
 }
 
 // Keep the matcher entry points stable for existing regression/replay callers.
@@ -52,17 +53,28 @@ impl Surface {
         match self {
             Self::Matcher => "matcher",
             Self::Projection => "projection",
+            Self::Update => "update",
         }
     }
     const fn field(self) -> &'static str {
         match self {
             Self::Matcher => "query",
             Self::Projection => "projection",
+            Self::Update => "update",
         }
     }
     pub fn inputs(self, case: &BsonDocument) -> Result<(&BsonDocument, &BsonDocument), String> {
         match (case.get_first("document"), case.get_first(self.field())) {
             (Some(BsonValue::Document(document)), Some(BsonValue::Document(query))) => {
+                if matches!(self, Self::Update)
+                    && (document.get_first("_id").is_none()
+                        || query.is_empty()
+                        || query.iter().any(|(name, _)| !name.starts_with('$')))
+                {
+                    return Err(
+                        "update diagnostic requires _id and a nonempty operator document".into(),
+                    );
+                }
                 Ok((document, query))
             }
             _ => Err(format!(
@@ -76,13 +88,15 @@ impl Surface {
     pub fn expected(self, case: &BsonDocument) -> Result<Outcome, String> {
         let field = match self {
             Self::Matcher => "matches",
-            Self::Projection => "result",
+            Self::Projection | Self::Update => "result",
         };
         match (self, case.get_first(field), case.get_first("error")) {
             (Self::Matcher, Some(BsonValue::Boolean(value)), None) => Ok(Outcome::Match(*value)),
-            (Self::Projection, Some(BsonValue::Document(value)), None) => encode_document(value)
-                .map(Outcome::Document)
-                .map_err(|error| error.to_string()),
+            (Self::Projection | Self::Update, Some(BsonValue::Document(value)), None) => {
+                encode_document(value)
+                    .map(Outcome::Document)
+                    .map_err(|error| error.to_string())
+            }
             (_, None, Some(BsonValue::Int32(code))) => Ok(Outcome::Code(*code)),
             _ => Err(format!(
                 "{} case requires exactly one reference outcome",
@@ -102,16 +116,35 @@ impl Surface {
                 .map(|result| {
                     Outcome::Document(encode_document(&result).expect("bounded projection output"))
                 }),
+            Self::Update => DocumentUpdater::compile(spec)
+                .and_then(|updater| updater.apply(document))
+                .map(|result| {
+                    Outcome::Document(encode_document(&result).expect("bounded update output"))
+                }),
         };
         match result {
             Ok(value) => value,
-            Err(error) => error
-                .source()
-                .and_then(|source| source.downcast_ref::<DocumentQueryError>())
-                .map_or_else(
+            Err(error) => {
+                let code = error.source().and_then(|source| {
+                    source
+                        .downcast_ref::<DocumentUpdateError>()
+                        .map(|error| error.mongo_code())
+                        .or_else(|| {
+                            source
+                                .downcast_ref::<DocumentMutationError>()
+                                .map(|error| error.mongo_code())
+                        })
+                        .or_else(|| {
+                            source
+                                .downcast_ref::<DocumentQueryError>()
+                                .map(|error| error.mongo_code())
+                        })
+                });
+                code.map_or_else(
                     || Outcome::NativeFailure(format!("{:?}", error.kind())),
-                    |error| Outcome::Code(error.mongo_code()),
-                ),
+                    Outcome::Code,
+                )
+            }
         }
     }
 
@@ -133,6 +166,7 @@ impl Surface {
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(match self {
                 Self::Matcher => "tests/document_matcher_oracle.py",
                 Self::Projection => "tests/document_projection_oracle.py",
+                Self::Update => "tests/document_update_oracle.py",
             }))
             .arg("--evaluate-one")
             .stdin(Stdio::from(input))
