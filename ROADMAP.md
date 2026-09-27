@@ -997,9 +997,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, forty-three query/public-client suites now
-      have complete source accounting (581 functions/1,119 reference cases), backed
-      by 288 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, forty-four query/public-client suites now
+      have complete source accounting (603 functions/1,148 reference cases), backed
+      by 291 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1026,6 +1026,12 @@ requires an earlier dependency:
       Linux/macOS; schema is prepared before overlapping roots. Private Python
       cache/lock counts, permanent-close cursor semantics and full database
       statistics remain explicit differences, not silently counted as parity.
+      Shared-root cache misses, peer index changes and find-and-modify preimages
+      now have durable wheel checks, as do four-way inserts and a one-winner
+      duplicate race. Diskless/named memory registries are not offered: direct
+      memory selection rejects before storage, while explicit patch scopes own
+      real SQLite roots and ignore per-client backend/host overrides. Nested
+      temporary cleanup is checked without claiming private registry equivalence.
       Update-modifier wire fixtures now cover min/max representation/order, sparse
       arrays, rename/pop validation, equality-seeded upserts, no-match preflight
       and single-record failure rollback; helper-only non-BSON inputs are explicit.
