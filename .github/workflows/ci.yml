@@ -14,6 +14,11 @@ on:
         type: boolean
         required: false
         default: false
+      mongo_soak:
+        description: Run the opt-in ten-minute mixed Mongo CRUD and restart soak
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +32,45 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  mongo-soak:
+    name: Mongo mixed CRUD and restart soak (opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.mongo_soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BRISKDB_MONGO_SOAK_SECONDS: "600"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-wire-1.85
+
+      - name: Require timed mixed CRUD and resource churn
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.85.0 test --locked --no-default-features --features mongo --test mongo_wire \
+            resource_churn::extended::timed_mixed_crud_restart_soak -- --ignored --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mongo-soak.log"
+
+      - name: Retain soak progress and outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mongo-soak.log
+          if-no-files-found: warn
+          retention-days: 7
+
   mongo-fuzz:
     name: Mongo document fuzz (opt-in)
     if: github.event_name == 'workflow_dispatch' && inputs.mongo_fuzz
