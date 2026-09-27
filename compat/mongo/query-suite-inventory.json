@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-three locked suites is classified; 1119 reference parameter cases are not 1119 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-four locked suites is classified; 1148 reference parameter cases are not 1148 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4519,6 +4519,114 @@
             "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result"
           ],
           "note": "Real logical lifecycle and every native find batch mode preserve correct absence/cursor ownership; corruption is never converted to an empty result. Private cache token sequences, creation monkeypatches and exact retry counts are not native implementations or guarantees."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_memory_backend.py",
+      "sha256": "295e6e024e30c7168d1d71d0ee64a3f7f3155620d7493108c211241b7e82ffcd",
+      "reference_case_count": 29,
+      "function_count": 22,
+      "coverage": [
+        {
+          "source": [
+            "test_anonymous_memory_backend_supports_crud_without_creating_files",
+            "test_anonymous_memory_clients_are_isolated",
+            "test_named_memory_clients_share_data_and_survive_close",
+            "test_different_named_memory_registries_are_isolated",
+            "test_mongo_client_memory_uri_uses_the_named_registry_without_disk",
+            "test_memory_uri_scheme_is_case_insensitive_for_both_client_classes",
+            "test_closing_anonymous_client_clears_its_private_namespace"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shared_store.py::test_memory_selection_rejects_and_temporary_scopes_use_owned_sqlite",
+            "python/tests/test_patching.py::test_shared_isolated_store_real_queries_results_and_cleanup",
+            "python/tests/test_patching.py::test_explicit_folders_and_decorator_persist_and_reopen_layout"
+          ],
+          "note": "BriskDB exposes native SQLite storage, not anonymous/named diskless registries or memory-URI selection. Direct memory backend selection rejects before acquisition. Explicit patch scopes own isolated temporary SQLite roots (or persistent configured folders); patched client backend/host arguments do not override that scope. Real manifest existence and scope cleanup are checked, not counted as a no-files memory backend."
+        },
+        {
+          "source": [
+            "test_named_reader_refreshes_a_cached_miss_after_another_client_writes",
+            "test_each_retained_collection_handle_tracks_its_own_cache_revision",
+            "test_shared_collection_invalidates_its_cached_equality_index",
+            "test_shared_find_one_and_update_refreshes_before_returning_old_document"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shared_store.py::test_retained_misses_indexes_and_preimages_observe_peer_changes"
+          ],
+          "note": "Real shared-root SQLite clients observe peer inserts after cached misses, indexed changes and current find-and-modify preimages even after unrelated collection reads. TinyMongo's memory cache/revision implementation is not provided; these are adapted public outcomes with durable reopen."
+        },
+        {
+          "source": [
+            "test_memory_storage_copies_input_and_returned_documents",
+            "test_memory_storage_uses_the_same_json_value_rules_as_default_storage"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shared_store.py::test_retained_misses_indexes_and_preimages_observe_peer_changes"
+          ],
+          "note": "BSON transport detaches nested input/returned mappings, encodes tuples as arrays and rejects sets before mutation. Native BSON is not TinyMongo's JSON memory codec, and the exact TinyMongo InvalidDocument.document object identity is not claimed."
+        },
+        {
+          "source": [
+            "test_named_clients_share_collection_lifecycle_and_local_index_behavior"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "Retained native collection/index handles follow shared-root logical drop/recreate, with real PyMongo command/result shapes rather than TinyMongo memory registry identity and boolean drop results."
+        },
+        {
+          "source": [
+            "test_named_memory_backend_handles_concurrent_client_inserts",
+            "test_concurrent_duplicate_id_allows_exactly_one_insert"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shared_store.py::test_concurrent_shared_clients_insert_all_rows_and_choose_one_duplicate_owner"
+          ],
+          "note": "Four simultaneous native shared-root clients retain all 80 inserted rows; a four-way duplicate-ID race has exactly one acknowledged owner and three code-11000 failures, with 81 rows and the winner checked after reopen. This validates SQLite outcomes, not a Python memory-registry lock implementation."
+        },
+        {
+          "source": [
+            "test_memory_database_listing_and_capabilities"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_common.py::test_database_handles_logical_drop_and_explicit_statistics_gap",
+            "python/tests/test_upstream_aggregation_core.py::test_tinymongo_capability_helpers_are_not_part_of_the_pymongo_client_api"
+          ],
+          "note": "Native logical database names/lifecycle work; full statistics remain explicit code-115 under #166. TinyMongo's capabilities mapping with memory/persistent/multiprocess flags is not part of the PyMongo client API and is not fabricated."
+        },
+        {
+          "source": [
+            "test_stale_cleanup_does_not_remove_a_replacement_memory_entry",
+            "test_clear_memory_database_handles_missing_and_replaced_entries"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_patching.py::test_nested_reused_scope_restores_lifo_and_preserves_outer",
+            "python/tests/test_patching.py::test_restore_after_exception_invalid_constructor_and_startup_failure",
+            "python/tests/test_upstream_shared_store.py::test_memory_selection_rejects_and_temporary_scopes_use_owned_sqlite"
+          ],
+          "note": "Private memory-entry identity, fake locks and clear_memory_database replacement hooks have no native registry equivalent. Owned patch-scope cleanup, nested isolation and exception restoration provide separate resource-lifetime evidence; they do not execute the memory-registry race hooks."
+        },
+        {
+          "source": [
+            "test_invalid_named_memory_addresses_fail_clearly",
+            "test_other_uri_schemes_are_rejected_instead_of_silently_isolated",
+            "test_memory_storage_extension_is_empty"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shared_store.py::test_memory_selection_rejects_and_temporary_scopes_use_owned_sqlite",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "Both direct client classes reject unsupported memory selection for valid, malformed and foreign URI addresses before creating a requested folder or acquiring storage. There is no memory URI parser or private storage_extension helper. Inside an explicit patch scope, its configured native store takes precedence over per-client host/backend arguments."
         }
       ]
     }

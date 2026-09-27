@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 581 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 603 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -62,14 +62,14 @@ functions in the locked `test_query_more.py`,
 `test_bulk_insert_planning.py`, `test_storage_backends.py` and
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
-and `test_sharded_sqlite_point_read_optimizations.py` suites
-(1,119 reference parameter cases). 288 added wheel scenarios and existing patch
+and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py` suites
+(1,148 reference parameter cases). 291 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,119 unchanged upstream candidate passes or complete #186 certification.
+not 1,148 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -153,6 +153,15 @@ without leaking capacity. A VFS without that probe gets a fresh validated handle
 instead of unverified reuse. This fixes the previously reproduced warmed-reader
 gap, but is a checkout boundary, not continuous protection against a file swap
 during an in-flight operation. Stop clients before replacing database files.
+
+Shared-root clients also check retained misses, peer index updates and current
+find-and-modify preimages, detached nested values and four-way insert/duplicate
+races with durable reopen. This is native SQLite, not TinyMongo's diskless memory
+registry. Direct memory backend selection rejects before acquiring storage.
+Explicit patch scopes instead own real temporary SQLite roots (or configured
+persistent folders); per-client host/backend arguments do not override that
+scope. Nested temporary scopes remain isolated and remove only their own roots.
+Private memory-registry cleanup hooks and capability mappings are not exposed.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
