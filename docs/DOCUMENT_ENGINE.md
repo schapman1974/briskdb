@@ -418,6 +418,14 @@ Unrequested reads allocate no collector, read no timing clock and update no
 counters. Failed/aborted requests return no snapshot; counters saturate rather than wrap. This does not change filtering,
 routing, transaction boundaries or MongoDB wire explain support.
 
+Record operations inspect the document table and secondary-entry schema once
+each per call. A shared private presence result distinguishes absent storage,
+the records-only legacy upgrade state, and complete current storage; it is not
+cached between calls. Reads/writes still require both exact schemas, and orphaned,
+malformed or unreadable metadata fails closed. Explicit provisioning/upgrade
+retains its transaction and final full validation. This removes a duplicate
+secondary-schema inspection, not an integrity check or a schema-generation fence.
+
 Singleton candidates also pin the document-first join, preventing stale SQLite
 statistics from sorting an entire large equality/null-key group for each one-row
 frontier. These joins prioritize bounded pagination memory: SQLite can still walk

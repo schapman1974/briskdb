@@ -2052,6 +2052,50 @@ Benchmark namespaces were confirmed absent afterwards, and the owned scratch
 MongoDB container and its anonymous volumes were removed. No application data,
 published wheel, release tag, or deployment was changed.
 
+### Removing duplicate physical-schema inspection
+
+The next controlled pair isolates a small storage-path change:
+[before](benchmarks/mongo-public-clients-schema-before-2026-09-27.json) at
+`8f778885e113aebb89ce44297d08d3c2458f1895` and
+[after](benchmarks/mongo-public-clients-schema-after-2026-09-27.json) at
+`83faf9a73fa7625020fe3daa37fed07d00ea4d4b`. Both are development release-built
+wheels, not published artifacts. The candidate wheel SHA-256 is
+`d2d539d11f1b6e464c6b1b6a8227707cb51248502dc1160335413691059b66f8`.
+These runs use BriskDB and locked TinyMongo only; they do not rerun or compare
+against the MongoDB container. Workload, worker hash, host, reference package,
+interpreters, four-shard/four-writer configuration and three trials match.
+Compiles and correctness suites finished before each timing run.
+
+Each record operation formerly inspected the exact secondary-entry schema twice.
+A shared presence result now distinguishes absent, legacy records-only and
+complete storage, inspecting the records and secondary schemas once each.
+Ordinary operations still require both exact schemas; there is no cached
+authority or omitted integrity check. A deterministic authorizer-based test
+counts two schema SELECTs per call, including repeat calls. Malformed/orphaned
+schemas and failed inspection still reject without repair; explicit legacy
+provisioning retains transactional rechecks.
+
+| Median elapsed time per command in this fixture | Before | After |
+| --- | ---: | ---: |
+| Exact-ID read | 4.731 ms | 4.739 ms |
+| Indexed equality query (materialized) | 39.494 ms | 36.634 ms |
+| Scan query (materialized) | 169.354 ms | 132.649 ms |
+| Grouped aggregation (materialized) | 288.828 ms | 250.799 ms |
+| Sorted scatter window (materialized) | 35.458 ms | 33.255 ms |
+
+Scan/group values above convert the report's per-fixture-document units back
+to full commands using the fixed 1,000-document fixture. Observed scan, group
+and indexed-query medians are approximately 22%, 13% and 7% lower respectively;
+point-read overhead is essentially unchanged. These are measurements of one
+matched small-workload pair, not statistical or general speedup guarantees.
+All twelve trials across both runs retain the same 1,256 records/content hash,
+and all 24 median regression checks pass the unchanged 1.5x bound. The full
+report also includes workloads not improved by this change, including index
+creation. Stable/MSRV schema tests, nine index-storage upgrade/recovery tests,
+43 index/read tests, 46 wire tests and 545 installed-wheel tests pass locally.
+Six native manual timing tests and seven explicit wire driver/soak tiers remain
+opt-in; broader release/security/application acceptance is not implied.
+
 ## Versioned files
 
 [`compat/mongo/v1/manifest.json`](../compat/mongo/v1/manifest.json) is the
