@@ -32,8 +32,10 @@ PostgreSQL still requires TLS and SCRAM-SHA-256 for remote access and supports
 bounded simple and parameterized text/binary extended queries, with
 single-shard transactions rather than general distributed transactions.
 
-The current source uses manifest version 21; the version-number bump itself
-does not change storage. There is no stable pre-1.0 on-disk compatibility promise.
+The current unreleased source uses manifest version 22 and semantic digest 14.
+That upgrade adds an empty security-binding table without rewriting application
+data or enabling authentication. This is source development, not a newly
+published release. There is no stable pre-1.0 on-disk compatibility promise.
 Before opening older data with this build, stop all owners and take a complete
 data-directory copy. In-place downgrade is unsupported. Use the
 [storage-format contract](docs/STORAGE_FORMAT.md) for exact supported migration

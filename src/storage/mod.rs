@@ -4679,6 +4679,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_security_binding;
                      DROP TABLE briskdb_document_index_operation;
                      DROP TABLE briskdb_document_index_storage;
                      DROP TABLE briskdb_document_index_identities;
@@ -4795,6 +4796,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_security_binding;
                  DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
@@ -4905,6 +4907,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_security_binding;
                  DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
@@ -8262,8 +8265,18 @@ mod tests {
                 .unwrap();
             assert_eq!(before, after);
             release_shared_root_peer(peer, &release);
-            drop(Storage::open(temp.path(), 2).unwrap());
-            assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            // An empty legacy catalog needs only the metadata upgrade. An
+            // explicit in-progress index recovery requires document support.
+            if legacy || cfg!(feature = "documents") {
+                drop(Storage::open(temp.path(), 2).unwrap());
+                assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            } else {
+                assert_eq!(
+                    Storage::open(temp.path(), 2).unwrap_err().kind(),
+                    EngineErrorKind::FailedPrecondition
+                );
+                assert!(manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            }
         }
     }
 
