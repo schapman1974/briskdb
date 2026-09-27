@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 603 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 610 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -62,14 +62,15 @@ functions in the locked `test_query_more.py`,
 `test_bulk_insert_planning.py`, `test_storage_backends.py` and
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
-and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py` suites
-(1,148 reference parameter cases). 294 added wheel scenarios and existing patch
+and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
+`test_tinymongo_coverage_edges.py`, `test_beanie_compat.py` suites
+(1,155 reference parameter cases). 297 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,148 unchanged upstream candidate passes or complete #186 certification.
+not 1,155 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -169,6 +170,15 @@ Explicit patch scopes instead own real temporary SQLite roots (or configured
 persistent folders); per-client host/backend arguments do not override that
 scope. Nested temporary scopes remain isolated and remove only their own roots.
 Private memory-registry cleanup hooks and capability mappings are not exposed.
+
+Discovery edge scenarios check real sync/async build information, ping,
+authorized/name-only and filtered collection names, explicit unsupported commands
+and closed-client refusal. Build information identifies BriskDB instead of
+copying TinyMongo's hard-coded MongoDB 8.0.0 payload. Malformed inputs keep the
+pinned driver's errors; detached private database objects and TinyDB condition
+construction hooks are not APIs. Dropping one same-field nonunique index leaves
+the unique index enforced after reopen. Legacy manual cursors/`hasNext`, foreign
+Parquet directory statistics and remote cleanup hooks remain explicit differences.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
