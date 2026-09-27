@@ -274,6 +274,7 @@ pub(super) enum ScopeValue {
     Database(DataDomain, String),
     AllDatabases(DataDomain),
     AllSecurityRealms,
+    NonSystemDocumentCollections(String),
 }
 
 /// Explicit coverage for a privilege. Broad data coverage never includes a
@@ -305,6 +306,17 @@ impl Scope {
         Self(ScopeValue::AllSecurityRealms)
     }
 
+    /// Collection-only coverage in one exact document database. Excludes
+    /// `system.*` everywhere and `replset.*` in `local`; exceptions such as
+    /// `system.js` require a separate exact grant. Never covers SQL, database
+    /// metadata/creation, security realms or server administration.
+    pub fn non_system_document_collections(database: &str) -> EngineResult<Self> {
+        validate_data_database(DataDomain::Document, database)?;
+        Ok(Self(ScopeValue::NonSystemDocumentCollections(
+            database.to_owned(),
+        )))
+    }
+
     fn accepts(&self, kind: ResourceKind) -> bool {
         match &self.0 {
             ScopeValue::Exact(resource) => resource.kind() == kind,
@@ -316,6 +328,7 @@ impl Scope {
                 ResourceKind::DataDomain | ResourceKind::Database | ResourceKind::Object
             ),
             ScopeValue::AllSecurityRealms => kind == ResourceKind::SecurityRealm,
+            ScopeValue::NonSystemDocumentCollections(_) => kind == ResourceKind::Object,
         }
     }
 
@@ -328,6 +341,14 @@ impl Scope {
             }
             ScopeValue::AllDatabases(domain) => resource.domain() == Some(*domain),
             ScopeValue::AllSecurityRealms => resource.kind() == ResourceKind::SecurityRealm,
+            ScopeValue::NonSystemDocumentCollections(database) => {
+                resource.domain() == Some(DataDomain::Document)
+                    && resource.database_name() == Some(database.as_str())
+                    && resource.object_name().is_some_and(|name| {
+                        !(name.starts_with("system.")
+                            || database == "local" && name.starts_with("replset."))
+                    })
+            }
         }
     }
 }
@@ -347,6 +368,9 @@ impl fmt::Debug for Scope {
                 .field(domain)
                 .finish(),
             ScopeValue::AllSecurityRealms => formatter.write_str("AllSecurityRealmsScope"),
+            ScopeValue::NonSystemDocumentCollections(_) => {
+                formatter.write_str("NonSystemDocumentCollectionsScope { .. }")
+            }
         }
     }
 }

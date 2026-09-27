@@ -105,6 +105,8 @@ fn every_action_scope_and_resource_variant_round_trips_without_broadening() {
             Scope::all_databases(DataDomain::Relational),
             Scope::all_databases(DataDomain::Document),
             Scope::all_security_realms(),
+            Scope::non_system_document_collections("App").unwrap(),
+            Scope::non_system_document_collections("local").unwrap(),
         ])
         .collect::<Vec<_>>();
     let mut catalog = SecurityCatalog::new();
@@ -197,6 +199,82 @@ fn writer() -> Writer {
         len: 0,
     }
 }
+
+#[test]
+fn non_system_scope_uses_canonical_v2_without_widening_or_changing_legacy_v1_records() {
+    let (mut catalog, user, role) = setup();
+    let legacy = catalog.to_record().unwrap();
+    assert!(legacy.as_bytes().starts_with(MAGIC));
+    catalog
+        .replace_role(
+            &role,
+            Policy::new([Privilege::new(
+                Action::ReadData,
+                Scope::non_system_document_collections("app").unwrap(),
+            )
+            .unwrap()])
+            .unwrap(),
+        )
+        .unwrap();
+    let extended = catalog.to_record().unwrap();
+    assert!(extended.as_bytes().starts_with(MAGIC_V2));
+    let restored = SecurityCatalog::from_record(extended.as_bytes()).unwrap();
+    assert_eq!(
+        restored.to_record().unwrap().as_bytes(),
+        extended.as_bytes()
+    );
+    let principal = login(&restored, &user);
+    restored
+        .authorize(&principal, Action::ReadData, &target())
+        .unwrap();
+    assert!(
+        restored
+            .authorize(
+                &principal,
+                Action::ReadData,
+                &Resource::object(DataDomain::Document, "app", "system.users").unwrap()
+            )
+            .is_err()
+    );
+    // A v1 header cannot hide a v2-only scope, even with a recomputed checksum.
+    rejects(&modify(&extended, |bytes| {
+        bytes[..8].copy_from_slice(MAGIC)
+    }));
+    // A gratuitous version promotion is not the canonical encoding either.
+    rejects(&modify(&legacy, |bytes| {
+        bytes[..8].copy_from_slice(MAGIC_V2)
+    }));
+    for end in 0..extended.as_bytes().len() {
+        rejects(&extended.as_bytes()[..end]);
+    }
+    for index in 0..extended.as_bytes().len() {
+        let mut bytes = extended.as_bytes().to_vec();
+        bytes[index] ^= 1;
+        rejects(&bytes);
+    }
+    catalog
+        .replace_role(&role, policy(Action::ReadData))
+        .unwrap();
+    assert_eq!(catalog.to_record().unwrap().as_bytes(), legacy.as_bytes());
+}
+
+#[test]
+fn version_two_rejects_malformed_non_system_scopes_and_wrong_action_kinds() {
+    for (action, scope) in [
+        ("read_data", vec![5, 0, 0]),
+        ("read_data", vec![5, 0, 1, 0xff]),
+        ("read_data", vec![5, 0, 1, 0]),
+        ("read_data", vec![5, 0, 64]),
+        ("read_data", vec![6]),
+        ("connect_database", vec![5, 0, 3, b'a', b'p', b'p']),
+        ("create_user", vec![5, 0, 3, b'a', b'p', b'p']),
+    ] {
+        let raw = raw_policy(&[(action, &scope)]);
+        let mut payload = raw[..raw.len() - CHECKSUM_BYTES].to_vec();
+        payload[..8].copy_from_slice(MAGIC_V2);
+        rejects(&seal(&payload));
+    }
+}
 fn finish(writer: Writer) -> Vec<u8> {
     seal(&writer.bytes.unwrap())
 }
@@ -285,7 +363,7 @@ fn duplicate_names_and_memberships_missing_references_and_oversized_unions_fail(
     reader.take(18).unwrap();
     let role_start = payload.len() - reader.remaining.len();
     reader.name().unwrap();
-    reader.policy().unwrap();
+    reader.policy(1).unwrap();
     let role_end = payload.len() - reader.remaining.len();
     reader.short().unwrap();
     let user_start = payload.len() - reader.remaining.len();

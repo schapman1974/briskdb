@@ -6,6 +6,8 @@ use crate::core::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{fs, os::unix::fs::PermissionsExt};
 
+#[cfg(feature = "documents")]
+mod non_system;
 mod user_info;
 mod user_management;
 

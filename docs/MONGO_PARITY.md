@@ -798,6 +798,13 @@ commands with collection-existence probes also require `ListObjects`; implicit
 creation needs `CreateObject` and `CreateDatabase`, upserts need `InsertData`,
 and returning mutations need `ReadData`. Domain-wide database-name discovery is
 not yet filtered to the user's grants. Built-in Mongo roles are not implemented.
+Trusted hosts can use `Scope::non_system_document_collections(db)` when preparing
+flat data-role policies: it excludes `system.*` and the reserved `local.replset.*`
+namespace, with explicit exact grants for exceptions such as `system.js`.
+Database-connect/list privileges remain separate. This scope is groundwork for
+built-in roles, not an implicit `read`/`readWrite` implementation; existing custom
+database-wide grants keep their behavior. See the [security-catalog encoding boundary](ARCHITECTURE.md#named-security-catalog-and-principal-admission-unreleased)
+before using a new scope with older authenticated hosts.
 Permission checks also precede empty/missing-collection shortcuts and implicit
 namespace creation; the eventual engine operation refreshes authority again.
 
