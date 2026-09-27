@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -203,18 +204,37 @@ class HttpTlsServerTests(unittest.TestCase):
                     self.assertEqual(fetch(server.admin_address or "", identity, "/sqlite/v1/catalog", token=token)[0], 404)
                     environment = dict(os.environ)
                     environment["SSL_CERT_FILE"] = str(identity.certificate)
-                    program = """import briskdb, sqlite3, sys
+                    program = """import briskdb, os, sqlite3, sys
 connection = sqlite3.connect(':memory:')
-with briskdb.attach_remote(connection, sys.argv[1], token=sys.argv[2]):
-    assert connection.execute('SELECT * FROM remote.users').fetchall() == [(7,)]
+available = (sqlite3.sqlite_version_info >= (3, 31, 0)
+             and hasattr(connection, 'enable_load_extension')
+             and hasattr(connection, 'load_extension'))
+if available:
+    with briskdb.attach_remote(connection, sys.argv[1], token=sys.argv[2]):
+        assert connection.execute('SELECT * FROM remote.users').fetchall() == [(7,)]
+    print('verified HTTPS sqlite3 passed')
+else:
+    assert os.environ.get('BRISKDB_REQUIRE_REMOTE_SQLITE') != '1', 'addon execution is required'
+    try:
+        briskdb.attach_remote(connection, sys.argv[1], token=sys.argv[2])
+    except sqlite3.NotSupportedError:
+        pass
+    else:
+        raise AssertionError('unsupported host SQLite accepted the addon')
+    assert all(row[1] != 'remote' for row in connection.execute('PRAGMA database_list'))
+    print('verified HTTPS sqlite3 capability rejection')
 connection.close()
-print('verified HTTPS sqlite3 passed')
 """
                     result = subprocess.run([sys.executable, "-c", program,
                                              "https://localhost:" + server.http_address.rsplit(":", 1)[1], token],
                                             env=environment, text=True, capture_output=True, timeout=20)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("verified HTTPS sqlite3 passed", result.stdout)
+                    available = (sqlite3.sqlite_version_info >= (3, 31, 0)
+                                 and hasattr(sqlite3.Connection, "enable_load_extension")
+                                 and hasattr(sqlite3.Connection, "load_extension"))
+                    expected = ("verified HTTPS sqlite3 passed" if available
+                                else "verified HTTPS sqlite3 capability rejection")
+                    self.assertIn(expected, result.stdout)
 
 
 class AsyncHttpTlsServerTests(unittest.IsolatedAsyncioTestCase):

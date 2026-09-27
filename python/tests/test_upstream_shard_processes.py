@@ -73,7 +73,9 @@ def stop_owned_processes(processes):
 
 class UpstreamShardProcessTests(unittest.TestCase):
     def setUp(self):
-        self.threads_before = {id(thread) for thread in threading.enumerate()}
+        # Keep the objects alive: completed PyMongo monitors may disappear while
+        # a new client starts, and CPython can immediately reuse their id().
+        self.threads_before = set(threading.enumerate())
         self.children_before = {process.pid for process in multiprocessing.active_children()}
         self.root = tempfile.TemporaryDirectory()
         self.addCleanup(self.root.cleanup)
@@ -180,7 +182,7 @@ class UpstreamShardProcessTests(unittest.TestCase):
     def test_real_driver_uses_background_threads_without_python_worker_processes(self):
         self.items.insert_one({"_id": "foreground"})
         self.assertEqual(self.items.find_one({"_id": "foreground"}), {"_id": "foreground"})
-        self.assertTrue(any(id(thread) not in self.threads_before and thread.is_alive() and thread.name.startswith("pymongo")
+        self.assertTrue(any(thread not in self.threads_before and thread.is_alive() and thread.name.startswith("pymongo")
                             for thread in threading.enumerate()))
         self.assertEqual({process.pid for process in multiprocessing.active_children()}, self.children_before)
         self.client.close()

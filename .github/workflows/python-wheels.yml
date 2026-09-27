@@ -54,7 +54,9 @@ jobs:
           twine==7.0.0
 
       - name: Check Rust, extension, and build metadata parity
-        run: python python/scripts/check_versions.py
+        run: |
+          python -m unittest discover -s python/scripts -p 'test_check_versions.py' -v
+          python python/scripts/check_versions.py
 
       - name: Install optional driver for the full source typing contract
         # mongo.pyi subclasses the real typed driver. This build environment is
@@ -124,7 +126,10 @@ jobs:
   wheels:
     name: Python wheel (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # The Intel Mac beta rehearsal needed ~12 minutes to build and ~7.5
+    # minutes for one installed-Python suite. Keep both runtime suites and the
+    # extension-enabled HTTPS checks; budget for all of them, not just one.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -289,6 +294,8 @@ jobs:
           "$(brew --prefix python@3.14)/bin/python3.14" -m venv "$RUNNER_TEMP/briskdb-remote-host"
           "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m pip install --no-index --only-binary=:all: dist/*.whl
           "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m unittest discover -s python/tests -p test_remote_sqlite.py -v
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m pip install -r python/test-requirements.txt
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m unittest discover -s python/tests -p test_http_tls_server.py -v
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

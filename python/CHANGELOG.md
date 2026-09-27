@@ -1,6 +1,19 @@
 # Python changelog
 
-## Unreleased
+## 0.1.0-beta.1 — local/developer beta
+
+Python distribution version: `0.1.0b1`. Publication follows the full CI and
+platform artifact gates; a source version alone does not mean it is on PyPI.
+
+- Local `patch()`, synchronous/asynchronous clients and the embedded document
+  subset are the beta scope. Full database statistics and advanced collection
+  options remain excluded. Secure remote Mongo hosting is experimental and is
+  not enabled in this wheel; the external application acceptance run is pending.
+- Expanded source-locked public-client, index-model and query coverage; local
+  bulk-insert encoding preflight and explicit reduced index semantics; improved
+  resource bounds, restart/recovery testing and differential diagnostics.
+- Upgrades use manifest version 22. Stop every owner and keep a complete
+  pre-upgrade backup; there is no supported in-place downgrade.
 
 - Encrypted attached Mongo servers support synchronous/async `reload_mongo_tls()`
   with timeout/cancellation controls, including while queued for the handle.
@@ -13,7 +26,7 @@
   uses the shared bounded loader; handshakes share finite socket slots and drain
   during server/database close. Mongo remains anonymous and loopback-only.
   Defaults, managed `patch()` transport and PostgreSQL/SQLite credentials are
-  unchanged. No new package release is implied.
+  unchanged.
 
 - Secure attached PostgreSQL servers now support `reload_postgres_security()`
   in synchronous and asyncio Python, with certificate/key/user/password-file

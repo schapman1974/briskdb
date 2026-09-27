@@ -1,5 +1,34 @@
 # Mongo compatibility parity contract
 
+## Local/developer beta scope
+
+`0.1.0-beta.1` (`0.1.0b1` on PyPI) targets local development and application
+testing with embedded document APIs, sync/async PyMongo clients and
+`briskdb.patch()`. The detailed supported query, CRUD/update, aggregation, index
+and lifecycle contracts below remain authoritative. Beta is not a claim of full
+MongoDB parity, full TinyMongo backend emulation or production readiness.
+
+The following remain explicit exclusions, not completed tickets:
+
+- #166: full database `sizeOnDisk`/`empty` statistics and statistics-dependent
+  `listDatabases` filters, plus advanced collection-creation options. Use
+  `list_database_names()`/wire `nameOnly: true` and plain collection creation.
+- #188/#64: supported secure remote hosting. Standalone Rust authentication is
+  experimental; Python/daemon/composed host configuration and remaining role
+  administration are not complete. Python local Mongo stays anonymous/loopback-only.
+- #181: the additional large-application acceptance run belongs to the owner's
+  tester and is still pending. It is separate from the owned ODM/contract tests.
+- Mongo sessions/transactions, global multi-shard write atomicity, TTL expiration,
+  full-text search and alternative TinyMongo backends remain unsupported.
+
+Publication requires restored stable/MSRV CI, the frozen candidate/oracle and
+real-driver/ODM gates, recovery and bounded fuzz/soak checks, and fresh audited
+platform wheels/sdist with installed-package tests. No local-only success or
+deferred application run substitutes for those gates. The wider production and
+security issues remain open after a successful local beta.
+
+## Contract inventory
+
 Status: TinyMongo v1 contract frozen for issue
 [#161](https://github.com/schapman1974/briskdb/issues/161); BriskDB candidate
 endpoint has an opt-in shared document command slice and aggregation candidate gate
@@ -740,7 +769,7 @@ For an ordinary root, readiness reports `anonymous_tls_loopback`.
 ### Authenticated Rust Mongo (unreleased)
 
 The standalone Rust host supports `mongo-tls,auth-scram` with an explicitly
-activated security root. This is **not** enabled in the published alpha.7 wheel,
+activated security root. This is **not** enabled in the beta Python wheel,
 Python `serve`/`patch`, daemon or composed `AttachedServer` paths. Those retain
 their existing anonymous loopback boundaries. Secure roots currently support
 document and scoped user commands, not SQL or shared PostgreSQL/HTTP/SQLite-remote authentication.

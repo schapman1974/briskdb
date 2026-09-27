@@ -40,7 +40,7 @@ Verify a downloaded artifact with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify briskdb-0.1.0a6-*.whl --repo schapman1974/briskdb
+gh attestation verify briskdb-0.1.0b1-*.whl --repo schapman1974/briskdb
 ```
 
 Do not reuse or move a release tag. Update both Cargo package versions and the
@@ -48,3 +48,12 @@ release notes, commit, pass CI, and then create the matching `v<crate-version>`
 tag. Pushing that tag is the single trigger for both the GitHub prerelease and
 PyPI publication; an ordinary version-changing branch or main-branch push
 cannot publish.
+
+For the local/developer beta, first restore the CI and Python distribution
+workflows and the original stable/MSRV required checks. Run CI with the opt-in
+Mongo fuzz and soak tiers, then run `Release` by `workflow_dispatch` on the
+exact candidate commit's branch. This rehearsal builds/tests the native archives,
+Debian packages, wheels and sdist, but both publishing jobs are tag-only and must
+remain skipped. Merge only a green PR, verify the final main commit, and tag only
+after its required validation passes. The deferred external app run is not a pass;
+secure remote Mongo hosting and the documented metadata gaps remain excluded.

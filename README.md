@@ -27,18 +27,28 @@ tables through a local or remote server, using the same Python wheel.
 
 [Try it without a compiler](#try-it-in-30-seconds) ·
 [Use Python sqlite3](#use-python-sqlite3-with-briskdb) ·
-[Download an alpha](https://github.com/schapman1974/briskdb/releases) ·
+[Download a prerelease](https://github.com/schapman1974/briskdb/releases) ·
 [Open the data browser](#browse-the-whole-logical-database) ·
 [Follow MongoDB and MySQL](#follow-the-build)
 
 > [!IMPORTANT]
-> BriskDB is an alpha, not a production-ready database service. The
-> [boundaries are explicit](#honest-alpha-boundaries), and measured results are
-> published even when they are not flattering.
+> This beta targets local development, application testing, and the documented
+> PyMongo subset—not a production-ready database service or full MongoDB parity.
+> [Boundaries are explicit](#honest-beta-boundaries); secure remote Mongo hosting
+> remains experimental.
 
-Version: **0.1.0-alpha.7** (Python: `0.1.0a7`). PyMongo patching and remote
-`sqlite3` require alpha.7 or this checkout, not the older alpha.6 release.
-See [PyPI](https://pypi.org/project/briskdb/0.1.0a7/) for release artifacts.
+Release version: **0.1.0-beta.1** (Python: `0.1.0b1`). A version in this checkout
+does not itself mean publication: use the matching
+[GitHub prerelease](https://github.com/schapman1974/briskdb/releases) and
+[PyPI artifacts](https://pypi.org/project/briskdb/) after the release gates pass.
+
+The beta includes local sync/async clients, `briskdb.patch()`, persistent SQLite
+storage, queries, CRUD/upserts, indexes, and bounded aggregation. Full database
+disk statistics/statistics filters and advanced collection-creation options are
+excluded; use `list_database_names()` for discovery. TTL expiration, full-text
+search, Mongo sessions/transactions, and complete TinyMongo backend emulation
+are not provided. See the [beta scope](docs/MONGO_PARITY.md#localdeveloper-beta-scope)
+before testing an existing application.
 
 ## Why developers might care
 
@@ -95,10 +105,10 @@ server. `briskdb.attach_remote()` exposes them as SQLite virtual tables in the
 `remote` schema; it does not replace Python's `sqlite3` driver or copy the
 server's database files. SQLite runs joins, filters, and aggregates locally.
 
-This addon is a **read-only alpha preview** included in the alpha.7 wheel:
+This addon remains a **read-only experimental preview** included in the wheel:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb==0.1.0a7'
+python -m pip install --only-binary=:all: 'briskdb==0.1.0b1'
 ```
 
 To build a checkout instead, use `python -m pip install ./python` with
@@ -196,7 +206,7 @@ administration listener. It uses the same bounded engine paths as other
 clients, combines sharded rows into one logical view, reads global tables once,
 and preserves large integer values.
 
-For the current local alpha:
+For the local/developer beta:
 
 ```text
 http://127.0.0.1:7655/admin
@@ -241,7 +251,7 @@ experimental and opt-in; the exact contract lives in
 | Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, unique indexes and safe equality candidates, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), whole-bulk post-image semantics and broader query planning remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
-| Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb) in alpha.7; authenticated table access, parameters and local joins |
+| Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb), still experimental; authenticated table access, parameters and local joins |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Where BriskDB fits
@@ -365,7 +375,7 @@ the server leaves the database running; closing the database drains its servers.
 Mongo remains loopback-only even alongside TLS/SCRAM PostgreSQL or authenticated
 SQLite remote. Their credentials do not secure the Mongo port.
 
-Unreleased source builds also support `db.serve(mongo=..., mongo_tls_cert=...,
+Beta.1 also supports `db.serve(mongo=..., mongo_tls_cert=...,
 mongo_tls_key=...)` in sync/async Python. Use stock PyMongo with `tls=True` and
 `tlsCAFile` for a verified connection; see the [Python TLS example](python/README.md#encrypt-the-mongo-listener-unreleased).
 Rust hosts select `mongo-tls`; see the [Rust TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
@@ -376,7 +386,7 @@ identity rotation; see the [reload contract](docs/POSTGRES_LISTENER.md#daemon-se
 Those daemon/Python paths still leave Mongo anonymous and loopback-only. Plaintext remains the default;
 managed `briskdb.patch()` clients retain their existing plaintext local transport.
 
-Unreleased standalone **Rust hosts** can now opt into an activated security root
+Experimental standalone **Rust hosts** can opt into an activated security root
 with `mongo-tls,auth-scram`: verified TLS, Mongo SCRAM-SHA-256, current
 document permissions, identity-bound pooled cursors, scoped user/password/role
 membership commands and bounded account/role inspection. This is not enabled by
@@ -389,11 +399,11 @@ built-ins and never overwrite existing custom roles.
 
 ### Use existing PyMongo code with the BriskDB wheel
 
-The alpha.7 wheel supports TinyMongo-style usage without a separate database
+The beta wheel supports TinyMongo-style usage without a separate database
 process. Install the wheel and its optional pinned PyMongo companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0a7'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
 ```
 
 For a source build, run `python -m pip install './python[pymongo]'` from the
@@ -514,7 +524,7 @@ with briskdb.open("./data", shards=4) as db:
         print(server.data_address, server.admin_address, server.postgres_address)
 ```
 
-On current main (unreleased), an already-secure attached PostgreSQL server also
+In beta.1, an already-secure attached PostgreSQL server also
 supports `server.reload_postgres_security(...)`
 and its asyncio equivalent; see the [TLS reload example](python/README.md#reload-postgresql-security).
 Encrypted attached Mongo also supports `server.reload_mongo_tls(...)` and its
@@ -599,18 +609,20 @@ Star BriskDB if you want to follow any of these bets:
 - MySQL compatibility over the same protocol-neutral Rust engine;
 - serverless snapshots and object-store-backed lifecycle;
 - more storage backends without giving up the ordinary SQLite option; or
-- honest benchmark and failure evidence as the alpha becomes a real release.
+- honest benchmark and failure evidence throughout beta testing.
 
 If you try it, an issue with your client, workload, or missing SQL shape is even
 more valuable than a star. Start with the
-[alpha releases](https://github.com/schapman1974/briskdb/releases), then tell us
+[prereleases](https://github.com/schapman1974/briskdb/releases), then tell us
 [what broke or what surprised you](https://github.com/schapman1974/briskdb/issues/new/choose).
 
-## Honest alpha boundaries
+<a id="honest-alpha-boundaries"></a>
+
+## Honest beta boundaries
 
 - PostgreSQL has TLS and single-identity SCRAM-SHA-256 authentication, but no
   roles or authorization yet. The separated HTTP data and administration
-  listeners remain loopback-only development surfaces. Unreleased daemon, Rust,
+  listeners remain loopback-only development surfaces. The daemon, Rust,
   and [Python attached hosts](python/README.md#encrypt-and-reload-httpadmin-unreleased)
   can opt into HTTP/admin TLS and identity reload
   without changing that authentication boundary.

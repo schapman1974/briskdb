@@ -47,6 +47,7 @@ fn cargo_versions_convert_to_debian_versions_without_shell_tilde_expansion() {
 
     for (cargo_version, expected) in [
         ("0.1.0-alpha.7", "0.1.0~alpha.7-1"),
+        ("0.1.0-beta.1", "0.1.0~beta.1-1"),
         ("0.1.0-alpha.6", "0.1.0~alpha.6-1"),
         ("0.1.0", "0.1.0-1"),
     ] {

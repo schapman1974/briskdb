@@ -6,7 +6,7 @@
 |---|---|---|---|
 | CPython 3.9–3.14 | `manylinux_2_28` (glibc) | x86-64, ARM64 | Built, audited, installed, and tested on native Linux runners |
 | CPython 3.9–3.14 | macOS 11+ | Intel x86-64, Apple Silicon ARM64 | Built, dependency-inspected, installed, and tested on native macOS runners |
-| CPython 3.9–3.14 | `musllinux`/Alpine | — | No wheel; source builds are untested and unsupported in this alpha |
+| CPython 3.9–3.14 | `musllinux`/Alpine | — | No wheel; source builds are untested and unsupported in this beta |
 | PyPy or free-threaded CPython | — | — | Unsupported |
 
 One `cp39-abi3` wheel per platform supports the stated CPython range. A local
@@ -58,12 +58,12 @@ versions rather than advertising an untested lifecycle compatibility range.
 
 The `briskdb-python` crate version must exactly equal the root `briskdb` Rust
 crate version. Python metadata and `briskdb.__version__` use the equivalent PEP
-440 spelling (`0.1.0-alpha.7` becomes `0.1.0a7`). Release automation rejects a
-tag or artifact when those versions are not equivalent. A Python alpha package
+440 spelling (`0.1.0-beta.1` becomes `0.1.0b1`). Release automation rejects a
+tag or artifact when those versions are not equivalent. A Python prerelease package
 supports only its exact bundled Rust engine; mixing an extension and core from
 different releases is unsupported.
 
-Before 1.0, Python APIs and type declarations may change between alpha/minor
+Before 1.0, Python APIs and type declarations may change between prerelease/minor
 releases. Breaking changes belong in `CHANGELOG.md` and the repository release
 notes.
 

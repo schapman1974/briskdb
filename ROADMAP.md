@@ -17,6 +17,20 @@ This roadmap is ordered by dependency and risk rather than by calendar date.
 
 ## Product contract
 
+### Local/developer beta release
+
+The `0.1.0-beta.1` / Python `0.1.0b1` release targets the existing local embedded
+and PyMongo subset. Freeze feature additions while the restored full CI,
+compatibility/recovery/fuzz/soak, native packaging and installed-wheel/sdist gates
+run; fix release blockers before tagging. The version in source is a candidate
+until the release workflow publishes verified artifacts.
+
+Full database statistics/advanced collection options (#166), the owner's
+external application run (#181), and supported secure remote hosting (#188/#64)
+remain explicit exclusions, not completed work. The broader roadmap does not
+block this narrowly scoped beta. See the [beta contract](docs/MONGO_PARITY.md#localdeveloper-beta-scope)
+and [release notes](RELEASE_NOTES.md).
+
 ### Remote SQLite addon
 
 Tracked in [#349](https://github.com/schapman1974/briskdb/issues/349).

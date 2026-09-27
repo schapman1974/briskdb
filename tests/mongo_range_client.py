@@ -1,5 +1,7 @@
 """Real sync/async driver string-range reads, writes and persisted index use."""
 
+import asyncio
+
 from bson import BSON, Decimal128
 import pymongo
 
@@ -19,6 +21,19 @@ QUERIES = [{"a": {operator: bound}} for operator in ("$gt", "$gte", "$lt", "$lte
     {"$or": [{"a": {"$gte": "k025"}}, {"a": None}]},
     {"a.nested": {"$gte": "z"}},
 ]
+
+# This is a functional corpus, not a 20-second end-to-end benchmark. Retain
+# that watchdog for each named phase/query instead of sharing it across 19
+# queries, hundreds of getMore requests, index builds and both multi-updates.
+ASYNC_PHASE_TIMEOUT = 20
+ASYNC_SUITE_TIMEOUT = ASYNC_PHASE_TIMEOUT * (len(QUERIES) + 3)
+
+
+async def bounded_phase(label, awaitable):
+    try:
+        return await asyncio.wait_for(awaitable, timeout=ASYNC_PHASE_TIMEOUT)
+    except asyncio.TimeoutError as error:
+        raise AssertionError(f"async string-range phase timed out: {label}") from error
 
 
 def rows(cursor):
@@ -48,16 +63,28 @@ async def async_string_range_smoke(uri, reopened):
         database = client.wire_string_range_async
         scan, indexed = database.scan, database.indexed
         if not reopened:
-            await scan.insert_many(RECORDS)
-            await indexed.insert_many(RECORDS)
-            await indexed.create_index("a", sparse=True)
-            await indexed.create_index("a.nested")
-        for query in QUERIES:
-            expected = [BSON.encode(row) async for row in scan.find(query).sort("rank", -1).batch_size(2)]
-            actual = [BSON.encode(row) async for row in indexed.find(query).sort("rank", -1).batch_size(2)]
-            assert actual == expected
-            assert await indexed.count_documents(query) == await scan.count_documents(query)
-            assert await indexed.distinct("rank", query) == await scan.distinct("rank", query)
-        for collection in (scan, indexed):
-            await collection.update_many({"a": {"$gte": "k025"}}, {"$inc": {"visited": 1}})
-        assert [BSON.encode(row) async for row in indexed.find({})] == [BSON.encode(row) async for row in scan.find({})]
+            await bounded_phase("seed and indexes", seed_async_ranges(scan, indexed))
+        for position, query in enumerate(QUERIES):
+            await bounded_phase(f"query {position}", compare_async_range(scan, indexed, query))
+        await bounded_phase("updates and post-images", update_async_ranges(scan, indexed))
+
+
+async def seed_async_ranges(scan, indexed):
+    await scan.insert_many(RECORDS)
+    await indexed.insert_many(RECORDS)
+    await indexed.create_index("a", sparse=True)
+    await indexed.create_index("a.nested")
+
+
+async def compare_async_range(scan, indexed, query):
+    expected = [BSON.encode(row) async for row in scan.find(query).sort("rank", -1).batch_size(2)]
+    actual = [BSON.encode(row) async for row in indexed.find(query).sort("rank", -1).batch_size(2)]
+    assert actual == expected
+    assert await indexed.count_documents(query) == await scan.count_documents(query)
+    assert await indexed.distinct("rank", query) == await scan.distinct("rank", query)
+
+
+async def update_async_ranges(scan, indexed):
+    for collection in (scan, indexed):
+        await collection.update_many({"a": {"$gte": "k025"}}, {"$inc": {"visited": 1}})
+    assert [BSON.encode(row) async for row in indexed.find({})] == [BSON.encode(row) async for row in scan.find({})]

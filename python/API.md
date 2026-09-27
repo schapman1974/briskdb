@@ -65,7 +65,7 @@ Original remote connection/authentication settings are not used; no new Mongo
 semantics or TinyMongo storage backends are implied. See
 [examples and substitution boundaries](README.md#patch-pymongo-for-local-testing).
 
-### Local bulk-insert preflight (source builds)
+### Local bulk-insert preflight (beta.1)
 
 Local sync/async collections validate and encode the entire `insert_many()`
 iterable before sending any insert, including batches longer than the listener's
@@ -81,9 +81,9 @@ omitted from `inserted_ids`, following PyMongo. Strict boolean arguments and emp
 iterables are validated before mutation. Ordinary PyMongo classes are unchanged.
 This is serialization preflight, not a batch transaction: server validation,
 cancellation, transport and storage failures can still leave earlier writes
-committed. These additions are not in the published alpha.7 wheel.
+committed. These additions require beta.1 or newer, not the alpha.7 wheel.
 
-### Local index-model compatibility (source builds)
+### Local index-model compatibility (beta.1)
 
 Collections obtained from `briskdb.MongoClient`, `AsyncMongoClient`, or a
 `briskdb.patch()` scope accept an iterable of PyMongo `IndexModel` objects,
@@ -118,8 +118,7 @@ metadata and requested return names. Ordinary PyMongo classes are unchanged.
 This does not open or
 repair old TinyMongo files, promote their private v1 catalogs, or choose an
 arbitrary index for an ambiguous field alias. Use exact names in that case.
-These additions are in the source checkout; they are not part of the published
-alpha.7 wheel.
+These additions require beta.1 or newer, not the alpha.7 wheel.
 
 ## Native document commands
 

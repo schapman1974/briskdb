@@ -221,10 +221,17 @@ jobs:
       - name: Require stopped Mongo import, restore, and rollback drill
         env:
           BRISKDB_MONGO_ORACLE_PYTHON: python
-          BRISKDB_MONGO_WIRE_PYTHON: ${{ github.workspace }}/target/mongo-operating-driver/bin/python
         run: |
-          python -m venv target/mongo-operating-driver
-          target/mongo-operating-driver/bin/python -m pip install pymongo==4.17.0
+          # A real-driver environment must not be restored from the Rust target
+          # cache or share the source oracle's patched PyMongo installation.
+          mongo_driver_dir="$(mktemp -d "$RUNNER_TEMP/briskdb-operating-driver.XXXXXX")"
+          python -m venv --without-pip "$mongo_driver_dir"
+          # Invoke ensurepip directly so setup failures retain their real cause
+          # instead of venv swallowing the subprocess output.
+          "$mongo_driver_dir/bin/python" -Im ensurepip --upgrade --default-pip
+          "$mongo_driver_dir/bin/python" -m pip install pymongo==4.17.0
+          export BRISKDB_MONGO_WIRE_PYTHON="$mongo_driver_dir/bin/python"
+          "$BRISKDB_MONGO_WIRE_PYTHON" -c 'import pathlib, pymongo, sys; assert pymongo.version == "4.17.0"; assert pathlib.Path(sys.prefix) in pathlib.Path(pymongo.__file__).parents'
           cargo +1.85.0 test --locked --no-default-features --features mongo,tinymongo-import \
             --test mongo_operating_drill -- --ignored --nocapture --test-threads=1
 
@@ -308,7 +315,9 @@ jobs:
   mongo-wire:
     name: Mongo real-wire discovery and documents (PyMongo 4.17.0)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # The complete beta gate builds independent anonymous, TLS, authenticated,
+    # composed-host and daemon feature sets after the real driver corpus.
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -644,9 +653,9 @@ jobs:
   test:
     name: Tests (${{ matrix.rust }})
     runs-on: ubuntu-24.04
-    # Full target tests plus the recovery/benchmark smoke matrix now exceed
-    # twenty minutes on hosted runners. Keep all coverage and allow completion.
-    timeout-minutes: 30
+    # The beta rehearsal reached the final benchmark correctness smoke tests on
+    # MSRV at the 30-minute limit. Keep every test and leave room for doc tests.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -700,7 +709,9 @@ jobs:
   python:
     name: Python source build (${{ matrix.python }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Python 3.9's full installed suite and isolated index-model oracle reached
+    # the old 20-minute limit at the final native lint step in the beta gate.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

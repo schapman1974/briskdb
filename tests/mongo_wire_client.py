@@ -9,7 +9,7 @@ from datetime import datetime
 
 import pymongo
 from mongo_read_options_client import sync_read_options, async_read_options
-from mongo_range_client import string_range_smoke, async_string_range_smoke
+from mongo_range_client import ASYNC_SUITE_TIMEOUT, string_range_smoke, async_string_range_smoke
 from mongo_partial_groups_client import partial_group_smoke, async_partial_group_smoke
 from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure, WriteError
@@ -3128,7 +3128,7 @@ if __name__ == "__main__":
     string_range_smoke(sys.argv[1], reopened)
     partial_group_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_partial_group_smoke(sys.argv[1], reopened), timeout=20))
-    asyncio.run(asyncio.wait_for(async_string_range_smoke(sys.argv[1], reopened), timeout=20))
+    asyncio.run(asyncio.wait_for(async_string_range_smoke(sys.argv[1], reopened), timeout=ASYNC_SUITE_TIMEOUT))
     compression_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_compression_smoke(sys.argv[1], reopened), timeout=20))
     id_in_routing_smoke(sys.argv[1], reopened)
