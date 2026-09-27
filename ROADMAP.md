@@ -418,6 +418,10 @@ database under differential/property tests.
 
 - [ ] User/role catalog, password hashing, credential rotation, and least-
   privilege authorization for data/schema/admin operations.
+  The opt-in shared SCRAM-SHA-256 verifier foundation now provides bounded
+  password derivation, redacted/zeroizing credential records and proof validation
+  independently of network adapters. Catalog persistence, user/role policy,
+  authenticated sessions and listener enforcement are still outstanding.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and

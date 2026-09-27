@@ -46,6 +46,8 @@ postgres = [
 ]
 # Shared transport identity loading; does not open a listener or authenticate users.
 transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:zeroize"]
+# Shared credential primitives only; this does not enable listener authentication.
+auth-scram = ["dep:ring", "dep:stringprep", "dep:subtle", "dep:zeroize"]
 # Compatibility alias for the PostgreSQL transport-security surface. The
 # adapter always includes TLS and SCRAM so a downstream listener cannot compile
 # an accidentally insecure non-loopback configuration.
@@ -137,6 +139,9 @@ time = { version = "=0.3.45", default-features = false, optional = true }
 # pulling in the dependency's defaults.
 pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"], optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
+ring = { version = "=0.17.14", optional = true }
+stringprep = { version = "=0.1.5", optional = true }
+subtle = { version = "=2.6.1", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits", "preupdate_hook"] }
 same-file = "1.0"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
@@ -158,6 +163,7 @@ utoipa-axum = { version = "=0.2.0", default-features = false, optional = true }
 zeroize = { version = "=1.9.0", optional = true }
 
 [dev-dependencies]
+base64 = "0.22.1"
 criterion = { version = "0.7", default-features = false }
 jsonschema = { version = "=0.54.0", default-features = false, features = ["arbitrary-precision"] }
 oas3 = "=0.21.0"

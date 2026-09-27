@@ -1187,6 +1187,36 @@ eight-hour browser cookie authenticates the admin JSON calls; it does not retain
 SQL session state. Schema-migration broadcast and status calls also go through
 the shared engine, but do not perform a routing decision in the adapter.
 
+### Shared credential verifier foundation (unreleased)
+
+The opt-in `auth-scram` feature exposes `core::authentication::ScramSha256Verifier`
+without any HTTP, PostgreSQL, Mongo, or TLS adapter. It is a credential primitive,
+not an enabled authentication policy, user/role catalog, or authenticated session.
+Existing listeners and their loopback restrictions are unchanged; #64/#188 remain
+open for catalog persistence, rotation/identity policy, authorization and adapters.
+
+Provisioning uses strict SASLprep, fresh 16-byte operating-system salts, and
+ring's PBKDF2-HMAC-SHA-256/HMAC/SHA-256 implementation. Only StoredKey and ServerKey
+are retained, not plaintext or the client-reusable SaltedPassword. The default
+cost is 600,000 iterations; explicitly selected/restored costs are bounded to
+4,096–1,000,000 for interoperability. The lower bound is not a recommendation to
+reduce the default. The algorithm follows [RFC 5802](https://www.rfc-editor.org/rfc/rfc5802.html)
+and [RFC 7677](https://www.rfc-editor.org/rfc/rfc7677.html); the default follows
+[OWASP's PBKDF2 cost guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2),
+not a claim of FIPS certification. Input and normalized passwords are capped at
+1,024 UTF-8 bytes; provisioning belongs behind bounded blocking admission.
+
+The primitive checks decoded client proofs in constant time against an at-most
+8,192-byte host-owned AuthMessage and returns a server signature only on success.
+It does not parse SASL, validate nonce/username/channel binding, prevent replay,
+or associate a proof with a user: adapters must do those before admitting sessions.
+Incorrect or wrong-length proofs have one fixed permission-denied diagnostic.
+The 92-byte `BRKSCR01` record is sensitive, versioned, and strictly decoded, but
+neither encrypted nor authenticated; a future catalog must supply access control,
+integrity, and atomic updates. Exporting a record writes no files or manifest
+version. Debug output is redacted; owned secret buffers/records zeroize on drop,
+without promising erasure of caller or cryptographic/normalization-library copies.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`

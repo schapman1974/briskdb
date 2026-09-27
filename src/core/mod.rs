@@ -3,6 +3,8 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+#[cfg(feature = "auth-scram")]
+pub mod authentication;
 mod catalog;
 mod control;
 mod engine;
