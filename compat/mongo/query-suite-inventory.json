@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-seven locked suites is classified; 1195 reference parameter cases are not 1195 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-nine locked suites is classified; 1243 reference parameter cases are not 1243 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4929,6 +4929,241 @@
             "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
           ],
           "note": "Real native indexes retain enforcement and metadata after separate reopen, dropped indexes stay removed, and retained peer handles recreate collections without stale records/index state. Driver return shapes are documented separately."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_tinymongo.py",
+      "sha256": "7809ea4ef30a0c2b2f9e3b9e63770e74d6ec6c5efee480907820d0aaf872aa91",
+      "reference_case_count": 36,
+      "function_count": 36,
+      "coverage": [
+        {
+          "source": [
+            "test_initialize_db",
+            "test_access_database_by_subscription",
+            "test_access_collection_by_subscription"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Native shared clients expose real PyMongo Database/Collection objects, not TinyMongo class identities. Selecting a handle is lazy and does not create storage metadata."
+        },
+        {
+          "source": [
+            "test_list_collections"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "The unchanged legacy source fails this assertion even against locked current TinyMongo: selecting tinyCollection without writing does not create it. BriskDB also creates on write, hides internal tables, and uses modern list_collection_names rather than removed collection_names. This failed reference test is not counted as a pass."
+        },
+        {
+          "source": [
+            "test_initialize_collection",
+            "test_find_with_filter_named_parameter",
+            "test_greater_than",
+            "test_find_in_subdocument",
+            "test_find_in_subdocument_with_operator",
+            "test_find_in_subdocument_3_levels",
+            "test_sort_positive",
+            "test_sort_negative",
+            "test_empty_find",
+            "test_find_one",
+            "test_find_one_with_filter_named_parameter",
+            "test_gte_lt",
+            "test_gt_lte",
+            "test_ne",
+            "test_in",
+            "test_and",
+            "test_or"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_legacy_hundred_row_query_results_without_removed_cursor_count"
+          ],
+          "note": "The complete owned 100-row nested fixture has explicit expected IDs/counts for range, equality, membership, arrays, logical conditions, ordering and named filter arguments. Modern iteration/count_documents replace removed Cursor.count and Collection.count APIs; these are adapted results, not unchanged legacy MongoDB-comparison execution."
+        },
+        {
+          "source": [
+            "test_regex"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_legacy_hundred_row_query_results_without_removed_cursor_count"
+          ],
+          "note": "The old [5]{1,2} assertion expects 11 but matches 19 strings in 0..99 under both locked current TinyMongo and BriskDB. The second regex matches the same eight expected values. Exact current IDs are asserted; stale counts/indices and removed cursor methods are not reproduced."
+        },
+        {
+          "source": [
+            "test_not"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_negation_uses_current_conjunction_not_stale_legacy_expectation"
+          ],
+          "note": "The legacy assertion expects 80 for NOT(count>=90 AND count<10), an impossible conjunction. Locked current TinyMongo and BriskDB return all 100 rows; the ordinary NOT(10<=count<90) returns 20. Both exact result sets are tested, not the stale assertion."
+        },
+        {
+          "source": [
+            "test_sort_behavior"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_locked_ninety_row_mixed_sort_matches_current_reference_order"
+          ],
+          "note": "The exact locked 90-row mixed_type.json fixture is independently SHA-256 checked. Native sort matches the current reference's complete captured ID order, including stable ties, before/after reopen. The legacy test's removed MongoDB Cursor.count and direct cursor indexing are not retained."
+        },
+        {
+          "source": [
+            "test_has_next",
+            "test_not_has_next"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Real PyMongo next/iteration exhaustion is checked. TinyMongo hasNext and Cursor.count are not installed; AttributeError is intentional and modern collection_names/count calls also reject."
+        },
+        {
+          "source": [
+            "test_drop_collection"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Modern driver drop returns None both for existing and missing collections, not TinyMongo's True/False; catalog removal and repeated idempotent drop are verified."
+        },
+        {
+          "source": [
+            "test_sort_wrong_input_type",
+            "test_insert_many_wrong_input",
+            "test_insert_one_with_list_input"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_direct_id_operator_routes_and_invalid_values_use_real_bson_driver"
+          ],
+          "note": "Malformed sort/list insert and mapping-as-batch inputs raise real PyMongo TypeError rather than legacy ValueError where applicable. BSON-unencodable Python objects reject without changing stored documents."
+        },
+        {
+          "source": [
+            "test_update_one_set",
+            "test_delete_one",
+            "test_delete_all",
+            "test_delete_many",
+            "test_insert_one",
+            "test_insert_many"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_crud_results_replacements_and_duplicate_batches_keep_exact_state"
+          ],
+          "note": "Native inserted IDs, update counts/updatedExisting, filtered/full deletes, replacement ID preservation and duplicate batch errors are exercised with exact persisted state. The legacy Cursor['field']/count and exact old result dictionaries are replaced by current driver accessors; no private retry count is claimed."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_remaining_coverage.py",
+      "sha256": "b2d4d1fb15b7e091f1873e8b3ddfad7352c2064e844add6d6574dc60f9cd03cf",
+      "reference_case_count": 12,
+      "function_count": 10,
+      "coverage": [
+        {
+          "source": [
+            "test_bson_capabilities_are_enabled_atomically"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_extended_types_roundtrip_as_native_bson_not_python_registry_tags"
+          ],
+          "note": "BriskDB's Mongo extra requires real PyMongo/BSON; all-or-none monkeypatching of TinyMongo's optional class registry is not an extension point. Real required BSON type roundtrips are tested instead, not a no-PyMongo fallback."
+        },
+        {
+          "source": [
+            "test_bson_recursive_equality_handles_mixed_and_unregistered_values"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_bson_registry.py::test_recursive_bson_equality_keeps_nested_bool_and_document_order",
+            "python/tests/test_upstream_core_client.py::test_direct_id_operator_routes_and_invalid_values_use_real_bson_driver"
+          ],
+          "note": "Native recursive BSON equality distinguishes documents/scalars and bool/numbers. Arbitrary Python object identity is not serializable: real driver InvalidDocument replaces a private helper's marker-is-marker fallback."
+        },
+        {
+          "source": [
+            "test_cli_copies_unique_and_nonunique_indexes"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::legacy_blob_imports_documents_and_logical_index",
+            "src/import/tinymongo.rs::advanced_import_envelopes_match_native_declarations_without_rewriting"
+          ],
+          "note": "BriskDB does not ship TinyMongo's live _copy_indexes CLI helper. Explicit stopped-source import validates/retains native declarations, including uniqueness and key metadata; custom indexes initially require native builds rather than promising a fake target create_index call sequence."
+        },
+        {
+          "source": [
+            "test_cli_replace_collection_restores_or_preserves_previous_data",
+            "test_cli_replace_collection_reports_a_rollback_failure"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt"
+          ],
+          "note": "BriskDB's stopped-source importer stages into a fresh destination, removes a failed unpublished stage and preserves the source. It does not delete/reinsert an existing live collection and cannot promise TinyMongo's compensating rollback callback/error chain. Native failure/retry/source-preservation evidence is explicit, not equivalent live replacement semantics."
+        },
+        {
+          "source": [
+            "test_cli_migrate_records_an_empty_collection_without_inserting"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill/legacy_blob.rs::genuine_legacy_blob_import_preserves_tagged_values_and_unchanged_source"
+          ],
+          "note": "A genuine stopped legacy blob imports three logical collections including an empty one, keeps source hashes unchanged and verifies empty collection discovery/count after mutate/reopen. TinyMongo live CLI source/target clients, deletion callbacks and printed JSON format are not implemented."
+        },
+        {
+          "source": [
+            "test_persistent_native_insert_rejection_returns_bulk_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_crud_results_replacements_and_duplicate_batches_keep_exact_state"
+          ],
+          "note": "Both ordered/unordered real duplicate batches report nInserted=0, index=0 and code 11000 without changing durable data. No injected Python engine or exactly-three-attempt private retry guarantee exists."
+        },
+        {
+          "source": [
+            "test_direct_id_and_cached_match_helpers_cover_operator_routes"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_direct_id_operator_routes_and_invalid_values_use_real_bson_driver"
+          ],
+          "note": "Native integer/double equality and singleton membership work; bare regex matches text while explicit $eq compares BSON regex identity. Private _MISSING and cache tuple identities are not asserted."
+        },
+        {
+          "source": [
+            "test_tinydb_updates_and_replacements_use_native_query_routes"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_crud_results_replacements_and_duplicate_batches_keep_exact_state"
+          ],
+          "note": "Exists-selected update/replacement yields exact matched/modified counts, preserves _id, replaces Ada with Grace and remains identical after native reopen. TinyDB storage is not selected."
+        },
+        {
+          "source": [
+            "test_build_table_delegates_to_a_table_backend"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "BriskDB exposes real driver collection handles and creates native catalog/storage on write. TinyMongo's build_table/table=None/private engine delegation is not an API; lazy handle and actual discovery/drop effects are checked."
         }
       ]
     }
