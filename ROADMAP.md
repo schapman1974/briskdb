@@ -424,8 +424,12 @@ database under differential/property tests.
   Unix key-permission checks. Certificate/key/password reads now validate the
   opened descriptor, enforce a limit even if the file grows, reject Unix FIFOs
   without blocking, and zeroize their fixed input buffers on all exit paths.
-  This #65/#188 foundation does not add reload or
-  enable Mongo TLS/authentication; Mongo still refuses non-loopback binds.
+  Secure Rust attached servers can explicitly reload the complete PostgreSQL
+  TLS/SCRAM identity without rebinding; failed/cancelled reloads retain the
+  previous identity, and existing connections keep one consistent snapshot.
+  CLI/Python reload, other listeners and immediate session revocation remain
+  separate work. This does not enable Mongo TLS/authentication; Mongo still
+  refuses non-loopback binds.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

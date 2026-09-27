@@ -7,6 +7,9 @@
 //! protocol-neutral core session; `server`, `core`, and BriskDB's public API do
 //! not accept or return `pgwire` types.
 
+mod reload;
+pub(crate) use reload::ReloadableSecurity;
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -934,7 +937,7 @@ pub struct Adapter {
     default_database: LogicalDatabaseId,
     default_database_name: Box<str>,
     cancellations: Arc<CancellationRegistry>,
-    security: Option<Arc<LoadedSecurity>>,
+    security: Option<ReloadableSecurity>,
 }
 
 impl Adapter {
@@ -952,9 +955,14 @@ impl Adapter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_loaded_security(engine: Engine, security: LoadedSecurity) -> Self {
+        Self::with_reloadable_security(engine, ReloadableSecurity::new(security))
+    }
+
+    pub(crate) fn with_reloadable_security(engine: Engine, security: ReloadableSecurity) -> Self {
         let mut adapter = Self::new(engine);
-        adapter.security = Some(Arc::new(security));
+        adapter.security = Some(security);
         adapter
     }
 
@@ -1007,7 +1015,8 @@ impl Adapter {
     }
 
     pub(crate) fn wire_connection(&self) -> WireConnection {
-        let scram = self.security.as_ref().map(|security| {
+        let security = self.security.as_ref().map(ReloadableSecurity::snapshot);
+        let scram = security.as_ref().map(|security| {
             security
                 .scram()
                 .expect("loaded PostgreSQL security was validated")
@@ -1015,6 +1024,7 @@ impl Adapter {
         WireConnection {
             state: Arc::new(WireConnectionState {
                 adapter: self.clone(),
+                security,
                 installed: OnceLock::new(),
                 authentication: AsyncMutex::new(AuthenticationState::new(scram)),
             }),
@@ -1549,6 +1559,9 @@ pub(crate) struct WireConnection {
 
 struct WireConnectionState {
     adapter: Adapter,
+    // TLS, channel binding, SCRAM challenge and final user validation all use
+    // this exact snapshot, even when the adapter reloads during authentication.
+    security: Option<Arc<LoadedSecurity>>,
     installed: OnceLock<InstalledWireConnection>,
     authentication: AsyncMutex<AuthenticationState>,
 }
@@ -1999,7 +2012,7 @@ impl StartupHandler for WireHandlers {
             PgWireFrontendMessage::Startup(startup) => {
                 let pending = validate_startup(&startup)?;
                 set_startup_metadata(client, &pending);
-                if self.connection.state.adapter.security.is_none() {
+                if self.connection.state.security.is_none() {
                     return finish_startup(&self.connection, client, pending).await;
                 }
                 if !client.is_secure() {
@@ -2063,7 +2076,6 @@ impl StartupHandler for WireHandlers {
                     let configured_user = self
                         .connection
                         .state
-                        .adapter
                         .security
                         .as_ref()
                         .expect("SCRAM is present only for secure adapters")
@@ -3465,7 +3477,7 @@ async fn run_socket(
     tokio::pin!(startup_timeout);
     let socket = tokio::select! {
         _ = &mut startup_timeout => return Ok(()),
-        socket = negotiate_transport(stream, handlers.connection.state.adapter.security.as_deref()) => socket?,
+        socket = negotiate_transport(stream, handlers.connection.state.security.as_deref()) => socket?,
     };
     let Some((mut socket, initial_message)) = socket else {
         return Ok(());
@@ -3806,6 +3818,8 @@ fn engine_error_to_pgwire_with_severity(error: EngineError, severity: &str) -> P
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "listeners")]
+    mod reload;
     use std::{fmt::Debug, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
@@ -3945,12 +3959,16 @@ mod tests {
     }
 
     fn test_tls_connector() -> pgwire::tokio::tokio_rustls::TlsConnector {
-        let mut roots = rustls::RootCertStore::empty();
         let certificate = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/postgres-tls/server.crt"
         ));
-        for certificate in rustls_pemfile::certs(&mut certificate.as_slice()) {
+        test_tls_connector_for(certificate)
+    }
+
+    fn test_tls_connector_for(mut certificate: &[u8]) -> pgwire::tokio::tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut certificate) {
             roots.add(certificate.unwrap()).unwrap();
         }
         let config = rustls::ClientConfig::builder()
@@ -3974,10 +3992,18 @@ mod tests {
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .unwrap()
             .to_owned();
-        let mut tls = test_tls_connector()
+        let tls = test_tls_connector()
             .connect(server_name, tcp)
             .await
             .unwrap();
+        authenticate_tls(tls, user, password).await
+    }
+
+    async fn authenticate_tls(
+        mut tls: TestTlsStream,
+        user: &str,
+        password: &str,
+    ) -> Result<TestTlsStream, std::collections::BTreeMap<u8, String>> {
         tls.write_all(&startup_packet_with(
             196_608,
             &[("user", user), ("database", "default")],
