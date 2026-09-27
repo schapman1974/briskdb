@@ -175,6 +175,13 @@ class MongoClient(_LocalStoreBinding, _Client):
     def get_default_database(self, *args: Any, **kwargs: Any) -> Database:
         return Database._wrap(super().get_default_database(*args, **kwargs))
 
+    def _get_topology(self) -> Any:
+        # The pinned driver routes reads, writes, commands and getMore through
+        # this hook. Reject inherited native ownership before it opens/reuses
+        # topology locks or network connections, including retained handles.
+        self._briskdb_store.check_process()
+        return super()._get_topology()
+
     def close(self) -> None:
         self._briskdb_store.check_process()
         try:
@@ -220,6 +227,10 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
 
     def get_default_database(self, *args: Any, **kwargs: Any) -> AsyncDatabase:
         return AsyncDatabase._wrap(super().get_default_database(*args, **kwargs))
+
+    async def _get_topology(self) -> Any:
+        self._briskdb_store.check_process()
+        return await super()._get_topology()
 
     async def close(self) -> None:
         self._briskdb_store.check_process()
