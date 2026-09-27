@@ -7,6 +7,8 @@ use crate::{CancellationToken, EngineError, EngineErrorKind, EngineState, Reques
 /// no Mongo listener, TLS identity or SIGHUP handler is enabled implicitly.
 #[derive(Default, Clone)]
 pub struct DaemonOptions {
+    pub(super) http_tls: Option<HttpTlsConfig>,
+    pub(super) admin_tls: Option<HttpTlsConfig>,
     pub(super) address: Option<SocketAddr>,
     #[cfg(feature = "mongo-tls")]
     pub(super) tls: Option<crate::protocol::mongo::MongoTlsConfig>,
@@ -16,6 +18,20 @@ pub struct DaemonOptions {
 impl DaemonOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Encrypt the data plane without changing its loopback-only policy.
+    #[must_use]
+    pub fn with_http_tls(mut self, config: HttpTlsConfig) -> Self {
+        self.http_tls = Some(config);
+        self
+    }
+
+    /// Encrypt an explicitly enabled administration plane independently.
+    #[must_use]
+    pub fn with_admin_tls(mut self, config: HttpTlsConfig) -> Self {
+        self.admin_tls = Some(config);
+        self
     }
 
     #[cfg(feature = "mongo")]
@@ -59,7 +75,7 @@ impl DaemonOptions {
         #[cfg(not(feature = "mongo-tls"))]
         let mongo_secure = false;
         anyhow::ensure!(
-            postgres_secure || mongo_secure,
+            postgres_secure || mongo_secure || self.http_tls.is_some() || self.admin_tls.is_some(),
             "SIGHUP security reload requires at least one already-secure listener"
         );
         Ok(())
@@ -70,6 +86,8 @@ impl std::fmt::Debug for DaemonOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("DaemonOptions");
         debug
+            .field("http_tls", &self.http_tls.is_some())
+            .field("admin_tls", &self.admin_tls.is_some())
             .field("mongo_address", &self.address)
             .field("reload_on_sighup", &self.reload_on_sighup);
         #[cfg(feature = "mongo-tls")]
@@ -80,6 +98,8 @@ impl std::fmt::Debug for DaemonOptions {
 
 #[derive(Clone)]
 pub(super) struct Sources {
+    pub http: Option<HttpTlsConfig>,
+    pub admin: Option<HttpTlsConfig>,
     pub postgres: Option<postgres::SecurityConfig>,
     #[cfg(feature = "mongo-tls")]
     pub mongo: Option<crate::protocol::mongo::MongoTlsConfig>,
@@ -93,17 +113,23 @@ impl Sources {
             postgres: self.postgres.map(|config| config.load()).transpose()?,
             #[cfg(feature = "mongo-tls")]
             mongo: self.mongo.map(|config| config.load()).transpose()?,
+            http: self.http.map(HttpTlsConfig::load).transpose()?,
+            admin: self.admin.map(HttpTlsConfig::load).transpose()?,
         })
     }
 }
 
 pub(super) struct Targets {
+    pub http: Option<http_tls::Reloadable>,
+    pub admin: Option<http_tls::Reloadable>,
     pub postgres: Option<postgres::ReloadableSecurity>,
     #[cfg(feature = "mongo-tls")]
     pub mongo: Option<crate::protocol::mongo::ReloadableTls>,
 }
 
 struct Loaded {
+    http: Option<Arc<http_tls::Loaded>>,
+    admin: Option<Arc<http_tls::Loaded>>,
     postgres: Option<postgres::LoadedSecurity>,
     #[cfg(feature = "mongo-tls")]
     mongo: Option<crate::protocol::mongo::LoadedTls>,
@@ -236,6 +262,14 @@ impl Targets {
             loaded.mongo.is_some() == self.mongo.is_some(),
             "Mongo reload target mismatch"
         );
+        anyhow::ensure!(
+            loaded.http.is_some() == self.http.is_some(),
+            "HTTP data reload target mismatch"
+        );
+        anyhow::ensure!(
+            loaded.admin.is_some() == self.admin.is_some(),
+            "HTTP admin reload target mismatch"
+        );
         // Each connector publishes one whole immutable identity. This is not a
         // cross-connector transaction or an atomic multi-file deployment.
         if let (Some(target), Some(identity)) = (&self.postgres, loaded.postgres) {
@@ -243,6 +277,12 @@ impl Targets {
         }
         #[cfg(feature = "mongo-tls")]
         if let (Some(target), Some(identity)) = (&self.mongo, loaded.mongo) {
+            target.replace(identity);
+        }
+        if let (Some(target), Some(identity)) = (&self.http, loaded.http) {
+            target.replace(identity);
+        }
+        if let (Some(target), Some(identity)) = (&self.admin, loaded.admin) {
             target.replace(identity);
         }
         Ok(())

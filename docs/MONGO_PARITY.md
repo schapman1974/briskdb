@@ -811,8 +811,10 @@ Rust process hosts can call
 with `server,mongo-tls`. Existing `Config` literals and legacy entry points are
 unchanged. Unix daemons can explicitly opt into `--reload-on-sighup`
 (`BRISKDB_RELOAD_ON_SIGHUP=true`), then replace the startup files and send SIGHUP
-without rebinding. All configured Mongo/PostgreSQL identities validate before
-any replacement; invalid preparation preserves both. Admitted sockets keep their
+without rebinding. All configured Mongo/PostgreSQL and optional
+[HTTP/admin identities](HTTP_LISTENERS.md#encrypt-daemon-http-planes-unreleased)
+validate before any replacement; invalid preparation preserves every active
+identity. Admitted sockets keep their
 old identity. Only one preparation worker runs; a 15-second publication deadline
 and shutdown/lifecycle guards prevent late publication. This is neither an atomic
 multi-file deployment nor a cross-connector publication transaction. See the

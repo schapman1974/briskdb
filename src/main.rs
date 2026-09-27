@@ -94,6 +94,22 @@ struct Args {
     #[arg(long, env = "BRISKDB_MONGO_TLS_KEY", value_name = "PATH")]
     mongo_tls_key: Option<PathBuf>,
 
+    /// PEM certificate for the loopback HTTP data plane.
+    #[arg(long, env = "BRISKDB_HTTP_TLS_CERT", value_name = "PATH")]
+    http_tls_cert: Option<PathBuf>,
+
+    /// PEM private key paired with --http-tls-cert.
+    #[arg(long, env = "BRISKDB_HTTP_TLS_KEY", value_name = "PATH")]
+    http_tls_key: Option<PathBuf>,
+
+    /// PEM certificate for the enabled loopback HTTP administration plane.
+    #[arg(long, env = "BRISKDB_ADMIN_TLS_CERT", value_name = "PATH")]
+    admin_tls_cert: Option<PathBuf>,
+
+    /// PEM private key paired with --admin-tls-cert.
+    #[arg(long, env = "BRISKDB_ADMIN_TLS_KEY", value_name = "PATH")]
+    admin_tls_key: Option<PathBuf>,
+
     /// On Unix, reread configured TLS/SCRAM files on SIGHUP; never revokes existing sessions.
     #[arg(long, env = "BRISKDB_RELOAD_ON_SIGHUP", default_value_t = false,
         action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -211,6 +227,27 @@ struct Args {
 }
 
 impl Args {
+    fn validate_http_tls(&self) -> EngineResult<()> {
+        for (certificate, key, label) in [
+            (&self.http_tls_cert, &self.http_tls_key, "http"),
+            (&self.admin_tls_cert, &self.admin_tls_key, "admin"),
+        ] {
+            if certificate.is_some() != key.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("--{label}-tls-cert and --{label}-tls-key must be set together"),
+                ));
+            }
+        }
+        if self.admin_tls_cert.is_some() && self.admin_listen == ListenerSetting::Disabled {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "admin HTTP TLS requires an enabled --admin-listen address",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_mongo_tls(&self) -> EngineResult<()> {
         match (&self.mongo_tls_cert, &self.mongo_tls_key) {
             (None, None) => return Ok(()),
@@ -243,6 +280,7 @@ impl Args {
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
         self.validate_mongo_tls()?;
+        self.validate_http_tls()?;
         #[cfg(not(feature = "mongo"))]
         if self.mongo_listen != ListenerSetting::Disabled {
             return Err(EngineError::new(
@@ -285,7 +323,11 @@ impl Args {
                     "SIGHUP security reload requires a Unix target",
                 ));
             }
-            if postgres_security.is_none() && self.mongo_tls_cert.is_none() {
+            if postgres_security.is_none()
+                && self.mongo_tls_cert.is_none()
+                && self.http_tls_cert.is_none()
+                && self.admin_tls_cert.is_none()
+            {
                 return Err(EngineError::new(
                     EngineErrorKind::InvalidArgument,
                     "SIGHUP security reload requires at least one already-secure listener",
@@ -330,7 +372,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Validate pairs/feature support before moving fields or starting any I/O.
     args.validate_mongo_tls()?;
+    args.validate_http_tls()?;
     let mut daemon = server::DaemonOptions::new();
+    if let Some((certificate, key)) = args.http_tls_cert.as_ref().zip(args.http_tls_key.as_ref()) {
+        daemon = daemon.with_http_tls(server::HttpTlsConfig::new(certificate, key));
+    }
+    if let Some((certificate, key)) = args
+        .admin_tls_cert
+        .as_ref()
+        .zip(args.admin_tls_key.as_ref())
+    {
+        daemon = daemon.with_admin_tls(server::HttpTlsConfig::new(certificate, key));
+    }
     if args.reload_on_sighup {
         daemon = daemon.with_sighup_reload();
     }
@@ -374,6 +427,10 @@ mod tests {
         assert_eq!(args.mongo_listen, ListenerSetting::Disabled);
         assert_eq!(args.mongo_tls_cert, None);
         assert_eq!(args.mongo_tls_key, None);
+        assert_eq!(args.http_tls_cert, None);
+        assert_eq!(args.http_tls_key, None);
+        assert_eq!(args.admin_tls_cert, None);
+        assert_eq!(args.admin_tls_key, None);
         assert!(!args.reload_on_sighup);
         assert_eq!(args.postgres_tls_cert, None);
         assert_eq!(args.postgres_tls_key, None);
@@ -456,6 +513,125 @@ mod tests {
             ])
             .env(MARKER, "1")
             .env("BRISKDB_MONGO_LISTEN", "127.0.0.1:27017")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn http_tls_pairs_and_enabled_admin_are_required_without_reading_files() {
+        for plane in ["http", "admin"] {
+            for suffix in ["cert", "key"] {
+                let flag = format!("--{plane}-tls-{suffix}");
+                let args = Args::try_parse_from(["briskdb", &flag, "missing"]).unwrap();
+                assert_eq!(
+                    args.into_server_parts().unwrap_err().kind(),
+                    EngineErrorKind::InvalidArgument
+                );
+            }
+            let certificate = format!("--{plane}-tls-cert");
+            let key = format!("--{plane}-tls-key");
+            let args =
+                Args::try_parse_from(["briskdb", &certificate, "missing.crt", &key, "missing.key"])
+                    .unwrap();
+            assert!(args.into_server_parts().is_ok());
+            let args = Args::try_parse_from([
+                "briskdb",
+                &certificate,
+                "missing.crt",
+                &key,
+                "missing.key",
+                "--reload-on-sighup",
+            ])
+            .unwrap();
+            assert_eq!(args.into_server_parts().is_ok(), cfg!(unix));
+        }
+        let args = Args::try_parse_from([
+            "briskdb",
+            "--admin-listen",
+            "disabled",
+            "--admin-tls-cert",
+            "missing.crt",
+            "--admin-tls-key",
+            "missing.key",
+        ])
+        .unwrap();
+        assert!(
+            args.into_server_parts()
+                .unwrap_err()
+                .to_string()
+                .contains("enabled --admin-listen")
+        );
+    }
+
+    #[test]
+    fn http_tls_environment_and_cli_precedence_are_isolated_in_children() {
+        const MARKER: &str = "BRISKDB_HTTP_TLS_ENV_TEST_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(
+                args.http_tls_cert,
+                Some(PathBuf::from("environment-http.crt"))
+            );
+            assert_eq!(
+                args.http_tls_key,
+                Some(PathBuf::from("environment-http.key"))
+            );
+            assert_eq!(
+                args.admin_tls_cert,
+                Some(PathBuf::from("environment-admin.crt"))
+            );
+            assert_eq!(
+                args.admin_tls_key,
+                Some(PathBuf::from("environment-admin.key"))
+            );
+            let args = Args::try_parse_from([
+                "briskdb",
+                "--http-tls-cert",
+                "explicit-http.crt",
+                "--http-tls-key",
+                "explicit-http.key",
+                "--admin-tls-cert",
+                "explicit-admin.crt",
+                "--admin-tls-key",
+                "explicit-admin.key",
+            ])
+            .unwrap();
+            assert_eq!(args.http_tls_cert, Some(PathBuf::from("explicit-http.crt")));
+            assert_eq!(args.http_tls_key, Some(PathBuf::from("explicit-http.key")));
+            assert_eq!(
+                args.admin_tls_cert,
+                Some(PathBuf::from("explicit-admin.crt"))
+            );
+            assert_eq!(
+                args.admin_tls_key,
+                Some(PathBuf::from("explicit-admin.key"))
+            );
+            assert!(args.into_server_parts().is_ok());
+            assert!(
+                Args::try_parse_from(["briskdb", "--admin-listen", "disabled"])
+                    .unwrap()
+                    .into_server_parts()
+                    .is_err()
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::http_tls_environment_and_cli_precedence_are_isolated_in_children",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("BRISKDB_HTTP_TLS_CERT", "environment-http.crt")
+            .env("BRISKDB_HTTP_TLS_KEY", "environment-http.key")
+            .env("BRISKDB_ADMIN_TLS_CERT", "environment-admin.crt")
+            .env("BRISKDB_ADMIN_TLS_KEY", "environment-admin.key")
             .output()
             .unwrap();
         assert!(

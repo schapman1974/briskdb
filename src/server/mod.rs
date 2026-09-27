@@ -279,15 +279,15 @@ pub async fn run_with_mongo_tls(
     .await
 }
 
-/// Run the process-owned server with explicit optional Mongo and Unix SIGHUP
-/// security reload behavior. Existing entry points retain their defaults.
+/// Run the process-owned server with explicit HTTP/admin TLS, optional Mongo and
+/// Unix SIGHUP security reload. Existing entry points retain their defaults.
 #[cfg(feature = "server")]
 pub async fn run_with_options(
     config: Config,
     options: EngineOptions,
-    mongo: DaemonOptions,
+    listener_options: DaemonOptions,
 ) -> anyhow::Result<()> {
-    let mongo_listen = mongo.address;
+    let mongo_listen = listener_options.address;
     let listener_config = ListenerConfig {
         http_listen: config.listen,
         admin_listen: config.admin_listen,
@@ -295,15 +295,20 @@ pub async fn run_with_options(
     };
     validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
     validate_optional_mongo(&listener_config, mongo_listen)?;
-    mongo.validate_reload(config.postgres_security.is_some())?;
+    listener_options.validate_reload(config.postgres_security.is_some())?;
+    if listener_options.admin_tls.is_some() && config.admin_listen.is_none() {
+        anyhow::bail!("admin HTTP TLS requires an enabled admin listener");
+    }
     #[cfg(feature = "mongo-tls")]
-    if mongo.tls.is_some() && mongo_listen.is_none() {
+    if listener_options.tls.is_some() && mongo_listen.is_none() {
         anyhow::bail!("Mongo TLS configuration requires an enabled Mongo listener");
     }
     let reload_sources = daemon::Sources {
+        http: listener_options.http_tls.clone(),
+        admin: listener_options.admin_tls.clone(),
         postgres: config.postgres_security.clone(),
         #[cfg(feature = "mongo-tls")]
-        mongo: mongo.tls.clone(),
+        mongo: listener_options.tls.clone(),
     };
     let postgres_security = match config.postgres_security.clone() {
         Some(config) => Some(postgres::ReloadableSecurity::new(
@@ -315,7 +320,7 @@ pub async fn run_with_options(
         None => None,
     };
     #[cfg(feature = "mongo-tls")]
-    let mongo_tls = match mongo.tls {
+    let mongo_tls = match listener_options.tls {
         Some(config) => Some(crate::protocol::mongo::ReloadableTls::new(
             tokio::task::spawn_blocking(move || config.load())
                 .await
@@ -328,7 +333,15 @@ pub async fn run_with_options(
     let mongo_secure = mongo_tls.is_some();
     #[cfg(not(feature = "mongo-tls"))]
     let mongo_secure = false;
+    let http_tls = http_tls::Planes {
+        data: options::prepare_http_identity(listener_options.http_tls).await?,
+        admin: options::prepare_http_identity(listener_options.admin_tls).await?,
+    };
+    let http_secure = http_tls.data.is_some();
+    let admin_secure = http_tls.admin.is_some();
     let reload_targets = daemon::Targets {
+        http: http_tls.data.clone(),
+        admin: http_tls.admin.clone(),
         postgres: postgres_security.clone(),
         #[cfg(feature = "mongo-tls")]
         mongo: mongo_tls.clone(),
@@ -343,7 +356,8 @@ pub async fn run_with_options(
         crate::DocumentSupport::Disabled
     });
     let database = builder.open().await?;
-    let listeners = match bind_configured_listeners(&listener_config, &database, mongo_listen).await
+    let mut listeners = match bind_configured_listeners(&listener_config, &database, mongo_listen)
+        .await
     {
         Ok(listeners) => listeners,
         Err(error) => {
@@ -354,6 +368,7 @@ pub async fn run_with_options(
             return Err(error);
         }
     };
+    listeners.http_tls = http_tls;
     #[cfg(feature = "mongo-tls")]
     let listeners = {
         let mut listeners = listeners;
@@ -388,7 +403,7 @@ pub async fn run_with_options(
     };
     let engine = database.engine().clone();
     let reloader = match daemon::Reloader::prepare(
-        mongo.reload_on_sighup,
+        listener_options.reload_on_sighup,
         reload_sources,
         reload_targets,
     ) {
@@ -416,7 +431,9 @@ pub async fn run_with_options(
         postgres_listen = ?config.postgres_listen,
         mongo_listen = ?mongo_listen,
         mongo_secure,
-        security_reload_on_sighup = mongo.reload_on_sighup,
+        http_secure,
+        admin_secure,
+        security_reload_on_sighup = listener_options.reload_on_sighup,
         postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),

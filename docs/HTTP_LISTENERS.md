@@ -16,7 +16,7 @@ Command-line input takes precedence over the environment, which takes
 precedence over the default. Addresses must be numeric IPv4 or IPv6 socket
 addresses. The ordinary SQL data and administration routers have no user
 authentication or role-authorization boundary, so each configured address must
-be loopback even with the attached Rust TLS option below. A non-loopback
+be loopback even with the TLS options below. A non-loopback
 data or administration address is rejected before the database opens or any
 listener binds.
 
@@ -41,6 +41,47 @@ addresses are required to differ.
 the data plane. The second default port is intentional: scripts that used
 operator or browser paths at `127.0.0.1:7654` must use
 `127.0.0.1:7655`. Relative paths and successful response bodies are unchanged.
+
+### Encrypt daemon HTTP planes (unreleased)
+
+Both the ordinary daemon and `server::run_with_options` now support independent
+HTTP identities. Each certificate/key pair is optional; plaintext stays the
+default, and setting only one member of a pair is an error.
+
+| Plane | Certificate flag / environment | Private-key flag / environment |
+| --- | --- | --- |
+| Data | `--http-tls-cert` / `BRISKDB_HTTP_TLS_CERT` | `--http-tls-key` / `BRISKDB_HTTP_TLS_KEY` |
+| Administration | `--admin-tls-cert` / `BRISKDB_ADMIN_TLS_CERT` | `--admin-tls-key` / `BRISKDB_ADMIN_TLS_KEY` |
+
+```sh
+briskdb --listen 127.0.0.1:7654 --admin-listen 127.0.0.1:7655 \
+  --http-tls-cert ./data.crt --http-tls-key ./data.key \
+  --admin-tls-cert ./admin.crt --admin-tls-key ./admin.key \
+  --reload-on-sighup
+```
+
+CLI values override environment values. The administration pair requires an
+enabled admin address. Rust hosts select the same behavior with
+`DaemonOptions::with_http_tls(HttpTlsConfig)` and
+`with_admin_tls(HttpTlsConfig)`, leaving existing `Config` literals unchanged.
+Address/option validation precedes identity file I/O; the bounded shared loader
+prepares all configured identities off-runtime before opening database files or
+binding sockets. A failed bind releases earlier sockets and closes the owned
+database for retry. Readiness logs record only `http_secure` / `admin_secure`
+booleans, not identity contents. **Neither plane gains caller authentication or
+permission to bind off loopback.** TLS is HTTP/1.1 only, using the same finite
+handshake/admission and shutdown contract as the attached host below.
+
+On Unix, explicit `--reload-on-sighup` now rereads configured HTTP/admin paths as
+well as PostgreSQL/Mongo paths. All candidates must validate before any identity
+is published; a bad admin key, for example, keeps every active identity unchanged.
+Each plane publishes one complete identity, not a cross-plane atomic transaction
+or atomic multi-file deployment. Newly admitted connections use the replacement;
+already-admitted handshakes and established connections retain their generation.
+One worker, a 15-second publication deadline, shutdown guards and fixed/redacted
+outcome logs retain the existing reload contract. Replace related files fully
+before signaling. Without this flag no reload handler is installed; the default
+SIGHUP behavior remains host/platform-defined. Reload is not session revocation.
 
 ## Route ownership
 
@@ -142,9 +183,8 @@ identity; PostgreSQL credentials do not authenticate HTTP callers.
 `with_http_tls(...)` also encrypts a selected `with_sqlite_remote(...)` router.
 Its bearer-token and table-allowlist requirements stay in force; the TLS
 certificate alone does not authorize remote-table access. Administration remains
-separate. Both addresses still require loopback. Python/daemon HTTP TLS options
-are not exposed by this increment; existing SIGHUP reload currently covers only
-configured PostgreSQL/Mongo identities.
+separate. Both addresses still require loopback. Python HTTP TLS configuration
+is not exposed by this increment; daemon configuration is described above.
 
 ### Reload attached Rust HTTP identities (unreleased)
 
