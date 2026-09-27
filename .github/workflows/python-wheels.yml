@@ -54,7 +54,9 @@ jobs:
           twine==7.0.0
 
       - name: Check Rust, extension, and build metadata parity
-        run: python python/scripts/check_versions.py
+        run: |
+          python -m unittest discover -s python/scripts -p 'test_check_versions.py' -v
+          python python/scripts/check_versions.py
 
       - name: Install optional driver for the full source typing contract
         # mongo.pyi subclasses the real typed driver. This build environment is

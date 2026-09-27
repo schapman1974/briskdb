@@ -1,6 +1,6 @@
 #[test]
-fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.7");
+fn beta_release_contract_covers_every_native_archive_and_safety_boundary() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-beta.1");
     assert!(include_str!("../fuzz/Cargo.lock").contains(&format!(
         "name = \"briskdb\"\nversion = {:?}",
         env!("CARGO_PKG_VERSION")
@@ -60,7 +60,10 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
         "bounded simple and parameterized text/binary extended queries",
         "single-shard transactions",
         "not full MongoDB or TinyMongo parity",
-        "Mongo remains unauthenticated and loopback-only",
+        "Mongo listener remains anonymous and loopback-only",
+        "Secure remote Mongo hosting remains experimental",
+        "external large-application check (#181) remains pending",
+        "Explicit beta exclusions",
         "read-only SQLite virtual-table addon",
         "`briskdb.patch()`",
         "Cross-platform artifact tests and native dependency audits are required before publishing",
@@ -112,6 +115,7 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
     let metadata = include_str!("../python/pyproject.toml");
     for required in [
         "requires-python = \">=3.9\"",
+        "Development Status :: 4 - Beta",
         "Typing :: Typed",
         "license-files = [\"BRISKDB_LICENSE.txt\"]",
         "maturin==1.14.1",

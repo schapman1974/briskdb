@@ -9,6 +9,17 @@ import subprocess
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def validate_dependency_features(dependency: dict) -> None:
+    if dependency["uses_default_features"] or dependency["features"] != [
+        "documents",
+        "listeners",
+        "mongo-tls",
+    ]:
+        raise SystemExit(
+            "briskdb-python must depend only on the documents, listeners, and mongo-tls features"
+        )
+
+
 def main() -> None:
     completed = subprocess.run(
         [
@@ -43,14 +54,7 @@ def main() -> None:
     if len(core_dependencies) != 1:
         raise SystemExit("briskdb-python must have exactly one briskdb dependency")
     dependency = core_dependencies[0]
-    if dependency["uses_default_features"] or dependency["features"] != [
-        "documents",
-        "listeners",
-        "mongo",
-    ]:
-        raise SystemExit(
-            "briskdb-python must depend only on the documents, listeners, and mongo features"
-        )
+    validate_dependency_features(dependency)
     if pathlib.Path(dependency["path"]).resolve() != ROOT:
         raise SystemExit("briskdb-python must bind the workspace's exact briskdb core")
 

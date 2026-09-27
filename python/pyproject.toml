@@ -12,7 +12,7 @@ license = "MIT"
 license-files = ["BRISKDB_LICENSE.txt"]
 authors = [{ name = "BriskDB contributors" }]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",

@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb"
-version = "0.1.0-alpha.7"
+version = "0.1.0-beta.1"
 dependencies = [
  "blake3",
  "bson",

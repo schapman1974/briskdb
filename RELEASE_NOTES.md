@@ -1,3 +1,70 @@
+# BriskDB 0.1.0-beta.1 — local/developer beta
+
+Rust crate version: `0.1.0-beta.1`; Python distribution version: `0.1.0b1`.
+Publication is gated on full CI, native packaging, installed platform-wheel and
+source-distribution checks. Until the matching tag and artifacts exist, this is
+a release candidate, not a published package.
+
+After publication, install the pinned companion with:
+
+```bash
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
+```
+
+## Supported beta scope
+
+This beta is for local development and application testing: embedded Rust/Python,
+local synchronous/asynchronous PyMongo clients, and `briskdb.patch()` over
+temporary or persistent sharded SQLite storage. It includes the documented BSON
+query/projection/sort, CRUD/upsert, field/array update, bounded aggregation,
+collection lifecycle and index subsets. Since alpha.7, local client compatibility,
+bulk encoding preflight, index-model handling, restart/concurrency coverage,
+differential diagnostics, resource accounting and listener observability have
+expanded. This is **not full MongoDB or TinyMongo parity**.
+
+Explicit beta exclusions are full `listDatabases` disk statistics and
+statistics-dependent filters, advanced collection-creation options, Mongo
+sessions/transactions, TTL expiration, full-text search and alternative TinyMongo
+storage backends. Use `list_database_names()` for database discovery. Collection
+options and supported command shapes are listed in [Mongo compatibility](docs/MONGO_PARITY.md).
+Multi-document writes are not globally atomic across shard files; temporary
+unique-key collisions can reject a bulk update even when its final image would
+be unique. The external large-application check (#181) remains pending the
+project owner's tester; it is not counted as passed.
+
+## Experimental and network boundaries
+
+The Python wheel's Mongo listener remains anonymous and loopback-only, including
+managed local clients; optional TLS does not add authentication. Secure remote
+Mongo hosting remains experimental and Rust-host-only: explicit security-root
+activation, TLS/SCRAM-SHA-256, current document privileges, user management and
+bounded user/role inspection exist, but role administration and Python/daemon/
+composed-host security configuration are incomplete. Do not expose local Mongo
+listeners through a public proxy.
+
+PostgreSQL retains TLS and SCRAM-SHA-256, bounded simple and parameterized
+text/binary extended queries, and single-shard transactions. Shared multi-user
+SQL/HTTP authorization and a production-server guarantee are not included.
+The read-only SQLite virtual-table addon remains experimental and requires a
+compatible host SQLite extension loader; it gains no write or transaction support.
+SQL tables and BSON collections remain separate models. MySQL is not implemented.
+
+## Artifacts and upgrade safety
+
+Cross-platform artifact tests and native dependency audits are required before
+publishing. Wheels target CPython 3.9–3.14 on macOS 11+/manylinux_2_28, x86-64 and
+ARM64; Windows, Alpine/musl, PyPy and free-threaded CPython are not supported.
+The source distribution requires Rust 1.85+. See [Python compatibility](python/COMPATIBILITY.md).
+
+This release uses manifest version 22 and semantic digest 14. There is no stable
+pre-1.0 on-disk compatibility promise. Stop every owner and take a complete
+data-directory copy before upgrading. In-place downgrade is unsupported;
+rollback requires restoring that complete pre-upgrade backup. Shared files must
+remain on a supported same-host local filesystem. Secure roots additionally
+require their private `security.sqlite`; never copy only shard files.
+See [storage format](docs/STORAGE_FORMAT.md), [backup/restore](docs/OFFLINE_BACKUP.md)
+and [pre-1.0 policy](docs/PRE_1_COMPATIBILITY.md).
+
 # BriskDB 0.1.0-alpha.7 — 2026-09-24
 
 Rust crate version: `0.1.0-alpha.7`; Python distribution version: `0.1.0a7`.

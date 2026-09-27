@@ -1,5 +1,11 @@
 # BriskDB for Python
 
+`0.1.0b1` is a **local/developer beta**, not full MongoDB compatibility or a
+production-ready remote database service. The
+[beta scope](https://github.com/schapman1974/briskdb/blob/main/docs/MONGO_PARITY.md#localdeveloper-beta-scope)
+lists exclusions, including full database statistics, advanced collection
+options, Mongo sessions/transactions, TTL expiration and full-text search.
+
 This package runs BriskDB's sharded SQLite engine in the Python process. It
 starts no listener by default and never installs a signal handler or global
 logger. A database can optionally expose its exact engine through
@@ -9,14 +15,13 @@ Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
 macOS and Linux targets:
 
 ```bash
-python -m pip install --only-binary=:all: briskdb
+python -m pip install --only-binary=:all: 'briskdb==0.1.0b1'
 ```
 
 Document commands use PyMongo's public BSON classes as an optional companion:
 
 ```bash
-python -m pip install --only-binary=:all: briskdb
-python -m pip install pymongo
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
 ```
 
 The BriskDB wheel does not require or import PyMongo for SQL-only applications.
@@ -41,11 +46,11 @@ db.close()
 
 ## Patch PyMongo for local testing
 
-The alpha.7 wheel includes `briskdb.patch()`, a TinyMongo-style
+The beta wheel includes `briskdb.patch()`, a TinyMongo-style
 context manager/decorator. Install its optional pinned driver companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0a7'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
 # Or build a repository checkout with Rust 1.85+:
 python -m pip install './python[pymongo]'
 # For a supplied test wheel (replacing any same-version older build):
@@ -332,7 +337,9 @@ Closing a server leaves the database usable; closing the database first closes
 all of its attached servers. The asyncio API provides `await db.serve()` and
 an `AsyncServer` context manager with the same lifecycle.
 
-### Encrypt and reload HTTP/admin (unreleased)
+<a id="encrypt-and-reload-httpadmin-unreleased"></a>
+
+### Encrypt and reload HTTP/admin (beta.1)
 
 Current main can encrypt either HTTP plane independently, including SQLite-remote:
 
@@ -373,7 +380,7 @@ HTTP/1.1, finite handshakes and per-plane socket bounds follow the
 
 ### Reload PostgreSQL security
 
-Current main (unreleased) can reload an **already-secure** attached server without
+Beta.1 can reload an **already-secure** attached server without
 changing its address. Pass all four fields; no plaintext password argument is used:
 
 ```python
@@ -419,7 +426,9 @@ PyMongo is still optional for importing BriskDB and for SQL-only applications.
 See the [Mongo compatibility contract](../docs/MONGO_PARITY.md) for the supported
 subset and limits; this is not a full MongoDB server.
 
-### Encrypt the Mongo listener (unreleased)
+<a id="encrypt-the-mongo-listener-unreleased"></a>
+
+### Encrypt the Mongo listener (beta.1)
 
 Source builds support paired certificate/key paths in synchronous and async
 `serve()`. For a server certificate valid for `localhost`:
@@ -446,7 +455,9 @@ PostgreSQL TLS/SCRAM or authenticated SQLite remote, without sharing credentials
 TLS authenticates the server only: Mongo remains anonymous and loopback-only,
 and must not be publicly proxied. Managed `briskdb.patch()` clients are unchanged.
 
-### Reload Mongo TLS (unreleased)
+<a id="reload-mongo-tls-unreleased"></a>
+
+### Reload Mongo TLS (beta.1)
 
 An already-encrypted attached listener can replace its certificate/key without
 rebinding. Within the `serve()` context above:
@@ -493,7 +504,7 @@ The [API reference](API.md), [platform matrix](COMPATIBILITY.md), and
 [serverless-shaped warm-handler example](SERVERLESS.md) define the supported
 package surface and its current boundaries.
 
-This is an alpha API. SQL supports `None`, `bool`, bounded integers, `float`,
+This is a pre-1.0 API. SQL supports `None`, `bool`, bounded integers, `float`,
 `str`, bytes-like values, and exact `decimal.Decimal` conversion with explicit
 errors when SQLite cannot store a value losslessly. See the executable
 [value and exception contract](VALUE_CONVERSIONS.md) for boundaries and the
