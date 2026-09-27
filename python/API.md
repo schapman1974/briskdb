@@ -527,6 +527,17 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
   remains its compatibility alias. `.admin_address`, `.postgres_address`, and `.mongo_address`
   report optional bound addresses.
 - `Server.close()` is idempotent; server context exit closes only listeners.
+- Unreleased: `Server.reload_postgres_security(*, tls_cert, tls_key, user,
+  password_file, timeout_ms=None, cancellation=None) -> None` reloads an
+  already-secure PostgreSQL listener without rebinding. Paths accept `str` or
+  `PathLike[str]`; all identity fields are required. `AsyncServer` exposes the
+  same awaited method. Invalid material leaves the active identity unchanged;
+  admitted connections retain their original snapshot. Controls apply while
+  queued and preparing, and are rechecked before publication. Cancellation or
+  timeout cannot undo a completed publication. Closed handles raise
+  `FailedPreconditionError`; anonymous/closing listeners and invalid material
+  raise `OperationalError`; cancellation/deadline use their typed request errors.
+  This does not secure Mongo/HTTP or revoke existing sessions.
 - Database close first drains every attached server, then stops the engine.
 
 Data HTTP, administration HTTP, and unauthenticated PostgreSQL accept only

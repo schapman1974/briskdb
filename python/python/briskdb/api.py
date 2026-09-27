@@ -1064,6 +1064,28 @@ class AsyncServer:
     def closed(self) -> bool:
         return self._server.closed
 
+    async def reload_postgres_security(
+        self,
+        *,
+        tls_cert: Union[str, PathLike[str]],
+        tls_key: Union[str, PathLike[str]],
+        user: str,
+        password_file: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> None:
+        """Reload a secure listener; admitted connections retain their identity.
+
+        Cancellation cannot undo an identity already published. Blocking file
+        preparation may finish after cancellation, but cannot publish afterward
+        when the native operation observes cancellation before publication.
+        """
+        await _cancelable_call(
+            self._server.reload_postgres_security,
+            tls_cert=tls_cert, tls_key=tls_key, user=user, password_file=password_file,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+        )
+
     async def close(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._server.close)
 

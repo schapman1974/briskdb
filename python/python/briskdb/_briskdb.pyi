@@ -363,6 +363,11 @@ class Database:
     def __exit__(self, *exception: object) -> bool: ...
 
 class Server:
+    def reload_postgres_security(
+        self, *, tls_cert: Union[str, PathLike[str]], tls_key: Union[str, PathLike[str]],
+        user: str, password_file: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+    ) -> None: ...
     @property
     def data_address(self) -> str: ...
     @property

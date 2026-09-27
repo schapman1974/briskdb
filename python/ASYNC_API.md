@@ -69,6 +69,14 @@ async with await database.serve(postgres="127.0.0.1:0") as server:
 ```
 
 `AsyncServer.close()` drains its listeners but leaves the database running.
+
+Unreleased: `await server.reload_postgres_security(tls_cert=..., tls_key=...,
+user=..., password_file=..., timeout_ms=5_000)` replaces an already-secure
+PostgreSQL identity without rebinding. It supports `cancellation=` and signals
+the native token if the asyncio task is cancelled. Controls apply while waiting
+for the handle and preparing the identity; cancellation cannot undo a completed
+publication. Existing sessions/handshakes retain their old identity. See the
+[reload contract](README.md#reload-postgresql-security) for lifecycle and scope.
 `data_address` is the data plane and `http_address` remains its compatibility
 alias; `admin_address` is the optional administration plane. The admin listener
 defaults to an operating-system-selected loopback
