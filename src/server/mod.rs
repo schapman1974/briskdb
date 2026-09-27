@@ -377,9 +377,8 @@ pub async fn run_with_options(
         }
         listeners
     };
-    #[cfg(feature = "mongo")]
-    let mongo_listen = match listeners.addresses() {
-        Ok(addresses) => addresses.mongo(),
+    let bound_addresses = match listeners.addresses() {
+        Ok(addresses) => addresses,
         Err(error) => {
             database.begin_close();
             if let Err(shutdown_error) = database.close().await {
@@ -388,6 +387,8 @@ pub async fn run_with_options(
             return Err(error);
         }
     };
+    #[cfg(feature = "mongo")]
+    let mongo_listen = bound_addresses.mongo();
     // Tokio's portable `ctrl_c()` future installs its handler only when first
     // polled. Construct platform signal streams synchronously here so a signal
     // cannot land between the readiness log and handler installation.
@@ -426,9 +427,9 @@ pub async fn run_with_options(
     let experimental_vtab_writes = false;
 
     info!(
-        listen = %config.listen,
-        admin_listen = ?config.admin_listen,
-        postgres_listen = ?config.postgres_listen,
+        listen = %bound_addresses.http(),
+        admin_listen = ?bound_addresses.admin(),
+        postgres_listen = ?bound_addresses.postgres(),
         mongo_listen = ?mongo_listen,
         mongo_secure,
         http_secure,

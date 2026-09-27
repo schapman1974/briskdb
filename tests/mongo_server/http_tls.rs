@@ -143,18 +143,8 @@ fn start(http: Option<&Identity>, admin: Option<&Identity>, reload: bool) -> Hos
     let root = tempfile::tempdir().unwrap();
     let log = root.path().join("daemon.log");
     let data = root.path().join("data");
-    let data_reservation = reserve();
-    let admin_reservation = reserve();
-    let http_address = data_reservation.local_addr().unwrap();
-    let admin_address = admin_reservation.local_addr().unwrap();
-    let mut command = command_with_listeners(
-        &data,
-        &log,
-        None,
-        &http_address.to_string(),
-        &admin_address.to_string(),
-        "disabled",
-    );
+    let mut command =
+        command_with_listeners(&data, &log, None, "127.0.0.1:0", "127.0.0.1:0", "disabled");
     command.args(["--shutdown-grace-ms", "100"]);
     if let Some(identity) = http {
         identity.configure(&mut command, "http");
@@ -165,10 +155,10 @@ fn start(http: Option<&Identity>, admin: Option<&Identity>, reload: bool) -> Hos
     if reload {
         command.arg("--reload-on-sighup");
     }
-    drop(data_reservation);
-    drop(admin_reservation);
     let mut process = Process(command.spawn().unwrap());
     let text = ready(&mut process, &log);
+    let http_address = bound_address(&text, "listen");
+    let admin_address = bound_address(&text, "admin_listen");
     assert!(text.contains(&format!("http_secure={}", http.is_some())));
     assert!(text.contains(&format!("admin_secure={}", admin.is_some())));
     assert!(text.contains(&format!("security_reload_on_sighup={reload}")));
@@ -179,6 +169,15 @@ fn start(http: Option<&Identity>, admin: Option<&Identity>, reload: bool) -> Hos
         http: http_address,
         admin: admin_address,
     }
+}
+
+#[test]
+fn daemon_reports_bound_listener_addresses() {
+    let mut host = start(None, None, false);
+    assert_ne!(host.http, host.admin);
+    assert!(request(&mut tcp(host.http), "/v1").starts_with("HTTP/1.1 200"));
+    assert!(request(&mut tcp(host.admin), "/health").starts_with("HTTP/1.1 200"));
+    terminate(&mut host.process);
 }
 
 fn signal(host: &mut Host, success: bool, expected_count: usize) {
@@ -484,16 +483,33 @@ fn daemon_http_tls_late_bind_failure_releases_the_data_socket_and_database() {
     identity.configure(&mut command, "admin");
     let mut process = Process(command.spawn().unwrap());
     assert!(!process.wait().success());
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("BriskDB is ready"));
     assert!(
-        !fs::read_to_string(&log)
-            .unwrap()
-            .contains("BriskDB is ready")
+        text.contains("failed to bind admin HTTP listener"),
+        "{text}"
     );
     let rebound = TcpListener::bind(http).unwrap();
-    drop(rebound);
-    drop(occupied);
+    // The successful rebind proves cleanup. Keep both old ports occupied while
+    // restarting the same database on OS-selected ports: dropping them and
+    // asking a new process to reclaim them races other tests and client sockets.
+    let retry_log = root.path().join("retry.log");
+    let mut command = command_with_listeners(
+        &data,
+        &retry_log,
+        None,
+        "127.0.0.1:0",
+        "127.0.0.1:0",
+        "disabled",
+    );
+    identity.configure(&mut command, "http");
+    identity.configure(&mut command, "admin");
     let mut process = Process(command.spawn().unwrap());
-    ready(&mut process, &log);
+    let text = ready(&mut process, &retry_log);
+    let http = bound_address(&text, "listen");
+    let admin = bound_address(&text, "admin_listen");
+    assert_ne!(http, rebound.local_addr().unwrap());
+    assert_ne!(admin, occupied.local_addr().unwrap());
     assert!(
         request(&mut connect(http, Some(false), "localhost").unwrap(), "/v1")
             .starts_with("HTTP/1.1 200")

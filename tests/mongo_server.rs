@@ -126,6 +126,40 @@ fn ready(process: &mut Process, log: &Path) -> String {
     }
 }
 
+fn bound_address(text: &str, field: &str) -> std::net::SocketAddr {
+    let line = text
+        .lines()
+        .find(|line| line.contains("BriskDB is ready"))
+        .expect("daemon readiness record");
+    let prefix = format!("{field}=");
+    let value = line
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing {field}: {line}"));
+    let value = value
+        .strip_prefix("Some(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(value);
+    let address: std::net::SocketAddr = value.parse().expect("bound listener address");
+    assert!(address.ip().is_loopback(), "{field}: {address}");
+    assert_ne!(address.port(), 0, "readiness must report the bound {field}");
+    address
+}
+
+#[test]
+fn readiness_address_parser_requires_exact_fields_and_selected_ports() {
+    let text = "admin_listen=Some(127.0.0.1:1235) listen=127.0.0.1:1234 postgres_listen=Some([::1]:1236) BriskDB is ready";
+    assert_eq!(bound_address(text, "listen").port(), 1234);
+    assert_eq!(bound_address(text, "admin_listen").port(), 1235);
+    assert_eq!(bound_address(text, "postgres_listen").port(), 1236);
+    for text in [
+        "listen=127.0.0.1:0 BriskDB is ready",
+        "admin_listen=Some(127.0.0.1:1234) BriskDB is ready",
+    ] {
+        assert!(std::panic::catch_unwind(|| bound_address(text, "listen")).is_err());
+    }
+}
+
 fn terminate(process: &mut Process) {
     // The readiness line is emitted only after installing signal handlers.
     assert_eq!(

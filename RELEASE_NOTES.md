@@ -48,6 +48,8 @@ SQL/HTTP authorization and a production-server guarantee are not included.
 The read-only SQLite virtual-table addon remains experimental and requires a
 compatible host SQLite extension loader; it gains no write or transaction support.
 SQL tables and BSON collections remain separate models. MySQL is not implemented.
+Daemon readiness logs report the actual bound HTTP, administration and PostgreSQL
+addresses, including OS-selected ports when configured with `:0`.
 
 ## Artifacts and upgrade safety
 
