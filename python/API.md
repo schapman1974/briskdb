@@ -521,7 +521,7 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
 
 ## Attached listeners
 
-- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, mongo=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None, sqlite_remote_token=None, sqlite_remote_tables=None, sqlite_remote_routing_key=None) -> Server`; pass `admin=None` to disable administration
+- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, mongo=None, mongo_tls_cert=None, mongo_tls_key=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None, sqlite_remote_token=None, sqlite_remote_tables=None, sqlite_remote_routing_key=None) -> Server`; pass `admin=None` to disable administration
 - `await async_db.serve(...) -> AsyncServer`
 - `Server.data_address` reports the data address and `Server.http_address`
   remains its compatibility alias. `.admin_address`, `.postgres_address`, and `.mongo_address`
@@ -559,6 +559,23 @@ without stopping the borrowed database or retaining any newly bound sockets.
 Mongo uses the same attached-server ownership, close/drain and database-close
 registry as the other listeners. Its BSON collections are separate from SQL
 tables. No Mongo socket or Python client dependency is enabled by default.
+
+Unreleased source builds accept `mongo_tls_cert` and `mongo_tls_key` together,
+as `str` or `PathLike[str]`, with an explicit `mongo=` address. Defaults remain
+plaintext; partial pairs or TLS configuration without a Mongo listener raise
+`InvalidArgumentError`. Invalid certificate/key files raise `OperationalError`
+without leaving bound sockets behind. The shared loader bounds and validates
+opened files; Unix keys must not be group-writable or accessible to others.
+Handshakes use the same finite connection slots and a 15-second deadline.
+Server/database close drains incomplete handshakes as well as established sockets.
+
+Pass `tls=True, tlsCAFile="./ca.crt"` to stock `pymongo.MongoClient` or
+`AsyncMongoClient`, using a hostname present in the server certificate. Never
+disable certificate/hostname verification. TLS proves the server's identity;
+Mongo remains anonymous and **loopback-only**, with no inherited PostgreSQL or
+SQLite-remote credentials. No Mongo reload method or managed-patch TLS behavior
+is added. PostgreSQL and SQLite remote still require separate Python serve handles;
+either can coexist with encrypted Mongo.
 
 ## Results and errors
 

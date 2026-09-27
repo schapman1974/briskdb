@@ -33,8 +33,8 @@ use briskdb::{
     CancellationToken as EngineCancellationToken, CheckpointReport, Column, DocumentSupport,
     EngineOptions, EngineState, EngineStatus, PreparedStatementLimits, RequestContext,
     ResultLimits, SessionState, Statement, TransactionExecution, Value,
-    protocol::postgres::SecurityConfig as PostgresSecurityConfig,
-    server::{AttachedServer, ListenerAddresses, ListenerConfig},
+    protocol::{mongo::MongoTlsConfig, postgres::SecurityConfig as PostgresSecurityConfig},
+    server::{AttachedServer, AttachedServerOptions, ListenerAddresses, ListenerConfig},
 };
 use pyo3::{
     prelude::*,
@@ -879,6 +879,8 @@ impl Database {
         admin = "127.0.0.1:0",
         postgres = None,
         mongo = None,
+        mongo_tls_cert = None,
+        mongo_tls_key = None,
         postgres_tls_cert = None,
         postgres_tls_key = None,
         postgres_user = "briskdb",
@@ -896,6 +898,8 @@ impl Database {
         admin: Option<&str>,
         postgres: Option<&str>,
         mongo: Option<&str>,
+        mongo_tls_cert: Option<PathBuf>,
+        mongo_tls_key: Option<PathBuf>,
         postgres_tls_cert: Option<PathBuf>,
         postgres_tls_key: Option<PathBuf>,
         postgres_user: &str,
@@ -951,6 +955,22 @@ impl Database {
         if let Some(address) = mongo_listen {
             validate_python_listener_address(address, "Mongo")?;
         }
+        let mongo_tls = match (mongo_tls_cert, mongo_tls_key) {
+            (None, None) => None,
+            (Some(certificate), Some(private_key)) => {
+                if mongo_listen.is_none() {
+                    return Err(crate::error::invalid_value(
+                        "mongo_tls_cert and mongo_tls_key require the Mongo listener",
+                    ));
+                }
+                Some(MongoTlsConfig::new(certificate, private_key))
+            }
+            _ => {
+                return Err(crate::error::invalid_value(
+                    "mongo_tls_cert and mongo_tls_key must be set together",
+                ));
+            }
+        };
         validate_python_listener_address(http_listen, "HTTP")?;
         if let Some(address) = admin_listen {
             validate_python_listener_address(address, "admin HTTP")?;
@@ -992,62 +1012,27 @@ impl Database {
                 admin_listen,
                 postgres_listen,
             };
-            let attached =
-                match (remote, postgres_security, mongo_listen) {
-                    (Some(remote), _, Some(address)) => shared.runtime.runtime.block_on(
-                        AttachedServer::start_sqlite_remote_with_mongo(
-                            &database,
-                            listener_config,
-                            remote,
-                            address,
-                        ),
-                    ),
-                    (Some(remote), _, None) => {
-                        shared
-                            .runtime
-                            .runtime
-                            .block_on(AttachedServer::start_sqlite_remote(
-                                &database,
-                                listener_config,
-                                remote,
-                            ))
-                    }
-                    (None, Some(security), Some(address)) => {
-                        shared
-                            .runtime
-                            .runtime
-                            .block_on(AttachedServer::start_secure_with_mongo(
-                                &database,
-                                listener_config,
-                                security,
-                                address,
-                            ))
-                    }
-                    (None, Some(security), None) => {
-                        shared
-                            .runtime
-                            .runtime
-                            .block_on(AttachedServer::start_secure(
-                                &database,
-                                listener_config,
-                                security,
-                            ))
-                    }
-                    (None, None, Some(address)) => {
-                        shared
-                            .runtime
-                            .runtime
-                            .block_on(AttachedServer::start_with_mongo(
-                                &database,
-                                listener_config,
-                                address,
-                            ))
-                    }
-                    (None, None, None) => shared
-                        .runtime
-                        .runtime
-                        .block_on(AttachedServer::start(&database, listener_config)),
-                }
+            let mut options = AttachedServerOptions::new();
+            if let Some(remote) = remote {
+                options = options.with_sqlite_remote(remote);
+            }
+            if let Some(security) = postgres_security {
+                options = options.with_postgres_security(security);
+            }
+            if let Some(address) = mongo_listen {
+                options = match mongo_tls {
+                    Some(identity) => options.with_mongo_tls(address, identity),
+                    None => options.with_mongo(address),
+                };
+            }
+            let attached = shared
+                .runtime
+                .runtime
+                .block_on(AttachedServer::start_with_options(
+                    &database,
+                    listener_config,
+                    options,
+                ))
                 .map_err(listener_error)?;
             let server = Arc::new(ServerShared {
                 addresses: attached.addresses(),

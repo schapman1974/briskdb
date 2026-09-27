@@ -91,6 +91,13 @@ actual socket for `pymongo.AsyncMongoClient`. This defaults to `None`, remains
 unauthenticated/loopback-only even alongside secured PostgreSQL or SQLite remote,
 and shares native BSON collections and the same close/drain lifecycle.
 
+Unreleased source builds accept `mongo_tls_cert=...` and `mongo_tls_key=...`
+together on that same awaited `serve()` call. Paths accept strings or `PathLike`.
+Configure the stock async client with `tls=True, tlsCAFile=...` and a hostname
+matching the certificate. Both default to `None`; partial configuration is
+rejected, and TLS never removes the loopback restriction or authenticates users.
+See the [verified TLS example](README.md#encrypt-the-mongo-listener-unreleased).
+
 Native document methods have the same sync/async pairing. Enable the document
 engine on open and install PyMongo for its `bson` value classes:
 

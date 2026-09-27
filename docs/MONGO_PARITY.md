@@ -714,9 +714,13 @@ with MongoClient("mongodb://localhost:27017/?directConnection=true",
 `AsyncMongoClient` accepts the same TLS options. Do not disable certificate or
 hostname verification. TLS authenticates the **server**, not Mongo users: local
 processes must still be trusted, all non-loopback binds are rejected before
-reading identity files, and public proxying remains unsafe. The daemon,
-Python `db.serve()` and managed PyMongo patch hosts still use their existing
-plaintext loopback transport; they do not yet expose Mongo TLS. Legacy Rust
+reading identity files, and public proxying remains unsafe. Unreleased Python
+`db.serve(mongo=..., mongo_tls_cert=..., mongo_tls_key=...)` exposes this encrypted
+transport in sync/async source builds; both paths are required together and
+stock PyMongo must verify the server certificate/hostname. See the
+[Python example](../python/README.md#encrypt-the-mongo-listener-unreleased).
+The daemon and managed PyMongo patch hosts still use their existing plaintext
+loopback transport; they do not yet expose Mongo TLS. Legacy Rust
 `AttachedServer::*_with_mongo` constructors also remain plaintext; opt into
 attached TLS with the options API below.
 Mongo authentication, roles and remote binding remain separate work.

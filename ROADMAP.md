@@ -440,7 +440,10 @@ database under differential/property tests.
   rotation and native race/resource coverage. Rust `AttachedServerOptions` composes
   Mongo TLS, PostgreSQL TLS/SCRAM and SQLite-remote configuration with preflight,
   off-runtime security preparation and all-socket binding before serving. Existing
-  constructors remain compatible. Daemon/Python Mongo TLS configuration,
+  constructors remain compatible. Sync/async Python `db.serve()` now accepts
+  paired Mongo certificate/key paths; real verified PyMongo, PostgreSQL/SQLite
+  coexistence, persistence, rejected configuration and close/drain tests cover
+  the wheel. Plaintext/patch defaults stay unchanged. Daemon Mongo TLS configuration,
   CLI reload, other listeners and immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
