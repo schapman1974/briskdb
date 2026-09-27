@@ -1072,6 +1072,10 @@ requires an earlier dependency:
       construction/cleanup; valid driver session handling is unchanged. Native
       environment/storage/backend and remaining driver error differences remain
       explicit; this does not add Mongo session support.
+      Inherited local sync/async clients now reject reads, writes, commands and
+      cursor getMore before driver topology work, not only close/custom bulk
+      helpers. Real-fork checks preserve the parent's data and live cursor;
+      children must use spawn and create their own client.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-

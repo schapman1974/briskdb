@@ -129,6 +129,14 @@ threads are intentional, unlike TinyMongo's background-thread-free client; the
 owned client does not add multiprocessing-managed worker processes. These are
 bounded local concurrency checks, not long-duration soak certification.
 
+Local sync/async clients check process ownership before the pinned driver's
+topology lookup for reads, writes, commands and cursor getMore, including retained
+collection/cursor handles. A real-fork regression verifies prompt refusal and
+unchanged parent data/cursor state; simulated owner changes also check both driver
+paths before topology work. Use multiprocessing `spawn` and open a fresh client
+inside each child. This does not make inherited engines fork-safe or prohibit
+inspection of already-decoded Python objects.
+
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
 sparse/partial membership transfers, compound parent-path collisions, and exactly
