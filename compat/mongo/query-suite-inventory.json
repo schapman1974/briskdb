@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-six locked suites is classified; 1155 reference parameter cases are not 1155 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-seven locked suites is classified; 1195 reference parameter cases are not 1195 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4718,6 +4718,217 @@
             "python/tests/test_upstream_discovery_edges.py::test_async_discovery_uses_real_metadata_and_closed_client_errors"
           ],
           "note": "Real async driver discovery/ping and collection filters work with native identity metadata, code-59 serverStatus refusal and permanent closed-client errors. This is adapted discovery coverage, not a claim that BriskDB returns TinyMongo's hard-coded version payload. The unchanged real Beanie application fixture remains separately checked by tests/mongo_odm.rs."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_backend.py",
+      "sha256": "2d8eadc6e78b8dd67e739af2c2b9c66058923ef9caff673652d3d1a4e51ef7ed",
+      "reference_case_count": 40,
+      "function_count": 27,
+      "coverage": [
+        {
+          "source": [
+            "test_retained_database_handle_cannot_write_after_drop_and_reshard",
+            "test_drop_collection_fans_out_and_drop_database_removes_layout"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_native_layout_wal_and_fixed_root_shards_survive_logical_drop",
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "BriskDB uses one shared root/layout, not a separately reshardable directory per logical database. Logical drops preserve shared manifest/shards and other databases; mismatched shard counts reject both while live and after close. Retained handles can recreate logical collections under the same fixed layout, and driver drop results differ from private boolean returns. A per-database drop is not permission to change the root's shard count."
+        },
+        {
+          "source": [
+            "test_database_handle_reopens_after_close_and_client_can_drop_it"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_closed_client_cannot_revive_retained_collection_but_peer_and_reopen_work",
+            "python/tests/test_upstream_common.py::test_database_handles_logical_drop_and_explicit_statistics_gap"
+          ],
+          "note": "There is no TinyMongo database.close/reopen identity API. Real PyMongo client close is permanent; a new client or live peer remains usable, and logical database drop preserves the shared native root rather than deleting a database directory."
+        },
+        {
+          "source": [
+            "test_backend_selection_crud_reopen_and_stable_routing"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_common_storage_queries_mutations_and_natural_counts_survive_reopen",
+            "python/tests/test_upstream_shard_mutations.py::test_natural_first_targeted_updates_and_grouped_deletes_keep_exact_counts",
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "Native CRUD, routed IDs and durable reopen are tested with actual engine plan diagnostics. Private ShardedSQLiteTableBackend objects, physical per-collection tables and TinyMongo hash/file layout are not BriskDB APIs or storage formats."
+        },
+        {
+          "source": [
+            "test_default_layout_and_wal_on_manifest_and_every_shard",
+            "test_attached_union_explicitly_enables_portable_sqlite_uri_handling"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_native_layout_wal_and_fixed_root_shards_survive_logical_drop",
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "The native default is four shard files plus one root manifest, all verified WAL after close; literal question-mark/hash/Unicode path characters survive native writes and reopen. BriskDB does not use Python _manifest_connect(uri=True), ATTACH pool hooks or TinyMongo's nested 000/data.sqlite paths."
+        },
+        {
+          "source": [
+            "test_reopen_rejects_a_different_shard_count",
+            "test_invalid_shard_count_types_are_rejected",
+            "test_invalid_shard_count_ranges_are_rejected"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_native_layout_wal_and_fixed_root_shards_survive_logical_drop",
+            "python/tests/test_upstream_sharded_backend.py::test_shard_configuration_aliases_reject_invalid_counts_before_storage"
+          ],
+          "note": "Both direct client classes reject all six invalid types and five invalid ranges before creating storage, using eager ValueError rather than lazy private-backend TypeError. Live mismatches reject ValueError; closed-root mismatches return native FailedPreconditionError without losing data."
+        },
+        {
+          "source": [
+            "test_scatter_count_query_and_global_sorted_window",
+            "test_more_than_default_attach_limit_uses_established_scatter_fallback",
+            "test_attached_union_supports_concurrent_readers_and_collection_recreation"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "An actual eleven-shard root has three plan-proven IDs per shard, full/filtered counts, a global sorted window, four concurrent readers, detached values and exact reopen/drop/recreation results. Native bounded scatter works beyond SQLite's default ATTACH limit without an attached-union fast path or its fallback monkeypatch."
+        },
+        {
+          "source": [
+            "test_unfiltered_scans_use_read_only_attached_union_and_reuse_connections"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen",
+            "src/storage/pool.rs::connections_open_lazily_and_keep_stable_ids_when_reused",
+            "src/storage/pool.rs::read_only_table_list_metadata_keeps_a_pooled_connection_reusable"
+          ],
+          "note": "Native repeated reads and pool reuse have concrete evidence, but there is no Python ATTACH pool, _find_existing_attached call counter or exposed read-only attached connection. Internal handle modes/authorizers are not asserted to match TinyMongo's private DELETE-on-attached-handle probe."
+        },
+        {
+          "source": [
+            "test_attached_reader_rejects_invalid_shard_metadata_and_closes",
+            "test_reopen_rejects_missing_or_swapped_shard_files"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/shard.rs::only_creating_may_enable_wal",
+            "src/storage/shard.rs::adopting_and_ready_never_create_a_missing_shard",
+            "src/storage/shard.rs::exact_validation_rejects_foreign_future_layout_and_shard_identity",
+            "src/storage/pool.rs::warmed_leases_reject_changed_file_identity_and_release_capacity"
+          ],
+          "note": "Native fresh/open validation rejects invalid WAL/identity/missing files; warmed lease validation rejects replacement and releases capacity. These run real SQLite/path cases, not fake Python Result/Connection objects or private attached-reader exception messages."
+        },
+        {
+          "source": [
+            "test_attached_reader_rejects_files_changed_during_open"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::warmed_leases_reject_changed_file_identity_and_release_capacity",
+            "python/tests/test_mongo_storage_file_identity.py::test_warmed_point_reads_reject_missing_or_replaced_shards_without_stale_results"
+          ],
+          "note": "The source monkeypatches two private attached-file snapshots. Native file identity is checked at pool checkout and real changed files fail closed, but there is no ATTACH snapshot algorithm or continuous protection against replacement during an in-flight operation. Stop clients before replacing files; this is not a claim that the source's synthetic during-open sequence executes unchanged."
+        },
+        {
+          "source": [
+            "test_attached_reader_pool_retires_stale_poisoned_and_inherited_entries"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/pool.rs::stale_idle_generation_is_retired_before_checkout",
+            "src/storage/pool.rs::checked_out_connection_from_a_stale_generation_is_retired_on_checkin",
+            "src/storage/pool.rs::explicit_broken_and_panicking_connections_are_discarded",
+            "python/tests/test_mongo_fork_startup.py::test_real_fork_rejects_live_empty_and_patch_startup_with_parent_locks_held"
+          ],
+          "note": "Native stale/broken/panicking leases retire without capacity loss. Forked Mongo state instead rejects before inherited locks and cannot be made usable by resetting a private pool PID; spawn and fresh child clients are required. Fake Python stat failures and attached idle-list identity are not extension hooks."
+        },
+        {
+          "source": [
+            "test_attached_scan_operational_error_fallbacks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity",
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result",
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "BriskDB scatters without ATTACH, so private string-matched too-many-attached/no-such-table fallbacks and _attached_reads_disabled are not implemented. Native operational failures retain their classification, corruption never becomes an empty result, and eleven-shard normal reads have real evidence."
+        },
+        {
+          "source": [
+            "test_attached_union_preserves_legacy_null_order_and_filters_still_scatter"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_shard_atomicity.py::test_natural_and_sorted_find_modify_ignore_physical_shard_order",
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "Directly overwriting TinyMongo's private __tinymongo_order with NULL is not a valid native-format mutation or a promised ordering API. Native natural/sorted selection and filtered scatter outcomes are separately exercised without claiming legacy physical-column or private attached-versus-filtered call paths."
+        },
+        {
+          "source": [
+            "test_index_fanout_and_cross_shard_unique_collisions",
+            "test_compound_sparse_and_partial_unique_indexes_across_shards"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_compound_sparse_and_partial_uniqueness_is_proven_cross_shard",
+            "python/tests/test_upstream_shard_mutations.py::test_cross_shard_unique_updates_noops_and_replacement_preserve_owners",
+            "src/storage/document/enabled/index_operations/tests.rs::compound_sparse_and_partial_membership_build_and_write_together"
+          ],
+          "note": "Real plans choose IDs on different native shards for each collection. Compound/sparse/partial ownership, skipped membership, cross-shard duplicate rejection and durable metadata are tested, with native entry/catalog evidence instead of TinyMongo __tinymongo_indexes SQL rows."
+        },
+        {
+          "source": [
+            "test_async_client_crud_with_configured_shards"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_async_api.py::test_async_crud_metadata_and_idempotent_close",
+            "python/tests/test_upstream_sharded_backend.py::test_shard_configuration_aliases_reject_invalid_counts_before_storage"
+          ],
+          "note": "Real async clients exercise CRUD/results and native storage selection; both sqlite aliases refer to BriskDB's sharded SQLite engine. The private backend type and TinyMongo's per-database file layout are not exposed."
+        },
+        {
+          "source": [
+            "test_mongo_client_recognizes_sqlite_shards_option",
+            "test_sqlite_shards_option_does_not_change_normal_sqlite_backend"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_shard_configuration_aliases_reject_invalid_counts_before_storage"
+          ],
+          "note": "Host URLs are not contacted, tinymongo_folder/sqlite_shards aliases are recognized, and both sqlite/sqlite-sharded select the same native engine with the requested two shards. Unlike TinyMongo, backend=sqlite is not a separate one-file storage backend that ignores shard selection."
+        },
+        {
+          "source": [
+            "test_multi_shard_batch_preserves_duplicate_ordering_semantics"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_ordered_and_unordered_cross_shard_duplicates_keep_input_error_indices"
+          ],
+          "note": "Plan-proven two-shard IDs reproduce ordered/unordered nInserted, global error indices [2]/[2,4], code 11000 and original error-op object identity. Exact surviving IDs persist after reopen; private physical row-count SQL is replaced by native routed fixtures."
+        },
+        {
+          "source": [
+            "test_index_create_and_drop_survive_separate_reopens",
+            "test_stale_client_recreates_dropped_collection_consistently"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_index_and_enforcement_survive_client_restart",
+            "python/tests/test_upstream_durable_indexes.py::test_index_metadata_is_collection_scoped_and_drop_persists",
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "Real native indexes retain enforcement and metadata after separate reopen, dropped indexes stay removed, and retained peer handles recreate collections without stale records/index state. Driver return shapes are documented separately."
         }
       ]
     }
