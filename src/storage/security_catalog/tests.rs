@@ -42,6 +42,49 @@ fn setup() -> (
 }
 
 #[test]
+fn replacement_cannot_reset_identity_history_or_bypass_credential_rotation() {
+    let (_temp, path, id, mut store) = setup();
+    let (_, original) = store.load().unwrap().into_parts();
+    let before = fs::read(&path).unwrap();
+    // A fresh salt without advancing the generation is not a valid rotation.
+    // A newly constructed empty catalog also resets the identity allocator.
+    for invalid in [catalog(), SecurityCatalog::new()] {
+        let error = store.replace(1, &invalid).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(error.to_string().contains("identity or credential history"));
+        assert!(!store.fenced);
+        assert_eq!(store.load().unwrap().revision(), 1);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let mut valid = SecurityCatalog::from_record(original.to_record().unwrap().as_bytes()).unwrap();
+    valid
+        .rotate_credentials(
+            &name("alice"),
+            ScramSha256Verifier::from_password_with_iterations("new password", 4096).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(store.replace(1, &valid).unwrap(), 2);
+    assert!(store.replace(2, &original).is_err());
+    assert!(!store.fenced);
+    drop(store);
+    let mut reopened = SecurityCatalogStore::open(&path, id).unwrap();
+    let (_, restored) = reopened.load().unwrap().into_parts();
+    assert_eq!(
+        restored.to_record().unwrap().as_bytes(),
+        valid.to_record().unwrap().as_bytes()
+    );
+    let removed = without_users(&mut reopened);
+    assert_eq!(reopened.replace(2, &removed).unwrap(), 3);
+    assert!(reopened.replace(3, &valid).is_err());
+}
+
+fn without_users(store: &mut SecurityCatalogStore) -> SecurityCatalog {
+    let (_, mut state) = store.load().unwrap().into_parts();
+    state.drop_user(&name("alice")).unwrap();
+    state
+}
+
+#[test]
 fn create_reopen_replace_preserves_complete_catalog_and_private_permissions() {
     let (_temp, path, id, mut store) = setup();
     assert_eq!(
@@ -256,7 +299,7 @@ fn retained_handle_rejects_replaced_file_and_permissions_changes() {
 #[test]
 fn revision_overflow_and_observed_rollback_are_rejected() {
     let (_temp, path, _id, mut store) = setup();
-    let state = catalog();
+    let (_, state) = store.load().unwrap().into_parts();
     for revision in [0, i64::MAX as u64, u64::MAX] {
         assert!(store.replace(revision, &state).is_err());
     }
@@ -299,8 +342,9 @@ fn store_and_snapshot_debug_do_not_expose_names_paths_or_credentials() {
 fn conflicting_update_still_advances_the_observed_rollback_floor() {
     let (_temp, path, id, mut first) = setup();
     let mut second = SecurityCatalogStore::open(&path, id).unwrap();
-    first.replace(1, &catalog()).unwrap();
-    assert!(second.replace(1, &catalog()).is_err());
+    let (_, state) = first.load().unwrap().into_parts();
+    first.replace(1, &state).unwrap();
+    assert!(second.replace(1, &state).is_err());
     assert_eq!(second.observed_revision, 2);
     Connection::open(&path)
         .unwrap()
@@ -316,8 +360,9 @@ fn conflicting_update_still_advances_the_observed_rollback_floor() {
 fn file_replacement_during_a_write_rolls_back_and_fences_the_original_handle() {
     let (temp, path, id, mut store) = setup();
     let original = temp.path().join("original.sqlite");
+    let changed = without_users(&mut store);
     let error = store
-        .replace_with_hook(1, &SecurityCatalog::new(), |_| {
+        .replace_with_hook(1, &changed, |_| {
             fs::rename(&path, &original).unwrap();
             // Keep the replacement independent of the original SQLite journal.
             let mut sentinel = fs::OpenOptions::new()
@@ -347,6 +392,7 @@ fn file_replacement_during_a_write_rolls_back_and_fences_the_original_handle() {
 #[test]
 fn busy_commit_is_bounded_fences_the_handle_and_reopens_the_old_revision() {
     let (_temp, path, id, mut store) = setup();
+    let changed = without_users(&mut store);
     let mut reader = Connection::open(&path).unwrap();
     let transaction = reader.transaction().unwrap();
     let revision: i64 = transaction
@@ -356,7 +402,7 @@ fn busy_commit_is_bounded_fences_the_handle_and_reopens_the_old_revision() {
         .unwrap();
     assert_eq!(revision, 1);
     let began = std::time::Instant::now();
-    let error = store.replace(1, &SecurityCatalog::new()).unwrap_err();
+    let error = store.replace(1, &changed).unwrap_err();
     assert_eq!(error.kind(), EngineErrorKind::Busy);
     assert!(began.elapsed() < Duration::from_secs(6));
     assert!(store.fenced);
@@ -384,8 +430,9 @@ fn crash_writer_child() {
     };
     let id = SecurityStoreId::from_bytes([7; 16]).unwrap();
     let mut store = SecurityCatalogStore::open(PathBuf::from(path), id).unwrap();
+    let changed = without_users(&mut store);
     store
-        .replace_with_hook(1, &SecurityCatalog::new(), |_| std::process::exit(79))
+        .replace_with_hook(1, &changed, |_| std::process::exit(79))
         .unwrap();
     panic!("crash hook did not exit");
 }
@@ -417,7 +464,8 @@ fn process_exit_before_commit_recovers_the_complete_previous_catalog() {
     assert_eq!(revision, 1);
     assert_eq!(recovered.user_count(), 1);
     assert_eq!(recovered.role_count(), 1);
-    assert_eq!(store.replace(1, &SecurityCatalog::new()).unwrap(), 2);
+    let changed = without_users(&mut store);
+    assert_eq!(store.replace(1, &changed).unwrap(), 2);
     drop(store);
     assert_eq!(
         SecurityCatalogStore::open(path, id)

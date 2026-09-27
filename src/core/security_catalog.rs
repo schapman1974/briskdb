@@ -14,6 +14,7 @@ use std::{
     fmt,
     sync::Arc,
 };
+use subtle::ConstantTimeEq;
 
 use super::{
     EngineError, EngineErrorKind, EngineResult,
@@ -388,6 +389,44 @@ impl SecurityCatalog {
                 .map(|name| self.roles.get(name).expect("validated role")),
         )?;
         Ok(names)
+    }
+
+    /// Storage replacement must preserve identity history before a runtime can
+    /// safely couple durable revisions to retained principals. Restoration to an
+    /// earlier history requires a separate store/root incarnation, not this API.
+    pub(crate) fn validate_successor(&self, successor: &Self) -> EngineResult<()> {
+        let invalid = || {
+            error(
+                EngineErrorKind::FailedPrecondition,
+                "security catalog replacement rewinds identity or credential history",
+            )
+        };
+        if successor.next_user_id < self.next_user_id {
+            return Err(invalid());
+        }
+        for (name, next) in &successor.users {
+            match self
+                .users
+                .get(name)
+                .filter(|previous| previous.id == next.id)
+            {
+                Some(previous) => {
+                    if next.credential_generation < previous.credential_generation {
+                        return Err(invalid());
+                    }
+                    if next.credential_generation == previous.credential_generation {
+                        let old_record = previous.verifier.to_record();
+                        let next_record = next.verifier.to_record();
+                        if !bool::from(old_record.as_bytes().ct_eq(next_record.as_bytes())) {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                None if next.id < self.next_user_id => return Err(invalid()),
+                None => {}
+            }
+        }
+        Ok(())
     }
 }
 
