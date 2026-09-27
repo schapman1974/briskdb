@@ -599,8 +599,8 @@ more valuable than a star. Start with the
 
 - PostgreSQL has TLS and single-identity SCRAM-SHA-256 authentication, but no
   roles or authorization yet. The separated HTTP data and administration
-  listeners remain loopback-only development surfaces. Unreleased Rust attached
-  hosts can opt into [verified HTTP/admin TLS](docs/HTTP_LISTENERS.md#encrypt-attached-rust-http-planes-unreleased)
+  listeners remain loopback-only development surfaces. Unreleased daemon and Rust
+  attached hosts can opt into [HTTP/admin TLS](docs/HTTP_LISTENERS.md#encrypt-daemon-http-planes-unreleased)
   without changing that authentication boundary.
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.

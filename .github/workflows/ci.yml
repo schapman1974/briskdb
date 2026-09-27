@@ -378,6 +378,8 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features server-cli,mongo-tls \
             --bin briskdb --test mongo_server -- --include-ignored
+          cargo test --locked --no-default-features --features server-cli \
+            --bin briskdb --test mongo_server -- --include-ignored
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications

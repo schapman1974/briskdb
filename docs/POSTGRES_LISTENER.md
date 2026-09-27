@@ -82,8 +82,9 @@ Issue #65 remains open for the other listener surfaces.
 
 ## Daemon security reload (unreleased)
 
-On Unix, add `--reload-on-sighup` to a daemon configured with PostgreSQL TLS/SCRAM
-and/or Mongo TLS. `BRISKDB_RELOAD_ON_SIGHUP=true` is equivalent;
+On Unix, add `--reload-on-sighup` to a daemon configured with PostgreSQL TLS/SCRAM,
+Mongo TLS, and/or [HTTP/admin TLS](HTTP_LISTENERS.md#encrypt-daemon-http-planes-unreleased).
+`BRISKDB_RELOAD_ON_SIGHUP=true` is equivalent;
 `--reload-on-sighup=false` explicitly overrides the environment. The default is
 off. Startup rejects opt-in on non-Unix or without an already-secure listener,
 before creating database files. The process-wide SIGHUP handler is installed
@@ -96,13 +97,13 @@ It does not reread environment variables, change usernames or addresses, enable
 new listeners, or apply arbitrary configuration changes. A signal is a request,
 not an acknowledgment: wait for `listener security reloaded` in the daemon log.
 
-Every configured identity is validated on one blocking worker before either
-connector publishes a replacement. Invalid preparation leaves all active
+Every configured identity is validated on one blocking worker before any
+listener publishes a replacement. Invalid preparation leaves all active
 identities unchanged. Each connector publishes a complete identity atomically;
 publication is not a cross-connector transaction or atomic multi-file deployment.
 Admitted sockets retain their old identity, including PostgreSQL password proofs
-and Mongo pending handshakes. This is **not session revocation**, Mongo user
-authentication or permission to expose anonymous listeners remotely.
+and pending Mongo/HTTP handshakes. This is **not session revocation**, Mongo/HTTP
+user authentication or permission to expose anonymous listeners remotely.
 
 Reload has a 15-second publication deadline and checks engine/shutdown state
 immediately before publication. Failure logs `listener security reload rejected`
@@ -114,7 +115,8 @@ worker publication authority. No filesystem watcher is installed.
 
 Rust process hosts can use `server::run_with_options(config, engine_options,
 DaemonOptions::new().with_sighup_reload()).await`; use `with_mongo(...)` or
-`with_mongo_tls(...)` on those options for the optional Mongo listener. Existing
+`with_mongo_tls(...)` on those options for the optional Mongo listener, and
+`with_http_tls(...)` / `with_admin_tls(...)` for the HTTP planes. Existing
 `Config` literals, `run*` entry points, and their no-reload defaults remain valid.
 
 ## Startup and failure order
@@ -405,8 +407,9 @@ binding, and takes ALPN values from its caller. It opens no socket and does not
 authenticate users. PostgreSQL still selects `postgresql` ALPN and retains its
 existing TLS/SCRAM configuration and non-loopback checks. The Rust attached-server
 reload API above uses complete validated identities; shared users/roles and
-Mongo TLS/authentication under #64/#188 remain outstanding. Mongo remains
-anonymous-loopback-only.
+Mongo authentication under #64/#188 remain outstanding. Unreleased Mongo TLS
+startup/reload is documented in [Mongo parity](MONGO_PARITY.md#encrypted-daemon-mongo-unreleased);
+Mongo remains anonymous-loopback-only even when encrypted.
 
 TLS keys, certificates, plaintext passwords, and derived SCRAM material are
 process configuration only; none is written to the BriskDB data root. The
@@ -425,7 +428,8 @@ without waiting for a writer. Non-Unix hosts still require appropriate OS ACLs;
 no Unix-mode-equivalent ACL validation is added. Operators must still publish
 complete files atomically and control the secret directory: this is not a
 multi-file snapshot or a guarantee against concurrent in-place writes. Reload
-must be explicitly requested through the host API above.
+must be explicitly requested through the host API or the opt-in daemon signal
+handler above.
 This work changes no
 HTTP route, JSON body, SQL subset, planner rule, manifest table, shard header,
 migration journal, stored row, or storage-format version.

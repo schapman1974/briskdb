@@ -460,8 +460,10 @@ database under differential/property tests.
   Authenticated SQLite-remote routing retains its bearer checks over HTTPS.
   Attached HTTP/admin identities now also reload independently with admission-time
   snapshots, cancellation/deadline and engine-lifecycle guards; failed preparation
-  preserves active identities. HTTP Python/daemon configuration, authorization and
-  immediate session revocation remain separate work.
+  preserves active identities. Daemon HTTP/admin certificate/key options now share
+  the same startup preflight and opt-in SIGHUP complete-candidate validation as
+  PostgreSQL/Mongo. HTTP Python configuration, authorization and immediate session
+  revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

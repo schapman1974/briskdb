@@ -165,7 +165,7 @@ impl AttachedServer {
     }
 }
 
-async fn prepare_http_identity(
+pub(super) async fn prepare_http_identity(
     config: Option<HttpTlsConfig>,
 ) -> anyhow::Result<Option<http_tls::Reloadable>> {
     match config {

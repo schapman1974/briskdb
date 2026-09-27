@@ -18,6 +18,9 @@ mod tls;
 #[path = "mongo_server/reload.rs"]
 mod reload;
 
+#[path = "mongo_server/http_tls.rs"]
+mod http_tls;
+
 struct Process(Child);
 
 impl Process {
@@ -60,6 +63,17 @@ fn command_with_postgres(
     http: &str,
     postgres: &str,
 ) -> Command {
+    command_with_listeners(data, log, mongo, http, "disabled", postgres)
+}
+
+fn command_with_listeners(
+    data: &Path,
+    log: &Path,
+    mongo: Option<&str>,
+    http: &str,
+    admin: &str,
+    postgres: &str,
+) -> Command {
     let output = File::create(log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_briskdb"));
     // Never let developer/service environment settings change these tests.
@@ -73,7 +87,7 @@ fn command_with_postgres(
             "--listen",
             http,
             "--admin-listen",
-            "disabled",
+            admin,
             "--postgres-listen",
             postgres,
             "--shards",

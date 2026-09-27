@@ -31,7 +31,7 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 | `http` | Separate Axum data/admin routers, versioned materialized/streamed data and operational APIs, request correlation, eligible-write replay, active-query cancellation, code-first OpenAPI, and admin browser; combined compatibility router retained | Alpha-supported |
 | `postgres` | PostgreSQL wire adapter, including TLS/SCRAM implementation | Alpha-supported, bounded SQL subset |
 | `listeners` | Host-controlled data HTTP, optional admin HTTP, and optional PostgreSQL listeners, selecting `tls`, without signals or engine ownership; unreleased independent HTTP/admin TLS with guarded identity reload and finite per-plane socket admission | Alpha-supported, with unreleased HTTP TLS options |
-| `server` | Daemon listener assembly, signal handling, engine ownership and explicit `DaemonOptions` (including unreleased opt-in Unix SIGHUP security reload) | Process integration |
+| `server` | Daemon listener assembly, signal handling, engine ownership and explicit `DaemonOptions` (including unreleased HTTP/admin TLS and opt-in Unix SIGHUP security reload for every configured secure listener) | Process integration |
 | `server-cli` | `briskdb` binary, Clap, logging subscriber, multithread runtime | Process integration |
 | `sqlite-import` | Offline SQLite import library | Alpha-supported |
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |

@@ -24,6 +24,8 @@ fn sources(root: &std::path::Path) -> Sources {
         }
     }
     Sources {
+        http: Some(HttpTlsConfig::new(&certificate, &key)),
+        admin: Some(HttpTlsConfig::new(&certificate, &key)),
         postgres: Some(
             postgres::SecurityConfig::new(&certificate, &key, "briskdb", password).unwrap(),
         ),
@@ -38,6 +40,8 @@ fn sources(root: &std::path::Path) -> Sources {
 fn targets(sources: &Sources) -> Targets {
     let loaded = sources.clone().load().unwrap();
     Targets {
+        http: loaded.http.map(http_tls::Reloadable::new),
+        admin: loaded.admin.map(http_tls::Reloadable::new),
         postgres: loaded.postgres.map(postgres::ReloadableSecurity::new),
         #[cfg(feature = "mongo-tls")]
         mongo: loaded.mongo.map(crate::protocol::mongo::ReloadableTls::new),
@@ -57,6 +61,22 @@ async fn database() -> (tempfile::TempDir, BriskDb) {
 #[test]
 fn explicit_options_validate_reload_and_do_not_print_identity_paths() {
     assert!(!DaemonOptions::new().reload_on_sighup);
+    assert!(DaemonOptions::new().http_tls.is_none());
+    assert!(DaemonOptions::new().admin_tls.is_none());
+    for options in [
+        DaemonOptions::new().with_http_tls(HttpTlsConfig::new("hidden-cert", "hidden-key")),
+        DaemonOptions::new().with_admin_tls(HttpTlsConfig::new("hidden-cert", "hidden-key")),
+    ] {
+        assert_eq!(
+            options
+                .clone()
+                .with_sighup_reload()
+                .validate_reload(false)
+                .is_ok(),
+            cfg!(unix)
+        );
+        assert!(!format!("{options:?}").contains("hidden"));
+    }
     assert!(DaemonOptions::new().validate_reload(false).is_ok());
     assert!(
         DaemonOptions::new()
@@ -91,6 +111,86 @@ fn explicit_options_validate_reload_and_do_not_print_identity_paths() {
         failure_reason(&anyhow::anyhow!("secret-value")),
         "invalid_configuration_or_lifecycle"
     );
+}
+
+#[tokio::test]
+async fn late_http_failure_and_target_mismatch_preserve_the_complete_listener_bundle() {
+    let (_root, db) = database().await;
+    let files = tempfile::tempdir().unwrap();
+    let sources = sources(files.path());
+    let targets = targets(&sources);
+    let postgres = targets.postgres.as_ref().unwrap().snapshot();
+    let http = targets.http.as_ref().unwrap().snapshot();
+    let admin = targets.admin.as_ref().unwrap().snapshot();
+    #[cfg(feature = "mongo-tls")]
+    let mongo = targets.mongo.as_ref().unwrap().snapshot();
+    let unchanged = || {
+        assert!(Arc::ptr_eq(
+            &postgres,
+            &targets.postgres.as_ref().unwrap().snapshot()
+        ));
+        assert!(Arc::ptr_eq(
+            &http,
+            &targets.http.as_ref().unwrap().snapshot()
+        ));
+        assert!(Arc::ptr_eq(
+            &admin,
+            &targets.admin.as_ref().unwrap().snapshot()
+        ));
+        #[cfg(feature = "mongo-tls")]
+        assert!(Arc::ptr_eq(
+            &mongo,
+            &targets.mongo.as_ref().unwrap().snapshot()
+        ));
+    };
+    let shutdown = CancellationToken::new();
+    for admin in [false, true] {
+        let mut invalid = sources.clone();
+        if admin {
+            invalid.admin = Some(HttpTlsConfig::new("missing", "missing"));
+        } else {
+            invalid.http = Some(HttpTlsConfig::new("missing", "missing"));
+        }
+        assert!(
+            targets
+                .publish_after(db.engine(), &shutdown, RequestContext::new(), async {
+                    invalid.load()
+                })
+                .await
+                .is_err()
+        );
+        unchanged();
+        let mut mismatch = sources.clone().load().unwrap();
+        if admin {
+            mismatch.admin = None;
+        } else {
+            mismatch.http = None;
+        }
+        assert!(
+            targets
+                .publish_after(db.engine(), &shutdown, RequestContext::new(), async {
+                    Ok(mismatch)
+                })
+                .await
+                .is_err()
+        );
+        unchanged();
+    }
+    targets
+        .publish_after(db.engine(), &shutdown, RequestContext::new(), async {
+            sources.load()
+        })
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(
+        &http,
+        &targets.http.as_ref().unwrap().snapshot()
+    ));
+    assert!(!Arc::ptr_eq(
+        &admin,
+        &targets.admin.as_ref().unwrap().snapshot()
+    ));
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
