@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-nine locked suites is classified; 1243 reference parameter cases are not 1243 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty locked suites is classified; 1307 reference parameter cases are not 1307 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -5164,6 +5164,344 @@
             "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
           ],
           "note": "BriskDB exposes real driver collection handles and creates native catalog/storage on write. TinyMongo's build_table/table=None/private engine delegation is not an API; lazy handle and actual discovery/drop effects are checked."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_coverage_init.py",
+      "sha256": "e6b8ccb8851c5b1213978cb54c161ed31a63f71e832d9d4bd5d71b2c6f893d80",
+      "reference_case_count": 64,
+      "function_count": 50,
+      "coverage": [
+        {
+          "source": [
+            "test_require_wal_fails_closed_for_missing_empty_and_non_wal_rows"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/shard.rs::only_creating_may_enable_wal",
+            "src/storage/shard.rs::ready_validation_never_repairs_a_changed_journal_mode"
+          ],
+          "note": "Real SQLite WAL checks reject changed modes without repairing READY files. Fake Python fetchone(None/empty tuple) branches and exact private diagnostics are not native hooks."
+        },
+        {
+          "source": [
+            "test_shard_collection_creation_rechecks_order_column_cache",
+            "test_collection_creation_rechecks_ready_cache_after_taking_shard_locks",
+            "test_create_collection_rechecks_manifest_after_taking_locks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document.rs::startup_resumes_document_collection_provisioning_from_durable_cursor",
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "Native catalog/journal lifecycle and peer-handle recreation are tested. TinyMongo's _ready_order_collections/_ready_collections caches and lock-context monkeypatches do not exist in BriskDB; this is not execution of their synthetic private race sequences."
+        },
+        {
+          "source": [
+            "test_sharded_backend_rejects_a_non_threadsafe_sqlite_runtime"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_eleven_shard_scans_global_windows_and_concurrent_readers_reopen"
+          ],
+          "note": "Native rusqlite bundles its own SQLite runtime; monkeypatching Python sqlite3.threadsafety cannot reconfigure it. Real bounded concurrent native reads are tested rather than asserting a Python runtime check."
+        },
+        {
+          "source": [
+            "test_sharded_backend_rejects_a_file_as_its_database_directory",
+            "test_new_sharded_directory_rejects_unclaimed_existing_contents"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/mod.rs::classifies_invalid_storage_path_shape_as_a_failed_precondition",
+            "src/storage/mod.rs::fresh_manifest_is_not_initialized_beside_unexplained_physical_files",
+            "src/storage/mod.rs::unrelated_files_are_tolerated_but_extra_canonical_shards_fail_startup",
+            "python/tests/test_upstream_startup.py::test_directory_policy_preserves_bystanders_and_rejects_unclaimed_shards"
+          ],
+          "note": "A root file rejects without changing its bytes. Unlike TinyMongo's per-database directory policy, native initialization tolerates and preserves unrelated root-level files. Unexplained entries inside shards block fresh initialization without creating a manifest; valid layouts tolerate unrelated shard-directory notes but reject extra canonical shard files. These distinct policies have explicit native/wheel evidence."
+        },
+        {
+          "source": [
+            "test_manifest_rejects_multiple_configuration_rows",
+            "test_manifest_rejects_unsupported_or_corrupt_configuration",
+            "test_manifest_rejects_and_preserves_an_unsupported_sqlite_user_version"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/manifest.rs::rejects_corrupt_physical_layout_rows",
+            "src/storage/manifest.rs::rejects_inconsistent_or_tampered_current_manifests",
+            "src/storage/manifest.rs::rejects_future_and_foreign_manifests_without_mutating_them"
+          ],
+          "note": "Native exact-cardinality/layout/checksum/version validation rejects corrupt configuration and preserves foreign/future formats. Native schema, hash/version codes and error classes are not TinyMongo's __tinymongo_config format."
+        },
+        {
+          "source": [
+            "test_ready_manifest_rejects_a_missing_shard_file",
+            "test_ready_manifest_rejects_a_shard_without_identity_metadata",
+            "test_reopen_rejects_swapped_shard_files",
+            "test_reopen_rejects_corrupt_shard_identity_rows"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/mod.rs::ready_layout_never_recreates_a_missing_shard_at_startup_or_runtime",
+            "src/storage/mod.rs::startup_rejects_swapped_and_cross_layout_shards",
+            "src/storage/shard.rs::exact_validation_rejects_foreign_future_layout_and_shard_identity",
+            "src/storage/shard.rs::altered_metadata_schema_and_conflicting_legacy_object_fail_closed"
+          ],
+          "note": "Native missing files, foreign/swapped identity and malformed metadata fail closed. Storage-owned singleton/shape constraints differ from TinyMongo's manually inserted duplicate identity rows."
+        },
+        {
+          "source": [
+            "test_initializing_manifest_recreates_a_missing_shard_and_becomes_ready"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/mod.rs::partial_creating_layout_resumes_through_storage_open_and_publishes_ready",
+            "src/storage/shard.rs::adopting_and_ready_never_create_a_missing_shard"
+          ],
+          "note": "Only the native Creating lifecycle may provision missing shards; interrupted creation resumes and publishes Ready. Adopting/Ready do not recreate missing files. No legacy state-column mutation is promised."
+        },
+        {
+          "source": [
+            "test_mark_ready_rejects_a_manifest_identity_change"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/manifest.rs::ready_transition_rejects_different_layout_identity_or_state_without_mutation"
+          ],
+          "note": "Ready transition checks exact expected identity/state and changes neither on mismatch, replacing mutable Python database_id hooks."
+        },
+        {
+          "source": [
+            "test_write_shards_retries_when_a_unique_index_appears_while_locking"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document/enabled/unique/tests.rs::concurrent_cross_shard_writers_choose_exactly_one_unique_owner",
+            "python/tests/test_upstream_durable_indexes.py::test_concurrent_unique_inserts_allow_exactly_one_writer"
+          ],
+          "note": "Native schema admission and unique ownership fences preserve one-owner results. No private catalog iterator or exactly-two-read lock-retry sequence is implemented."
+        },
+        {
+          "source": [
+            "test_reopen_rejects_cross_shard_conflicts_in_pending_unique_index"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/unique/tests.rs::unique_build_rejects_existing_cross_shard_duplicates_without_activation",
+            "src/storage/document/enabled/unique/tests.rs::startup_rejects_cross_shard_duplicate_owners_even_with_valid_entries"
+          ],
+          "note": "Native Pending declarations do not enforce uniqueness or automatically build on reopen; an explicit build rejects duplicates without activation. Forged/conflicting READY unique ownership fails startup. TinyMongo's pending-auto-completion corruption behavior is not claimed."
+        },
+        {
+          "source": [
+            "test_drop_missing_collection_returns_false",
+            "test_drop_collection_rechecks_when_another_client_finishes_first"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed",
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "Real driver drop is idempotent and returns None, not backend boolean outcomes. Retained peer handles observe logical drops; private in-lock completion injection is not an extension point."
+        },
+        {
+          "source": [
+            "test_interrupted_collection_drop_is_tombstoned_and_finished_on_reopen",
+            "test_drop_collection_resumes_an_existing_dropping_state"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/document.rs::every_document_drop_commit_boundary_recovers_after_process_exit"
+          ],
+          "note": "Actual process exits across collection/database drop commit boundaries recover accepted deletion, preserve unrelated collections/records and never reuse old namespace/index identities. Native journals replace private per-shard drop callbacks and state writes."
+        },
+        {
+          "source": [
+            "test_create_index_retry_is_idempotent"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_index_creation_is_idempotent_and_rejects_conflicts"
+          ],
+          "note": "Repeated equivalent native index creation retains one definition and rejects conflicting definitions through the actual driver."
+        },
+        {
+          "source": [
+            "test_create_index_failure_removes_pending_metadata_and_rolls_back_children",
+            "test_sqlite_child_create_index_rolls_back_native_ddl_with_catalog_failure"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::every_combined_creation_boundary_removes_only_unfinished_new_declarations",
+            "src/storage/document/enabled/index_operations/tests.rs::combined_creation_cleanup_can_itself_restart_at_every_commit_boundary"
+          ],
+          "note": "Native combined creation removes only unpublished declarations/entries and journaled cleanup itself survives interruption. Existing pending declarations and committed prior indexes survive. No Python child create_index/rollback callback, error chain or legacy SQL index naming is exposed."
+        },
+        {
+          "source": [
+            "test_drop_missing_index_uses_mongodb_error_code"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "tests/mongo_wire.rs::index_removal_validates_selection_options_and_counts_without_record_loss"
+          ],
+          "note": "Wire index removal validates missing-index errors and preserves documents; source private message text is not a byte-stable promise."
+        },
+        {
+          "source": [
+            "test_drop_index_tolerates_a_child_where_the_index_is_already_missing"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::ready_coverage_corruption_is_rejected_without_repair",
+            "src/storage/document/enabled/index_operations/tests.rs::every_built_drop_boundary_recovers_without_rewriting_surviving_authority"
+          ],
+          "note": "Native READY index coverage must be valid; arbitrary missing authority/entries are corruption rather than silently tolerated child-catalog drift. Partial cleanup is allowed only under the matching durable drop journal, whose restart paths are tested."
+        },
+        {
+          "source": [
+            "test_drop_index_failure_restores_earlier_children_and_keeps_manifest",
+            "test_sqlite_child_drop_index_rolls_back_partially_executed_native_ddl",
+            "test_failed_drop_retains_pending_state_and_recovers_on_reopen",
+            "test_drop_index_reraises_original_error_after_successful_restore"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::every_built_drop_boundary_recovers_without_rewriting_surviving_authority"
+          ],
+          "note": "After native drop intent commits, recovery finishes deletion while preserving surviving indexes/records and allocator history. TinyMongo's attempt to recreate earlier children, recover failed drops back to Ready, and re-raise injected Python errors is a different contract, not the native recovery algorithm."
+        },
+        {
+          "source": [
+            "test_reopen_rejects_invalid_manifest_index_rows",
+            "test_reopen_rejects_an_index_row_for_a_missing_collection",
+            "test_invalid_collection_state_fails_in_listing_and_catalog_reads",
+            "test_setting_state_for_missing_collection_fails_closed"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/manifest.rs::document_catalog_tables_are_all_semantic_checksum_authority",
+            "src/storage/manifest.rs::document_catalog_cross_row_invariants_fail_closed_after_resealing"
+          ],
+          "note": "Checksummed native catalog/state and cross-row invariants reject invalid/orphan authority, including resealed relational corruption. Private state setters and TinyMongo table/enum encodings are not native interfaces."
+        },
+        {
+          "source": [
+            "test_reopen_rejects_an_unexpected_native_tinymongo_index",
+            "test_reopen_rejects_a_manifest_collection_missing_from_one_shard",
+            "test_reopen_rejects_a_collection_without_the_order_column",
+            "test_reopen_rejects_a_missing_child_index_catalog_entry",
+            "test_reopen_rejects_a_missing_native_physical_index"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/index_storage/tests.rs::ready_roots_reject_missing_or_malformed_entry_schema_without_repair",
+            "src/storage/document/index_storage/tests.rs::orphan_index_schema_is_rejected",
+            "src/storage/document/enabled/index_operations/tests.rs::ready_coverage_corruption_is_rejected_without_repair",
+            "src/storage/mod.rs::identical_offline_schema_drift_on_every_shard_is_not_rebaselined"
+          ],
+          "note": "BriskDB uses shared native document/entry tables, not per-collection SQL tables or child index catalogs. Actual schema drift, orphan/malformed entry schema and missing/corrupt READY coverage reject without repair. Source private physical objects are not native format fixtures."
+        },
+        {
+          "source": [
+            "test_ready_unique_index_reopens_without_document_wide_revalidation"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/unique/tests.rs::startup_rejects_cross_shard_duplicate_owners_even_with_valid_entries",
+            "src/storage/document/enabled/index_operations/tests.rs::ready_coverage_corruption_is_rejected_without_repair"
+          ],
+          "note": "Native startup validates READY coverage/checksums and cross-shard unique ownership. It does not promise TinyMongo's monkeypatched no-document-wide-validation optimization."
+        },
+        {
+          "source": [
+            "test_pending_index_is_completed_and_marked_ready_on_reopen"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::every_build_commit_boundary_recovers_without_partial_activation",
+            "tests/document_engine.rs::collection_index_preparation_preserves_reopened_scope_without_activating_indexes"
+          ],
+          "note": "Unpublished native builds clean derived entries and retain an existing Pending declaration for an explicit retry; they do not autoactivate on reopen. Activated indexes remain Ready and durable."
+        },
+        {
+          "source": [
+            "test_manifest_read_connection_reopens_after_close_and_on_pid_change"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_closed_client_cannot_revive_retained_collection_but_peer_and_reopen_work",
+            "python/tests/test_mongo_fork_startup.py::test_real_fork_rejects_live_empty_and_patch_startup_with_parent_locks_held"
+          ],
+          "note": "Real driver close is permanent; inherited Mongo state rejects before locks, even after all clients close. There is no private manifest-connection PID-reset/reopen protocol; use spawn/fresh clients."
+        },
+        {
+          "source": [
+            "test_closed_backend_does_not_recreate_a_missing_manifest"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/mod.rs::missing_manifest_beside_existing_shards_is_not_recreated",
+            "src/storage/mod.rs::noncreating_manifest_open_rejects_a_file_removed_after_preflight",
+            "python/tests/test_mongo_missing_manifest.py::test_missing_manifest_rejects_default_and_explicit_startup_without_recreation"
+          ],
+          "note": "A real missing-manifest startup side effect was found and fixed: no replacement is created beside nonempty shards, repeated native/sync/async attempts preserve shard bytes, and exact stopped-fixture restoration reopens. Closed clients themselves do not revive."
+        },
+        {
+          "source": [
+            "test_manifest_catalog_is_one_snapshot_when_an_index_is_created_mid_read"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/document.rs::manifest_snapshot_reads_remain_coherent_across_concurrent_catalog_commit"
+          ],
+          "note": "An actual concurrent catalog commit cannot split a native manifest read snapshot; old and subsequent snapshots retain consistent index membership."
+        },
+        {
+          "source": [
+            "test_find_with_order_discards_a_row_that_stops_matching_before_reload",
+            "test_reads_retry_when_collection_metadata_changes"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/document_engine.rs::matcher_filters_before_global_pagination_and_count_and_reopens",
+            "src/storage/document.rs::manifest_snapshot_reads_remain_coherent_across_concurrent_catalog_commit"
+          ],
+          "note": "Native residual filtering and coherent catalog snapshots are tested. TinyMongo's two-phase Python find/reload and exact generation-retry counters/error strings do not exist; no global multi-shard snapshot-isolation guarantee is inferred from these mappings."
+        },
+        {
+          "source": [
+            "test_manifest_read_wraps_an_unavailable_identity_table"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result",
+            "src/storage/manifest.rs::rejects_altered_catalog_table_definitions"
+          ],
+          "note": "Corrupt/missing native catalog authority fails with an error instead of becoming empty results. Private manifest connection cleanup objects and exception messages differ."
+        },
+        {
+          "source": [
+            "test_public_write_lock_and_write_shards_create_missing_collection"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed",
+            "src/storage/document.rs::startup_resumes_document_collection_provisioning_from_durable_cursor"
+          ],
+          "note": "Native create-on-write catalog/storage and durable provisioning are tested. Public Mongo callers do not receive TinyMongo's private backend write-lock contexts or their returned IndexSpec lists."
+        },
+        {
+          "source": [
+            "test_dotted_index_reopens_without_a_scalar_type_index"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_startup.py::test_dotted_unique_index_reopens_and_drop_remains_durable"
+          ],
+          "note": "A real dotted unique index is idempotent, retains exact metadata/enforcement after reopen, and remains dropped across later reopens while duplicate values become legal. TinyMongo's private scalar type-index SQL object is not part of native storage."
         }
       ]
     }
