@@ -73,7 +73,10 @@ async fn correlated_events_keep_host_dispatchers_payloads_and_listener_lifetimes
         assert_eq!(&event["connection_id"], connection);
         assert_eq!(event["wire_request_id"], "77");
         assert_eq!(event["sequence"], (number + 1).to_string());
-        assert_eq!(event.len(), 11);
+        assert_eq!(event.len(), 14);
+        assert_eq!(event["authentication"], "anonymous");
+        assert_eq!(event["audit_user"], "");
+        assert_eq!(event["credential_generation"], "0");
     }
     assert_eq!(first.events[1]["command"], "other");
     assert_eq!(first.events[1]["error_code"], "59");

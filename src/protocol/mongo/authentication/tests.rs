@@ -173,6 +173,10 @@ async fn success_requires_the_correct_proof_and_optional_empty_ack_before_sessio
             .await
             .unwrap();
         assert!(!session.is_authenticated());
+        assert_eq!(
+            service.audit_context(&session),
+            super::super::events::AuditContext::unauthenticated()
+        );
         let (proof, expected) = proof(&challenge, "alice", fixtures::PASSWORD);
         let reply = conversation
             .handle(&service, &continuation(&challenge, &proof), &mut session)
@@ -183,6 +187,10 @@ async fn success_requires_the_correct_proof_and_optional_empty_ack_before_sessio
         assert_eq!(reply.get_first("done"), Some(&BsonValue::Boolean(skip)));
         if !skip {
             assert_eq!(session.id(), original);
+            assert_eq!(
+                service.audit_context(&session),
+                super::super::events::AuditContext::unauthenticated()
+            );
             let reply = conversation
                 .handle(&service, &continuation(&challenge, b""), &mut session)
                 .await
@@ -201,6 +209,68 @@ async fn success_requires_the_correct_proof_and_optional_empty_ack_before_sessio
                 .unwrap(),
         );
         assert_eq!(session.id(), identity);
+    }
+}
+
+#[tokio::test]
+async fn audit_identity_is_listener_scoped_stable_across_pooling_and_never_resurrects_accounts() {
+    use super::super::events::AuditContext;
+    async fn login(service: &Authentication, name: &SecurityName) -> Session {
+        let attempt = service
+            .engine
+            .begin_authentication(name.clone())
+            .await
+            .unwrap();
+        let (_, transcript, proof) = fixtures::exchange(&attempt, fixtures::PASSWORD);
+        service
+            .engine
+            .complete_authentication(attempt, transcript.into_bytes(), proof)
+            .await
+            .unwrap()
+            .0
+    }
+    let (_root, service) = service().await;
+    let user = SecurityName::new("admin", "alice").unwrap();
+    let first = login(&service, &user).await;
+    let pooled = login(&service, &user).await;
+    let original = service.audit_context(&first);
+    assert_eq!(original, service.audit_context(&pooled));
+    let cursor = service.engine.cursor_session(&first).await.unwrap();
+    assert_eq!(original, service.audit_context(&cursor));
+    let other_listener = Authentication::new(service.engine.clone()).unwrap();
+    assert_ne!(original, other_listener.audit_context(&first));
+    let (id, generation) = first.principal.as_ref().unwrap().audit_identity();
+    let hash = blake3::keyed_hash(&service.audit_key, &id.to_le_bytes());
+    assert_eq!(original, AuditContext::authenticated(hash, generation));
+    let changed = user.clone();
+    service
+        .engine
+        .update_security_catalog(move |catalog| {
+            catalog.rotate_credentials(&changed, fixtures::credential())
+        })
+        .await
+        .unwrap();
+    let rotated = login(&service, &user).await;
+    assert_eq!(
+        service.audit_context(&rotated),
+        AuditContext::authenticated(hash, generation + 1)
+    );
+    // Context describes the original login even when its next operation is denied.
+    assert_eq!(service.audit_context(&first), original);
+    assert!(service.engine.cursor_session(&first).await.is_err());
+    let changed = user.clone();
+    service
+        .engine
+        .update_security_catalog(move |catalog| {
+            catalog.drop_user(&changed)?;
+            catalog.create_user(changed, fixtures::credential(), [])
+        })
+        .await
+        .unwrap();
+    let recreated = login(&service, &user).await;
+    assert_ne!(service.audit_context(&recreated), original);
+    for secret in ["alice", "admin", fixtures::PASSWORD] {
+        assert!(!format!("{original:?}").contains(secret));
     }
 }
 

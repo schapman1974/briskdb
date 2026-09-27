@@ -15,12 +15,12 @@ use crate::document::{BsonDocument, BsonValue, DocumentExecution};
 mod reads;
 pub use reads::{MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoReadMetrics};
 
-const COMMANDS: usize = 22;
+const COMMANDS: usize = MongoCommandKind::Other as usize + 1;
 #[cfg(test)]
 mod tests;
-const ERROR_CODES: [i32; 31] = [
-    1, 2, 9, 13, 14, 20, 26, 27, 28, 40, 43, 48, 50, 52, 54, 56, 59, 66, 72, 73, 85, 86, 91, 112,
-    115, 197, 224, 237, 10334, 11000, 11601,
+const ERROR_CODES: [i32; 32] = [
+    1, 2, 9, 13, 14, 18, 20, 26, 27, 28, 40, 43, 48, 50, 52, 54, 56, 59, 66, 72, 73, 85, 86, 91,
+    112, 115, 197, 224, 237, 10334, 11000, 11601,
 ];
 
 /// Inclusive histogram bounds in microseconds; the eighth bucket is overflow.
@@ -57,6 +57,15 @@ pub enum MongoCommandKind {
     Drop,
     DropIndexes,
     DropDatabase,
+    SaslStart,
+    SaslContinue,
+    Authenticate,
+    Logout,
+    CreateUser,
+    UpdateUser,
+    DropUser,
+    GrantRolesToUser,
+    RevokeRolesFromUser,
     Other,
 }
 
@@ -83,6 +92,15 @@ impl MongoCommandKind {
         Self::Drop,
         Self::DropIndexes,
         Self::DropDatabase,
+        Self::SaslStart,
+        Self::SaslContinue,
+        Self::Authenticate,
+        Self::Logout,
+        Self::CreateUser,
+        Self::UpdateUser,
+        Self::DropUser,
+        Self::GrantRolesToUser,
+        Self::RevokeRolesFromUser,
         Self::Other,
     ];
 
@@ -109,6 +127,15 @@ impl MongoCommandKind {
             "drop" => Self::Drop,
             "dropIndexes" => Self::DropIndexes,
             "dropDatabase" => Self::DropDatabase,
+            "saslStart" => Self::SaslStart,
+            "saslContinue" => Self::SaslContinue,
+            "authenticate" => Self::Authenticate,
+            "logout" => Self::Logout,
+            "createUser" => Self::CreateUser,
+            "updateUser" => Self::UpdateUser,
+            "dropUser" => Self::DropUser,
+            "grantRolesToUser" => Self::GrantRolesToUser,
+            "revokeRolesFromUser" => Self::RevokeRolesFromUser,
             _ => Self::Other,
         }
     }
@@ -137,6 +164,15 @@ impl MongoCommandKind {
             Self::Drop => "drop",
             Self::DropIndexes => "dropIndexes",
             Self::DropDatabase => "dropDatabase",
+            Self::SaslStart => "saslStart",
+            Self::SaslContinue => "saslContinue",
+            Self::Authenticate => "authenticate",
+            Self::Logout => "logout",
+            Self::CreateUser => "createUser",
+            Self::UpdateUser => "updateUser",
+            Self::DropUser => "dropUser",
+            Self::GrantRolesToUser => "grantRolesToUser",
+            Self::RevokeRolesFromUser => "revokeRolesFromUser",
             Self::Other => "other",
         }
     }
@@ -276,7 +312,7 @@ pub(super) struct Metrics {
     read_metrics_enabled: AtomicBool,
     reads: reads::ReadCounters,
     commands: [CommandCounters; COMMANDS],
-    error_codes: [AtomicU64; 31],
+    error_codes: [AtomicU64; ERROR_CODES.len()],
     other_codes: AtomicU64,
 }
 
@@ -456,6 +492,13 @@ pub(super) struct CommandGuard {
 }
 
 impl CommandGuard {
+    #[cfg(feature = "auth-scram")]
+    pub(super) fn authentication(&mut self, context: super::events::AuditContext) {
+        if let Some(trace) = &mut self.trace {
+            trace.authentication(context);
+        }
+    }
+
     pub(super) fn with_correlation(
         mut self,
         connection_id: u64,

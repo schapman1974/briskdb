@@ -456,6 +456,12 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .with_correlation(connection_id, request.request_id, sequence);
         #[cfg(feature = "auth-scram")]
+        let mut observed = observed;
+        #[cfg(feature = "auth-scram")]
+        if let Some(service) = &executor.authentication {
+            observed.authentication(service.audit_context(&session));
+        }
+        #[cfg(feature = "auth-scram")]
         let auth_reply = if let Some(service) = &executor.authentication {
             tokio::select! {
                 biased;
@@ -467,6 +473,16 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         };
         #[cfg(not(feature = "auth-scram"))]
         let auth_reply: Option<BsonDocument> = None;
+        #[cfg(feature = "auth-scram")]
+        if let Some(service) = executor
+            .authentication
+            .as_ref()
+            .filter(|_| auth_reply.is_some())
+        {
+            // Successful final SASL acknowledgement installs a new session.
+            // Record its identity, never the unverified name in the request.
+            observed.authentication(service.audit_context(&session));
+        }
         let body = if let Some(reply) = auth_reply {
             reply
         } else if prepared.is_some() && executor.authentication_required(&session) {

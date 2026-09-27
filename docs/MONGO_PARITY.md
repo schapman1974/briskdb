@@ -826,7 +826,7 @@ Security contract:
   removal and revocation affect subsequent work, not already-admitted operations.
 - Trusted hosts administer the catalog through `update_security_catalog`; the
   five scoped user commands below use a separate authorized engine path. Broader
-  user/role administration, built-in roles, per-user auditing, full fault/soak
+  user/role administration, built-in roles, durable audit retention, full fault/soak
   acceptance and Python/daemon/composed-host configuration remain separate work.
 
 Local gates include real PyMongo 4.17.0 sync/async SCRAM with verified TLS and zlib,
@@ -1508,11 +1508,16 @@ pipeline; this does not replace its matching, pagination or grouping semantics.
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task
-failures, 22 fixed command families, 31 fixed error codes plus an unknown-code
+failures, 31 fixed command families, 32 fixed error codes plus an unknown-code
 counter, write-error occurrences and response-size rejections. Command counters
 separate started, in-flight, completed, failed, aborted and deliberately suppressed
 one-way responses. Unknown command names share `Other`; namespaces, query values,
 identities and diagnostic text never become labels or retained metric data.
+The fixed families include SASL start/continue, legacy authentication/logout
+(including their rejected outcomes), and the five user-management commands.
+Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
+do not represent distinct users or successful logins, since a SASL exchange can
+span multiple commands.
 The `cursors` group exposes registered, active, peak and closed wire cursors,
 idle-pruned entries and connection/registry capacity rejections (including failed
 handoffs). Retained batches and socket handoffs do not re-register a cursor.
@@ -1554,12 +1559,42 @@ including across connection tasks and blocking reply workers.
 Events contain only the process-unique frontend `connection_id`, client-supplied
 numeric `wire_request_id`, connection-local `sequence`, fixed command family,
 `completed`/`failed`/`aborted` outcome, first classified error code/category,
-write-error count, response-suppression flag and elapsed microseconds. Repeated
+write-error count, response-suppression flag and elapsed microseconds, plus the
+established session's authentication context below. Repeated
 wire IDs are distinguished by the sequence; none of these fields authenticates
 a caller. Unknown commands/codes become `other`; code zero with category `none`
 or `other` is not a Mongo error code. Namespaces, documents, query/update/filter
-values, comments, credentials, paths, client metadata and error text are never
-recorded. Identities are event fields, not metric labels.
+values, comments, account/realm names, credentials, paths, client metadata and
+error text are never recorded. Identity correlation is in event fields, not metric labels.
+
+Authenticated standalone listeners add three bounded fields to spans and final
+events: `authentication` (`anonymous`, `unauthenticated`, or `authenticated`),
+`audit_user` (empty or a 64-character opaque hexadecimal label), and
+`credential_generation` (zero without an established principal). Ordinary roots
+report `anonymous`; secure sockets start `unauthenticated`. Only a successful
+final SASL acknowledgement installs an authenticated identity; failed logins never
+record the attempted username or a user label. SASL success is observable as a
+completed `saslContinue` with `authentication=authenticated`.
+
+The label is a keyed hash of the immutable catalog account ID, using a fresh
+random, zeroizing key per listener and no per-user map. The same account has
+the same label across its pooled sockets and password rotations; rotation changes
+`credential_generation`. Deletion/recreation gets a new account ID and label,
+and separate/restarted listeners use different labels. These fields describe the
+socket's established login, **not** a fresh authorization decision: a revoked
+socket keeps its original context on subsequent denied requests. Names/credentials
+never become labels, and audit metadata never grants access or replaces the
+engine's current-privilege checks. Native and real PyMongo TLS tests cover pooled
+correlation, rotation, stale denials, user commands, failed login, aborted outcomes,
+redaction and listener separation.
+
+This is opt-in diagnostic tracing through the host's subscriber, not a durable,
+tamper-evident or complete compliance audit log. It deliberately cannot resolve
+labels back to usernames, correlate identities across restarts, or retain an
+attempted login name. Malformed frames rejected before command admission have
+no request event; decoded command-validation errors do. Delivery failures and
+uncertain commits retain the existing boundaries below. Hosts remain
+responsible for access control, bounded export queues, retention and monitoring.
 
 The same final-outcome boundary as metrics applies: completion is not proof of
 socket delivery or a globally committed write. Spans start after preparation;

@@ -446,6 +446,11 @@ database under differential/property tests.
   membership grants/revocations now derive realm permissions in the shared engine,
   authorize before hashing, and bind authorization to the durable write revision.
   Mongo exposes the corresponding five commands with strict option validation.
+  Payload-free Mongo tracing now distinguishes authentication/user-command
+  outcomes and correlates immutable accounts across pooled sockets with
+  listener-scoped keyed labels and explicit credential generations. Failed
+  logins never emit attempted usernames; these diagnostic events are not a
+  durable audit log or a new authorization decision.
   Built-in roles, broader user/role administration, Python/daemon/composed-host
   wiring, relational/admin admission and broader security release gates remain outstanding.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
@@ -1392,6 +1397,10 @@ requires an earlier dependency:
       tasks/blocking workers. Fixed outcome/error classifications retain no BSON,
       namespace, comment, credential or diagnostic payload; guards release on
       completion/abort/unwind without installing a subscriber or export queue.
+      Authentication/user-management command families and code 18 now have fixed
+      metrics categories. Authenticated tracing adds opaque listener-local account
+      correlation and credential generations without raw names or per-user metric
+      labels; revoked sockets retain their original login context on denials.
       Host readiness now reports listener/document/engine/schema admission states
       and explicit anonymous-loopback security through a non-owning live probe.
       Detected catalog/shard failures map to schema-degraded, without paths or

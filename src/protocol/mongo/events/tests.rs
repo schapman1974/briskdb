@@ -97,8 +97,11 @@ fn command_events_keep_only_bounded_correlation_and_final_outcomes() {
         assert_eq!(
             event.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "audit_user",
+                "authentication",
                 "command",
                 "connection_id",
+                "credential_generation",
                 "elapsed_micros",
                 "error_category",
                 "error_code",
@@ -111,6 +114,9 @@ fn command_events_keep_only_bounded_correlation_and_final_outcomes() {
             ]
         );
         assert!(event["elapsed_micros"].parse::<u64>().is_ok());
+        assert_eq!(event["authentication"], "anonymous");
+        assert_eq!(event["audit_user"], "");
+        assert_eq!(event["credential_generation"], "0");
     }
     assert_eq!(state.events[0]["outcome"], "completed");
     assert_eq!(state.events[0]["wire_request_id"], "-91");
@@ -131,6 +137,70 @@ fn command_events_keep_only_bounded_correlation_and_final_outcomes() {
         metrics.snapshot().command(MongoCommandKind::Find).in_flight,
         0
     );
+}
+
+#[cfg(feature = "auth-scram")]
+#[test]
+fn authentication_events_follow_session_installation_without_raw_identity_or_metric_labels() {
+    use super::AuditContext;
+    let capture = Capture::default();
+    let metrics = Arc::new(Metrics::default());
+    let identity = blake3::keyed_hash(&[7; 32], &41u64.to_le_bytes());
+    let mut guard = tracing::subscriber::with_default(capture.clone(), || {
+        let mut guard = metrics
+            .command("saslContinue", Instant::now())
+            .with_correlation(1, 1, 1);
+        guard.authentication(AuditContext::unauthenticated());
+        guard
+    });
+    // Final SASL success changes the established session before reply encoding.
+    guard.authentication(AuditContext::authenticated(identity, 3));
+    std::thread::spawn(move || guard.complete(&doc([("ok", BsonValue::Int32(1))]), false))
+        .join()
+        .unwrap();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let mut guard = metrics
+            .command("saslStart", Instant::now())
+            .with_correlation(2, 1, 1);
+        guard.authentication(AuditContext::unauthenticated());
+        guard.complete(
+            &doc([("ok", BsonValue::Int32(0)), ("code", BsonValue::Int32(18))]),
+            false,
+        );
+        let mut guard = metrics
+            .command("dropUser", Instant::now())
+            .with_correlation(1, 2, 2);
+        guard.authentication(AuditContext::authenticated(identity, 3));
+        drop(guard);
+    });
+    let state = capture.0.lock().unwrap();
+    for index in [0, 2] {
+        assert_eq!(state.events[index]["authentication"], "authenticated");
+        assert_eq!(
+            state.events[index]["audit_user"],
+            identity.to_hex().as_str()
+        );
+        assert_eq!(state.events[index]["credential_generation"], "3");
+        assert_eq!(
+            state.spans[index]["audit_user"],
+            state.events[index]["audit_user"]
+        );
+    }
+    assert_eq!(state.events[1]["authentication"], "unauthenticated");
+    assert_eq!(state.events[1]["audit_user"], "");
+    assert_eq!(state.events[1]["error_code"], "18");
+    assert_eq!(state.events[1]["error_category"], "known");
+    assert_eq!(state.events[2]["outcome"], "aborted");
+    assert!(state.live.is_empty());
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.errors_with_code(18), Some(1));
+    assert_eq!(
+        snapshot.command(MongoCommandKind::SaslContinue).completed,
+        1
+    );
+    assert_eq!(snapshot.command(MongoCommandKind::SaslStart).failed, 1);
+    assert_eq!(snapshot.command(MongoCommandKind::DropUser).aborted, 1);
+    assert!(!format!("{snapshot:?}").contains(identity.to_hex().as_str()));
 }
 
 #[test]
