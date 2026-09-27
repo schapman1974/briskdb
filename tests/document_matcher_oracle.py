@@ -38,6 +38,19 @@ def emit(document, query):
 
 def main():
     verify_source()
+    if sys.argv[1:] == ["--evaluate-one"]:
+        # Diagnostic reduction must recompute the reference outcome after every
+        # candidate deletion, never reuse a stale expected value from a case.
+        payload = sys.stdin.buffer.read(64 * 1024 + 1)
+        if len(payload) > 64 * 1024:
+            raise ValueError("matcher reproducer exceeds diagnostic input bound")
+        case = BSON(payload).decode()
+        if not isinstance(case.get("document"), dict) or not isinstance(case.get("query"), dict):
+            raise ValueError("matcher reproducer requires document and query objects")
+        emit(case["document"], case["query"])
+        return
+    if sys.argv[1:]:
+        raise ValueError("unknown matcher oracle arguments")
     values = [
         None, False, True, -10, 0, 1, 2, Int64(7), Int64(2**40),
         Int64(2**63 - 1), Int64(-(2**63)), 1.0, 10.9, -10.9,

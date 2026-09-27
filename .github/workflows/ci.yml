@@ -158,6 +158,14 @@ jobs:
           --test document_index_keys_oracle
           -- --ignored --nocapture
 
+      - name: Verify differential reducer with source-backed fault injection
+        env:
+          BRISKDB_MONGO_ORACLE_PYTHON: python
+        run: >-
+          cargo +1.85.0 test --locked --no-default-features --features documents
+          --test mongo_matcher_reproducer source_backed_fault_injection
+          -- --ignored --nocapture
+
       - name: Generate full reference-only Mongo parity report
         run: |
           mkdir -p target/mongo-parity
