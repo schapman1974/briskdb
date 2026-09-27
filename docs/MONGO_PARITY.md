@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 610 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 637 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -63,14 +63,15 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
 and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
-`test_tinymongo_coverage_edges.py`, `test_beanie_compat.py` suites
-(1,155 reference parameter cases). 297 added wheel scenarios and existing patch
+`test_tinymongo_coverage_edges.py`, `test_beanie_compat.py`,
+`test_sharded_sqlite_backend.py` suites
+(1,195 reference parameter cases). 302 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,155 unchanged upstream candidate passes or complete #186 certification.
+not 1,195 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -179,6 +180,17 @@ pinned driver's errors; detached private database objects and TinyDB condition
 construction hooks are not APIs. Dropping one same-field nonunique index leaves
 the unique index enforced after reopen. Legacy manual cursors/`hasNext`, foreign
 Parquet directory statistics and remote cleanup hooks remain explicit differences.
+
+Broader sharded-backend scenarios use plan-proven IDs on every shard of an
+eleven-shard root, concurrent readers, global sorted windows and exact restart
+results. Additional tests prove cross-shard compound/sparse/partial uniqueness,
+ordered/unordered duplicate indices and original error-operation identity.
+Native default layout/WAL checks include paths with question marks, hashes and
+Unicode. Invalid shard options reject eagerly before storage; both SQLite aliases
+use the same sharded engine. Logical database drops never delete shared root
+files or allow changing its shard count. TinyMongo's ATTACH pool, URI flags,
+private retry/poison/PID hooks and manually overwritten legacy order columns are
+not native APIs; their exclusions and actual native lifecycle evidence are mapped.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
