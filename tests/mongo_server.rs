@@ -11,6 +11,10 @@ use std::{
 
 const DEADLINE: Duration = Duration::from_secs(15);
 
+#[cfg(feature = "mongo-tls")]
+#[path = "mongo_server/tls.rs"]
+mod tls;
+
 struct Process(Child);
 
 impl Process {
@@ -38,7 +42,11 @@ impl Drop for Process {
     }
 }
 
-fn start(data: &Path, log: &Path, mongo: Option<&str>) -> Process {
+fn command(data: &Path, log: &Path, mongo: Option<&str>) -> Command {
+    command_with_http(data, log, mongo, "127.0.0.1:0")
+}
+
+fn command_with_http(data: &Path, log: &Path, mongo: Option<&str>, http: &str) -> Command {
     let output = File::create(log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_briskdb"));
     // Never let developer/service environment settings change these tests.
@@ -50,7 +58,7 @@ fn start(data: &Path, log: &Path, mongo: Option<&str>) -> Process {
     command
         .args([
             "--listen",
-            "127.0.0.1:0",
+            http,
             "--admin-listen",
             "disabled",
             "--postgres-listen",
@@ -68,7 +76,11 @@ fn start(data: &Path, log: &Path, mongo: Option<&str>) -> Process {
         .env("NO_COLOR", "1")
         .stdout(output.try_clone().unwrap())
         .stderr(output);
-    Process(command.spawn().unwrap())
+    command
+}
+
+fn start(data: &Path, log: &Path, mongo: Option<&str>) -> Process {
+    Process(command(data, log, mongo).spawn().unwrap())
 }
 
 fn ready(process: &mut Process, log: &Path) -> String {
@@ -121,6 +133,61 @@ fn daemon_without_mongo_rejects_activation_before_creating_files() {
     assert!(!data.exists());
 }
 
+#[test]
+fn daemon_rejects_incomplete_or_disabled_tls_before_creating_files() {
+    for (address, flags) in [
+        (Some("127.0.0.1:0"), vec!["--mongo-tls-cert", "missing.crt"]),
+        (Some("127.0.0.1:0"), vec!["--mongo-tls-key", "missing.key"]),
+        (
+            Some("disabled"),
+            vec![
+                "--mongo-tls-cert",
+                "missing.crt",
+                "--mongo-tls-key",
+                "missing.key",
+            ],
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let log = root.path().join("daemon.log");
+        let mut child = Process(command(&data, &log, address).args(flags).spawn().unwrap());
+        assert!(!child.wait().success());
+        assert!(!data.exists());
+        assert!(
+            !fs::read_to_string(log)
+                .unwrap()
+                .contains("BriskDB is ready")
+        );
+    }
+}
+
+#[cfg(not(feature = "mongo-tls"))]
+#[test]
+fn daemon_without_mongo_tls_rejects_complete_tls_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let log = root.path().join("daemon.log");
+    let mut child = Process(
+        command(&data, &log, Some("127.0.0.1:0"))
+            .args([
+                "--mongo-tls-cert",
+                "missing.crt",
+                "--mongo-tls-key",
+                "missing.key",
+            ])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!child.wait().success());
+    assert!(!data.exists());
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("`mongo-tls` Cargo feature")
+    );
+}
+
 #[cfg(feature = "mongo")]
 mod enabled {
     use std::{
@@ -145,6 +212,13 @@ mod enabled {
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        exchange_stream(&mut stream, command)
+    }
+
+    pub(super) fn exchange_stream(
+        stream: &mut (impl Read + Write),
+        command: BsonDocument,
+    ) -> BsonDocument {
         let mut payload = BytesMut::new();
         payload.put_u32_le(0);
         payload.put_u8(0);
@@ -185,6 +259,13 @@ mod enabled {
     }
 
     fn check_data(address: SocketAddr, insert: bool) {
+        check_data_with(|command| exchange(address, command), insert);
+    }
+
+    pub(super) fn check_data_with(
+        mut exchange: impl FnMut(BsonDocument) -> BsonDocument,
+        insert: bool,
+    ) {
         let doc = BsonDocument::from_entries([
             ("_id", BsonValue::Int32(123)),
             ("name", BsonValue::from("Ada")),
@@ -192,7 +273,6 @@ mod enabled {
         .unwrap();
         if insert {
             let reply = exchange(
-                address,
                 BsonDocument::from_entries([
                     ("insert", BsonValue::from("users")),
                     (
@@ -206,7 +286,6 @@ mod enabled {
             assert_eq!(reply.get_first("n"), Some(&BsonValue::Int32(1)));
         }
         let reply = exchange(
-            address,
             BsonDocument::from_entries([
                 ("find", BsonValue::from("users")),
                 ("filter", BsonValue::Document(BsonDocument::new())),

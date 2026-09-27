@@ -372,6 +372,13 @@ jobs:
           cargo test --locked --no-default-features --features listeners,mongo-tls,tokio/rt-multi-thread \
             --lib server::options::tests -- --include-ignored
 
+      - name: Require real daemon Mongo TLS configuration, clients and restart
+        env:
+          BRISKDB_MONGO_WIRE_PYTHON: python
+        run: |
+          cargo test --locked --no-default-features --features server-cli,mongo-tls \
+            --bin briskdb --test mongo_server -- --include-ignored
+
   mongo-odm:
     name: Mongo real ODM and Talk Python applications
     runs-on: ubuntu-24.04
