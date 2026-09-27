@@ -66,6 +66,9 @@ A cancelled request may finish its blocking preparation work in the background,
 but cannot publish that candidate.
 Concurrent successful reloads publish in completion order; callers needing a
 specific order should await each reload before starting the next.
+Rust hosts can use `reload_postgres_security_with_context(config, context)` for
+`RequestContext` cancellation/deadlines, including a check immediately before
+publication; query-result limits are irrelevant to this configuration operation.
 
 Each accepted connection retains one snapshot for TLS, SCRAM channel binding,
 password proof and username checks. Established sessions and handshakes already
@@ -73,8 +76,10 @@ admitted before publication retain that snapshot; new connections use the new
 one. **Reload is not immediate session revocation.** Stop/drain the listener if
 existing sessions must be removed. Safely publish complete secret files first;
 the loader does not snapshot several files atomically. No filesystem watcher,
-SIGHUP handler, CLI/Python reload method, role catalog, or Mongo/HTTP security is
-added by this Rust-host API. Issue #65 remains open for the other listener and
+SIGHUP handler, CLI reload method, role catalog, or Mongo/HTTP security is
+added. Python's sync/async wrappers now expose the same explicit reload with
+request controls; see the [Python example](../python/README.md#reload-postgresql-security).
+Issue #65 remains open for the other listener and
 host surfaces.
 
 ## Startup and failure order

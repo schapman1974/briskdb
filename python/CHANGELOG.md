@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Secure attached PostgreSQL servers now support `reload_postgres_security()`
+  in synchronous and asyncio Python, with certificate/key/user/password-file
+  replacement, timeouts and cancellation. Each admitted connection retains one
+  consistent identity; failed or cancelled preparation cannot replace the
+  active identity. This is not session revocation or Mongo authentication.
+
 - Native document `execution_stats=True` now reports total and per-shard
   `storage_read_nanos` in both synchronous and asyncio results. These are
   overlapping elapsed storage-call times, including SQLite execution and BSON

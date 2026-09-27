@@ -332,6 +332,31 @@ Closing a server leaves the database usable; closing the database first closes
 all of its attached servers. The asyncio API provides `await db.serve()` and
 an `AsyncServer` context manager with the same lifecycle.
 
+### Reload PostgreSQL security
+
+Current main (unreleased) can reload an **already-secure** attached server without
+changing its address. Pass all four fields; no plaintext password argument is used:
+
+```python
+server.reload_postgres_security(
+    tls_cert="next/server.crt", tls_key="next/server.key",
+    user="briskdb", password_file="next/password", timeout_ms=5_000,
+)
+# With AsyncServer: await server.reload_postgres_security(...)
+```
+
+New connections use the new certificate and credentials. Existing sessions and
+in-progress handshakes retain their original identity; this is not immediate
+revocation. Bad configuration, cancellation or an expired deadline observed
+before publication leaves the active identity unchanged. Cancellation cannot
+undo a completed publication; blocking file preparation may finish in the
+background without publishing. `cancellation=briskdb.CancellationToken()` is also
+supported, and cancelling the asyncio task signals its native request token.
+Anonymous, closing and closed servers cannot be upgraded with this method.
+Mongo stays loopback-only; this does not authenticate Mongo or expose HTTP.
+
+### Mongo listener
+
 For PyMongo clients, the same wheel includes an optional Mongo listener:
 
 ```python

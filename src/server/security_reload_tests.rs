@@ -1,4 +1,5 @@
 use super::*;
+use crate::{EngineError, EngineErrorKind, RequestContext};
 
 fn security_files() -> (tempfile::TempDir, postgres::SecurityConfig) {
     let directory = tempfile::tempdir().unwrap();
@@ -54,10 +55,13 @@ async fn cancelled_reload_never_publishes_and_a_later_reload_succeeds() {
     let original = server.postgres_security.as_ref().unwrap().snapshot();
     let (release, ready) = oneshot::channel::<()>();
     let loaded = config.load().unwrap();
-    let mut operation = Box::pin(server.reload_postgres_security_with(async {
-        ready.await.unwrap();
-        Ok(loaded)
-    }));
+    let mut operation = Box::pin(server.reload_postgres_security_with(
+        crate::RequestContext::new(),
+        async {
+            ready.await.unwrap();
+            Ok(loaded)
+        },
+    ));
     assert!(futures::poll!(operation.as_mut()).is_pending());
     drop(operation);
     assert!(release.send(()).is_err());
@@ -87,10 +91,13 @@ async fn listener_exit_during_preparation_prevents_publication() {
     let original = server.postgres_security.as_ref().unwrap().snapshot();
     let (release, ready) = oneshot::channel::<()>();
     let loaded = config.load().unwrap();
-    let mut operation = Box::pin(server.reload_postgres_security_with(async {
-        ready.await.unwrap();
-        Ok(loaded)
-    }));
+    let mut operation = Box::pin(server.reload_postgres_security_with(
+        crate::RequestContext::new(),
+        async {
+            ready.await.unwrap();
+            Ok(loaded)
+        },
+    ));
     assert!(futures::poll!(operation.as_mut()).is_pending());
     server.task.as_ref().unwrap().abort();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -107,5 +114,138 @@ async fn listener_exit_during_preparation_prevents_publication() {
         &server.postgres_security.as_ref().unwrap().snapshot()
     ));
     assert!(server.close().await.is_err());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_controls_are_rechecked_after_preparation_before_publication() {
+    let data = tempfile::tempdir().unwrap();
+    let (_secrets, config) = security_files();
+    let db = BriskDb::builder(data.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = attached(&db, config.clone()).await;
+    let original = server.postgres_security.as_ref().unwrap().snapshot();
+    for cancel in [true, false] {
+        let loaded = config.load().unwrap();
+        let context = if cancel {
+            RequestContext::new()
+        } else {
+            RequestContext::new()
+                .with_timeout(Duration::from_millis(5))
+                .unwrap()
+        };
+        let token = context.cancellation_token();
+        let error = server
+            .reload_postgres_security_with(context, async {
+                // Deliberately finish without yielding: select has already polled
+                // the controls before they become ready. Only the publication
+                // guard can prevent this otherwise-ready candidate from committing.
+                if cancel {
+                    token.cancel();
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(loaded)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<EngineError>().unwrap().kind(),
+            if cancel {
+                EngineErrorKind::Cancelled
+            } else {
+                EngineErrorKind::DeadlineExceeded
+            }
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &server.postgres_security.as_ref().unwrap().snapshot()
+        ));
+    }
+    server.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pre_cancelled_and_expired_controls_never_start_preparation() {
+    let data = tempfile::tempdir().unwrap();
+    let (_secrets, config) = security_files();
+    let db = BriskDb::builder(data.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = attached(&db, config).await;
+    let cancelled = RequestContext::new();
+    cancelled.cancellation_token().cancel();
+    for (context, kind) in [
+        (cancelled, EngineErrorKind::Cancelled),
+        (
+            RequestContext::new().with_deadline(std::time::Instant::now()),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        let error = server
+            .reload_postgres_security_with(context, async {
+                panic!("pre-cancelled/expired reload must not start preparation")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<EngineError>().unwrap().kind(), kind);
+    }
+    server.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_controls_interrupt_pending_preparation_without_publication() {
+    let data = tempfile::tempdir().unwrap();
+    let (_secrets, config) = security_files();
+    let db = BriskDb::builder(data.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = attached(&db, config).await;
+    let original = server.postgres_security.as_ref().unwrap().snapshot();
+    for cancel in [true, false] {
+        let context = if cancel {
+            RequestContext::new()
+        } else {
+            RequestContext::new()
+                .with_timeout(Duration::from_millis(10))
+                .unwrap()
+        };
+        let token = context.cancellation_token();
+        let (entered, entered_rx) = oneshot::channel();
+        let operation = server.reload_postgres_security_with(context, async {
+            entered.send(()).unwrap();
+            std::future::pending::<anyhow::Result<postgres::LoadedSecurity>>().await
+        });
+        let trigger = async {
+            entered_rx.await.unwrap();
+            if cancel {
+                token.cancel();
+            }
+        };
+        let (result, ()) = tokio::join!(operation, trigger);
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<EngineError>().unwrap().kind(),
+            if cancel {
+                EngineErrorKind::Cancelled
+            } else {
+                EngineErrorKind::DeadlineExceeded
+            }
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &server.postgres_security.as_ref().unwrap().snapshot()
+        ));
+    }
+    server.close().await.unwrap();
     db.close().await.unwrap();
 }

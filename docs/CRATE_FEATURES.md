@@ -40,6 +40,7 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 | `documents` | BSON values and codec, catalog/storage, TinyMongo-ready semantic keys, protocol-neutral document commands, and their `BriskDb`/`BriskSession` facade; also selects `embedded` | Experimental document engine; no MongoDB listener yet |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Compatibility alias for the secure `postgres` surface | Alpha-supported; selected by `listeners` |
+| `transport-tls` | Internal shared certificate/key loading with descriptor validation, bounded secret buffers and caller-selected ALPN | Foundation selected by `postgres`; does not enable a listener or Mongo authentication |
 
 `default = ["server-cli", "sqlite-import-cli"]`. `listeners` selects
 `embedded`, `http`, and `postgres`; `server` adds process signal handling.

@@ -548,7 +548,19 @@ impl AttachedServer {
         &self,
         config: postgres::SecurityConfig,
     ) -> anyhow::Result<()> {
-        self.reload_postgres_security_with(async move {
+        self.reload_postgres_security_with_context(config, crate::RequestContext::new())
+            .await
+    }
+
+    /// Reload with cancellation and an absolute deadline, rechecked immediately
+    /// before publication. Query result limits in the context do not apply.
+    /// Cancellation/deadline cannot undo an identity already published.
+    pub async fn reload_postgres_security_with_context(
+        &self,
+        config: postgres::SecurityConfig,
+        context: crate::RequestContext,
+    ) -> anyhow::Result<()> {
+        self.reload_postgres_security_with(context, async move {
             tokio::task::spawn_blocking(move || config.load())
                 .await
                 .context("PostgreSQL security reload worker failed")?
@@ -559,15 +571,31 @@ impl AttachedServer {
 
     async fn reload_postgres_security_with(
         &self,
+        context: crate::RequestContext,
         prepare: impl Future<Output = anyhow::Result<postgres::LoadedSecurity>>,
     ) -> anyhow::Result<()> {
+        check_security_reload_context(&context)?;
         let target = self
             .postgres_security
             .as_ref()
             .context("PostgreSQL security reload requires an already-secure attached listener")?;
         self.require_running_for_reload()?;
-        let loaded = prepare.await?;
+        let cancellation = context.cancellation_token();
+        let deadline = async {
+            if let Some(deadline) = context.deadline() {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let loaded = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(security_reload_cancelled().into()),
+            _ = deadline => return Err(security_reload_timed_out().into()),
+            result = prepare => result?,
+        };
         self.require_running_for_reload()?;
+        check_security_reload_context(&context)?;
         target.replace(loaded);
         Ok(())
     }
@@ -608,6 +636,33 @@ impl Drop for AttachedServer {
     fn drop(&mut self) {
         self.begin_close();
     }
+}
+
+fn security_reload_cancelled() -> crate::EngineError {
+    crate::EngineError::new(
+        crate::EngineErrorKind::Cancelled,
+        "PostgreSQL security reload was cancelled before completion",
+    )
+}
+
+fn security_reload_timed_out() -> crate::EngineError {
+    crate::EngineError::new(
+        crate::EngineErrorKind::DeadlineExceeded,
+        "PostgreSQL security reload deadline elapsed",
+    )
+}
+
+fn check_security_reload_context(context: &crate::RequestContext) -> crate::EngineResult<()> {
+    if context.cancellation_token().is_cancelled() {
+        return Err(security_reload_cancelled());
+    }
+    if context
+        .deadline()
+        .is_some_and(|deadline| deadline <= std::time::Instant::now())
+    {
+        return Err(security_reload_timed_out());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "server")]

@@ -492,6 +492,10 @@ with briskdb.open("./data", shards=4) as db:
         print(server.data_address, server.admin_address, server.postgres_address)
 ```
 
+On current main (unreleased), an already-secure attached PostgreSQL server also
+supports `server.reload_postgres_security(...)`
+and its asyncio equivalent; see the [TLS reload example](python/README.md#reload-postgresql-security).
+
 The wheel also exposes the current protocol-neutral document slice through
 sync and asyncio sessions. Install PyMongo for its BSON value classes, then
 enable document commands on the database handle:

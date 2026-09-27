@@ -427,7 +427,8 @@ database under differential/property tests.
   Secure Rust attached servers can explicitly reload the complete PostgreSQL
   TLS/SCRAM identity without rebinding; failed/cancelled reloads retain the
   previous identity, and existing connections keep one consistent snapshot.
-  CLI/Python reload, other listeners and immediate session revocation remain
+  Python sync/async wrappers expose reload with queued/preparation cancellation,
+  deadlines and a final publication guard. CLI reload, other listeners and immediate session revocation remain
   separate work. This does not enable Mongo TLS/authentication; Mongo still
   refuses non-loopback binds.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard

@@ -3,6 +3,7 @@ mod document_api;
 mod error;
 mod mongo_client;
 mod remote_sqlite;
+mod server_reload;
 mod value;
 
 use std::{
@@ -1143,6 +1144,27 @@ struct Server {
 
 #[pymethods]
 impl Server {
+    /// Reload this already-secure PostgreSQL listener; existing sessions retain
+    /// their original identity. File I/O and derivation run without the GIL.
+    #[pyo3(signature = (*, tls_cert, tls_key, user, password_file, timeout_ms=None, cancellation=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn reload_postgres_security(
+        &self,
+        py: Python<'_>,
+        tls_cert: PathBuf,
+        tls_key: PathBuf,
+        user: &str,
+        password_file: PathBuf,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<()> {
+        let config = PostgresSecurityConfig::new(tls_cert, tls_key, user, password_file)
+            .map_err(listener_error)?;
+        let context = request_context(timeout_ms, cancellation)?;
+        let shared = Arc::clone(&self.shared);
+        run_native(py, move || shared.reload_security_native(config, context))
+    }
+
     #[getter]
     fn data_address(&self) -> String {
         self.shared.addresses.data().to_string()
