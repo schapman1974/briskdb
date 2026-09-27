@@ -69,6 +69,8 @@ pub struct BriskDbBuilder {
     engine_options: EngineOptions,
     runtime_behavior: RuntimeBehavior,
     document_support: DocumentSupport,
+    #[cfg(feature = "auth-scram")]
+    authenticated_root: bool,
 }
 
 impl BriskDbBuilder {
@@ -81,6 +83,8 @@ impl BriskDbBuilder {
             engine_options: EngineOptions::default(),
             runtime_behavior: RuntimeBehavior::default(),
             document_support: DocumentSupport::default(),
+            #[cfg(feature = "auth-scram")]
+            authenticated_root: false,
         }
     }
 
@@ -133,8 +137,25 @@ impl BriskDbBuilder {
         self
     }
 
+    /// Open an explicitly provisioned security root. Requires an explicit shard
+    /// count and enabled document support; this never activates an ordinary root.
+    #[cfg(feature = "auth-scram")]
+    pub const fn with_authenticated_root(mut self) -> Self {
+        self.authenticated_root = true;
+        self
+    }
+
     /// Validate the complete configuration without touching the filesystem.
     pub fn validate(&self) -> EngineResult<()> {
+        #[cfg(feature = "auth-scram")]
+        if self.authenticated_root
+            && (self.shard_count.is_none() || self.document_support != DocumentSupport::Enabled)
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "authenticated roots require an explicit shard count and enabled documents",
+            ));
+        }
         if self.root.as_os_str().is_empty() {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidArgument,
@@ -163,11 +184,31 @@ impl BriskDbBuilder {
     /// Validate and open one embedded database on the caller's Tokio runtime.
     pub async fn open(self) -> EngineResult<BriskDb> {
         self.validate()?;
-        let engine = match self.shard_count {
-            Some(shard_count) => {
-                Engine::open_with_options(&self.root, shard_count, self.engine_options).await?
+        #[cfg(feature = "auth-scram")]
+        let authenticated = self.authenticated_root;
+        #[cfg(not(feature = "auth-scram"))]
+        let authenticated = false;
+        let engine = if authenticated {
+            #[cfg(feature = "auth-scram")]
+            {
+                Engine::open_authenticated(
+                    &self.root,
+                    self.shard_count.expect("validated shard count"),
+                    self.engine_options,
+                )
+                .await?
             }
-            None => Engine::open_detected_with_options(&self.root, self.engine_options).await?,
+            #[cfg(not(feature = "auth-scram"))]
+            {
+                unreachable!("authentication feature is disabled")
+            }
+        } else {
+            match self.shard_count {
+                Some(shard_count) => {
+                    Engine::open_with_options(&self.root, shard_count, self.engine_options).await?
+                }
+                None => Engine::open_detected_with_options(&self.root, self.engine_options).await?,
+            }
         };
         Ok(BriskDb {
             engine,

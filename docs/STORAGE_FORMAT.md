@@ -78,8 +78,10 @@ never automatically adopted, replaced or deleted. Backups/restores must include
 both the manifest and its credential store as one consistent root.
 `Engine::open_authenticated` validates the binding and matching store before
 storage startup; it supports authenticated document admission only. Ordinary
-SQL/HTTP/PostgreSQL/SQLite-remote and Mongo listener paths do not yet support this
-mode and fail closed. The marker is recognized independently of feature flags.
+SQL/HTTP/PostgreSQL/SQLite-remote and composed listener paths do not yet support this
+mode and fail closed. The standalone Rust Mongo TLS listener supports this mode
+with `mongo-tls,auth-scram` and the explicit authenticated builder. The marker is
+recognized independently of feature flags.
 
 ```sql
 CREATE TABLE briskdb_manifest (

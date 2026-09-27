@@ -54,6 +54,28 @@ pub struct ScramSha256Verifier {
 }
 
 impl ScramSha256Verifier {
+    /// Unusable, stable-per-name challenge material for hiding absent users.
+    /// There is no known password/client key for this synthetic StoredKey.
+    #[cfg(feature = "mongo")]
+    pub(crate) fn concealed(seed: &[u8; 32], realm: &str, name: &str) -> Self {
+        let derive = |label: &[u8]| {
+            let mut hash = blake3::Hasher::new_keyed(seed);
+            hash.update(b"briskdb.scram.absent-user.v1\0");
+            hash.update(label);
+            hash.update(&(realm.len() as u64).to_le_bytes());
+            hash.update(realm.as_bytes());
+            hash.update(&(name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            Zeroizing::new(*hash.finalize().as_bytes())
+        };
+        Self {
+            iterations: NonZeroU32::new(DEFAULT_SCRAM_SHA256_ITERATIONS).expect("nonzero default"),
+            salt: derive(b"salt")[..16].try_into().expect("salt width"),
+            stored_key: derive(b"stored-key"),
+            server_key: derive(b"server-key"),
+        }
+    }
+
     /// Provision with a fresh operating-system salt and the default work factor.
     /// Passwords use strict SASLprep, including rejection of prohibited output.
     pub fn from_password(password: &str) -> EngineResult<Self> {

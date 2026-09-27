@@ -439,8 +439,11 @@ database under differential/property tests.
   Explicit offline root activation and authenticated Rust-engine startup now bind
   that authority to immutable sessions and enforce document-command/cursor privileges.
   Unsupported SQL/admin/protocol entry points fail closed in this opt-in mode.
-  Mongo SCRAM conversations, built-in roles/user commands, Python/daemon wiring,
-  relational/admin admission and listener authentication remain outstanding.
+  Standalone Rust Mongo TLS now supports bounded SCRAM-SHA-256 conversations,
+  verified PyMongo sync/async clients, current document privileges and same-user
+  pooled cursors with cross-user/generation isolation. Only explicit secure roots
+  may bind off loopback. Built-in roles/user commands, Python/daemon/composed-host
+  wiring, relational/admin admission and broader security release gates remain outstanding.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and

@@ -1,4 +1,4 @@
-//! Wire cursor IDs are capabilities scoped to this listener and namespace.
+//! Wire cursor IDs are scoped to listener, namespace and authenticated identity.
 //! A dedicated engine session follows each cursor across pooled TCP sockets.
 //! Disconnect cleanup follows the last socket to use it.
 
@@ -83,17 +83,35 @@ impl WireCursors {
         Ok(())
     }
 
-    pub fn lookup(
+    #[cfg(test)]
+    fn lookup(
         self: &Arc<Self>,
         id: DocumentCursorId,
         namespace: &DocumentNamespace,
         connection: u64,
     ) -> Result<WireCursorLease> {
+        self.lookup_for_session(
+            id,
+            namespace,
+            connection,
+            &Session::new(1, crate::core::PreparedStatementLimits::default()),
+        )
+    }
+
+    pub fn lookup_for_session(
+        self: &Arc<Self>,
+        id: DocumentCursorId,
+        namespace: &DocumentNamespace,
+        connection: u64,
+        requester: &Session,
+    ) -> Result<WireCursorLease> {
         let mut entries = self.0.lock().unwrap_or_else(|error| error.into_inner());
         prune(&mut entries);
         let previous = entries
             .get(&id)
-            .filter(|entry| &entry.namespace == namespace)
+            .filter(|entry| {
+                &entry.namespace == namespace && entry.session.same_authentication(requester)
+            })
             .ok_or_else(|| CommandError::new(43, "CursorNotFound", "cursor not found"))?
             .connection;
         if previous != connection
@@ -112,7 +130,9 @@ impl WireCursors {
         }
         let entry = entries
             .get_mut(&id)
-            .filter(|entry| &entry.namespace == namespace)
+            .filter(|entry| {
+                &entry.namespace == namespace && entry.session.same_authentication(requester)
+            })
             .ok_or_else(|| CommandError::new(43, "CursorNotFound", "cursor not found"))?;
         if entry.in_use {
             return Err(CommandError::new(
@@ -141,17 +161,26 @@ impl WireCursors {
         })
     }
 
-    pub fn take(
+    #[cfg(test)]
+    fn take(&self, id: DocumentCursorId, namespace: &DocumentNamespace) -> Option<Arc<Session>> {
+        self.take_for_session(
+            id,
+            namespace,
+            &Session::new(1, crate::core::PreparedStatementLimits::default()),
+        )
+    }
+
+    pub fn take_for_session(
         &self,
         id: DocumentCursorId,
         namespace: &DocumentNamespace,
+        requester: &Session,
     ) -> Option<Arc<Session>> {
         let mut entries = self.0.lock().unwrap_or_else(|error| error.into_inner());
         prune(&mut entries);
-        if entries
-            .get(&id)
-            .is_some_and(|entry| &entry.namespace == namespace)
-        {
+        if entries.get(&id).is_some_and(|entry| {
+            &entry.namespace == namespace && entry.session.same_authentication(requester)
+        }) {
             entries.remove(&id).map(|entry| entry.session)
         } else {
             None
@@ -246,6 +275,84 @@ impl Drop for ConnectionCursors {
 mod tests {
     use super::*;
     use crate::core::PreparedStatementLimits;
+
+    #[cfg(feature = "auth-scram")]
+    #[test]
+    fn pooled_cursor_identity_precedes_handoff_quota_and_removal() {
+        use crate::core::security_catalog::{SecurityCatalog, SecurityName, tests as fixtures};
+        fn session(catalog: &SecurityCatalog, user: &SecurityName, owner: u64) -> Session {
+            let attempt = catalog.begin_scram(user).unwrap();
+            let (_, message, proof) = fixtures::exchange(&attempt, fixtures::PASSWORD);
+            let principal = catalog
+                .complete_scram(attempt, message.as_bytes(), &proof)
+                .unwrap()
+                .into_parts()
+                .0;
+            let mut session = Session::new(owner, PreparedStatementLimits::default());
+            session.principal = Some(principal);
+            session
+        }
+        let (mut catalog, alice, role) = fixtures::setup();
+        let bob = SecurityName::new("app", "bob").unwrap();
+        catalog
+            .create_user(bob.clone(), fixtures::credential(), [role.clone()])
+            .unwrap();
+        let owner = Arc::new(session(&catalog, &alice, 1));
+        let pooled = session(&catalog, &alice, 1);
+        let foreign = session(&catalog, &bob, 1);
+        let engine_mismatch = session(&catalog, &alice, 2);
+        let anonymous = Session::new(1, PreparedStatementLimits::default());
+        let registry = Arc::new(WireCursors::default());
+        let id = DocumentCursorId::new(1).unwrap();
+        registry.register(id, namespace(), owner, 10, None).unwrap();
+        for requester in [&foreign, &engine_mismatch, &anonymous] {
+            assert_eq!(
+                error_code(registry.lookup_for_session(id, &namespace(), 20, requester)),
+                43
+            );
+            assert!(
+                registry
+                    .take_for_session(id, &namespace(), requester)
+                    .is_none()
+            );
+            assert_eq!(registry.0.lock().unwrap()[&id].connection, 10);
+        }
+        registry
+            .lookup_for_session(id, &namespace(), 20, &pooled)
+            .unwrap()
+            .complete(Duration::ZERO, true)
+            .unwrap();
+        assert_eq!(registry.0.lock().unwrap()[&id].connection, 20);
+        // A newly authenticated generation cannot acquire old-generation state.
+        catalog
+            .rotate_credentials(&alice, fixtures::credential())
+            .unwrap();
+        let rotated = session(&catalog, &alice, 1);
+        assert_eq!(
+            error_code(registry.lookup_for_session(id, &namespace(), 30, &rotated)),
+            43
+        );
+        assert!(
+            registry
+                .take_for_session(id, &namespace(), &rotated)
+                .is_none()
+        );
+        catalog.drop_user(&alice).unwrap();
+        catalog
+            .create_user(alice.clone(), fixtures::credential(), [role])
+            .unwrap();
+        let recreated = session(&catalog, &alice, 1);
+        assert_eq!(
+            error_code(registry.lookup_for_session(id, &namespace(), 30, &recreated)),
+            43
+        );
+        assert!(
+            registry
+                .take_for_session(id, &namespace(), &pooled)
+                .is_some()
+        );
+        assert_counts(&registry.1, (1, 1, 0, 1, 0, 0));
+    }
 
     fn namespace() -> DocumentNamespace {
         DocumentNamespace::new("db", "items").unwrap()

@@ -729,6 +729,20 @@ impl Engine {
         )
     }
 
+    /// A cursor outlives a pooled socket, but never its authenticated identity.
+    #[cfg(feature = "mongo")]
+    pub(crate) async fn cursor_session(&self, source: &Session) -> EngineResult<Session> {
+        let _operation = self.operation_lifecycle(RequestContext::new())?;
+        let _source = self.ready_session(source).await?;
+        #[allow(unused_mut)]
+        let mut session = self.session();
+        #[cfg(feature = "auth-scram")]
+        if self.security_enabled() {
+            self.copy_session_identity(source, &mut session).await?;
+        }
+        Ok(session)
+    }
+
     /// Return the configured physical shard count.
     pub fn shard_count(&self) -> u16 {
         self.inner.database.shard_count()

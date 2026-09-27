@@ -39,6 +39,8 @@ pub enum MongoSecurityMode {
     AnonymousLoopback,
     /// TLS server identity, but no Mongo user authentication. Loopback only.
     AnonymousTlsLoopback,
+    /// TLS plus SCRAM-SHA-256, with engine-enforced document privileges.
+    AuthenticatedTls,
 }
 
 impl MongoSecurityMode {
@@ -46,6 +48,7 @@ impl MongoSecurityMode {
         match self {
             Self::AnonymousLoopback => "anonymous_loopback",
             Self::AnonymousTlsLoopback => "anonymous_tls_loopback",
+            Self::AuthenticatedTls => "authenticated_tls",
         }
     }
 }

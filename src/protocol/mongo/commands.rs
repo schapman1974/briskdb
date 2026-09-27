@@ -1225,6 +1225,8 @@ pub(super) struct Executor {
     metrics: Arc<metrics::Metrics>,
     creation: Mutex<()>,
     cursors: Arc<cursors::WireCursors>,
+    #[cfg(feature = "auth-scram")]
+    pub(super) authentication: Option<super::authentication::Authentication>,
 }
 
 impl Executor {
@@ -1238,6 +1240,28 @@ impl Executor {
             metrics: Arc::clone(&metrics),
             creation: Mutex::new(()),
             cursors: Arc::new(cursors::WireCursors::with_limits(metrics, limits)),
+            #[cfg(feature = "auth-scram")]
+            authentication: None,
+        }
+    }
+
+    pub(super) fn running(&self) -> bool {
+        self.database.engine().state() == crate::EngineState::Running
+    }
+
+    pub(super) fn secured(&self) -> bool {
+        self.database.engine().security_enabled()
+    }
+
+    pub(super) fn authentication_required(&self, session: &Session) -> bool {
+        #[cfg(feature = "auth-scram")]
+        {
+            self.secured() && !session.is_authenticated()
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        {
+            let _ = session;
+            self.secured()
         }
     }
 
@@ -1257,9 +1281,22 @@ impl Executor {
         self.cursors.discard(id);
     }
 
+    #[cfg(test)]
     pub(super) async fn execute(
         &self,
         session: &Session,
+        request_id: i32,
+        prepared: Prepared,
+        shutdown: CancellationToken,
+    ) -> BsonDocument {
+        self.execute_on_connection(session, session.id().get(), request_id, prepared, shutdown)
+            .await
+    }
+
+    pub(super) async fn execute_on_connection(
+        &self,
+        session: &Session,
+        connection: u64,
         request_id: i32,
         prepared: Prepared,
         shutdown: CancellationToken,
@@ -1291,7 +1328,10 @@ impl Executor {
         identity[8..12].copy_from_slice(&request_id.to_le_bytes());
         identity[12..].copy_from_slice(&1u32.to_le_bytes());
         let identity = DocumentRequestId::new(identity).expect("nonzero request identity");
-        match self.run(session, identity, context, prepared.command).await {
+        match self
+            .run(session, connection, identity, context, prepared.command)
+            .await
+        {
             Ok(reply) => read_options::reply(reply, prepared.advisory_hint),
             Err(error) => error.document(),
         }
@@ -1315,6 +1355,24 @@ impl Executor {
                 execution.into_parts().2
             })
             .map_err(Into::into)
+    }
+
+    async fn authorize_early(
+        &self,
+        session: &Session,
+        context: &RequestContext,
+        command: &DocumentCommand,
+    ) -> Result<()> {
+        #[cfg(feature = "auth-scram")]
+        if self.secured() {
+            self.database
+                .engine()
+                .preflight_document_authorization(session, command, context.clone())
+                .await?;
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        let _ = (session, context, command);
+        Ok(())
     }
 
     async fn exists(
@@ -1365,6 +1423,7 @@ impl Executor {
     async fn run(
         &self,
         session: &Session,
+        connection: u64,
         identity: DocumentRequestId,
         context: RequestContext,
         command: Command,
@@ -1403,17 +1462,12 @@ impl Executor {
                 warnings,
                 model_names,
             }) => {
-                self.ensure_collection(session, identity, &context, request.namespace())
+                let namespace = request.namespace().clone();
+                let command = DocumentCommand::CreateIndexes(request);
+                self.authorize_early(session, &context, &command).await?;
+                self.ensure_collection(session, identity, &context, &namespace)
                     .await?;
-                match self
-                    .call(
-                        session,
-                        identity,
-                        &context,
-                        DocumentCommand::CreateIndexes(request),
-                    )
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::IndexesBuilt { before, after } => {
                         Ok(indexes::reply(before, after, warnings))
                     }
@@ -1518,6 +1572,7 @@ impl Executor {
                 }
             }
             Command::FindAndChange(command) => {
+                self.authorize_early(session, &context, &command).await?;
                 let namespace = match &command {
                     DocumentCommand::FindOneAndReplace(request) => request.namespace(),
                     DocumentCommand::FindOneAndUpdate(request) => request.namespace(),
@@ -1569,21 +1624,13 @@ impl Executor {
                 ]))
             }
             Command::FindAndDelete(request) => {
-                let value = if !self
-                    .exists(session, identity, &context, request.namespace())
-                    .await?
-                {
+                let namespace = request.namespace().clone();
+                let command = DocumentCommand::FindOneAndDelete(request);
+                self.authorize_early(session, &context, &command).await?;
+                let value = if !self.exists(session, identity, &context, &namespace).await? {
                     None
                 } else {
-                    match self
-                        .call(
-                            session,
-                            identity,
-                            &context,
-                            DocumentCommand::FindOneAndDelete(request),
-                        )
-                        .await?
-                    {
+                    match self.call(session, identity, &context, command).await? {
                         DocumentResult::Document(value) => value,
                         _ => {
                             return Err(CommandError::new(
@@ -1627,6 +1674,7 @@ impl Executor {
                     let result = match update {
                         Err(error) => Err(error),
                         Ok(update) => {
+                            self.authorize_early(session, &context, &update).await?;
                             safe_statement_error = !matches!(&update, DocumentCommand::Update(request) if request.scope() == DocumentMutationScope::Many);
                             let namespace = match &update {
                                 DocumentCommand::Replace(request) => request.namespace(),
@@ -1749,18 +1797,15 @@ impl Executor {
                             continue;
                         }
                     };
-                    if !self
-                        .exists(session, identity, &context, delete.namespace())
-                        .await?
-                    {
+                    let namespace = delete.namespace().clone();
+                    let command = DocumentCommand::Delete(delete);
+                    self.authorize_early(session, &context, &command).await?;
+                    if !self.exists(session, identity, &context, &namespace).await? {
                         continue;
                     }
                     // Operational failures can follow committed shard writes.
                     // Abort instead of claiming an exact count or retrying them.
-                    match self
-                        .call(session, identity, &context, DocumentCommand::Delete(delete))
-                        .await?
-                    {
+                    match self.call(session, identity, &context, command).await? {
                         DocumentResult::Delete(result) => {
                             count = count
                                 .checked_add(
@@ -1789,12 +1834,12 @@ impl Executor {
                 Ok(body)
             }
             Command::Insert(insert) => {
-                self.ensure_collection(session, identity, &context, insert.namespace())
+                let namespace = insert.namespace().clone();
+                let command = DocumentCommand::Insert(insert);
+                self.authorize_early(session, &context, &command).await?;
+                self.ensure_collection(session, identity, &context, &namespace)
                     .await?;
-                match self
-                    .call(session, identity, &context, DocumentCommand::Insert(insert))
-                    .await
-                {
+                match self.call(session, identity, &context, command).await {
                     Ok(DocumentResult::Insert(result)) => {
                         let mut body = fields([
                             ("ok", BsonValue::Double(1.0)),
@@ -1834,24 +1879,16 @@ impl Executor {
                 }
             }
             Command::Distinct(distinct) => {
-                if !self
-                    .exists(session, identity, &context, distinct.namespace())
-                    .await?
-                {
+                let namespace = distinct.namespace().clone();
+                let command = DocumentCommand::Distinct(distinct);
+                self.authorize_early(session, &context, &command).await?;
+                if !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("values", BsonValue::Array(Vec::new())),
                     ]));
                 }
-                match self
-                    .call(
-                        session,
-                        identity,
-                        &context,
-                        DocumentCommand::Distinct(distinct),
-                    )
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::Distinct(values) => Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("values", BsonValue::Array(values.into_vec())),
@@ -1864,19 +1901,16 @@ impl Executor {
                 }
             }
             Command::Count(count) => {
-                if !self
-                    .exists(session, identity, &context, count.namespace())
-                    .await?
-                {
+                let namespace = count.namespace().clone();
+                let command = DocumentCommand::Count(count);
+                self.authorize_early(session, &context, &command).await?;
+                if !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("n", BsonValue::Int64(0)),
                     ]));
                 }
-                match self
-                    .call(session, identity, &context, DocumentCommand::Count(count))
-                    .await?
-                {
+                match self.call(session, identity, &context, command).await? {
                     DocumentResult::Count(count) => Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         (
@@ -1903,18 +1937,7 @@ impl Executor {
                     Command::ListCollections(..) | Command::ListIndexes(..)
                 );
                 let direct_find = matches!(&command, Command::Find(..));
-                if let Command::ListIndexes(request, _) = &command {
-                    if !self
-                        .exists(session, identity, &context, request.namespace())
-                        .await?
-                    {
-                        return Err(CommandError::new(
-                            26,
-                            "NamespaceNotFound",
-                            "collection does not exist",
-                        ));
-                    }
-                }
+                let list_indexes = matches!(&command, Command::ListIndexes(..));
                 let (namespace, command, single_batch, empty_single_batch, budget) = match command {
                     Command::Find(find, single_batch, budget) => {
                         let namespace = find.namespace().clone();
@@ -1950,6 +1973,16 @@ impl Executor {
                     ),
                     _ => unreachable!("cursor command"),
                 };
+                if !direct_find || empty_single_batch {
+                    self.authorize_early(session, &context, &command).await?;
+                }
+                if list_indexes && !self.exists(session, identity, &context, &namespace).await? {
+                    return Err(CommandError::new(
+                        26,
+                        "NamespaceNotFound",
+                        "collection does not exist",
+                    ));
+                }
                 // A normal find already resolves its collection inside the
                 // admitted engine command and verified manifest snapshot. Do
                 // not execute a second catalog command just to check absence.
@@ -1966,7 +1999,8 @@ impl Executor {
                 }
                 // Mongo drivers may use a different pooled socket for getMore.
                 // Retain this cursor's engine ownership separately from TCP.
-                let cursor_session = Arc::new(self.session());
+                let cursor_session =
+                    Arc::new(self.database.engine().cursor_session(session).await?);
                 match self
                     .call(&cursor_session, identity, &context, command)
                     .await
@@ -1983,7 +2017,7 @@ impl Executor {
                                 id,
                                 namespace.clone(),
                                 cursor_session,
-                                session.id().get(),
+                                connection,
                                 budget.map(|budget| budget.saturating_sub(started.elapsed())),
                             )?;
                         }
@@ -1999,7 +2033,9 @@ impl Executor {
             Command::GetMore(next) => {
                 let namespace = next.namespace().clone();
                 let id = next.cursor_id();
-                let lease = self.cursors.lookup(id, &namespace, session.id().get())?;
+                let lease = self
+                    .cursors
+                    .lookup_for_session(id, &namespace, connection, session)?;
                 let started = Instant::now();
                 let context = if let Some(remaining) = lease.remaining {
                     let deadline = context
@@ -2041,7 +2077,9 @@ impl Executor {
                 let mut killed = Vec::new();
                 let mut missing = Vec::new();
                 for id in ids {
-                    let Some(cursor_session) = self.cursors.take(id, &namespace) else {
+                    let Some(cursor_session) =
+                        self.cursors.take_for_session(id, &namespace, session)
+                    else {
                         missing.push(BsonValue::Int64(id.get() as i64));
                         continue;
                     };
