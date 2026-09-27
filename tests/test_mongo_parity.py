@@ -87,6 +87,103 @@ def execution(target, outcome="passed", *, reason=None, observation=None):
 
 
 class JunitIngestTests(unittest.TestCase):
+    def test_all_pytest_outcomes_retain_categories_and_normalized_fingerprints(self):
+        examples = [
+            (None, None, None, "passed"),
+            ("skipped", "pytest.skip", "driver missing", "skipped"),
+            ("skipped", "pytest.xfail", "known gap", "xfailed"),
+            ("failure", "AssertionError", "different", "failed"),
+            ("error", "RuntimeError", "setup\n failed", "error"),
+            ("failure", "pytest.xpass", "fixed", "xpassed"),
+            ("failure", "builtins.Failed", "[XPASS(strict)] fixed", "xpassed"),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "outcomes.xml"
+
+            def cases(suite):
+                for index, (tag, category, message, _) in enumerate(examples):
+                    add_testcase(suite, "test_case_{0}[sync-memory]".format(index),
+                                 outcome=tag, outcome_type=category, message=message)
+
+            write_junit(path, cases)
+            rows = mongo_parity.ingest_junit(path, "candidate")["executions"]
+        self.assertEqual(len(rows), len(examples))
+        for row, (_, category, message, expected) in zip(rows, examples):
+            self.assertEqual(row["outcome"], expected)
+            self.assertEqual(row["reason"], " ".join(message.split()) if message else None)
+            self.assertEqual(row["observation"]["category"], category or "passed")
+            self.assertRegex(row["observation"]["fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len({row["observation"]["fingerprint"] for row in rows}), 7)
+
+    def test_windows_and_unc_paths_redact_without_changing_reference_urls(self):
+        observed = []
+        with tempfile.TemporaryDirectory() as root:
+            for index, (drive, share) in enumerate([
+                (r"C:\Users\Ada Lovelace\Temp\file.json", r"\\server\share\file.json"),
+                (r"D:\Build\Other User\input.json", r"\\another\volume\input.json"),
+            ]):
+                path = Path(root) / (str(index) + ".xml")
+
+                def cases(suite):
+                    add_testcase(suite, "test_case[sync-memory]", outcome="failure",
+                                 outcome_type="AssertionError",
+                                 message="Missing '{0}' and {1}; see https://example.test/a/b".format(drive, share))
+
+                write_junit(path, cases)
+                observed.append(mongo_parity.ingest_junit(path, "candidate")["executions"][0])
+        self.assertEqual(observed[0]["reason"], "Missing '<ABSOLUTE_PATH>' and <ABSOLUTE_PATH>; see https://example.test/a/b")
+        self.assertEqual(observed[0], observed[1])
+
+    def test_duplicate_dimensions_and_unknown_locked_case_metadata_fail_closed(self):
+        corpus = {"contract": "tinymongo-v1", "cases": [{
+            "id": "tests.contracts.test_contract::test_case", "apis": ["sync"], "suite": "core"}]}
+        variants = [
+            {"properties": [("tinymongo.api", "sync")]},
+            {"properties": [("tinymongo.backend", "memory")]},
+            {"properties": [("tinymongo.suite", "core")]},
+            {"properties": [("tinymongo.contract_id", "unknown::test_case")]},
+            {"contract_suite": "unknown"},
+            {"api": "other"},
+            {"backend": "bad backend"},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "invalid.xml"
+            for options in variants:
+                def cases(suite):
+                    name = "test_case[{0}-{1}]".format(options.get("api", "sync"), options.get("backend", "memory"))
+                    add_testcase(suite, name, **options)
+
+                write_junit(path, cases)
+                with self.subTest(options=options), self.assertRaises(mongo_parity.ContractError):
+                    mongo_parity.ingest_junit(path, "candidate", corpus)
+
+    def test_ingest_order_is_deterministic_and_malformed_input_never_looks_empty(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "results.xml"
+            observed = []
+            for names in (["test_b", "test_a"], ["test_a", "test_b"]):
+                def cases(suite):
+                    for name in names:
+                        add_testcase(suite, name + "[sync-memory]")
+
+                write_junit(path, cases)
+                observed.append(mongo_parity.ingest_junit(path, "candidate"))
+            self.assertEqual(observed[0], observed[1])
+            # Keep valid XML for name validation, so a parse failure cannot
+            # accidentally satisfy these rejection assertions.
+            for name in ("", "bad target", "-leading"):
+                with self.subTest(name=name), self.assertRaises(mongo_parity.ContractError):
+                    mongo_parity.ingest_junit(path, name)
+            # Native implementation labels allow internal/trailing hyphens;
+            # TinyMongo's report dimension-name validator is a different API.
+            for name in ("trailing-", "two--hyphens"):
+                rows = mongo_parity.ingest_junit(path, name)["executions"]
+                self.assertEqual({row["target"] for row in rows}, {name + "-memory"})
+            path.write_text("<testsuite>", encoding="utf-8")
+            for invalid in (path, Path(root) / "missing.xml"):
+                with self.assertRaises(mongo_parity.ContractError):
+                    mongo_parity.ingest_junit(invalid, "candidate")
+
     def test_only_exact_tinymongo_properties_define_contract_dimensions(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             junit = Path(temporary_directory) / "results.xml"
@@ -395,6 +492,36 @@ class StrictDifferenceTests(unittest.TestCase):
         self.assertTrue(failed)
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["stale_intentional_differences"], [difference])
+
+    def test_missing_required_candidate_and_skipped_candidate_are_not_passes(self):
+        report, _, failed = mongo_parity.compare_results(
+            self.manifest, self.corpus, {"differences": []}, [self.reference],
+            "tinymongo-memory", required_targets=["briskdb-memory"])
+        self.assertTrue(failed)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["missing_required_targets"], ["briskdb-memory"])
+        candidate = {"executions": [execution("briskdb-memory", "skipped", reason="not run")]}
+        report, _, failed = mongo_parity.compare_results(
+            self.manifest, self.corpus, {"differences": []}, [self.reference, candidate], "tinymongo-memory")
+        self.assertTrue(failed)
+        self.assertEqual(report["targets"][0]["mismatches"][0]["observed"], "skipped")
+
+    def test_report_requires_reference_and_rejects_duplicate_results(self):
+        candidate = {"executions": [execution("briskdb-memory")]}
+        for results in ([candidate], [self.reference, self.reference], [self.reference, candidate, candidate]):
+            with self.subTest(results=results), self.assertRaises(mongo_parity.ContractError):
+                mongo_parity.compare_results(self.manifest, self.corpus, {"differences": []},
+                                             results, "tinymongo-memory")
+
+    def test_report_json_and_markdown_are_deterministic_across_result_order(self):
+        candidate = {"executions": [execution("briskdb-memory")]}
+        forward = mongo_parity.compare_results(self.manifest, self.corpus, {"differences": []},
+                                               [self.reference, candidate], "tinymongo-memory")
+        reverse = mongo_parity.compare_results(self.manifest, self.corpus, {"differences": []},
+                                               [candidate, self.reference], "tinymongo-memory")
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward[0]["status"], "passed")
+        self.assertFalse(forward[2])
 
     def test_optional_allowlist_target_can_be_absent_from_reference_report(self):
         report, _, failed = mongo_parity.compare_results(

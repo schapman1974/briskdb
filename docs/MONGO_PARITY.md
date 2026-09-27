@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 769 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 818 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -67,14 +67,15 @@ and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
 `test_sharded_sqlite_backend.py`, `test_tinymongo.py`,
 `test_remaining_coverage.py`, `test_sharded_sqlite_coverage_init.py`,
 `test_coverage_edges.py`, `test_acceptance_runner.py`,
-`test_cli_replacement_safety.py` suites
-(1,345 reference parameter cases). 316 added wheel scenarios and existing patch
+`test_cli_replacement_safety.py`, `test_cli.py`, `test_compatibility_report.py`,
+`test_storage_benchmark.py`, `test_sqlite_comparison_benchmark.py` suites
+(1,411 reference parameter cases). 316 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,345 unchanged upstream candidate passes or complete #186 certification.
+not 1,411 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -240,6 +241,17 @@ result constructors, legacy cursor/collection helpers, placeholder GridFS wrappe
 alternate storage engines, CLI internals and acceptance-runner plugins are not
 BriskDB APIs. Native staged import is not live CLI compensating replacement; the
 source-accounted runner fixtures are not an external application acceptance pass.
+
+Reporting regressions distinguish every pytest outcome (including both XPASS
+forms), reject duplicated or unknown locked dimensions, redact Unix/Windows/UNC
+paths while preserving URLs, and keep ingestion/report output deterministic.
+Missing required targets, skipped candidates, absent references and duplicate
+result artifacts cannot become passing evidence. Native exact-fingerprint
+comparison is not TinyMongo's percentage-scoring/report schema. Native benchmark
+raw-sample, trial-rotation, result-digest and baseline validation likewise does not
+copy TinyMongo's private Markdown format or per-phase process runner. Migration
+preserves recognized BSON/index metadata into a fresh staged destination; it does
+not implement TinyMongo's live JSON import/replace or remote-backend CLI.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,

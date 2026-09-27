@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty-three locked suites is classified; 1345 reference parameter cases are not 1345 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks/CLI/runner utilities, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty-seven locked suites is classified; 1411 reference parameter cases are not 1411 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks/CLI/runner/reporting/benchmark utilities, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -5759,6 +5759,355 @@
             "tests/mongo_operating_drill.rs::stopped_import_backup_restore_and_source_rollback_preserve_mongo_data"
           ],
           "note": "TinyMongo's live CLI delete/insert compensating restore after partial fake mutations is not a BriskDB feature. Native migration reads a stopped source and stages/publishes a fresh destination, removes failed unpublished stages and preserves source bytes. Reopening an unchanged source is a pre-cutover fallback, not reverse migration of subsequent native writes."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_cli.py",
+      "sha256": "0c1583a9835eed6d0b0b739e402d9e76ae0845c6769bfe058a7bcb09fba564a6",
+      "function_count": 21,
+      "reference_case_count": 22,
+      "coverage": [
+        {
+          "source": [
+            "test_cli_inspect_export_import_and_migrate",
+            "test_cli_backend_option_exports_sqlite_backend",
+            "test_cli_import_from_stdin_and_replace_mode",
+            "test_cli_import_rejects_non_array_input"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_operating_drill.rs::stopped_import_backup_restore_and_source_rollback_preserve_mongo_data",
+            "src/import/tinymongo.rs::atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt"
+          ],
+          "note": "TinyMongo's inspect/list/export/JSON stdin/append/replace subcommands are not BriskDB's CLI. Native migration consumes a stopped allowlisted SQLite source and publishes a fresh staged database; its source preservation, rollback-to-unchanged-source and backup/restore are tested separately. No live JSON replacement or byte-identical CLI output claim."
+        },
+        {
+          "source": [
+            "test_cli_export_import_preserves_datetime_and_bytes_without_bson",
+            "test_cli_export_import_and_migrate_preserve_supported_bson_values",
+            "test_cli_export_import_preserves_embedded_document_field_order"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::tagged_json_restores_bson_and_keeps_field_order",
+            "src/import/tinymongo.rs::legacy_physical_ids_are_validated_and_restore_container_order",
+            "python/tests/test_upstream_bson_values.py::test_native_bson_roundtrips_bounds_timestamps_and_nested_code"
+          ],
+          "note": "Native stopped SQLite import decodes recognized legacy BSON tags and validates/restores field/ID order; actual wheel BSON values are separately tested. This is not TinyMongo JSON export/import, no-BSON Python fallback, bytearray acceptance or its CLI's datetime display semantics."
+        },
+        {
+          "source": [
+            "test_copy_indexes_preserves_names_keys_and_supported_options"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::advanced_import_envelopes_match_native_declarations_without_rewriting",
+            "src/import/tinymongo.rs::sharded_pending_index_may_exist_on_only_some_shards"
+          ],
+          "note": "Native import preserves supported index metadata as Pending declarations requiring explicit native builds. It does not call TinyMongo's private live _copy_indexes helper or silently activate imported indexes."
+        },
+        {
+          "source": [
+            "test_replace_collection_rolls_back_a_failed_destination_write",
+            "test_replace_collection_reports_a_failed_rollback_with_runtime_error",
+            "test_replace_collection_restores_previous_data_after_late_write_failure",
+            "test_replace_collection_reports_a_failed_rollback",
+            "test_replace_import_preflights_before_deleting_existing_data",
+            "test_migrate_preflights_target_indexes_before_deleting_existing_data"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt",
+            "src/import/staging.rs::rejects_existing_alias_and_symbolic_link_destinations",
+            "src/import/staging.rs::publish_is_no_replace_when_a_destination_appears"
+          ],
+          "note": "Native import refuses existing destinations, including an empty directory or a destination that appears at publication. Failure cleans only its unpublished owned stage and never deletes/restores a live destination collection. TinyMongo compensating rollback, old-target index preflight and exact chained errors therefore do not describe the native contract."
+        },
+        {
+          "source": [
+            "test_cli_migrate_all_databases",
+            "test_cli_hides_tinydb_default_table_from_listing_inspection_and_migration"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::plan_requires_explicit_non_reserved_unique_names",
+            "src/import/tinymongo.rs::table_native_reads_only_allowlisted_exact_schema",
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Native migration requires an explicit database/collection allowlist; it does not discover and migrate every database or internal TinyDB _default table. Native logical collection listing and reserved/explicit source-name validation are tested."
+        },
+        {
+          "source": [
+            "test_cli_storage_uri_options_are_passed_through",
+            "test_cli_storage_uri_inspect_and_db_names",
+            "test_cli_migrate_reports_environment_only_remote_configuration",
+            "test_cli_effective_remote_configuration_precedence"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "Fake object-store/remote SQL clients, TinyMongo storage-URI/DSN environment precedence and report fields are private CLI/backend behavior. Native Mongo uses BriskDB SQLite storage and rejects these backend choices before acquisition; the PostgreSQL network frontend does not imply PostgreSQL storage-backend support."
+        },
+        {
+          "source": [
+            "test_cli_passes_shard_counts_and_closes_embedded_clients"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_backend.py::test_shard_configuration_aliases_reject_invalid_counts_before_storage",
+            "python/tests/test_upstream_sharded_backend.py::test_native_layout_wal_and_fixed_root_shards_survive_logical_drop",
+            "src/import/tinymongo.rs::import_options_validate_shards_and_report_cancellation"
+          ],
+          "note": "Real native client/import shard bounds, aliases, durable fixed-root layout and client cleanup are tested. Fake TinyMongo CLI source/target shard keyword forwarding and its stdout schema are not native command-line interfaces."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_compatibility_report.py",
+      "sha256": "1697ae62b9e9b0dbb954bbf4552e7c400961e7d849854065aff058600756dcee",
+      "function_count": 17,
+      "reference_case_count": 23,
+      "coverage": [
+        {
+          "source": [
+            "test_default_targets_cover_sync_and_async_for_every_backend"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_complete_matrix_yields_228_cases_and_memory_reference"
+          ],
+          "note": "The immutable reference harvest checks all 14 source API/backend targets, then locks the 228-case/456-execution TinyMongo-memory baseline. Native candidate execution uses briskdb-briskdb, not 14 BriskDB storage backends."
+        },
+        {
+          "source": [
+            "test_junit_properties_are_preferred_over_parameter_name_fallback",
+            "test_name_and_classname_fallback_attribute_legacy_junit",
+            "test_conflicting_or_unknown_properties_are_unattributed"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_only_exact_tinymongo_properties_define_contract_dimensions",
+            "tests/test_mongo_parity.py::test_target_prefix_is_removed_without_consuming_equal_user_parameters",
+            "tests/test_mongo_parity.py::test_duplicate_dimensions_and_unknown_locked_case_metadata_fail_closed"
+          ],
+          "note": "Native ingestion requires unique exact dimension properties, a valid leading API/backend test parameter prefix and known locked case/API/suite metadata. It rejects malformed or unattributed inputs instead of guessing legacy suffix/classname dimensions or publishing an unattributed row."
+        },
+        {
+          "source": [
+            "test_read_junit_classifies_all_pytest_outcomes"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_all_pytest_outcomes_retain_categories_and_normalized_fingerprints"
+          ],
+          "note": "Native JUnit ingestion distinguishes pass, skip, xfail, failure, error and both XPASS forms; normalized reason/category produce distinct stable fingerprints. Its whitespace normalization uses the entire reason rather than TinyMongo's first-line reason policy."
+        },
+        {
+          "source": [
+            "test_complete_reference_backed_matrix_is_publishable",
+            "test_only_cells_with_same_api_passing_mongodb_reference_are_scored"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_complete_matrix_yields_228_cases_and_memory_reference",
+            "tests/test_mongo_parity.py::test_allowlist_rejects_a_different_failure_fingerprint",
+            "tests/test_mongo_parity.py::test_allowlist_accepts_the_reviewed_failure_fingerprint"
+          ],
+          "note": "Native reporting compares exact API/case outcome fingerprints to the locked TinyMongo reference and requires issue-backed reviewed differences. It does not emit TinyMongo's same-API-passing-MongoDB percentage or its publishable matrix schema; a local source-accounting total is never substituted for either certification."
+        },
+        {
+          "source": [
+            "test_matrix_flags_missing_skipped_unattributed_and_duplicates"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_missing_required_candidate_and_skipped_candidate_are_not_passes",
+            "tests/test_mongo_parity.py::test_report_requires_reference_and_rejects_duplicate_results",
+            "tests/test_mongo_parity.py::test_snapshot_rejects_one_missing_matrix_cell",
+            "tests/test_mongo_parity.py::test_duplicate_dimensions_and_unknown_locked_case_metadata_fail_closed"
+          ],
+          "note": "Native gates reject malformed/duplicate source cells and absent references, and fail reports for required-but-missing targets or skipped candidates against a passing baseline. They do not silently turn these into passes or emit the source's exact blocker schema."
+        },
+        {
+          "source": [
+            "test_reports_have_api_backend_and_suite_summaries",
+            "test_known_gaps_and_xpasses_include_all_dimensions"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_all_pytest_outcomes_retain_categories_and_normalized_fingerprints",
+            "tests/test_mongo_parity.py::test_allowlist_rejects_a_different_failure_fingerprint"
+          ],
+          "note": "Native records retain case/API/suite/target and outcome fingerprints and report target counts plus exact mismatches. TinyMongo's separate API/backend/suite scoring tables, known-gap lists and Markdown wording/escaping are not native schema promises."
+        },
+        {
+          "source": [
+            "test_absolute_paths_are_redacted_but_urls_are_preserved",
+            "test_windows_drive_and_unc_paths_are_redacted"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_reason_redaction_preserves_uris_and_produces_stable_fingerprint",
+            "tests/test_mongo_parity.py::test_windows_and_unc_paths_redact_without_changing_reference_urls"
+          ],
+          "note": "Actual native JUnit failure ingestion redacts Unix, quoted Windows-with-spaces and UNC paths while preserving URLs; changing local paths leaves normalized observations/fingerprints identical."
+        },
+        {
+          "source": [
+            "test_json_and_markdown_are_deterministic_across_input_order"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_ingest_order_is_deterministic_and_malformed_input_never_looks_empty",
+            "tests/test_mongo_parity.py::test_report_json_and_markdown_are_deterministic_across_result_order"
+          ],
+          "note": "Native JUnit rows and report data/Markdown are stable across testcase/result-file ordering. This does not promise TinyMongo's different schema or byte-identical formatting."
+        },
+        {
+          "source": [
+            "test_cli_accepts_multiple_inputs_and_emits_incomplete_reports"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_missing_required_candidate_and_skipped_candidate_are_not_passes",
+            "tests/test_mongo_parity.py::test_report_json_and_markdown_are_deterministic_across_result_order"
+          ],
+          "note": "Native reporting combines explicit input artifacts and marks missing required candidates failed; it is not TinyMongo's incomplete-but-exit-zero CLI, output filenames or baseline schema."
+        },
+        {
+          "source": [
+            "test_cli_errors_only_for_malformed_config_or_input",
+            "test_invalid_or_reserved_dimension_names_are_rejected"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_ingest_order_is_deterministic_and_malformed_input_never_looks_empty",
+            "tests/test_mongo_parity.py::test_duplicate_dimensions_and_unknown_locked_case_metadata_fail_closed",
+            "tests/test_mongo_parity.py::test_ingest_validates_contract_before_reading_results",
+            "tests/test_mongo_parity.py::test_report_validates_contract_before_reading_results"
+          ],
+          "note": "Native contract validation, strict dimensions/implementation names and malformed/missing JUnit errors are tested. CLI option names, exact errors and the source's reserved 'unattributed' dimension are not copied; native validation is governed by its locked contract."
+        },
+        {
+          "source": [
+            "test_reference_backend_must_be_configured"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_parity.py::test_report_requires_reference_and_rejects_duplicate_results"
+          ],
+          "note": "A native report requires an explicitly selected reference with complete corpus results, not merely a backend name present in CLI configuration."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_storage_benchmark.py",
+      "sha256": "74b20e8ee99d54ff7b08865d68da8a8b7df38a07e29c11cd973a659cc1fabeca",
+      "function_count": 10,
+      "reference_case_count": 20,
+      "coverage": [
+        {
+          "source": [
+            "test_insert_batches_preserve_documents_and_target_four_distinct_shards"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_shard_processes.py::test_spawned_writers_on_different_shards_progress_independently"
+          ],
+          "note": "Native concurrency tests select identities using the actual native routing plan and prove separate-shard writers progress. TinyMongo's private hash and exact 243/263/241/253 batch distribution are not BriskDB's routing contract."
+        },
+        {
+          "source": [
+            "test_concurrent_insert_runner_starts_all_workers_together_and_cleans_up",
+            "test_concurrent_insert_runner_identifies_worker_failures"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_orchestrator_rotates_isolated_backends_and_checks_equal_final_state",
+            "tests/test_mongo_benchmark.py::test_timeout_still_requests_cleanup_of_only_the_generated_mongodb_namespace"
+          ],
+          "note": "Native benchmark workers synchronize threaded insert waves and propagate process failures/timeouts; isolated orchestration and owned cleanup are tested. TinyMongo's private _run_simultaneously prepare/cleanup callbacks and exact worker-error strings are not native APIs."
+        },
+        {
+          "source": [
+            "test_real_local_backends_report_equivalent_crud_semantics",
+            "test_single_worker_profile_uses_one_process_for_every_phase"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_measurements_require_every_workload_sample_unit_and_result_digest",
+            "python/tests/test_upstream_storage_backends.py::test_common_storage_queries_mutations_and_natural_counts_survive_reopen",
+            "python/tests/test_upstream_shard_processes.py::test_spawned_writers_on_different_shards_progress_independently"
+          ],
+          "note": "Native benchmark reports verify raw samples and final records across isolated BriskDB/TinyMongo processes; separate wheel tests prove durable CRUD and spawned shard independence. It does not copy TinyMongo's per-phase 1/4-process runner, raw-SQL baseline, exact 13-row report or durability/file-size labels. Native timed insert waves use threads, and this benchmark alone is not a restart/durability certificate."
+        },
+        {
+          "source": [
+            "test_non_shareable_backends_are_not_mixed_into_process_results"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "tests/test_mongo_benchmark.py::test_orchestrator_rotates_isolated_backends_and_checks_equal_final_state"
+          ],
+          "note": "BriskDB's benchmark compares its native SQLite engine with the locked TinyMongo sharded-SQLite reference; memory/DuckDB are not selectable native Mongo backends. Private source backend availability reasons are not reproduced."
+        },
+        {
+          "source": [
+            "test_markdown_formatter_keeps_na_and_unavailable_rows_aligned"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_measurements_require_every_workload_sample_unit_and_result_digest",
+            "tests/test_mongo_benchmark.py::test_summaries_and_regression_ratios_use_verified_raw_measurements"
+          ],
+          "note": "Native performance evidence uses verified raw JSON measurements and baseline ratios, not TinyMongo's private Markdown table/N/A/unavailable formatter. Formatting a fabricated source row is not a benchmark result."
+        },
+        {
+          "source": [
+            "test_repeats_rotate_backends_and_aggregate_each_backend_in_input_order"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_orchestrator_rotates_isolated_backends_and_checks_equal_final_state",
+            "tests/test_mongo_benchmark.py::test_summaries_and_regression_ratios_use_verified_raw_measurements",
+            "tests/test_mongo_benchmark.py::test_baseline_mismatches_and_unverified_summaries_fail_closed"
+          ],
+          "note": "Native trials rotate isolated backends, verify identical final-state digests and derive summaries/ratios from validated raw measurements. Runtime/configuration/worker mismatches fail comparison. Source-specific median keys and throughput formulas are not byte-identical report fields."
+        },
+        {
+          "source": [
+            "test_cli_rejects_invalid_positive_counts_and_shard_bounds",
+            "test_cli_selects_backends_and_writes_json_without_external_services"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_configuration_is_bounded_and_boolean_values_are_not_counts",
+            "tests/test_mongo_benchmark.py::test_reference_uri_cannot_target_remote_or_named_application_databases",
+            "tests/test_mongo_benchmark.py::test_orchestrator_rotates_isolated_backends_and_checks_equal_final_state"
+          ],
+          "note": "Native benchmark configuration and isolated backend selection are bounded, and optional MongoDB references must be owned literal-loopback namespaces. Native worker limits (1-4), argument names and JSON schema differ from the source CLI's 1-64 shard-affine process selection."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sqlite_comparison_benchmark.py",
+      "sha256": "ae2f330e3a939c3b2656cab692bd4da179eff34be387a18908ba5dc570132fec",
+      "function_count": 1,
+      "reference_case_count": 1,
+      "coverage": [
+        {
+          "source": [
+            "test_sqlite_comparison_markdown_includes_point_update_schema"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/test_mongo_benchmark.py::test_measurements_require_every_workload_sample_unit_and_result_digest",
+            "tests/test_mongo_benchmark.py::test_summaries_and_regression_ratios_use_verified_raw_measurements"
+          ],
+          "note": "TinyMongo's private SQLite-comparison Markdown point-update/unavailable column layout is not a native API. Native reports validate point-update raw samples and derive checked summaries; no fabricated formatting fixture is counted as measured performance."
         }
       ]
     }
