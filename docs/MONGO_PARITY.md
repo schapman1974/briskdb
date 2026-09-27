@@ -770,18 +770,31 @@ shapes are retained. Cross-shard bulk atomicity is not claimed; it follows the
 decision and fault acceptance in #74/#183.
 
 The [index-suite inventory](../compat/mongo/index-suite-inventory.json) accounts
-for every function in the four source-locked suites named by #174: 73 functions,
-expanded by TinyMongo into 217 reference cases across its backend variants.
-It maps 59 functions to public candidate scenarios, seven to native equivalents,
-three to implementation-specific exclusions, and four to explicit contract
-differences. This is a coverage map, **not 217 unchanged candidate passes**.
-The exclusions concern private warning-plan helper types and old TinyDB catalog
-injection/repair; the differences retain real PyMongo results, direct
-descending/background support, and the reviewed cross-shard commit boundary.
+for every function in the four source-locked suites named by #174 plus
+`test_index_helpers.py`: 107 functions, expanded by TinyMongo into 285 reference
+cases across its backend variants. It maps 75 functions to public candidate
+scenarios, nine to native equivalents, seven to implementation-specific
+exclusions, and 16 to explicit contract differences. This is a coverage map,
+**not 285 unchanged candidate passes**. The exclusions concern private helper
+types and old TinyDB catalog injection/repair; the differences retain real
+PyMongo results, direct descending/background support, BSON input rules and
+the reviewed cross-shard commit boundary.
 Every entry names executable evidence and a rationale. The validator checks all
-four source hashes, exact function membership, collected reference case counts,
+five source hashes, exact function membership, collected reference case counts,
 and that the named candidate tests still exist. Missing, duplicate, unknown or
 unexplained entries fail; no frozen v1 corpus or allowance was rewritten.
+
+Four additional helper-derived wheel scenarios verify Unicode/canonical names,
+eager invalid definitions, nested missing/null uniqueness, numeric/bool/string
+distinctions, UUID subtype/regex identity, multiple constraints and v1/v2 metadata
+protocol inputs through reopen. Bare key pairs are not public PyMongo
+sequence-of-pairs inputs; tuples encode as BSON arrays, and redacted duplicate
+errors do not echo private index names. Supported metadata protocol inputs may
+omit sparse/partial defaults even for v2; this is not `IndexSpec.from_metadata`.
+Direct calls retain the existing reduced hashed/text/TTL behavior described
+above. Raw command replies contain reduction warnings; stock direct PyMongo
+does not turn those extra fields into Python warnings. The local `create_indexes`
+wrapper does. No TTL expiration or text search is implied by accepted options.
 
 Installed-wheel tests exercise the portable model/durable/advanced/exact-ID
 outcomes. Native entry/probe tests replace TinyMongo-specific JSON-expression
@@ -1477,8 +1490,9 @@ Ready indexes separately support conservative equality candidates.
 Required CI also compares
 six build/drop/recreation discovery states and the reopened result with the
 source-locked TinyMongo client, including built-in/name order and exact options.
-Only ordered key pairs are represented as BSON documents for transport. The full frozen
-index suites remain open; no frozen expected result or allowance is changed.
+Only ordered key pairs are represented as BSON documents for transport. The
+broader source accounting is tracked in the index inventory above; these oracle
+runs do not change a frozen expected result or allowance.
 
 The shared index-key foundation now checks 7,201 additional source-locked cases
 (29,370 document evaluations) against unchanged index helpers. It compares exact

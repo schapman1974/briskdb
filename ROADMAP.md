@@ -974,12 +974,20 @@ requires an earlier dependency:
       drop/recreate and retry, typed/multikey uniqueness, four-client contention,
       and explicit same-shard rollback. Driver metadata/result shapes and the
       #74/#183 cross-shard boundary remain explicit compatibility differences.
-      The source-checked inventory maps all 73 functions / 217 reference backend
-      cases from the four index suites to executable public/native evidence or
-      explicit implementation/contract rationales (59 public, 7 native equivalents,
-      3 private exclusions, 4 contract differences). These counts are not unchanged
+      The source-checked inventory maps all 107 functions / 285 reference backend
+      cases from the four index suites plus the index-helper suite to executable
+      public/native evidence or explicit implementation/contract rationales
+      (75 public, 9 native equivalents, 7 private exclusions, 16 contract
+      differences). These counts are not unchanged
       candidate passes. Hashes, complete function membership, collected case counts
       and candidate test symbols are checked; the immutable v1 contract is untouched.
+      Four added helper-derived wheel scenarios verify canonical/Unicode names,
+      invalid definitions, nested missing/null and typed BSON uniqueness,
+      multiple constraints and metadata protocol versions through reopen.
+      Private helper classes/token strings, bare pairs, tuple encoding, defaulted
+      v2 metadata and redacted diagnostics retain explicit differences. Existing
+      hashed/text/TTL reductions do not imply text search or expiration; raw
+      command warnings and local model-wrapper warnings remain distinct.
     - [x] [#182](https://github.com/schapman1974/briskdb/issues/182) — natural-order
       source pages now load their initial frontiers from at most eight target
       shards concurrently, sharing pool/worker admission and a checked aggregate

@@ -25,7 +25,7 @@ def checked_path(root, relative):
     return path
 
 
-def validate_inventory(data, source_root=None, *, expected_scope=(4, 73, 217)):
+def validate_inventory(data, source_root=None, *, expected_scope=(5, 107, 285)):
     if data["schema_version"] != 1 or data["source_commit"] != SOURCE_COMMIT:
         raise ValueError("unexpected source/schema version")
     source_paths = set()
