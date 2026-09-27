@@ -421,7 +421,10 @@ database under differential/property tests.
 - [ ] TLS configuration and reload for every listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and
-  Unix key-permission checks. This #65/#188 foundation does not add reload or
+  Unix key-permission checks. Certificate/key/password reads now validate the
+  opened descriptor, enforce a limit even if the file grows, reject Unix FIFOs
+  without blocking, and zeroize their fixed input buffers on all exit paths.
+  This #65/#188 foundation does not add reload or
   enable Mongo TLS/authentication; Mongo still refuses non-loopback binds.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.

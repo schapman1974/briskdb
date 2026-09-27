@@ -10,7 +10,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt, fs, io,
+    fmt, io,
     ops::ControlFlow,
     path::{Path, PathBuf},
     pin::Pin,
@@ -19,9 +19,7 @@ use std::{
     time::Duration,
 };
 
-use super::tls::{
-    contextual_io_error, load_server_identity, validate_private_file, validate_regular_file,
-};
+use super::tls::{load_server_identity, read_configuration_file};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use futures::{Sink, SinkExt, StreamExt, stream};
@@ -173,13 +171,6 @@ impl SecurityConfig {
     }
 
     pub(crate) fn load(&self) -> io::Result<LoadedSecurity> {
-        validate_regular_file(
-            &self.password_file,
-            "PostgreSQL password file",
-            MAX_PASSWORD_FILE_BYTES,
-        )?;
-        validate_private_file(&self.password_file, "PostgreSQL password file")?;
-
         let tls = load_server_identity(
             &self.certificate,
             &self.private_key,
@@ -187,20 +178,17 @@ impl SecurityConfig {
             &[b"postgresql"],
         )?;
 
-        let mut password = fs::read(&self.password_file).map_err(|error| {
-            contextual_io_error(
-                error,
-                format!(
-                    "failed to read PostgreSQL password file {}",
-                    self.password_file.display()
-                ),
-            )
-        })?;
-        if password.last() == Some(&b'\n') {
-            password.pop();
-            if password.last() == Some(&b'\r') {
-                password.pop();
-            }
+        let password_file = read_configuration_file(
+            &self.password_file,
+            "PostgreSQL password file",
+            MAX_PASSWORD_FILE_BYTES,
+            true,
+        )?;
+        let mut password = password_file.as_slice();
+        if let Some(without_newline) = password.strip_suffix(b"\n") {
+            password = without_newline
+                .strip_suffix(b"\r")
+                .unwrap_or(without_newline);
         }
         if password.is_empty()
             || password.len() > 1_024
@@ -208,14 +196,12 @@ impl SecurityConfig {
             || password.contains(&b'\n')
             || password.contains(&b'\r')
         {
-            password.fill(0);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "PostgreSQL password file must contain one non-empty UTF-8 line of at most 1024 bytes",
             ));
         }
-        if std::str::from_utf8(&password).is_err() {
-            password.fill(0);
+        if std::str::from_utf8(password).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "PostgreSQL password file must contain valid UTF-8",
@@ -223,17 +209,16 @@ impl SecurityConfig {
         }
         let mut salt = vec![0_u8; 16];
         if let Err(error) = getrandom::fill(&mut salt) {
-            password.fill(0);
             return Err(io::Error::other(format!(
                 "failed to generate PostgreSQL SCRAM salt: {error}"
             )));
         }
         let salted_password = gen_salted_password(
-            std::str::from_utf8(&password).expect("the password encoding was checked"),
+            std::str::from_utf8(password).expect("the password encoding was checked"),
             &salt,
             SCRAM_ITERATIONS,
         );
-        password.fill(0);
+        drop(password_file);
 
         let mut fake_salt = vec![0_u8; 16];
         getrandom::fill(&mut fake_salt).map_err(|error| {
@@ -4722,6 +4707,46 @@ mod tests {
             let error = config.load().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert!(!error.to_string().contains("correct horse"));
+        }
+    }
+
+    #[test]
+    fn password_file_line_and_size_boundaries_preserve_scram_derivation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_security_config(temp.path());
+        for (bytes, expected) in [
+            (b"secret".to_vec(), "secret".to_string()),
+            (b"secret\n".to_vec(), "secret".to_string()),
+            (b"secret\r\n".to_vec(), "secret".to_string()),
+            (vec![b'x'; 1024], "x".repeat(1024)),
+            (
+                [vec![b'x'; 1024], b"\r\n".to_vec()].concat(),
+                "x".repeat(1024),
+            ),
+            ("é".repeat(512).into_bytes(), "é".repeat(512)),
+        ] {
+            std::fs::write(config.password_file(), bytes).unwrap();
+            let loaded = config.load().unwrap();
+            assert_eq!(
+                loaded.credentials.salted_password,
+                gen_salted_password(&expected, &loaded.credentials.salt, SCRAM_ITERATIONS)
+            );
+        }
+        for bytes in [
+            Vec::new(),
+            b"\n".to_vec(),
+            b"\r\n".to_vec(),
+            b"secret\r".to_vec(),
+            b"secret\nother".to_vec(),
+            b"secret\0".to_vec(),
+            vec![0xff],
+            vec![b'x'; 1025],
+            vec![b'x'; 1027],
+        ] {
+            std::fs::write(config.password_file(), bytes).unwrap();
+            let error = config.load().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains("secret"));
         }
     }
 

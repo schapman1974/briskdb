@@ -2,14 +2,12 @@
 //! Selecting this feature never opens a listener or relaxes bind/authentication policy.
 #![cfg_attr(not(feature = "postgres"), allow(dead_code))]
 
-use std::{
-    fs::{self, File},
-    io::{self, BufReader},
-    path::Path,
-    sync::Arc,
-};
+use std::{io, path::Path, sync::Arc};
 
 use tokio_rustls::rustls;
+
+mod configuration;
+pub(crate) use configuration::read_configuration_file;
 
 const MAX_TLS_PEM_BYTES: u64 = 1_048_576;
 
@@ -29,19 +27,8 @@ pub(crate) fn load_server_identity(
 ) -> io::Result<LoadedTlsIdentity> {
     let certificate_label = format!("{protocol} TLS certificate");
     let key_label = format!("{protocol} TLS private key");
-    validate_regular_file(certificate, &certificate_label, MAX_TLS_PEM_BYTES)?;
-    validate_regular_file(private_key, &key_label, MAX_TLS_PEM_BYTES)?;
-    validate_private_file(private_key, &key_label)?;
-
-    let certificate_pem = fs::read(certificate).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!(
-                "failed to read {certificate_label} {}",
-                certificate.display()
-            ),
-        )
-    })?;
+    let certificate_pem =
+        read_configuration_file(certificate, &certificate_label, MAX_TLS_PEM_BYTES, false)?;
     let certificates = rustls_pemfile::certs(&mut certificate_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -62,13 +49,8 @@ pub(crate) fn load_server_identity(
             ),
         ));
     }
-    let key_file = File::open(private_key).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to read {key_label} {}", private_key.display()),
-        )
-    })?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+    let key_pem = read_configuration_file(private_key, &key_label, MAX_TLS_PEM_BYTES, true)?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
         .map_err(|error| {
             contextual_io_error(
                 error,
@@ -84,6 +66,7 @@ pub(crate) fn load_server_identity(
                 ),
             )
         })?;
+    drop(key_pem);
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
@@ -96,74 +79,12 @@ pub(crate) fn load_server_identity(
     config.alpn_protocols = alpn.iter().map(|value| value.to_vec()).collect();
     Ok(LoadedTlsIdentity {
         config: Arc::new(config),
-        certificate_pem: certificate_pem.into(),
+        certificate_pem: certificate_pem.as_slice().to_vec().into(),
     })
 }
 
 pub(crate) fn contextual_io_error(error: io::Error, message: String) -> io::Error {
     io::Error::new(error.kind(), format!("{message}: {error}"))
-}
-
-pub(crate) fn validate_regular_file(
-    path: &Path,
-    label: &str,
-    maximum_bytes: u64,
-) -> io::Result<()> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{label} {} is not a regular file", path.display()),
-        ));
-    }
-    if metadata.len() > maximum_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{label} {} exceeds the {maximum_bytes}-byte limit",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o037 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{label} {} must not be group-writable or accessible by other users (mode is {mode:03o})",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
-    fs::metadata(path).map_err(|error| {
-        contextual_io_error(
-            error,
-            format!("failed to inspect {label} {}", path.display()),
-        )
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
