@@ -1,25 +1,21 @@
 //! Blocking preparation owns no publication handle; the attached host publishes.
 
 use super::*;
+use crate::RequestContext;
 use crate::server::{
     AttachedServer, check_security_reload_context, security_reload_cancelled,
     security_reload_timed_out,
 };
-use crate::{EngineState, RequestContext};
 use anyhow::Context;
 use std::future::Future;
 
 pub(in crate::server) struct Target {
     identities: Planes,
-    engine: crate::core::EngineReadinessProbe,
 }
 
 impl Target {
-    pub(in crate::server) fn new(
-        identities: Planes,
-        engine: crate::core::EngineReadinessProbe,
-    ) -> Self {
-        Self { identities, engine }
+    pub(in crate::server) fn new(identities: Planes) -> Self {
+        Self { identities }
     }
 }
 
@@ -118,7 +114,7 @@ impl AttachedServer {
         let identity = plane.identity(&self.http_tls).with_context(|| {
             format!("{operation} reload requires an already-encrypted attached listener")
         })?;
-        self.require_running_for_http_reload()?;
+        self.require_running_for_reload("HTTP TLS")?;
         let cancellation = context.cancellation_token();
         let deadline = async {
             if let Some(deadline) = context.deadline() {
@@ -133,23 +129,9 @@ impl AttachedServer {
             _ = deadline => return Err(security_reload_timed_out(operation).into()),
             result = prepare => result?,
         };
-        self.require_running_for_http_reload()?;
+        self.require_running_for_reload("HTTP TLS")?;
         check_security_reload_context(&context, operation)?;
         identity.replace(loaded);
-        Ok(())
-    }
-
-    fn require_running_for_http_reload(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.shutdown.is_some()
-                && !self.is_closed()
-                && self
-                    .http_tls
-                    .engine
-                    .snapshot()
-                    .is_some_and(|engine| engine.lifecycle_state() == EngineState::Running),
-            "HTTP TLS reload requires a running attached listener and engine"
-        );
         Ok(())
     }
 }

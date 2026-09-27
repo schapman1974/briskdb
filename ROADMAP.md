@@ -418,7 +418,7 @@ database under differential/property tests.
 
 - [ ] User/role catalog, password hashing, credential rotation, and least-
   privilege authorization for data/schema/admin operations.
-- [ ] TLS configuration and reload for every listener; safe non-loopback startup
+- [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and
   Unix key-permission checks. Certificate/key/password reads now validate the
@@ -465,7 +465,11 @@ database under differential/property tests.
   PostgreSQL/Mongo. Python sync/async hosts expose independent HTTP/admin TLS pairs
   and guarded reload, including typed queued cancellation and verified HTTPS
   SQLite-remote access. Authorization and immediate session revocation remain
-  separate work.
+  separate work. All attached reloads now share a weak engine-lifecycle guard,
+  checked before preparation and publication; closing an engine rejects a
+  PostgreSQL candidate as well as Mongo/HTTP candidates. Retained closed handles
+  neither own database pools nor target a reopened database. These additions are
+  on main/unreleased; the reserved MySQL feature has no implemented listener.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

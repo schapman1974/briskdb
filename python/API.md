@@ -553,6 +553,8 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
   above apply. HTTP remains loopback-only; no plaintext upgrade, authentication,
   cross-plane atomic rotation or revocation is implied.
 - Database close first drains every attached server, then stops the engine.
+  All attached reloads check both listener and borrowed-engine lifecycle before
+  preparation and immediately before publication; neither can be closing/closed.
 
 Data HTTP, administration HTTP, and unauthenticated PostgreSQL accept only
 numeric loopback addresses. The data address serves `/v1` discovery, query, and
