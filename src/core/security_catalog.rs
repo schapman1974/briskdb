@@ -1,9 +1,10 @@
-//! Trusted, in-memory user/role catalog and principal-admission foundation.
+//! Shared user/role catalogs and principal-admission foundations.
 //!
-//! This is not the engine's active security catalog. It does not persist data,
-//! enable listener authentication, or wrap engine operations. Mutation methods
-//! are trusted provisioning APIs, not authorized wire commands. A future host
-//! must supply durable publication and serialize mutation with admission.
+//! [`SecurityCatalog`] is in-memory state, not the engine's active policy. It
+//! does not persist data, enable listener authentication or wrap engine operations.
+//! Mutation methods are trusted provisioning APIs, not authorized wire commands.
+//! [`DurableSecurityCatalog`] supplies revision-checked publication and refresh;
+//! a host still must integrate it with engine/session admission.
 //!
 //! SCRAM adapters must validate a fresh server-owned transcript, enforce TLS,
 //! prevent replay and bound pending exchanges. Unknown-user concealment, rate
@@ -22,7 +23,9 @@ use super::{
     authorization::{Action, MAX_POLICY_ROLES, Policy, Resource},
 };
 
+mod durable;
 mod record;
+pub use durable::DurableSecurityCatalog;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
 
 pub const MAX_SECURITY_USERS: usize = 1_024;

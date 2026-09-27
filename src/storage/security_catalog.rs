@@ -272,6 +272,14 @@ impl SecurityCatalogStore {
         Ok(next)
     }
 
+    pub(crate) const fn is_fenced(&self) -> bool {
+        self.fenced
+    }
+
+    pub(crate) const fn observed_revision(&self) -> u64 {
+        self.observed_revision
+    }
+
     fn check(&self) -> EngineResult<()> {
         if self.fenced {
             return Err(failure(

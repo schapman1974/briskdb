@@ -3,7 +3,7 @@ use crate::core::authorization::{DataDomain, MAX_POLICY_PRIVILEGES, Privilege, S
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 
-const PASSWORD: &str = "private password";
+pub(super) const PASSWORD: &str = "private password";
 
 fn copy_catalog(catalog: &SecurityCatalog) -> SecurityCatalog {
     SecurityCatalog::from_record(catalog.to_record().unwrap().as_bytes()).unwrap()
@@ -90,7 +90,7 @@ pub(super) fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
 }
 
 // Independent client both generates the proof and validates the server signature.
-fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, String, Vec<u8>) {
+pub(super) fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, String, Vec<u8>) {
     let mut client = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
     let first = std::str::from_utf8(client.message())
         .unwrap()
