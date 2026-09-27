@@ -1799,15 +1799,33 @@ bounded. This complements the BSON, comparison, matcher, projection, sorting,
 distinct and aggregation targets; it does not establish long-running fault-soak
 or a complete differential/release certification.
 
+The `mongo_wire` target additionally feeds arbitrary envelopes and raw request
+payloads through the public uncompressed codec/parser. Whole-buffer and fragmented
+decoding must agree on frames and terminal errors; incomplete/error input cannot
+be consumed or cause the decoder to reserve input capacity. Every input also
+constructs valid checksummed OP_MSG document sequences and a legacy handshake,
+checking coalesced frames plus a partial successor at EOF. A separate bitwise
+CRC32C implementation checks generated checksums and header/checksum tampering.
+Mutated/truncated checksum-free scaffolds also reach section/BSON error paths.
+Rejected encodes must leave pre-existing output bytes untouched. The same harness
+runs as 256 shrinkable ordinary test cases plus deterministic seeds, including
+oversized/negative length prefixes. It caps fuzz input at 16 KiB without changing
+the product limits, opens no sockets/storage and makes no claims about command
+execution, compressed transport or authenticated state machines. Existing socket
+and compression tests remain separate gates.
+
 ```sh
 cargo test --locked --all-features --lib document::update::properties
 cargo test --locked --all-features --lib core::routing::tests
 cargo test --locked --all-features --lib id_routing::tests
+cargo test --locked --no-default-features --features mongo --test mongo_wire_properties
 cargo check --locked --manifest-path fuzz/Cargo.toml --bins
 cargo install cargo-fuzz --version 0.13.2 --locked
 rustup toolchain install nightly --profile minimal
 cargo +nightly fuzz run document_update -- \
   -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -seed=186463
+cargo +nightly fuzz run mongo_wire -- \
+  -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -seed=186468
 ```
 
 Keep a failing artifact and reproduce it before reducing it. For an actual

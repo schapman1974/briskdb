@@ -10,7 +10,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-briskdb = { path = "..", default-features = false, features = ["documents"] }
+briskdb = { path = "..", default-features = false, features = ["mongo"] }
+bytes = "1.12"
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [[bin]]
 name = "bson_codec"
@@ -64,6 +66,13 @@ bench = false
 [[bin]]
 name = "document_update"
 path = "fuzz_targets/document_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mongo_wire"
+path = "fuzz_targets/mongo_wire.rs"
 test = false
 doc = false
 bench = false
