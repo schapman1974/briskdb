@@ -66,12 +66,18 @@ def mongo_contract(database: briskdb.Database) -> None:
     with database.serve(mongo="127.0.0.1:0") as server:
         address: Optional[str] = server.mongo_address
         print(address)
+    with database.serve(mongo="127.0.0.1:0", mongo_tls_cert=Path("server.crt"),
+                        mongo_tls_key="server.key") as encrypted:
+        print(encrypted.mongo_address)
 
 
 async def async_mongo_contract(database: briskdb.AsyncDatabase) -> None:
     async with await database.serve(mongo="127.0.0.1:0") as server:
         address: Optional[str] = server.mongo_address
         print(address)
+    async with await database.serve(mongo="127.0.0.1:0", mongo_tls_cert="server.crt",
+                                   mongo_tls_key=Path("server.key")) as encrypted:
+        print(encrypted.mongo_address)
 
 
 def sync_contract(path: str) -> None:

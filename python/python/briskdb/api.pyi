@@ -504,6 +504,8 @@ class AsyncDatabase:
         admin: Optional[str] = "127.0.0.1:0",
         postgres: Optional[str] = None,
         mongo: Optional[str] = None,
+        mongo_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        mongo_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",

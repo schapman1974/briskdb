@@ -380,6 +380,36 @@ PyMongo is still optional for importing BriskDB and for SQL-only applications.
 See the [Mongo compatibility contract](../docs/MONGO_PARITY.md) for the supported
 subset and limits; this is not a full MongoDB server.
 
+### Encrypt the Mongo listener (unreleased)
+
+Source builds support paired certificate/key paths in synchronous and async
+`serve()`. For a server certificate valid for `localhost`:
+
+```python
+import briskdb
+from pymongo import MongoClient
+
+with briskdb.open("./data", shards=2, documents=True) as db:
+    with db.serve(mongo="127.0.0.1:0", mongo_tls_cert="./server.crt",
+                  mongo_tls_key="./server.key") as server:
+        port = server.mongo_address.rsplit(":", 1)[1]
+        with MongoClient(f"mongodb://localhost:{port}/?directConnection=true",
+                         tls=True, tlsCAFile="./ca.crt") as client:
+            print(client.admin.command("ping"))
+```
+
+Trust the issuing CA and keep hostname/certificate verification enabled. Unix
+private keys must not be group-writable or accessible by others (`0600` works).
+Both paths and an explicit Mongo listener are required; defaults remain plaintext.
+Async hosts use the same keywords with `await db.serve(...)` and stock
+`AsyncMongoClient` with the same TLS options. Encrypted Mongo can coexist with
+PostgreSQL TLS/SCRAM or authenticated SQLite remote, without sharing credentials.
+TLS authenticates the server only: Mongo remains anonymous and loopback-only,
+and must not be publicly proxied. Managed `briskdb.patch()` clients are unchanged;
+Mongo reload through Python is not yet available.
+
+### Handle and process ownership
+
 Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.

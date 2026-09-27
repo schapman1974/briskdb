@@ -365,10 +365,12 @@ the server leaves the database running; closing the database drains its servers.
 Mongo remains loopback-only even alongside TLS/SCRAM PostgreSQL or authenticated
 SQLite remote. Their credentials do not secure the Mongo port.
 
-Unreleased Rust hosts can also opt into an encrypted standalone or attached Mongo listener
-with the `mongo-tls` feature. See the [TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
-It remains anonymous and loopback-only; the daemon and Python hosting APIs do
-not yet expose Mongo TLS configuration.
+Unreleased source builds also support `db.serve(mongo=..., mongo_tls_cert=...,
+mongo_tls_key=...)` in sync/async Python. Use stock PyMongo with `tls=True` and
+`tlsCAFile` for a verified connection; see the [Python TLS example](python/README.md#encrypt-the-mongo-listener-unreleased).
+Rust hosts select `mongo-tls`; see the [Rust TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
+TLS still leaves Mongo anonymous and loopback-only. The daemon and managed
+`briskdb.patch()` clients retain their existing plaintext local transport.
 
 ### Use existing PyMongo code with the BriskDB wheel
 
