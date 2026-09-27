@@ -1249,6 +1249,49 @@ closed. Debug output and diagnostics omit database, object and realm names.
 These are reusable decision primitives, not a claim that current sessions enforce
 RBAC or that Mongo authentication is ready. No on-disk format or defaults change.
 
+### Named security catalog and principal admission (unreleased)
+
+With `auth-scram`, `core::security_catalog::SecurityCatalog` provides an in-memory
+catalog of named users and flat roles. It is not installed into `Engine`, does
+not persist anything and enables no listener policy. Its mutations are **trusted
+provisioning APIs**, not wire commands: adapters must separately authorize user,
+credential, role and cross-realm grant operations before calling them. No user
+name, role name or realm implies administrator privileges.
+
+Realm/name components are exact, case-sensitive UTF-8 without normalization,
+globbing or dotted-component aliases. Realms are bounded to 63 bytes and names
+to 128 bytes. The catalog admits up to 1,024 users and 1,024 roles, with at most
+64 input role assignments per user (bounded before deduplication). All referenced
+roles must exist and their resolved union must fit the 256-privilege policy cap.
+Role replacement preflights every affected user before publication; failed
+creation, membership replacement or role updates do not partially change state.
+
+`begin_scram` snapshots one salted verifier and its identity/generation into a
+non-cloneable, single-use attempt. `complete_scram` requires a valid proof and a
+still-current catalog/user/credential generation before returning a principal
+and server signature. An independent SCRAM client validates both proof directions
+in tests. These functions are not a SASL grammar/nonce/channel-binding state
+machine. The eventual network host must validate fresh server-owned transcripts,
+enforce TLS, conceal unknown-user differences, limit pending exchanges and impose
+deadlines/rate limits before exposing this API to clients.
+
+A principal is an opaque process-local identity, not a cached policy. Each
+authorization resolves the user's current roles. Rotation invalidates all
+retained principals and pending proofs at the next admission, even for an
+identical replacement record. User deletion/recreation never reuses an identity;
+role deletion removes memberships so recreating a name cannot restore old
+grants. Monotonic identity/credential counters reject overflow. Distinct catalog
+incarnations cannot accept each other's principals or attempts even when names,
+credential records and numeric counters match.
+
+Mutation requires exclusive Rust access; a shared host must retain its lock
+through authentication completion or admission. This does not cancel already
+admitted operations, close existing cursors, bind transactions to principals, or
+make a permission check atomic with later engine work. Durable publication,
+engine/session ownership, cursor authorization and adapter enforcement remain
+under #64/#188. Debug and error output redact names, proofs and credential
+material. No manifest upgrade, default security policy or wheel behavior changes.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`

@@ -21,6 +21,8 @@ mod planner;
 mod prepared;
 mod routing;
 mod scatter;
+#[cfg(feature = "auth-scram")]
+pub mod security_catalog;
 mod session;
 mod stream;
 mod types;

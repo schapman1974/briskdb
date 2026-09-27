@@ -423,8 +423,11 @@ database under differential/property tests.
   independently of network adapters. Shared deny-by-default permission decisions
   now separate SQL/document objects, security realms and server administration,
   with exact bounded scopes, explicit actions and bounded flat role-policy unions.
-  Catalog persistence, role definitions/principal binding, authenticated sessions
-  and listener enforcement are still outstanding.
+  An opt-in in-memory user/flat-role catalog now binds proof-verified principals
+  to one catalog incarnation and credential generation, checks current roles at
+  admission, and invalidates retained identities on rotation/drop. Catalog
+  persistence, engine/session integration and listener enforcement are still
+  outstanding; these foundations do not enable network authentication or RBAC.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable
   `transport-tls` identity loader with caller-selected ALPN, PEM validation and
