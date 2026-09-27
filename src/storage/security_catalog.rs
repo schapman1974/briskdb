@@ -214,6 +214,10 @@ impl SecurityCatalogStore {
     /// Compare-and-swap a whole validated catalog. A stale revision never writes.
     /// Return the new revision only after commit. This publishes bytes, not live
     /// session authority; the host must couple that boundary to runtime admission.
+    /// Edit a loaded catalog: replacements cannot reset the user-ID allocator,
+    /// reuse identities, rewind credential generations or change verifier bytes
+    /// without a generation advance. Restore to an earlier history requires an
+    /// explicit separate store/root recovery decision, not a normal replacement.
     pub fn replace(
         &mut self,
         expected_revision: u64,
@@ -248,6 +252,7 @@ impl SecurityCatalogStore {
                 "security store revision conflict",
             ));
         }
+        current.catalog.validate_successor(catalog)?;
         let next = expected_revision + 1;
         // From this point an I/O error may have an uncertain durable outcome.
         // Fence first; only a confirmed complete commit clears the fence.

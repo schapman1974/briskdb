@@ -5,6 +5,65 @@ use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 
 const PASSWORD: &str = "private password";
 
+fn copy_catalog(catalog: &SecurityCatalog) -> SecurityCatalog {
+    SecurityCatalog::from_record(catalog.to_record().unwrap().as_bytes()).unwrap()
+}
+
+#[test]
+fn valid_successors_preserve_history_across_role_changes_rotation_and_recreation() {
+    let (catalog, user, role) = setup();
+    let mut next = copy_catalog(&catalog);
+    catalog.validate_successor(&next).unwrap();
+    next.replace_role(&role, policy(Action::InsertData))
+        .unwrap();
+    next.set_user_roles(&user, []).unwrap();
+    catalog.validate_successor(&next).unwrap();
+    next.rotate_credentials(&user, credential()).unwrap();
+    catalog.validate_successor(&next).unwrap();
+    next.create_user(name("other", "bob"), credential(), [])
+        .unwrap();
+    catalog.validate_successor(&next).unwrap();
+    next.drop_user(&user).unwrap();
+    catalog.validate_successor(&next).unwrap();
+    next.create_user(user, credential(), [role]).unwrap();
+    catalog.validate_successor(&next).unwrap();
+}
+
+#[test]
+fn successor_rejects_reset_counters_reused_ids_and_identity_renames() {
+    let (mut catalog, user, _) = setup();
+    let prior = copy_catalog(&catalog);
+    assert!(catalog.validate_successor(&SecurityCatalog::new()).is_err());
+    let mut renamed = copy_catalog(&catalog);
+    let entry = renamed.users.remove(&user).unwrap();
+    renamed.users.insert(name("other", "alice"), entry);
+    assert!(catalog.validate_successor(&renamed).is_err());
+    catalog.drop_user(&user).unwrap();
+    assert!(catalog.validate_successor(&prior).is_err());
+    let mut valid = copy_catalog(&catalog);
+    valid.create_user(user.clone(), credential(), []).unwrap();
+    catalog.validate_successor(&valid).unwrap();
+    valid.users.get_mut(&user).unwrap().id = 1;
+    assert!(catalog.validate_successor(&valid).is_err());
+}
+
+#[test]
+fn successor_rejects_credential_rewind_or_changed_verifier_without_a_new_generation() {
+    let (mut catalog, user, _) = setup();
+    let old = copy_catalog(&catalog);
+    let mut changed = copy_catalog(&catalog);
+    changed.users.get_mut(&user).unwrap().verifier = credential();
+    assert!(catalog.validate_successor(&changed).is_err());
+    changed.users.get_mut(&user).unwrap().credential_generation += 1;
+    catalog.validate_successor(&changed).unwrap();
+    catalog.rotate_credentials(&user, credential()).unwrap();
+    assert!(catalog.validate_successor(&old).is_err());
+    let mut same_record = copy_catalog(&catalog);
+    let identical = same_record.users[&user].verifier.clone();
+    same_record.rotate_credentials(&user, identical).unwrap();
+    catalog.validate_successor(&same_record).unwrap();
+}
+
 pub(super) fn name(realm: &str, name: &str) -> SecurityName {
     SecurityName::new(realm, name).unwrap()
 }

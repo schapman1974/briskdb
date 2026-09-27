@@ -1342,6 +1342,15 @@ Reads use one SQLite snapshot. Whole-catalog replacements use an immediate
 transaction and compare-and-swap revision; stale writers cannot overwrite newer
 changes. The revision is bounded to signed 64-bit storage, and an open handle
 rejects revisions below any revision it has observed, including conflict reads.
+Within a store, replacements also preserve catalog identity history: the user-ID
+allocator cannot move backward, new/recreated users cannot reuse earlier IDs,
+and surviving users cannot rewind credential generations. Changing any verifier
+bytes requires a generation advance; comparison of same-generation records is
+constant-time. Edit a loaded catalog rather than rebuilding it from scratch.
+Deleting all users retains the identity high-water mark. Invalid transitions are
+rejected before writes without fencing the handle or changing its durable revision.
+Restoring an earlier identity history needs an explicit separate store/root
+recovery decision; it is not a normal catalog update.
 This does not detect malicious rollback across a fresh process/reopen or replace
 an external freshness/recovery policy. Two-second busy admission and SQLite's
 row-length limit bound lock waiting and pre-parser blob allocation.
