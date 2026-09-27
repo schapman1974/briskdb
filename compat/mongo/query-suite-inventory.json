@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-three locked suites is classified; 1119 reference parameter cases are not 1119 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection/live-file-replacement gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-three locked suites is classified; 1119 reference parameter cases are not 1119 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4329,13 +4329,15 @@
           "source": [
             "test_warmed_reader_rejects_shard_file_replaced_by_another_shard"
           ],
-          "kind": "contract_difference",
+          "kind": "native_equivalent",
           "evidence": [
+            "python/tests/test_mongo_storage_file_identity.py::test_warmed_point_reads_reject_missing_or_replaced_shards_without_stale_results",
+            "src/storage/pool.rs::warmed_leases_reject_changed_file_identity_and_release_capacity",
             "src/storage/mod.rs::startup_rejects_swapped_and_cross_layout_shards",
             "src/storage/mod.rs::ready_layout_never_recreates_a_missing_shard_at_startup_or_runtime",
             "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity"
           ],
-          "note": "Native startup rejects swapped/cross-layout shard files, required runtime opens never recreate missing shards, and failed fresh pool replacement retires its lease. A disposable native diagnostic nevertheless confirmed that a warmed point read can return old data after a checkpointed cross-shard file replacement, while reopen rejects the swapped identity. This is an open #186/#187 hardening gap, not a candidate pass; follow-up must reject stale leased-file identity."
+          "note": "A previously reproduced stale-inode gap is now guarded before pooled reuse. POSIX wheel cases reject missing, same-shard-copy and cross-shard replacement with redacted code 1, then refuse reads of existing/absent namespaces on the degraded root. Five native variants also cover symlink/directory substitution, retired capacity and no file recreation. The check occurs at lease checkout, not continuously during an in-flight operation; operators must still stop clients before replacing files."
         },
         {
           "source": [
@@ -4440,7 +4442,7 @@
             "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity",
             "src/storage/pool.rs::explicit_broken_and_panicking_connections_are_discarded"
           ],
-          "note": "Native failed fresh opens and explicitly broken leases retire safely and recover bounded capacity. Injected inode sequences, exact two-attempt policy and TinyMongo idle-list mutation are private mechanisms, not certified detection of hot inode replacement on every native read."
+          "note": "Native failed fresh opens and explicitly broken leases retire safely and recover bounded capacity; reused leases now also validate their file identity. Injected inode sequences, exact two-attempt policy and TinyMongo idle-list mutation remain private mechanisms, not continuous detection during an already-running operation."
         },
         {
           "source": [

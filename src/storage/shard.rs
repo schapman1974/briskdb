@@ -2842,6 +2842,42 @@ fn validate_existing_file(path: &Path) -> EngineResult<()> {
     Ok(())
 }
 
+/// Prove that a pooled handle still names its original physical file.
+/// A VFS without the identity probe must use a fresh validated open instead.
+pub(super) fn pooled_file_is_current(connection: &Connection, path: &Path) -> EngineResult<bool> {
+    validate_existing_file(path)?;
+    canonical_open_path(path)?;
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: this live connection is exclusively checked out by its pool.
+    // SQLite borrows the NUL-terminated database name and writes only the
+    // supplied integer during this call; neither pointer escapes.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            MAIN_DB.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            std::ptr::from_mut(&mut moved).cast(),
+        )
+    };
+    interpret_file_identity_probe(result, moved)
+}
+
+fn interpret_file_identity_probe(result: i32, moved: i32) -> EngineResult<bool> {
+    match result {
+        rusqlite::ffi::SQLITE_OK if moved == 0 => Ok(true),
+        rusqlite::ffi::SQLITE_OK => Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "pooled shard file was moved, removed, or replaced",
+        )),
+        rusqlite::ffi::SQLITE_NOTFOUND => Ok(false),
+        code => Err(sqlite_error::storage(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+        .context("failed to validate pooled shard file identity")),
+    }
+}
+
 fn create_shards_directory(shards_dir: &Path, shard_count: u16) -> EngineResult<()> {
     match fs::create_dir(shards_dir) {
         Ok(()) => Ok(()),
@@ -3730,6 +3766,35 @@ mod tests {
     use crate::core::{
         IDENTIFIER_ENCODING_VERSION, LogicalDatabaseMetadata, ShardKeyMetadata, TableMetadata,
     };
+
+    #[test]
+    fn pooled_file_probe_requires_positive_identity_and_preserves_errors() {
+        use rusqlite::ffi;
+
+        assert!(interpret_file_identity_probe(ffi::SQLITE_OK, 0).unwrap());
+        for moved in [-1, 1, 2] {
+            assert_eq!(
+                interpret_file_identity_probe(ffi::SQLITE_OK, moved)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::DataCorruption
+            );
+        }
+        assert!(!interpret_file_identity_probe(ffi::SQLITE_NOTFOUND, 0).unwrap());
+        assert!(!interpret_file_identity_probe(ffi::SQLITE_NOTFOUND, 1).unwrap());
+        assert_eq!(
+            interpret_file_identity_probe(ffi::SQLITE_IOERR, 0)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::StorageUnavailable
+        );
+        assert_eq!(
+            interpret_file_identity_probe(ffi::SQLITE_CORRUPT, 0)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
 
     const LAYOUT_ID: [u8; 16] = *b"brisk-layout-001";
     const SHARD_CRASH_SQL: &str = "\
