@@ -999,7 +999,7 @@ requires an earlier dependency:
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
       frozen corpus and index inventory, forty-four query/public-client suites now
       have complete source accounting (603 functions/1,148 reference cases), backed
-      by 291 added wheel scenarios and existing patch regressions, including
+      by 294 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1082,6 +1082,10 @@ requires an earlier dependency:
       cursor getMore before driver topology work, not only close/custom bulk
       helpers. Real-fork checks preserve the parent's data and live cursor;
       children must use spawn and create their own client.
+      Startup and patch entry/exit also reject before inherited locks and async
+      startup executors, including an empty registry after all clients close.
+      Real-fork probes with locks held by another parent thread reproduce the
+      former deadlock and verify prompt refusal plus intact parent state.
       Sharded point-read accounting also verifies four concurrent readers,
       detached nested copies, peer/closed-client lifetime and external WAL
       truncation with a live client. Private pool/cache retry hooks differ;

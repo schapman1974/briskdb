@@ -10,7 +10,7 @@ import threading
 from typing import Any, Optional
 import warnings
 
-from ._mongo_runtime import _drained, acquire
+from ._mongo_runtime import _check_process, _drained, acquire
 
 _lock = threading.RLock()
 _owner: Any = None
@@ -43,6 +43,7 @@ class _Entry:
 
         class ConfiguredMongoClient(mongo.MongoClient):
             def __init__(self, *args: Any, **kwargs: Any) -> None:
+                _check_process()
                 with _lock:
                     if not entry.active:
                         raise mongo.errors.InvalidOperation("BriskDB patch scope is closed")
@@ -52,6 +53,7 @@ class _Entry:
 
         class ConfiguredAsyncMongoClient(mongo.AsyncMongoClient):
             def __init__(self, *args: Any, **kwargs: Any) -> None:
+                _check_process()
                 with _lock:
                     if not entry.active:
                         raise mongo.errors.InvalidOperation("BriskDB patch scope is closed")
@@ -113,6 +115,7 @@ class MongoPatch(ContextDecorator):
 
     def _enter(self, owner: Any, entry: _Entry) -> Any:
         global _owner
+        _check_process()
         with _lock:
             if _owner is not None and _owner != owner:
                 raise RuntimeError("briskdb.patch cannot overlap across threads or async tasks")
@@ -147,6 +150,7 @@ class MongoPatch(ContextDecorator):
 
     def _restore(self, owner: Any, expected: Optional[_Entry] = None) -> _Entry:
         global _owner
+        _check_process()
         with _lock:
             if not self._stack:
                 raise RuntimeError("briskdb.patch scope exited without being entered")
@@ -178,6 +182,7 @@ class MongoPatch(ContextDecorator):
         return False
 
     async def __aenter__(self) -> Any:
+        _check_process()  # Before an inherited event loop/executor is used.
         owner = _context_owner()
         entry = _Entry(True)
         try:

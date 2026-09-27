@@ -63,7 +63,7 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
 and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py` suites
-(1,148 reference parameter cases). 291 added wheel scenarios and existing patch
+(1,148 reference parameter cases). 294 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
@@ -137,6 +137,13 @@ unchanged parent data/cursor state; simulated owner changes also check both driv
 paths before topology work. Use multiprocessing `spawn` and open a fresh client
 inside each child. This does not make inherited engines fork-safe or prohibit
 inspection of already-decoded Python objects.
+Fresh local client construction and patch entry/exit also reject inherited Mongo
+state before startup/patch locks or async startup executors. Forked children do
+not reset or reuse these locks even after all parent clients close: an empty
+registry does not prove that inherited Python/native state is safe. Bounded
+real-fork probes hold each lock in another parent thread and verify prompt child
+refusal, no new storage and an unchanged, usable parent. Use `spawn`, including
+when the child intends to open a different database folder.
 
 Sharded point-read coverage adds four concurrent readers before/after a committed
 update, detached nested copies, typed/projection/date fidelity, and permanent
