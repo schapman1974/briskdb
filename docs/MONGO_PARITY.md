@@ -809,13 +809,20 @@ transport, **not authentication or permission to expose it publicly**.
 Rust process hosts can call
 `server::run_with_mongo_tls(config, engine_options, address, tls_config).await`
 with `server,mongo-tls`. Existing `Config` literals and legacy entry points are
-unchanged. There is no daemon hot-reload/SIGHUP handler yet; prepare complete
-replacement files and restart, or use the explicit standalone/attached host
-reload APIs above. This does not change PostgreSQL credentials, HTTP security,
-Mongo authentication/roles, or managed-patch behavior.
+unchanged. Unix daemons can explicitly opt into `--reload-on-sighup`
+(`BRISKDB_RELOAD_ON_SIGHUP=true`), then replace the startup files and send SIGHUP
+without rebinding. All configured Mongo/PostgreSQL identities validate before
+any replacement; invalid preparation preserves both. Admitted sockets keep their
+old identity. Only one preparation worker runs; a 15-second publication deadline
+and shutdown/lifecycle guards prevent late publication. This is neither an atomic
+multi-file deployment nor a cross-connector publication transaction. See the
+[daemon reload contract](POSTGRES_LISTENER.md#daemon-security-reload-unreleased),
+including fixed outcome logs, signal coalescing and timed-out worker handling.
+TLS remains anonymous/loopback-only and managed-patch behavior is unchanged.
 
 The real-process gate covers verified sync/async PyMongo, zlib, CRUD, indexes,
-cursors, rejection/recovery, SIGTERM and persisted collections on restart:
+cursors, rejection/recovery, SIGTERM, persisted collections on restart and
+SIGHUP rotation with live sessions and invalid Mongo/PostgreSQL replacements:
 
 ```sh
 BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \

@@ -94,6 +94,11 @@ struct Args {
     #[arg(long, env = "BRISKDB_MONGO_TLS_KEY", value_name = "PATH")]
     mongo_tls_key: Option<PathBuf>,
 
+    /// On Unix, reread configured TLS/SCRAM files on SIGHUP; never revokes existing sessions.
+    #[arg(long, env = "BRISKDB_RELOAD_ON_SIGHUP", default_value_t = false,
+        action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    reload_on_sighup: bool,
+
     /// PEM certificate chain for TLS on the PostgreSQL listener.
     #[arg(long, env = "BRISKDB_POSTGRES_TLS_CERT", value_name = "PATH")]
     postgres_tls_cert: Option<PathBuf>,
@@ -273,6 +278,20 @@ impl Args {
             }
         };
         let result_limits = ResultLimits::new(self.max_result_rows, self.max_result_bytes)?;
+        if self.reload_on_sighup {
+            if !cfg!(unix) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "SIGHUP security reload requires a Unix target",
+                ));
+            }
+            if postgres_security.is_none() && self.mongo_tls_cert.is_none() {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "SIGHUP security reload requires at least one already-secure listener",
+                ));
+            }
+        }
         let prepared_statement_limits = PreparedStatementLimits::new(
             self.max_prepared_statements_per_session,
             self.max_portals_per_session,
@@ -311,24 +330,27 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Validate pairs/feature support before moving fields or starting any I/O.
     args.validate_mongo_tls()?;
-    #[cfg(feature = "mongo")]
-    let mongo_listen = args.mongo_listen.into_option();
-    #[cfg(feature = "mongo-tls")]
-    let mongo_tls = args
-        .mongo_tls_cert
-        .as_ref()
-        .zip(args.mongo_tls_key.as_ref())
-        .map(|(certificate, key)| briskdb::protocol::mongo::MongoTlsConfig::new(certificate, key));
-    let (config, options) = args.into_server_parts()?;
-    #[cfg(feature = "mongo")]
-    if let Some(address) = mongo_listen {
-        #[cfg(feature = "mongo-tls")]
-        if let Some(tls) = mongo_tls {
-            return server::run_with_mongo_tls(config, options, address, tls).await;
-        }
-        return server::run_with_mongo(config, options, address).await;
+    let mut daemon = server::DaemonOptions::new();
+    if args.reload_on_sighup {
+        daemon = daemon.with_sighup_reload();
     }
-    server::run_with_engine_options(config, options).await
+    #[cfg(feature = "mongo")]
+    if let Some(address) = args.mongo_listen.into_option() {
+        daemon = daemon.with_mongo(address);
+        #[cfg(feature = "mongo-tls")]
+        if let Some((certificate, key)) = args
+            .mongo_tls_cert
+            .as_ref()
+            .zip(args.mongo_tls_key.as_ref())
+        {
+            daemon = daemon.with_mongo_tls(
+                address,
+                briskdb::protocol::mongo::MongoTlsConfig::new(certificate, key),
+            );
+        }
+    }
+    let (config, options) = args.into_server_parts()?;
+    server::run_with_options(config, options, daemon).await
 }
 
 #[cfg(test)]
@@ -352,6 +374,7 @@ mod tests {
         assert_eq!(args.mongo_listen, ListenerSetting::Disabled);
         assert_eq!(args.mongo_tls_cert, None);
         assert_eq!(args.mongo_tls_key, None);
+        assert!(!args.reload_on_sighup);
         assert_eq!(args.postgres_tls_cert, None);
         assert_eq!(args.postgres_tls_key, None);
         assert_eq!(args.postgres_user, "briskdb");
@@ -494,6 +517,60 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("`mongo-tls` Cargo feature")
+        );
+    }
+
+    #[test]
+    fn sighup_reload_is_explicit_and_requires_a_secure_identity() {
+        let args = Args::try_parse_from(["briskdb", "--reload-on-sighup"]).unwrap();
+        assert!(args.reload_on_sighup);
+        assert!(args.into_server_parts().is_err());
+        let args = Args::try_parse_from(["briskdb", "--reload-on-sighup=false"]).unwrap();
+        assert!(!args.reload_on_sighup);
+        assert!(args.into_server_parts().is_ok());
+        let args = Args::try_parse_from([
+            "briskdb",
+            "--reload-on-sighup",
+            "--postgres-listen",
+            "127.0.0.1:0",
+            "--postgres-tls-cert",
+            "missing.crt",
+            "--postgres-tls-key",
+            "missing.key",
+            "--postgres-password-file",
+            "missing.password",
+        ])
+        .unwrap();
+        assert_eq!(args.into_server_parts().is_ok(), cfg!(unix));
+    }
+
+    #[test]
+    fn sighup_reload_environment_and_explicit_disable_are_isolated_in_children() {
+        const MARKER: &str = "BRISKDB_RELOAD_ENV_TEST_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            assert!(Args::try_parse_from(["briskdb"]).unwrap().reload_on_sighup);
+            assert!(
+                !Args::try_parse_from(["briskdb", "--reload-on-sighup=false"])
+                    .unwrap()
+                    .reload_on_sighup
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::sighup_reload_environment_and_explicit_disable_are_isolated_in_children",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("BRISKDB_RELOAD_ON_SIGHUP", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

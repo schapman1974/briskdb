@@ -1,5 +1,9 @@
 //! Server process assembly and listener lifecycle.
 
+#[cfg(feature = "server")]
+mod daemon;
+#[cfg(feature = "server")]
+pub use daemon::DaemonOptions;
 #[cfg(feature = "mongo")]
 mod mongo;
 #[cfg(feature = "mongo-tls")]
@@ -235,7 +239,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`EngineOptions::default`].
 #[cfg(feature = "server")]
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
-    run_configured(config, options, DaemonMongoOptions::default()).await
+    run_with_options(config, options, DaemonOptions::default()).await
 }
 
 /// Opt into loopback Mongo alongside the normal process-owned listeners.
@@ -246,16 +250,7 @@ pub async fn run_with_mongo(
     options: EngineOptions,
     address: SocketAddr,
 ) -> anyhow::Result<()> {
-    run_configured(
-        config,
-        options,
-        DaemonMongoOptions {
-            address: Some(address),
-            #[cfg(feature = "mongo-tls")]
-            tls: None,
-        },
-    )
-    .await
+    run_with_options(config, options, DaemonOptions::new().with_mongo(address)).await
 }
 
 /// Opt into encrypted, still-anonymous loopback Mongo in the process-owned host.
@@ -268,30 +263,21 @@ pub async fn run_with_mongo_tls(
     address: SocketAddr,
     tls: crate::protocol::mongo::MongoTlsConfig,
 ) -> anyhow::Result<()> {
-    run_configured(
+    run_with_options(
         config,
         options,
-        DaemonMongoOptions {
-            address: Some(address),
-            tls: Some(tls),
-        },
+        DaemonOptions::new().with_mongo_tls(address, tls),
     )
     .await
 }
 
+/// Run the process-owned server with explicit optional Mongo and Unix SIGHUP
+/// security reload behavior. Existing entry points retain their defaults.
 #[cfg(feature = "server")]
-#[derive(Default)]
-struct DaemonMongoOptions {
-    address: Option<SocketAddr>,
-    #[cfg(feature = "mongo-tls")]
-    tls: Option<crate::protocol::mongo::MongoTlsConfig>,
-}
-
-#[cfg(feature = "server")]
-async fn run_configured(
+pub async fn run_with_options(
     config: Config,
     options: EngineOptions,
-    mongo: DaemonMongoOptions,
+    mongo: DaemonOptions,
 ) -> anyhow::Result<()> {
     let mongo_listen = mongo.address;
     let listener_config = ListenerConfig {
@@ -301,10 +287,16 @@ async fn run_configured(
     };
     validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
     validate_optional_mongo(&listener_config, mongo_listen)?;
+    mongo.validate_reload(config.postgres_security.is_some())?;
     #[cfg(feature = "mongo-tls")]
     if mongo.tls.is_some() && mongo_listen.is_none() {
         anyhow::bail!("Mongo TLS configuration requires an enabled Mongo listener");
     }
+    let reload_sources = daemon::Sources {
+        postgres: config.postgres_security.clone(),
+        #[cfg(feature = "mongo-tls")]
+        mongo: mongo.tls.clone(),
+    };
     let postgres_security = match config.postgres_security.clone() {
         Some(config) => Some(postgres::ReloadableSecurity::new(
             tokio::task::spawn_blocking(move || config.load())
@@ -328,6 +320,11 @@ async fn run_configured(
     let mongo_secure = mongo_tls.is_some();
     #[cfg(not(feature = "mongo-tls"))]
     let mongo_secure = false;
+    let reload_targets = daemon::Targets {
+        postgres: postgres_security.clone(),
+        #[cfg(feature = "mongo-tls")]
+        mongo: mongo_tls.clone(),
+    };
     let builder = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options);
@@ -382,6 +379,20 @@ async fn run_configured(
         }
     };
     let engine = database.engine().clone();
+    let reloader = match daemon::Reloader::prepare(
+        mongo.reload_on_sighup,
+        reload_sources,
+        reload_targets,
+    ) {
+        Ok(reloader) => reloader,
+        Err(error) => {
+            database.begin_close();
+            if let Err(shutdown_error) = database.close().await {
+                warn!(error = %shutdown_error, "failed to clean up after reload signal startup error");
+            }
+            return Err(error);
+        }
+    };
     let _global_index_worker = database
         .start_global_index_worker(GlobalIndexAsyncOptions::default())
         .context("failed to start asynchronous global-index maintenance")?;
@@ -397,6 +408,7 @@ async fn run_configured(
         postgres_listen = ?config.postgres_listen,
         mongo_listen = ?mongo_listen,
         mongo_secure,
+        security_reload_on_sighup = mongo.reload_on_sighup,
         postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),
@@ -428,7 +440,19 @@ async fn run_configured(
         "BriskDB is ready"
     );
 
-    let result = serve_listeners_with_shutdown(listeners, engine, signal, postgres_security).await;
+    let shutdown = crate::CancellationToken::new();
+    let signal = async {
+        signal.await;
+        shutdown.cancel();
+    };
+    let serving =
+        serve_listeners_with_shutdown(listeners, engine.clone(), signal, postgres_security);
+    tokio::pin!(serving);
+    let result = tokio::select! {
+        biased;
+        result = &mut serving => result,
+        () = reloader.run(&engine, &shutdown) => serving.await,
+    };
     drop(database);
     result
 }

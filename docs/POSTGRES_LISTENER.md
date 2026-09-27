@@ -76,11 +76,46 @@ admitted before publication retain that snapshot; new connections use the new
 one. **Reload is not immediate session revocation.** Stop/drain the listener if
 existing sessions must be removed. Safely publish complete secret files first;
 the loader does not snapshot several files atomically. No filesystem watcher,
-SIGHUP handler, CLI reload method, role catalog, or Mongo/HTTP security is
-added. Python's sync/async wrappers now expose the same explicit reload with
+role catalog or HTTP security is added. Python's sync/async wrappers expose the same explicit reload with
 request controls; see the [Python example](../python/README.md#reload-postgresql-security).
-Issue #65 remains open for the other listener and
-host surfaces.
+Issue #65 remains open for the other listener surfaces.
+
+## Daemon security reload (unreleased)
+
+On Unix, add `--reload-on-sighup` to a daemon configured with PostgreSQL TLS/SCRAM
+and/or Mongo TLS. `BRISKDB_RELOAD_ON_SIGHUP=true` is equivalent;
+`--reload-on-sighup=false` explicitly overrides the environment. The default is
+off. Startup rejects opt-in on non-Unix or without an already-secure listener,
+before creating database files. The process-wide SIGHUP handler is installed
+before readiness is logged; legacy entry points do not install it implicitly.
+
+Prepare complete replacement files, then send SIGHUP to that daemon's PID through
+your service manager or another normal process-control mechanism. It rereads
+the **startup paths** for each configured certificate/key and PostgreSQL password.
+It does not reread environment variables, change usernames or addresses, enable
+new listeners, or apply arbitrary configuration changes. A signal is a request,
+not an acknowledgment: wait for `listener security reloaded` in the daemon log.
+
+Every configured identity is validated on one blocking worker before either
+connector publishes a replacement. Invalid preparation leaves all active
+identities unchanged. Each connector publishes a complete identity atomically;
+publication is not a cross-connector transaction or atomic multi-file deployment.
+Admitted sockets retain their old identity, including PostgreSQL password proofs
+and Mongo pending handshakes. This is **not session revocation**, Mongo user
+authentication or permission to expose anonymous listeners remotely.
+
+Reload has a 15-second publication deadline and checks engine/shutdown state
+immediately before publication. Failure logs `listener security reload rejected`
+with a fixed reason code, without secret values. A timed-out blocking file read
+may still finish, but cannot publish; no next reload worker starts until it
+finishes. Only one worker runs, and repeated Unix signals may coalesce rather
+than forming a request queue. Shutdown stops waiting without granting a late
+worker publication authority. No filesystem watcher is installed.
+
+Rust process hosts can use `server::run_with_options(config, engine_options,
+DaemonOptions::new().with_sighup_reload()).await`; use `with_mongo(...)` or
+`with_mongo_tls(...)` on those options for the optional Mongo listener. Existing
+`Config` literals, `run*` entry points, and their no-reload defaults remain valid.
 
 ## Startup and failure order
 

@@ -259,3 +259,79 @@ fn real_pymongo_uses_daemon_tls_and_reopens_persisted_collections() {
         terminate(&mut child);
     }
 }
+
+fn wait_message(child: &mut Process, log: &Path, message: &str, count: usize) {
+    let until = Instant::now() + DEADLINE;
+    loop {
+        let text = fs::read_to_string(log).unwrap();
+        if text.matches(message).count() >= count {
+            return;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "daemon exited: {text}"
+        );
+        assert!(Instant::now() < until, "missing reload result: {text}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reload(child: &Process) {
+    assert_eq!(
+        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGHUP) },
+        0
+    );
+}
+
+#[test]
+fn daemon_sighup_rotates_mongo_preserves_failed_reloads_and_drains_signal_bursts() {
+    let root = tempfile::tempdir().unwrap();
+    let secrets = tempfile::tempdir().unwrap();
+    let (certificate, key) = identity(secrets.path(), false);
+    let old_trust = root.path().join("original-ca.crt");
+    fs::copy(&certificate, &old_trust).unwrap();
+    let data = root.path().join("data");
+    let log = root.path().join("daemon.log");
+    let mut child = Process(
+        tls_command(&data, &log, "127.0.0.1:0", &certificate, &key)
+            .arg("--reload-on-sighup")
+            .spawn()
+            .unwrap(),
+    );
+    let text = ready(&mut child, &log);
+    assert!(text.contains("security_reload_on_sighup=true"));
+    let bound = address(&text);
+    let mut original = connect(bound, Some(&old_trust), "localhost").unwrap();
+    enabled::check_data_with(
+        |command| enabled::exchange_stream(&mut original, command),
+        true,
+    );
+    identity(secrets.path(), true);
+    reload(&child);
+    wait_message(&mut child, &log, "listener security reloaded", 1);
+    assert!(connect(bound, Some(&old_trust), "localhost").is_err());
+    let mut current = connect(bound, Some(&certificate), "localhost").unwrap();
+    enabled::check_data_with(
+        |command| enabled::exchange_stream(&mut current, command),
+        false,
+    );
+    enabled::check_data_with(
+        |command| enabled::exchange_stream(&mut original, command),
+        false,
+    );
+    fs::write(&key, include_bytes!("../fixtures/postgres-tls/server.key")).unwrap();
+    reload(&child);
+    wait_message(&mut child, &log, "listener security reload rejected", 1);
+    assert!(connect(bound, Some(&certificate), "localhost").is_ok());
+    identity(secrets.path(), false);
+    reload(&child);
+    wait_message(&mut child, &log, "listener security reloaded", 2);
+    assert!(connect(bound, Some(&old_trust), "localhost").is_ok());
+    for _ in 0..100 {
+        reload(&child);
+    }
+    terminate(&mut child);
+    assert!(TcpStream::connect(bound).is_err());
+    let text = fs::read_to_string(log).unwrap();
+    assert!(!text.contains("BEGIN PRIVATE KEY"));
+}

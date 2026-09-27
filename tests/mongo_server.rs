@@ -15,6 +15,9 @@ const DEADLINE: Duration = Duration::from_secs(15);
 #[path = "mongo_server/tls.rs"]
 mod tls;
 
+#[path = "mongo_server/reload.rs"]
+mod reload;
+
 struct Process(Child);
 
 impl Process {
@@ -47,6 +50,16 @@ fn command(data: &Path, log: &Path, mongo: Option<&str>) -> Command {
 }
 
 fn command_with_http(data: &Path, log: &Path, mongo: Option<&str>, http: &str) -> Command {
+    command_with_postgres(data, log, mongo, http, "disabled")
+}
+
+fn command_with_postgres(
+    data: &Path,
+    log: &Path,
+    mongo: Option<&str>,
+    http: &str,
+    postgres: &str,
+) -> Command {
     let output = File::create(log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_briskdb"));
     // Never let developer/service environment settings change these tests.
@@ -62,7 +75,7 @@ fn command_with_http(data: &Path, log: &Path, mongo: Option<&str>, http: &str) -
             "--admin-listen",
             "disabled",
             "--postgres-listen",
-            "disabled",
+            postgres,
             "--shards",
             "2",
             "--data-dir",
@@ -160,6 +173,26 @@ fn daemon_rejects_incomplete_or_disabled_tls_before_creating_files() {
                 .contains("BriskDB is ready")
         );
     }
+}
+
+#[test]
+fn daemon_sighup_reload_without_security_fails_before_creating_files() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let log = root.path().join("daemon.log");
+    let mut child = Process(
+        command(&data, &log, None)
+            .arg("--reload-on-sighup")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!child.wait().success());
+    assert!(!data.exists());
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("already-secure listener")
+    );
 }
 
 #[cfg(not(feature = "mongo-tls"))]
