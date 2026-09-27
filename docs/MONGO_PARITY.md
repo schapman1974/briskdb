@@ -1991,6 +1991,58 @@ These are measurements of this small fixture, not a general speedup guarantee;
 write latency and the remaining engine/storage overhead are not fixed by this
 read-path change.
 
+### Current hardening baseline (2026-09-27)
+
+The [current raw baseline](benchmarks/mongo-public-clients-hardening-2026-09-27.json)
+uses a freshly release-built development wheel from main
+`02772e01e88117cacb8d5df4eecf133096066ec3`, after the storage-integrity and
+Mongo test-hardening changes. Its package version remains `0.1.0a7`; it is **not**
+the published alpha.7 artifact or a new release. The wheel SHA-256 is
+`32554ed229f9dc010a8afb2642dbcbd4782c7ce2a4ba01a1ebad614c9df77d12`;
+the report separately identifies its loaded native library and Python sources.
+Artifact validation and all 545 installed-wheel tests passed before timing.
+
+This run retains 1,000 seed documents, 64 operations, three rotating trials,
+four BriskDB/TinyMongo shards and four writer threads. The host is macOS ARM64
+(Darwin 25.6.0, 10 logical CPUs); all clients use Python 3.13.5 and PyMongo
+4.17.0. The locked TinyMongo source remains unchanged. MongoDB 7.0.43 runs in
+Docker Desktop on fresh VM-backed anonymous volumes, limited to two CPUs and
+2 GiB RAM with a 0.25 GiB WiredTiger cache. Its immutable image digest is in the
+report. Only literal-loopback access is exposed. This differs from the older
+MongoDB resource configuration, so the older reports are not its regression
+baseline or evidence of a controlled before/after speedup.
+
+| Median command latency in this current small workload | BriskDB wire | TinyMongo in-process | MongoDB Docker wire |
+| --- | ---: | ---: | ---: |
+| Exact-ID read | 4.777 ms | 0.064 ms | 0.871 ms |
+| Exact-ID update | 9.947 ms | 0.617 ms | 0.946 ms |
+| Indexed equality query (materialized) | 39.939 ms | 4.660 ms | 1.968 ms |
+| Sorted scatter window (materialized) | 35.278 ms | 14.261 ms | 1.408 ms |
+
+All nine baseline trials produce the same 1,256 final documents with SHA-256
+`ecdbda7a756269f0d4c41d60ead14c70390a9b41745d06b4b658ca6eaf2da1d5`.
+The complete twelve-workload report, not just these command examples, retains
+raw timings and units. BriskDB still has substantial end-to-end overhead in
+this fixture; semantic agreement is not performance parity. This is finite
+local evidence, not sustained-load, cross-platform or release acceptance.
+
+The [matched repeat](benchmarks/mongo-public-clients-hardening-repeat-2026-09-27.json)
+uses the same wheel, workload, interpreters, host and MongoDB environment. All
+18 trials across both runs agree on final records; all 36 median regression
+checks pass the unchanged 1.5x bound. The highest ratio is 1.083x rounded up
+(MongoDB point reads); BriskDB's highest is 1.025x rounded up (cursor iteration).
+This validates repeatability of this pair, not a code-change speedup. Reproduce
+the repeat with the same command/configuration plus:
+
+```sh
+--baseline docs/benchmarks/mongo-public-clients-hardening-2026-09-27.json \
+--maximum-regression-ratio 1.5 --output mongo-benchmark-new-repeat.json
+```
+
+Benchmark namespaces were confirmed absent afterwards, and the owned scratch
+MongoDB container and its anonymous volumes were removed. No application data,
+published wheel, release tag, or deployment was changed.
+
 ## Versioned files
 
 [`compat/mongo/v1/manifest.json`](../compat/mongo/v1/manifest.json) is the
