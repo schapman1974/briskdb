@@ -31,6 +31,7 @@ mod tests;
 pub(super) struct Authentication {
     engine: Engine,
     seed: Zeroizing<[u8; 32]>,
+    audit_key: Zeroizing<[u8; 32]>,
     admission: Mutex<(Instant, f64)>,
 }
 
@@ -40,11 +41,30 @@ impl Authentication {
         SystemRandom::new()
             .fill(&mut seed[..])
             .map_err(|_| io::Error::other("Mongo authentication entropy unavailable"))?;
+        let mut audit_key = Zeroizing::new([0; 32]);
+        SystemRandom::new()
+            .fill(&mut audit_key[..])
+            .map_err(|_| io::Error::other("Mongo audit entropy unavailable"))?;
         Ok(Self {
             engine,
             seed,
+            audit_key,
             admission: Mutex::new((Instant::now(), BURST)),
         })
+    }
+
+    /// The listener owns one engine/catalog. IDs are stable across its pooled
+    /// sockets and password changes, but not stable across listener lifetimes.
+    /// No account name, attempted username or per-user map enters telemetry.
+    pub(super) fn audit_context(&self, session: &Session) -> super::events::AuditContext {
+        match &session.principal {
+            Some(principal) => {
+                let (id, generation) = principal.audit_identity();
+                let user = blake3::keyed_hash(&self.audit_key, &id.to_le_bytes());
+                super::events::AuditContext::authenticated(user, generation)
+            }
+            None => super::events::AuditContext::unauthenticated(),
+        }
     }
 
     fn admit(&self) -> Result<(), ()> {

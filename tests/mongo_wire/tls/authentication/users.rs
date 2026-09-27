@@ -71,6 +71,32 @@ async fn real_pymongo_user_management_enforces_scopes_rotation_and_atomic_role_u
         let captured = capture.0.lock().unwrap();
         assert!(!captured.events.is_empty());
         assert!(captured.live.is_empty());
+        assert_audit_fields(&captured.events);
+        let mut operator = None;
+        for command in [
+            "createUser",
+            "updateUser",
+            "dropUser",
+            "grantRolesToUser",
+            "revokeRolesFromUser",
+        ] {
+            let event = captured
+                .events
+                .iter()
+                .find(|event| event["command"] == command && event["outcome"] == "completed")
+                .expect("successful audited user command");
+            assert_eq!(event["authentication"], "authenticated");
+            let label = &event["audit_user"];
+            assert_eq!(*operator.get_or_insert(label), label);
+        }
+        assert!(
+            captured
+                .events
+                .iter()
+                .any(|event| event["command"] == "createUser"
+                    && event["authentication"] == "unauthenticated"
+                    && event["error_code"] == "13")
+        );
         format!("{:?}{:?}", captured.spans, captured.events)
     };
     for secret in [

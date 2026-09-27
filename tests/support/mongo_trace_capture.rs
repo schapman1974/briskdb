@@ -48,7 +48,12 @@ impl Subscriber for Capture {
         state.live.insert(id, 1);
         Id::from_u64(id)
     }
-    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record(&self, id: &Id, values: &Record<'_>) {
+        let mut visitor = Visitor(Fields::new());
+        values.record(&mut visitor);
+        let index = usize::try_from(id.into_u64() - 1).unwrap();
+        self.0.lock().unwrap().spans[index].extend(visitor.0);
+    }
     fn record_follows_from(&self, _: &Id, _: &Id) {}
     fn event(&self, event: &Event<'_>) {
         let mut visitor = Visitor(Fields::new());

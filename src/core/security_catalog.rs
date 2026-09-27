@@ -88,6 +88,13 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// For listener-scoped pseudonymous audit correlation, never authorization.
+    /// The caller must namespace the ID to its one bound catalog/engine.
+    #[cfg(feature = "mongo")]
+    pub(crate) fn audit_identity(&self) -> (u64, u64) {
+        (self.user_id, self.credential_generation)
+    }
+
     #[cfg(feature = "mongo")]
     pub(crate) fn same_identity(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.catalog, &other.catalog)

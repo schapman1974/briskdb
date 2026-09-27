@@ -18,6 +18,62 @@ mod capture {
 #[path = "authentication/users.rs"]
 mod users;
 
+fn assert_audit_fields(events: &[capture::Fields]) {
+    let mut connections = std::collections::BTreeMap::new();
+    let mut identities = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+    let mut generations = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+    for event in events {
+        assert_eq!(event.len(), 14);
+        let label = &event["audit_user"];
+        let generation = event["credential_generation"].parse::<u64>().unwrap();
+        match event["authentication"].as_str() {
+            "authenticated" => {
+                assert_eq!(label.len(), 64);
+                assert!(label.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert!(generation > 0);
+                let identity = (label, generation);
+                let established = connections
+                    .entry(&event["connection_id"])
+                    .or_insert(identity);
+                assert_eq!(
+                    *established, identity,
+                    "a socket cannot change users or credential generation"
+                );
+                identities
+                    .entry(label)
+                    .or_default()
+                    .insert(&event["connection_id"]);
+                generations.entry(label).or_default().insert(generation);
+            }
+            "unauthenticated" => {
+                assert!(label.is_empty());
+                assert_eq!(generation, 0);
+                assert!(!connections.contains_key(&event["connection_id"]));
+            }
+            state => panic!("unexpected secured audit state: {state}"),
+        }
+    }
+    assert!(identities.len() >= 4);
+    assert!(
+        identities.values().any(|sockets| sockets.len() > 1),
+        "pooling must correlate one user across sockets"
+    );
+    assert!(
+        generations
+            .values()
+            .any(|values| values.contains(&1) && values.contains(&2)),
+        "rotation preserves account correlation but changes credential generation"
+    );
+    assert!(
+        events.iter().any(
+            |event| event["error_code"] == "18" && event["authentication"] == "unauthenticated"
+        )
+    );
+    assert!(events.iter().any(|event| event["command"] == "saslContinue"
+        && event["authentication"] == "authenticated"
+        && event["outcome"] == "completed"));
+}
+
 const PASSWORD: &str = "private test password";
 const REPLACEMENT: &str = "rotated test password";
 
@@ -255,9 +311,9 @@ async fn real_pymongo_scram_tls_roles_pooling_and_live_credential_rotation() {
         let traces = capture.0.lock().unwrap();
         assert!(!traces.events.is_empty());
         assert!(traces.live.is_empty());
+        assert_audit_fields(&traces.events);
         let mut sequences = std::collections::BTreeMap::new();
         for event in &traces.events {
-            assert_eq!(event.len(), 11);
             let sequence = sequences.entry(&event["connection_id"]).or_insert(0u64);
             *sequence += 1;
             assert_eq!(
