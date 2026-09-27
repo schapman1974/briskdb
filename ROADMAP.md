@@ -1262,7 +1262,13 @@ requires an earlier dependency:
       all 18 trials agree on final records and all 36 checks pass the fixed
       1.5x bound. Changed MongoDB resource limits require a new baseline rather
       than a speedup claim against the earlier run; substantial current wire
-      overhead remains visible. Wider app/soak/security gates,
+      overhead remains visible. Storage operations now inspect the record and
+      secondary schemas once each instead of repeating the secondary inspection;
+      exact validation, legacy upgrade distinction and fail-closed behavior are
+      retained without cached authority. Matched two-backend raw reports retain
+      identical records and pass all 24 regression checks; this fixture observes
+      lower scan/group/indexed-query medians, not a point-read fix or universal
+      performance guarantee. Wider app/soak/security gates,
       representative sustained-load evidence and complete release acceptance
       remain open.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts

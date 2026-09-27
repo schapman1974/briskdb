@@ -12,6 +12,8 @@ use crate::{
 use super::Storage;
 
 mod index_storage;
+#[cfg(all(test, feature = "documents"))]
+mod schema_tests;
 
 pub(super) const RECORDS_TABLE: &str = "briskdb_documents_v1";
 const RECORDS_SCHEMA_SQL: &str = "CREATE TABLE briskdb_documents_v1 (
@@ -51,7 +53,21 @@ pub(super) fn is_storage_table(name: &str) -> bool {
         || name.eq_ignore_ascii_case(index_storage::ENTRIES_TABLE)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentSchemaPresence {
+    Absent,
+    RecordsOnly,
+    Complete,
+}
+
 pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<bool> {
+    Ok(inspect_schema(connection)? != DocumentSchemaPresence::Absent)
+}
+
+/// Inspect both physical schemas once, without caching authority across calls.
+/// Records-only remains valid for the explicitly fenced legacy layout upgrade;
+/// ordinary reads/writes require Complete. Orphan/malformed indexes always fail.
+fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresence> {
     let objects = connection
         .prepare(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema
@@ -77,7 +93,7 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
                 "document index storage exists without document records",
             ));
         }
-        return Ok(false);
+        return Ok(DocumentSchemaPresence::Absent);
     }
     if objects.len() != 1
         || !is_exact_schema_object(
@@ -91,14 +107,16 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
             "shard document storage table has an incompatible schema",
         ));
     }
-    index_storage::validate_optional_schema(connection)?;
-    Ok(true)
+    Ok(if index_storage::validate_optional_schema(connection)? {
+        DocumentSchemaPresence::Complete
+    } else {
+        DocumentSchemaPresence::RecordsOnly
+    })
 }
 
 #[cfg(feature = "documents")]
 fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
-    if validate_optional_schema(connection)? && index_storage::validate_optional_schema(connection)?
-    {
+    if inspect_schema(connection)? == DocumentSchemaPresence::Complete {
         return Ok(());
     }
     let transaction = connection
@@ -110,7 +128,7 @@ fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
             .map_err(sqlite_error::storage)?;
     }
     index_storage::ensure_schema(&transaction)?;
-    if !validate_optional_schema(&transaction)? {
+    if inspect_schema(&transaction)? != DocumentSchemaPresence::Complete {
         return Err(corrupt(
             "document storage table creation did not produce its exact schema",
         ));
@@ -120,8 +138,7 @@ fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
 
 #[cfg(feature = "documents")]
 fn require_schema(connection: &Connection) -> EngineResult<()> {
-    if validate_optional_schema(connection)? && index_storage::validate_optional_schema(connection)?
-    {
+    if inspect_schema(connection)? == DocumentSchemaPresence::Complete {
         Ok(())
     } else {
         Err(corrupt(
