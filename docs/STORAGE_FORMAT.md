@@ -83,6 +83,13 @@ mode and fail closed. The standalone Rust Mongo TLS listener supports this mode
 with `mongo-tls,auth-scram` and the explicit authenticated builder. The marker is
 recognized independently of feature flags.
 
+The private catalog payload remains `BRKSEC01` unless a role uses the new
+non-system document-collection scope. Such catalogs use canonical `BRKSEC02`
+with a distinct checksum domain; older authenticated readers reject that payload
+and fail closed. Existing v1 records retain their bytes. Individual SCRAM
+verifiers, manifest v22 and the security-store SQLite schema are unchanged;
+see the [catalog encoding contract](ARCHITECTURE.md#named-security-catalog-and-principal-admission-unreleased).
+
 ```sql
 CREATE TABLE briskdb_manifest (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

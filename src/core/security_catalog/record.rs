@@ -12,7 +12,9 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// Whole-record admission limit, checked before hashing, parsing or allocation.
 pub const MAX_SECURITY_CATALOG_RECORD_BYTES: usize = 128 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"BRKSEC01";
+const MAGIC_V2: &[u8; 8] = b"BRKSEC02";
 const CHECKSUM_DOMAIN: &[u8] = b"briskdb.security-catalog.record.v1\0";
+const CHECKSUM_DOMAIN_V2: &[u8] = b"briskdb.security-catalog.record.v2\0";
 const CHECKSUM_BYTES: usize = 32;
 const MIN_RECORD_BYTES: usize = 8 + 8 + 2 + 2 + CHECKSUM_BYTES;
 
@@ -73,7 +75,9 @@ impl SecurityCatalog {
             return Err(invalid_record());
         }
         let (payload, digest) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
-        if !payload.starts_with(MAGIC) || checksum(payload).as_bytes() != digest {
+        if !(payload.starts_with(MAGIC) || payload.starts_with(MAGIC_V2))
+            || checksum(payload).as_bytes() != digest
+        {
             return Err(invalid_record());
         }
         decode(payload).map_err(|_| invalid_record())
@@ -82,7 +86,11 @@ impl SecurityCatalog {
 
 fn checksum(bytes: &[u8]) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(CHECKSUM_DOMAIN);
+    hasher.update(if bytes.starts_with(MAGIC_V2) {
+        CHECKSUM_DOMAIN_V2
+    } else {
+        CHECKSUM_DOMAIN
+    });
     hasher.update(bytes);
     hasher.finalize()
 }
@@ -128,8 +136,25 @@ impl Writer {
     }
 }
 
+fn uses_extended_scopes(catalog: &SecurityCatalog) -> bool {
+    catalog.roles.values().any(|policy| {
+        policy.privileges().any(|grant| {
+            matches!(
+                grant.scope().stored_value(),
+                ScopeValue::NonSystemDocumentCollections(_)
+            )
+        })
+    })
+}
+
 fn encode(catalog: &SecurityCatalog, writer: &mut Writer) -> EngineResult<()> {
-    writer.put(MAGIC)?;
+    // Preserve existing v1 bytes unless a policy needs the new scope. Older
+    // readers reject v2 before interpreting any grants, never widening them.
+    writer.put(if uses_extended_scopes(catalog) {
+        MAGIC_V2
+    } else {
+        MAGIC
+    })?;
     writer.long(catalog.next_user_id)?;
     writer.short(catalog.roles.len())?;
     let mut role_indices = BTreeMap::new();
@@ -204,6 +229,10 @@ fn encode_scope(scope: &Scope, writer: &mut Writer) -> EngineResult<()> {
             encode_domain(*domain, writer)
         }
         ScopeValue::AllSecurityRealms => writer.byte(4),
+        ScopeValue::NonSystemDocumentCollections(database) => {
+            writer.byte(5)?;
+            writer.text(database)
+        }
     }
 }
 
@@ -262,21 +291,22 @@ impl<'a> Reader<'a> {
             _ => Err(invalid_record()),
         }
     }
-    fn scope(&mut self) -> EngineResult<Scope> {
+    fn scope(&mut self, version: u8) -> EngineResult<Scope> {
         match self.byte()? {
             1 => Ok(Scope::exact(self.resource()?)),
             2 => Scope::database(self.domain()?, self.text(63)?),
             3 => Ok(Scope::all_databases(self.domain()?)),
             4 => Ok(Scope::all_security_realms()),
+            5 if version == 2 => Scope::non_system_document_collections(self.text(63)?),
             _ => Err(invalid_record()),
         }
     }
-    fn policy(&mut self) -> EngineResult<Policy> {
+    fn policy(&mut self, version: u8) -> EngineResult<Policy> {
         let count = self.count(MAX_POLICY_PRIVILEGES)?;
         let mut grants = BTreeSet::new();
         for _ in 0..count {
             let action = Action::from_code(self.text(64)?)?;
-            let grant = Privilege::new(action, self.scope()?)?;
+            let grant = Privilege::new(action, self.scope(version)?)?;
             if !grants.insert(grant) {
                 return Err(invalid_record());
             }
@@ -287,9 +317,11 @@ impl<'a> Reader<'a> {
 
 fn decode(payload: &[u8]) -> EngineResult<SecurityCatalog> {
     let mut reader = Reader { remaining: payload };
-    if reader.take(MAGIC.len())? != MAGIC {
-        return Err(invalid_record());
-    }
+    let version = match reader.take(MAGIC.len())? {
+        magic if magic == MAGIC => 1,
+        magic if magic == MAGIC_V2 => 2,
+        _ => return Err(invalid_record()),
+    };
     let next_user_id = reader.long()?;
     if next_user_id == 0 {
         return Err(invalid_record());
@@ -300,7 +332,7 @@ fn decode(payload: &[u8]) -> EngineResult<SecurityCatalog> {
     let mut role_names = Vec::with_capacity(role_count);
     for _ in 0..role_count {
         let name = reader.name()?;
-        let policy = reader.policy()?;
+        let policy = reader.policy(version)?;
         catalog.create_role(name.clone(), policy)?;
         role_names.push(name);
     }
@@ -338,7 +370,7 @@ fn decode(payload: &[u8]) -> EngineResult<SecurityCatalog> {
             },
         );
     }
-    if !reader.remaining.is_empty() {
+    if !reader.remaining.is_empty() || (version == 2) != uses_extended_scopes(&catalog) {
         return Err(invalid_record());
     }
     Ok(catalog)

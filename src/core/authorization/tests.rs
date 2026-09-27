@@ -4,6 +4,104 @@ fn object(domain: DataDomain, database: &str, name: &str) -> Resource {
     Resource::object(domain, database, name).unwrap()
 }
 
+#[test]
+fn non_system_document_scopes_exclude_reserved_names_and_never_grant_database_or_sql_access() {
+    for database in ["app", "local", "Local", "é.*"] {
+        let scope = Scope::non_system_document_collections(database).unwrap();
+        assert!(!format!("{scope:?}").contains(database));
+        for &action in Action::ALL {
+            assert_eq!(
+                Privilege::new(action, scope.clone()).is_ok(),
+                action.resource_kind() == ResourceKind::Object
+            );
+        }
+        let policy = Policy::new([grant(Action::ReadData, scope)]).unwrap();
+        for name in [
+            "items",
+            "system",
+            "systemx.users",
+            "a.system.users",
+            "SYSTEM.users",
+            "replset",
+        ] {
+            assert!(policy.allows(
+                Action::ReadData,
+                &object(DataDomain::Document, database, name)
+            ));
+        }
+        for name in [
+            "system.users",
+            "system.roles",
+            "system.js",
+            "system.buckets.items",
+            "system.profile",
+            "system.",
+        ] {
+            assert!(!policy.allows(
+                Action::ReadData,
+                &object(DataDomain::Document, database, name)
+            ));
+        }
+        assert_eq!(
+            policy.allows(
+                Action::ReadData,
+                &object(DataDomain::Document, database, "replset.config")
+            ),
+            database != "local"
+        );
+        for denied in [
+            Resource::database(DataDomain::Document, database).unwrap(),
+            Resource::data_domain(DataDomain::Document),
+            Resource::security_realm(database).unwrap(),
+            Resource::server(),
+            object(DataDomain::Document, "another", "items"),
+        ] {
+            assert!(!policy.allows(Action::ReadData, &denied));
+        }
+        assert!(!policy.allows(
+            Action::ReadData,
+            &object(DataDomain::Relational, "app", "items")
+        ));
+        assert!(!policy.allows(
+            Action::InsertData,
+            &object(DataDomain::Document, database, "items")
+        ));
+    }
+    for invalid in ["", "a\0b", &"x".repeat(64)] {
+        assert!(Scope::non_system_document_collections(invalid).is_err());
+    }
+}
+
+#[test]
+fn non_system_exceptions_are_explicit_and_existing_custom_database_grants_do_not_change() {
+    let scope = Scope::non_system_document_collections("app").unwrap();
+    let policy = Policy::new([
+        grant(Action::ReadData, scope),
+        grant(
+            Action::ReadData,
+            Scope::exact(object(DataDomain::Document, "app", "system.js")),
+        ),
+    ])
+    .unwrap();
+    assert!(policy.allows(
+        Action::ReadData,
+        &object(DataDomain::Document, "app", "system.js")
+    ));
+    assert!(!policy.allows(
+        Action::ReadData,
+        &object(DataDomain::Document, "app", "system.users")
+    ));
+    let old = read_policy(DataDomain::Document, "app");
+    assert!(old.allows(
+        Action::ReadData,
+        &object(DataDomain::Document, "app", "system.users")
+    ));
+    assert!(old.allows(
+        Action::ReadData,
+        &object(DataDomain::Document, "app", "system.js")
+    ));
+}
+
 fn grant(action: Action, scope: Scope) -> Privilege {
     Privilege::new(action, scope).unwrap()
 }

@@ -450,6 +450,10 @@ database under differential/property tests.
   checking all requested realms before account existence, refreshing authority
   per request and enforcing metadata row/byte budgets. Credential export,
   expanded privileges and all-realm enumeration remain unsupported.
+  A collection-only document scope now excludes `system.*` and `local.replset.*`
+  as groundwork for built-in data roles, with explicit exact-grant exceptions.
+  Catalogs needing it use canonical security-catalog record v2; existing v1 catalogs
+  remain byte-compatible and older readers reject the new scope/version.
   Payload-free Mongo tracing now distinguishes authentication/user-command
   outcomes and correlates immutable accounts across pooled sockets with
   listener-scoped keyed labels and explicit credential generations. Failed

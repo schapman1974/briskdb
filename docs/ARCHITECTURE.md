@@ -1247,7 +1247,8 @@ is no inherited role graph or superuser shortcut. Multi-resource authorization
 requires every requested privilege; empty or over-256 requirement lists fail
 closed. Debug output and diagnostics omit database, object and realm names.
 These are reusable decision primitives, not a claim that current sessions enforce
-RBAC or that Mongo authentication is ready. No on-disk format or defaults change.
+RBAC or that Mongo authentication is ready. Constructing these primitives changes
+no on-disk state or defaults.
 
 ### Named security catalog and principal admission (unreleased)
 
@@ -1292,7 +1293,7 @@ engine/session ownership and cursor authorization are supplied by the opt-in
 integration below; network adapter enforcement remains under #64/#188. Debug and error output redact names, proofs and credential
 material. No manifest upgrade, default security policy or wheel behavior changes.
 
-The catalog also exports/restores an explicit `BRKSEC01` binary record for the
+The catalog also exports/restores explicit `BRKSEC01`/`BRKSEC02` binary records for the
 future storage boundary. Export is deterministic, includes only the salted
 verifiers (not passwords), and sizes the output before a single secret-bearing
 allocation. Owned record buffers zeroize on drop; caller-owned input/copies are
@@ -1300,6 +1301,25 @@ not erased. The record's BLAKE3 checksum detects accidental corruption, **not
 forgery, rollback or wrong-root substitution**. It is not encrypted. File access,
 atomic publication, root binding, freshness and downgrade protection still need
 storage integration; exporting a record writes no files and changes no manifest.
+
+`Scope::non_system_document_collections(database)` covers only document objects
+in one exact database. It excludes every `system.*` name, and also `replset.*`
+when the database is exactly `local`. An exception such as `system.js` needs a
+separate exact privilege. The scope cannot authorize SQL, database-level actions,
+security realms or server administration. Existing exact/database/all-database
+custom grants retain their original coverage; this new scope does not silently
+change or narrow previously assigned policies. It supplies the reserved-namespace
+boundary needed for future built-in data roles, not automatic built-in roles.
+
+Records containing this scope use `BRKSEC02` and a version-2 checksum domain;
+scope tag 5 carries its bounded database name. All other catalogs retain their
+exact v1 representation and checksum. V1 may not contain the new scope, and a
+v2 record without it is rejected as noncanonical. Both versions retain the same
+credential/identity bounds. Older readers reject v2 before interpreting grants;
+older live authorities fail closed on refresh rather than caching old access.
+Removing the last new scope allows v1 encoding again without resetting account
+IDs/generations. This changes the opt-in credential payload, not manifest v22,
+the SQLite security-store schema, default anonymous roots or published wheels.
 
 Restore rejects unknown versions/actions/tags, incompatible grants, malformed
 UTF-8/names, duplicate names/grants/user IDs/memberships, missing role references,
