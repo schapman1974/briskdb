@@ -1293,6 +1293,32 @@ or RSS leak proof, throughput threshold, power-loss/disk-full drill, or replacem
 for driver cancellation, storage-corruption, security and release gates. No existing
 caps or timeouts are raised. The broader #185/#186/#187 acceptance remains open.
 
+An additional opt-in timed tier repeats those capacity/failure waves while a
+retained cursor is live. Every wave inserts and reads a temporary BSON record,
+deletes it and verifies absence, then increments and reads a durable revision.
+The working set stays at twelve durable records (thirteen during an insert).
+At most 32 waves run per engine lifetime; exact BSON content and the revision
+must survive every reopen, including a final read-only reopen after the last
+write. Shutdown still drains a retained cursor and partial frame; stale cursor
+IDs must fail in the new listener. Only one old listener observer is retained,
+and it must not keep its engine alive.
+
+```bash
+# Default: ten minutes. Explicit overrides must be 10..3600 seconds.
+cargo test --locked --no-default-features --features mongo --test mongo_wire \
+  resource_churn::extended::timed_mixed_crud_restart_soak -- --ignored --exact --nocapture
+```
+
+`BRISKDB_MONGO_SOAK_SECONDS=10` is a short harness check, not ten-minute soak
+evidence. Each run prints actual elapsed time, completed waves/engine lifetimes,
+and cursor/socket counts. The duration is an admission bound with a 60-second
+cleanup allowance; stalls fail instead of waiting indefinitely. CI exposes the
+ten-minute tier only through the `mongo_soak` workflow-dispatch input, retaining
+its log; normal PR/push runs are unchanged. The existing workflow remains paused
+during the local-only implementation batch. This finite test does not measure
+RSS/allocator leaks, simulate power loss or I/O failure, or certify production
+load, authenticated deployments, or the separate external-application gate.
+
 Read-work telemetry is separately opt-in for Rust hosts:
 
 ```rust,ignore

@@ -1295,6 +1295,11 @@ requires an earlier dependency:
       CI tier repeats 128 waves over four engine lifetimes and rejects stale
       cursors after reopen. Gauge/accounting checks are not allocator/RSS or
       long-duration/power-loss/disk-full soak certification.
+      A separate opt-in ten-minute tier now mixes insert/read/delete/increment
+      work into capacity/failure waves with a bounded record set; exact BSON
+      content and revision survive repeated engine lifetimes and a final reopen.
+      CI dispatch can retain its progress log without adding ordinary PR work.
+      Finite local runs are not allocator/RSS, power-loss or production-load proof.
       Per-shard timing/physical-I/O telemetry, exporters/engine-phase tracing, full
       governance and broader fault/soak acceptance remain open; no ceilings raised.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust

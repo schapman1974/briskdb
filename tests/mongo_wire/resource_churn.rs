@@ -4,6 +4,9 @@ use super::*;
 use briskdb::protocol::mongo::{MongoCommandKind, MongoListenerState, MongoMetricsSnapshot};
 use metrics::doc;
 
+#[path = "resource_churn/extended.rs"]
+mod extended;
+
 const COLLECTION: &str = "resource_churn";
 
 fn assert_drained(server: &MongoServer) {
@@ -96,7 +99,7 @@ fn assert_wave(before: &MongoMetricsSnapshot, after: &MongoMetricsSnapshot) {
     );
 }
 
-async fn wave(server: &MongoServer, exhaust: bool) {
+async fn wave(server: &MongoServer, exhaust: bool, revision: Option<i64>) {
     assert_drained(server);
     let before = server.metrics();
     let mut peers = Vec::new();
@@ -178,6 +181,9 @@ async fn wave(server: &MongoServer, exhaust: bool) {
     peers[3].write_all(&malformed).await.unwrap();
     disconnected(&mut peers[3]).await;
     assert_eq!(server.metrics().cursors.active, 1);
+    if let Some(revision) = revision {
+        extended::mutate(&mut receiver, revision).await;
+    }
     if exhaust {
         let reply = send_command(&mut receiver, &cursor_more(COLLECTION, id, 1000)).await;
         assert_eq!(live_cursor_id(&reply), 0);
@@ -246,7 +252,7 @@ async fn run(cycles: usize, waves: usize) {
         close_peer(&mut seed).await;
         wait_drained(&server).await;
         for index in 0..waves {
-            wave(&server, index % 2 == 0).await;
+            wave(&server, index % 2 == 0, None).await;
         }
         // Every cycle also drains shutdown with a retained cursor and partial
         // frames, then reopens the same durable records under a fresh listener.
