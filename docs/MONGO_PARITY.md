@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 637 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 683 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -64,14 +64,15 @@ functions in the locked `test_query_more.py`,
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
 and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
 `test_tinymongo_coverage_edges.py`, `test_beanie_compat.py`,
-`test_sharded_sqlite_backend.py` suites
-(1,195 reference parameter cases). 302 added wheel scenarios and existing patch
+`test_sharded_sqlite_backend.py`, `test_tinymongo.py`,
+`test_remaining_coverage.py` suites
+(1,243 reference parameter cases). 308 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,195 unchanged upstream candidate passes or complete #186 certification.
+not 1,243 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -191,6 +192,22 @@ use the same sharded engine. Logical database drops never delete shared root
 files or allow changing its shard count. TinyMongo's ATTACH pool, URI flags,
 private retry/poison/PID hooks and manually overwritten legacy order columns are
 not native APIs; their exclusions and actual native lifecycle evidence are mapped.
+
+The oldest `test_tinymongo.py` suite is not a passing current reference gate:
+without an explicitly owned MongoDB comparison server, three tests pass, one
+fails because handle selection no longer creates a collection, and 32 skip.
+Its removed cursor/collection methods and stale assertions are mapped, not
+counted as passes. Current TinyMongo and BriskDB both return 100 rows for the
+legacy contradictory `$not` example (not 80) and 19 matches for its first regex
+(not 11). Adapted 100-row query/CRUD regressions use modern driver methods, while
+the hash-checked 90-row mixed-sort fixture matches the current reference's exact
+order before/after native reopen. Inventory collection strips the ambient legacy
+MongoDB URI, preventing collection-time connections to a user's server.
+Remaining small backend cases distinguish real BSON/duplicate results from
+private Python registries and retry counts. TinyMongo's live CLI replacement
+and compensating rollback are not BriskDB's stopped-source, fresh-destination
+import; native stage cleanup/source preservation and empty-collection import
+have separate evidence.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
