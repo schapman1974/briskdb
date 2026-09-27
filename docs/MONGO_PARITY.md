@@ -66,7 +66,7 @@ and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
 `test_tinymongo_coverage_edges.py`, `test_beanie_compat.py`,
 `test_sharded_sqlite_backend.py`, `test_tinymongo.py`,
 `test_remaining_coverage.py` suites
-(1,243 reference parameter cases). 308 added wheel scenarios and existing patch
+(1,243 reference parameter cases). 309 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
@@ -208,6 +208,14 @@ private Python registries and retry counts. TinyMongo's live CLI replacement
 and compensating rollback are not BriskDB's stopped-source, fresh-destination
 import; native stage cleanup/source preservation and empty-collection import
 have separate evidence.
+
+Startup beside surviving shard files now requires the original manifest before
+global-index upgrades or writable manifest open. If that file is missing, native
+and sync/async Mongo constructors return a corruption error without creating an
+empty replacement or changing shard bytes. The native open also omits SQLite's
+create flag for nonempty layouts. Fresh empty roots can still initialize. Tests
+cover repeated default/matching/mismatched shard-count attempts and reopening an
+exactly restored stopped fixture; automatic manifest reconstruction is unsupported.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,

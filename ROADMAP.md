@@ -1007,7 +1007,7 @@ requires an earlier dependency:
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
       frozen corpus and index inventory, forty-nine query/public-client suites now
       have complete source accounting (683 functions/1,243 reference cases), backed
-      by 308 added wheel scenarios and existing patch regressions, including
+      by 309 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1119,6 +1119,11 @@ requires an earlier dependency:
       cannot inherit a user MongoDB URI. Small private backend/CLI cases map
       explicitly to native BSON, duplicate handling and fresh-destination import
       evidence rather than claiming live replacement/rollback compatibility.
+      Missing-manifest startup beside surviving shards rejects before upgrades
+      or SQLite file creation. Native and sync/async wheel regressions preserve
+      shard bytes across repeated attempts and exact stopped-fixture restoration;
+      empty-root creation still works. This fixes a reproduced empty-replacement
+      manifest side effect, not automatic recovery of missing authoritative data.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-
