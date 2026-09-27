@@ -1,5 +1,5 @@
 use super::*;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 struct IdentityFiles {
     _root: tempfile::TempDir,
@@ -150,7 +150,7 @@ fn missing_and_non_regular_files_are_rejected_with_connector_context() {
             .unwrap();
         assert!(matches!(
             error.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
         ));
         assert!(
             error
@@ -171,7 +171,8 @@ fn pem_file_size_limit_is_inclusive_and_applies_to_both_inputs() {
         };
         let file = fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_len(MAX_TLS_PEM_BYTES).unwrap();
-        validate_regular_file(path, "Test file", MAX_TLS_PEM_BYTES).unwrap();
+        configuration::validate_opened_file(&file, path, "Test file", MAX_TLS_PEM_BYTES, false)
+            .unwrap();
         file.set_len(MAX_TLS_PEM_BYTES + 1).unwrap();
         let error = files.load(&[]).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

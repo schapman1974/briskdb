@@ -336,9 +336,22 @@ TLS/authentication; Mongo remains anonymous-loopback-only.
 
 TLS keys, certificates, plaintext passwords, and derived SCRAM material are
 process configuration only; none is written to the BriskDB data root. The
-password file is read into bounded memory, converted to a random-salted SCRAM
-secret, and cleared. On Unix, private key/password files may be group-readable
-but cannot be group-writable or accessible by other users. This work changes no
+password file is read into bounded memory and converted to a random-salted SCRAM
+secret. Certificate, key and password readers validate the opened descriptor's
+regular-file type and size, then read at most the limit plus one overflow byte
+(1 MiB per PEM file; 1,026 bytes for the password including its optional line
+ending). Growth after validation cannot make a read exceed that bound. Private
+key and password input buffers use fixed allocations with zeroization on success,
+error or unwind; this does not claim erasure of every parser/cryptographic-library
+copy. On Unix, private key/password files may be group-readable but cannot be
+group-writable or accessible by other users. These checks use the opened file,
+not a separately inspected path; symlinks remain supported and their opened
+targets are validated. Unix opens are nonblocking so a substituted FIFO is rejected
+without waiting for a writer. Non-Unix hosts still require appropriate OS ACLs;
+no Unix-mode-equivalent ACL validation is added. Operators must still publish
+complete files atomically and control the secret directory: this is not a
+multi-file snapshot, a guarantee against concurrent in-place writes, or reload.
+This work changes no
 HTTP route, JSON body, SQL subset, planner rule, manifest table, shard header,
 migration journal, stored row, or storage-format version.
 Declared SQLite type metadata is now retained in protocol-neutral statement
