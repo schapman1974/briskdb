@@ -24,9 +24,6 @@ fn check(mongo: bool) {
     let mongo_files = tempfile::tempdir().unwrap();
     files(postgres.path());
     files(mongo_files.path());
-    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let pg_address = reservation.local_addr().unwrap();
-    drop(reservation);
     let log = root.path().join("daemon.log");
     let data = root.path().join("data");
     let mut command = command_with_postgres(
@@ -34,7 +31,7 @@ fn check(mongo: bool) {
         &log,
         mongo.then_some("127.0.0.1:0"),
         "127.0.0.1:0",
-        &pg_address.to_string(),
+        "127.0.0.1:0",
     );
     command
         .arg("--postgres-tls-cert")
@@ -53,6 +50,7 @@ fn check(mongo: bool) {
     }
     let mut child = Process(command.spawn().unwrap());
     let text = ready(&mut child, &log);
+    let pg_address = bound_address(&text, "postgres_listen");
     assert!(text.contains("security_reload_on_sighup=true"));
     let mongo_port = if mongo {
         text.split("mongo_listen=Some(")
