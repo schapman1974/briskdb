@@ -7464,6 +7464,7 @@ mod tests {
                     .finalize_global_unique_write(&reservation, &cancellation)
                     .map(|_| ())
             }
+            #[cfg(feature = "embedded")]
             "authority-coordinator-write" => {
                 drop(database);
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -7779,6 +7780,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embedded")]
     fn indexed_write_recovers_across_the_physical_commit_boundary() {
         for boundary in [
             "unique-write-physical-before-commit",
@@ -7831,6 +7833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embedded")]
     fn markerless_null_distinct_snapshot_crash_is_repaired_on_the_next_write() {
         let temp = tempfile::tempdir().unwrap();
         let index_id = setup_snapshot_only_authority_crash_root(temp.path());
