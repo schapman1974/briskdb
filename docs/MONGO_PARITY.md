@@ -812,8 +812,17 @@ closing the caller's database. Closing/dropping the server also drains pending T
 handshakes. `with_mongo(address)` preserves an already-selected Mongo TLS identity
 when changing its address. Existing `ListenerConfig` literals and legacy start
 methods remain compatible; defaults do not enable Mongo or TLS implicitly.
-The standalone `MongoServer::reload_tls` API above is not yet exposed through the
-composed `AttachedServer` handle.
+An encrypted composed handle exposes `reload_mongo_tls(config).await` and
+`reload_mongo_tls_with_context(config, request_context).await`. Both validate the
+replacement off-runtime and publish only after rechecking cancellation, deadlines
+and listener/engine lifecycle. The reload target retains only a weak engine probe;
+keeping a closed server does not keep database pools alive. Existing sockets keep
+their original identity/budget, as with standalone reload. Plaintext listeners
+cannot be upgraded this way. Concurrent successful Rust reloads publish in
+completion order; a published replacement cannot be undone by cancellation.
+PostgreSQL and Mongo identities remain independent. Python sync/async wrappers
+expose the same operation with queued controls and serialized close/reload; see
+[Mongo certificate rotation](../python/README.md#reload-mongo-tls-unreleased).
 
 The real composed gate requires PyMongo 4.17.0 and `psycopg[binary]` 3.2.13:
 

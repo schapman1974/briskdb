@@ -1068,6 +1068,25 @@ class AsyncServer:
     def closed(self) -> bool:
         return self._server.closed
 
+    async def reload_mongo_tls(
+        self,
+        *,
+        tls_cert: Union[str, PathLike[str]],
+        tls_key: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> None:
+        """Reload already-encrypted Mongo; admitted sockets keep their identity.
+
+        Cancellation before publication preserves the current identity; it cannot
+        undo publication. This does not authenticate users or revoke sessions.
+        """
+        await _cancelable_call(
+            self._server.reload_mongo_tls,
+            tls_cert=tls_cert, tls_key=tls_key,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+        )
+
     async def reload_postgres_security(
         self,
         *,

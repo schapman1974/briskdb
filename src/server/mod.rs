@@ -2,6 +2,8 @@
 
 #[cfg(feature = "mongo")]
 mod mongo;
+#[cfg(feature = "mongo-tls")]
+mod mongo_tls_reload;
 mod options;
 pub use options::AttachedServerOptions;
 use options::PreparedOptions;
@@ -411,6 +413,8 @@ fn validate_listener_addresses(
 pub struct AttachedServer {
     addresses: ListenerAddresses,
     postgres_security: Option<postgres::ReloadableSecurity>,
+    #[cfg(feature = "mongo-tls")]
+    mongo_tls: Option<mongo_tls_reload::Target>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -545,8 +549,16 @@ impl AttachedServer {
             #[cfg(feature = "mongo-tls")]
             mongo_tls,
         } = prepared;
+        #[cfg(feature = "mongo-tls")]
+        if mongo_tls.is_some() && mongo_address.is_none() {
+            anyhow::bail!("Mongo TLS configuration requires an enabled Mongo listener");
+        }
         validate_listener_addresses(&config, security.is_some())?;
         let listeners = bind_configured_listeners(&config, database, mongo_address).await?;
+        #[cfg(feature = "mongo-tls")]
+        let mongo_tls_target = mongo_tls.as_ref().map(|identity| {
+            mongo_tls_reload::Target::new(identity.clone(), database.engine().readiness_probe())
+        });
         #[cfg(feature = "mongo-tls")]
         let listeners = {
             let mut listeners = listeners;
@@ -576,6 +588,8 @@ impl AttachedServer {
         Ok(Self {
             addresses,
             postgres_security,
+            #[cfg(feature = "mongo-tls")]
+            mongo_tls: mongo_tls_target,
             shutdown: Some(shutdown),
             task: Some(task),
         })
@@ -628,7 +642,7 @@ impl AttachedServer {
         context: crate::RequestContext,
         prepare: impl Future<Output = anyhow::Result<postgres::LoadedSecurity>>,
     ) -> anyhow::Result<()> {
-        check_security_reload_context(&context)?;
+        check_security_reload_context(&context, "PostgreSQL security")?;
         let target = self
             .postgres_security
             .as_ref()
@@ -644,12 +658,12 @@ impl AttachedServer {
         };
         let loaded = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(security_reload_cancelled().into()),
-            _ = deadline => return Err(security_reload_timed_out().into()),
+            _ = cancellation.cancelled() => return Err(security_reload_cancelled("PostgreSQL security").into()),
+            _ = deadline => return Err(security_reload_timed_out("PostgreSQL security").into()),
             result = prepare => result?,
         };
         self.require_running_for_reload()?;
-        check_security_reload_context(&context)?;
+        check_security_reload_context(&context, "PostgreSQL security")?;
         target.replace(loaded);
         Ok(())
     }
@@ -692,29 +706,32 @@ impl Drop for AttachedServer {
     }
 }
 
-fn security_reload_cancelled() -> crate::EngineError {
+fn security_reload_cancelled(operation: &'static str) -> crate::EngineError {
     crate::EngineError::new(
         crate::EngineErrorKind::Cancelled,
-        "PostgreSQL security reload was cancelled before completion",
+        format!("{operation} reload was cancelled before completion"),
     )
 }
 
-fn security_reload_timed_out() -> crate::EngineError {
+fn security_reload_timed_out(operation: &'static str) -> crate::EngineError {
     crate::EngineError::new(
         crate::EngineErrorKind::DeadlineExceeded,
-        "PostgreSQL security reload deadline elapsed",
+        format!("{operation} reload deadline elapsed"),
     )
 }
 
-fn check_security_reload_context(context: &crate::RequestContext) -> crate::EngineResult<()> {
+fn check_security_reload_context(
+    context: &crate::RequestContext,
+    operation: &'static str,
+) -> crate::EngineResult<()> {
     if context.cancellation_token().is_cancelled() {
-        return Err(security_reload_cancelled());
+        return Err(security_reload_cancelled(operation));
     }
     if context
         .deadline()
         .is_some_and(|deadline| deadline <= std::time::Instant::now())
     {
-        return Err(security_reload_timed_out());
+        return Err(security_reload_timed_out(operation));
     }
     Ok(())
 }

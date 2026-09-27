@@ -30,7 +30,7 @@ pub use readiness::{
 #[cfg(feature = "mongo-tls")]
 pub use tls::MongoTlsConfig;
 #[cfg(all(feature = "mongo-tls", feature = "listeners"))]
-pub(crate) use tls::ReloadableTls;
+pub(crate) use tls::{LoadedTls, ReloadableTls};
 pub use wire::{DocumentSequence, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request};
 
 use std::io;

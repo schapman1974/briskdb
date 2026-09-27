@@ -2,12 +2,18 @@
 
 ## Unreleased
 
+- Encrypted attached Mongo servers support synchronous/async `reload_mongo_tls()`
+  with timeout/cancellation controls, including while queued for the handle.
+  Invalid replacements preserve the active identity; admitted sockets retain
+  their original certificate. PostgreSQL reload and Mongo reload are independent.
+  This adds no user authentication, session revocation or non-loopback access.
+
 - Sync/async `db.serve()` now accepts paired `mongo_tls_cert` / `mongo_tls_key`
   arguments for verified TLS connections from stock PyMongo. Server identity
   uses the shared bounded loader; handshakes share finite socket slots and drain
   during server/database close. Mongo remains anonymous and loopback-only.
   Defaults, managed `patch()` transport and PostgreSQL/SQLite credentials are
-  unchanged. No Mongo reload or new package release is implied.
+  unchanged. No new package release is implied.
 
 - Secure attached PostgreSQL servers now support `reload_postgres_security()`
   in synchronous and asyncio Python, with certificate/key/user/password-file

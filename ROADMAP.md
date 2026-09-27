@@ -443,7 +443,10 @@ database under differential/property tests.
   constructors remain compatible. Sync/async Python `db.serve()` now accepts
   paired Mongo certificate/key paths; real verified PyMongo, PostgreSQL/SQLite
   coexistence, persistence, rejected configuration and close/drain tests cover
-  the wheel. Plaintext/patch defaults stay unchanged. Daemon Mongo TLS configuration,
+  the wheel. Rust attached and Python sync/async handles also expose Mongo TLS
+  reload, with weak engine ownership, queued Python request controls, native
+  cancellation/lifecycle guards, verified client rotation and PostgreSQL isolation.
+  Plaintext/patch defaults stay unchanged. Daemon Mongo TLS configuration,
   CLI reload, other listeners and immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.

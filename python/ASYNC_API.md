@@ -98,6 +98,14 @@ matching the certificate. Both default to `None`; partial configuration is
 rejected, and TLS never removes the loopback restriction or authenticates users.
 See the [verified TLS example](README.md#encrypt-the-mongo-listener-unreleased).
 
+`await server.reload_mongo_tls(tls_cert=..., tls_key=..., timeout_ms=5_000)`
+replaces an already-encrypted Mongo identity without rebinding. It accepts
+`cancellation=` and signals the native token on task cancellation, including
+while queued behind another reload. Invalid/cancelled preparation cannot publish;
+cancellation cannot undo a completed publication. Admitted sockets retain their
+old identity. This neither authenticates users nor changes PostgreSQL's identity.
+See [Mongo certificate rotation](README.md#reload-mongo-tls-unreleased).
+
 Native document methods have the same sync/async pairing. Enable the document
 engine on open and install PyMongo for its `bson` value classes:
 
