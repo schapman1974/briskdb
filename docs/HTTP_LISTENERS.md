@@ -14,8 +14,9 @@ authority.
 
 Command-line input takes precedence over the environment, which takes
 precedence over the default. Addresses must be numeric IPv4 or IPv6 socket
-addresses. The current HTTP planes have no complete identity, authorization,
-or TLS boundary, so each configured address must be loopback. A non-loopback
+addresses. The ordinary SQL data and administration routers have no user
+authentication or role-authorization boundary, so each configured address must
+be loopback even with the attached Rust TLS option below. A non-loopback
 data or administration address is rejected before the database opens or any
 listener binds.
 
@@ -102,6 +103,59 @@ asynchronous `Database.serve()` add keyword-only
 `Server.admin_address` and `AsyncServer.admin_address` return the optional
 bound address. The ephemeral Python default avoids a fixed-port collision while
 keeping the browser and operator surface available to an attached server.
+
+### Encrypt attached Rust HTTP planes (unreleased)
+
+With `listeners`, Rust hosts can opt into independent server certificates for
+the data and administration planes through the existing options builder:
+
+```rust,ignore
+use briskdb::server::{AttachedServer, AttachedServerOptions, HttpTlsConfig, ListenerConfig};
+
+let mut server = AttachedServer::start_with_options(&database, ListenerConfig {
+    http_listen: "127.0.0.1:7654".parse()?,
+    admin_listen: Some("127.0.0.1:7655".parse()?),
+    postgres_listen: None,
+}, AttachedServerOptions::new()
+    .with_http_tls(HttpTlsConfig::new("./data.crt", "./data.key"))
+    .with_admin_tls(HttpTlsConfig::new("./admin.crt", "./admin.key"))
+).await?;
+// Connect using HTTPS, a trusted issuing CA, and a certificate-matching hostname.
+server.close().await?; // Stops listeners; the borrowed database remains open.
+```
+
+Either plane may remain plaintext; TLS is never enabled implicitly. An admin
+identity requires an enabled admin address. The same bounded, descriptor-validated
+certificate/key loader used by Mongo/PostgreSQL runs off-runtime before binding.
+Unix private keys must not be group-writable or accessible to others. Invalid
+material or a failed bind leaves no newly bound sockets and does not stop the
+borrowed database. Existing `ListenerConfig` literals and legacy constructors
+remain compatible. TLS does not alter route ownership, cookies, query semantics,
+or the **loopback-only** policy. Do not disable certificate/hostname verification.
+
+HTTP/1.1 is the only advertised ALPN; this does not add HTTP/2. Each TLS handshake
+has a 15-second default deadline, which `with_handshake_timeout(Duration)` may
+only narrow to a positive value. It uses an ordinary connection slot and is
+cancelled on close/drop, including incomplete handshakes. Each plane has its own
+identity; PostgreSQL credentials do not authenticate HTTP callers.
+
+`with_http_tls(...)` also encrypts a selected `with_sqlite_remote(...)` router.
+Its bearer-token and table-allowlist requirements stay in force; the TLS
+certificate alone does not authorize remote-table access. Administration remains
+separate. Both addresses still require loopback. Python/daemon HTTP TLS options
+and HTTP identity reload are not exposed by this increment; existing SIGHUP
+reload currently covers only configured PostgreSQL/Mongo identities.
+
+### Finite socket admission (unreleased)
+
+The attached and daemon HTTP hosts now allow at most **256 active data sockets
+and 256 active administration sockets**, independently, for both plaintext and
+TLS. The slot covers handshake, incomplete headers/body, active requests and
+keep-alive until the connection task exits. At capacity, newly accepted sockets
+are closed before request dispatch; no successful HTTP response is promised.
+Completion, transport failure, timeout, task cancellation and shutdown reclaim
+slots. Data saturation does not consume administration's reserved capacity.
+This is a host socket bound, not per-user governance or an idle-HTTP timeout.
 
 ## Startup and shutdown
 
