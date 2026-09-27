@@ -1792,6 +1792,15 @@ to deterministic native regressions. Property tests use proptest's shrinking and
 failure-seed persistence. These mechanisms do not substitute for minimizing
 cross-implementation differential mismatches, which remains a separate gate.
 
+The existing CI workflow also has an opt-in `mongo_fuzz` dispatch input. Once CI
+is re-enabled, selecting it runs every declared fuzz target with AddressSanitizer
+on pinned `nightly-2026-09-27`/cargo-fuzz 0.13.2, with 30 seconds per target,
+10 seconds per input and a 2 GiB RSS guard. Target discovery is checked and a
+target failure stops the job; corpora and crash reproducers are retained for
+seven days even on failure. Lockfile drift fails the run. This tier does not run
+on ordinary PRs/pushes and does not re-enable a disabled workflow. It is a bounded
+smoke tier, not a long-running soak or a Linux result until actually dispatched.
+
 ## Reproducible public-client performance comparison
 
 `scripts/mongo_benchmark.py` runs the same checked synchronous workloads in isolated

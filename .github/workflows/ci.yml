@@ -8,6 +8,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      mongo_fuzz:
+        description: Run the bounded, instrumented document fuzz tier
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -21,6 +27,59 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  mongo-fuzz:
+    name: Mongo document fuzz (opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.mongo_fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "2"
+      FUZZ_TOOLCHAIN: nightly-2026-09-27
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned fuzz toolchain and driver
+        run: |
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +"$FUZZ_TOOLCHAIN" --version
+          cargo fuzz --version
+
+      - name: Compile locked targets
+        run: cargo +"$FUZZ_TOOLCHAIN" check --locked --manifest-path fuzz/Cargo.toml --bins
+
+      - name: Run every declared target with AddressSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +"$FUZZ_TOOLCHAIN" fuzz list > "$RUNNER_TEMP/mongo-fuzz-targets.txt"
+          test -s "$RUNNER_TEMP/mongo-fuzz-targets.txt"
+          while IFS= read -r target; do
+            if [[ ! "$target" =~ ^[a-z0-9_]+$ ]]; then
+              echo "Unexpected fuzz target name" >&2
+              exit 1
+            fi
+            cargo +"$FUZZ_TOOLCHAIN" fuzz run "$target" -- \
+              -max_total_time=30 -max_len=4096 -timeout=10 \
+              -rss_limit_mb=2048 -seed=186465 -print_final_stats=1
+          done < "$RUNNER_TEMP/mongo-fuzz-targets.txt"
+          git diff --exit-code -- Cargo.lock fuzz/Cargo.lock
+
+      - name: Retain generated corpus and failure reproducers
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            fuzz/artifacts
+            fuzz/corpus
+            ${{ runner.temp }}/mongo-fuzz-targets.txt
+          if-no-files-found: warn
+          retention-days: 7
+
   mongo-contract:
     name: Mongo compatibility contract
     runs-on: ubuntu-24.04

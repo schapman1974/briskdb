@@ -1160,6 +1160,10 @@ requires an earlier dependency:
       pruning against the authoritative matcher across 2/3/8/64-shard layouts.
       These invariants complement real-engine shard-checkout/restart tests;
       they do not implement live resharding or certify long-running soak.
+      An opt-in dispatch tier in the existing CI workflow discovers all document
+      fuzz targets, runs bounded AddressSanitizer checks and retains failure
+      reproducers/corpora. It adds no ordinary PR/push workload and does not
+      re-enable paused CI; a remote Linux run and longer soak remain explicit gates.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-
