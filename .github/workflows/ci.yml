@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mongo_fuzz:
-        description: Run the bounded, instrumented document fuzz tier
+        description: Run the bounded, instrumented document and wire fuzz tier
         type: boolean
         required: false
         default: false
@@ -72,7 +72,7 @@ jobs:
           retention-days: 7
 
   mongo-fuzz:
-    name: Mongo document fuzz (opt-in)
+    name: Mongo document and wire fuzz (opt-in)
     if: github.event_name == 'workflow_dispatch' && inputs.mongo_fuzz
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -337,6 +337,7 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features mongo,tokio/rt-multi-thread --lib protocol::mongo
           cargo test --locked --no-default-features --features mongo --test mongo_wire --test mongo_compression
+          cargo test --locked --no-default-features --features mongo --test mongo_wire_properties
 
       - name: Require real PyMongo discovery, documents, and restart
         env:
@@ -541,7 +542,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Compile document fuzz targets
+      - name: Compile document and wire fuzz targets
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
 
       - name: Verify publishable crate package

@@ -1165,7 +1165,13 @@ requires an earlier dependency:
       pruning against the authoritative matcher across 2/3/8/64-shard layouts.
       These invariants complement real-engine shard-checkout/restart tests;
       they do not implement live resharding or certify long-running soak.
-      An opt-in dispatch tier in the existing CI workflow discovers all document
+      A shared wire fuzz/property harness now checks arbitrary envelope/request
+      parsing, fragmentation/coalescing, non-consuming bounded failures, EOF,
+      checksummed BSON sequences, legacy handshakes and atomic encode rejection.
+      Valid generated requests reach successful parser branches on every input;
+      independent CRC32C checks verify tampering rejection. This pure-codec tier
+      does not replace socket, compression or command/state-machine acceptance.
+      An opt-in dispatch tier in the existing CI workflow discovers all document/wire
       fuzz targets, runs bounded AddressSanitizer checks and retains failure
       reproducers/corpora. It adds no ordinary PR/push workload and does not
       re-enable paused CI; a remote Linux run and longer soak remain explicit gates.
