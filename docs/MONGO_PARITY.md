@@ -63,7 +63,7 @@ functions in the locked `test_query_more.py`,
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
 `test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
 and `test_sharded_sqlite_point_read_optimizations.py` suites
-(1,119 reference parameter cases). 287 added wheel scenarios and existing patch
+(1,119 reference parameter cases). 288 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
@@ -145,11 +145,14 @@ point reads spanning an update, an independent SQLite process truncates the
 manifest and shard WALs with the client still live. Native pool tests cover
 bounded admission, generation retirement, broken leases and transaction cleanup;
 they do not emulate TinyMongo's private Python pool/cache/SQL retry hooks. Native
-startup and fresh opens reject swapped/missing files. A disposable native
-diagnostic nevertheless confirmed that a warmed point reader can return the old
-file's data after checkpointed cross-shard replacement, while reopen rejects the
-identity. This remains an explicit #186/#187 hardening gap, not a passed source
-assertion; follow-up must reject stale leased-file identity.
+startup and fresh opens reject swapped/missing files. Reused pooled connections
+now also check the current regular path and SQLite's file-identity probe before
+checkout. Deleted/replaced POSIX files retire the stale lease, return redacted
+code-1 failures and degrade the root; symlink/directory substitutions also reject
+without leaking capacity. A VFS without that probe gets a fresh validated handle
+instead of unverified reuse. This fixes the previously reproduced warmed-reader
+gap, but is a checkout boundary, not continuous protection against a file swap
+during an in-flight operation. Stop clients before replacing database files.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,

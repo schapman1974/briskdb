@@ -655,7 +655,20 @@ impl ShardPoolInner {
         }
 
         if let Some(connection) = reusable {
-            if connection.schema_generation != self.storage.current_schema_generation() {
+            let current_file = super::shard::pooled_file_is_current(
+                &connection.connection,
+                &self.storage.shard_path(self.shard),
+            );
+            let current_file = match current_file {
+                Ok(current) => current,
+                Err(error) => {
+                    self.retire(connection);
+                    return self.storage.fail_closed_on_corruption(Err(error));
+                }
+            };
+            if !current_file
+                || connection.schema_generation != self.storage.current_schema_generation()
+            {
                 self.retire(connection);
                 return match control {
                     Some(control) => self.open_connection_controlled(control),
@@ -1636,6 +1649,95 @@ mod tests {
         assert_eq!(snapshot.retired, 0);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmed_leases_reject_changed_file_identity_and_release_capacity() {
+        use std::os::unix::fs::symlink;
+
+        for mutation in [
+            "missing",
+            "same-shard-copy",
+            "other-shard",
+            "symlink",
+            "directory",
+        ] {
+            let (temp, pools) = pools(1, 0);
+            let first = pools.acquire(0).await.unwrap().checkout().unwrap();
+            first.query_row("SELECT 1", [], |_| Ok(())).unwrap();
+            drop(first);
+            let target = temp.path().join("shards/0000.sqlite");
+            let other = temp.path().join("shards/0001.sqlite");
+            for path in [&target, &other] {
+                let connection = Connection::open(path).unwrap();
+                let checkpoint: (i64, i64, i64) = connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(checkpoint, (0, 0, 0));
+            }
+            let replacement = temp.path().join("replacement.sqlite");
+            match mutation {
+                "missing" => fs::remove_file(&target).unwrap(),
+                "same-shard-copy" | "other-shard" => {
+                    fs::copy(
+                        if mutation == "same-shard-copy" {
+                            &target
+                        } else {
+                            &other
+                        },
+                        &replacement,
+                    )
+                    .unwrap();
+                    fs::rename(&replacement, &target).unwrap();
+                }
+                "symlink" => {
+                    fs::rename(&target, &replacement).unwrap();
+                    symlink(&replacement, &target).unwrap();
+                }
+                "directory" => {
+                    fs::rename(&target, &replacement).unwrap();
+                    fs::create_dir(&target).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = match pools.acquire(0).await.unwrap().checkout() {
+                Ok(_) => panic!("stale file lease was reused"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                if matches!(mutation, "symlink" | "directory") {
+                    EngineErrorKind::FailedPrecondition
+                } else {
+                    EngineErrorKind::DataCorruption
+                },
+                "{mutation}: {error}"
+            );
+            let state = pools.snapshot().unwrap().shards[0];
+            assert_eq!(
+                (state.active, state.queued, state.idle),
+                (0, 0, 0),
+                "{mutation}"
+            );
+            assert_eq!(
+                (state.opened, state.reused, state.retired),
+                (1, 0, 1),
+                "{mutation}"
+            );
+            if error.kind() == EngineErrorKind::DataCorruption {
+                assert_eq!(
+                    pools.shards[0].inner.storage.schema_gate_snapshot().state,
+                    crate::storage::schema_gate::SchemaGateState::Degraded
+                );
+            }
+            if mutation == "missing" {
+                assert!(!target.exists(), "missing file must not be recreated");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stale_idle_generation_is_retired_before_checkout() {
         let (temp, pools) = pools(1, 0);
@@ -2217,15 +2319,16 @@ mod tests {
 
         let shard_path = temp.path().join("shards/0000.sqlite");
         let backup_path = temp.path().join("shards/0000.sqlite.backup");
-        fs::rename(&shard_path, &backup_path).unwrap();
-        fs::create_dir(&shard_path).unwrap();
-
         let mut second = pools
             .acquire_for_owner(0, second_owner)
             .await
             .unwrap()
             .checkout()
             .unwrap();
+        // Change the owned fixture after checkout so this still exercises
+        // the fresh-handle isolation failure, not the earlier identity guard.
+        fs::rename(&shard_path, &backup_path).unwrap();
+        fs::create_dir(&shard_path).unwrap();
         let error = second
             .isolate_foreign_sql("PRAGMA data_version")
             .unwrap_err();
