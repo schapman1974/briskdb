@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-four locked suites is classified; 1148 reference parameter cases are not 1148 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-six locked suites is classified; 1155 reference parameter cases are not 1155 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4627,6 +4627,97 @@
             "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
           ],
           "note": "Both direct client classes reject unsupported memory selection for valid, malformed and foreign URI addresses before creating a requested folder or acquiring storage. There is no memory URI parser or private storage_extension helper. Inside an explicit patch scope, its configured native store takes precedence over per-client host/backend arguments."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_tinymongo_coverage_edges.py",
+      "sha256": "30cf70c40613ec8cf1b125f744b089313663be532857cf69fbacdd3a0d76205f",
+      "function_count": 5,
+      "reference_case_count": 5,
+      "coverage": [
+        {
+          "source": [
+            "test_directory_database_metadata_and_drop_cleanup"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_upstream_common.py::test_database_handles_logical_drop_and_explicit_statistics_gap"
+          ],
+          "note": "Private stubbed Parquet directory traversal and byte totals are not a native backend. Parquet selection rejects before acquisition; real native logical discovery/drop preserves other databases. Full per-database sizeOnDisk remains explicit code 115 under #166 rather than fabricated directory attribution."
+        },
+        {
+          "source": [
+            "test_drop_database_unopened_and_cleanup_bypass_paths"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_common.py::test_database_handles_logical_drop_and_explicit_statistics_gap",
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "Fake _databases/_get_db/list_database_names hooks and manually assigned remote _storage_uri are private TinyMongo mechanisms. Native database/drop/missing/reopen and retained peer lifecycle have actual storage evidence; no S3 URI cleanup bypass or foreign JSON-file deletion behavior is implemented."
+        },
+        {
+          "source": [
+            "test_create_indexes_skip_and_duplicate_field_drop_branches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_discovery_edges.py::test_skipped_text_and_duplicate_field_index_drop_preserve_remaining_uniqueness"
+          ],
+          "note": "Skipped text models return requested names with a compatibility warning and no text metadata. Dropping a same-field nonunique index leaves the unique index enforced through reopen. Native metadata uses real driver BSON documents/cursors, private _indexes is not exposed, and the second positional create_indexes argument is a driver session rejected as code 72 rather than a private extra-iterable TypeError."
+        },
+        {
+          "source": [
+            "test_parse_condition_operator_construction_edges"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_membership_logical_existence_and_filtered_counts",
+            "python/tests/test_upstream_queries.py::test_malformed_queries_and_known_unsupported_operators_are_explicit",
+            "python/tests/test_upstream_regex_values.py::test_full_wire_validation_does_not_expose_private_regex_only_shortcuts"
+          ],
+          "note": "The source merely constructs private TinyDB parse_condition iterators with prev_key/last_prev_key, including incomplete or invalid contexts; it does not assert query results. BriskDB has no such helper. Public/native full-query validation and logical/membership/regex outcomes are exercised separately, without claiming those partial construction hooks."
+        },
+        {
+          "source": [
+            "test_cursor_clone_and_closed_legacy_methods"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_discovery_edges.py::test_skipped_text_and_duplicate_field_index_drop_preserve_remaining_uniqueness",
+            "python/tests/test_upstream_common.py::test_distinct_index_metadata_and_modern_cursor_lifecycle"
+          ],
+          "note": "Real query cursors clone independently and an exhausted/closed cursor stops; hasNext and manual TinyMongoCursor(list) construction are not exposed. Existing coverage explicitly retains PyMongo buffered-close/rewind semantics rather than TinyMongo's permanent-close rule."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_beanie_compat.py",
+      "sha256": "c655b0310ab8a4750521bb43b14aff384fe3aa02f947b958e64d22b37bbc4ec8",
+      "function_count": 2,
+      "reference_case_count": 2,
+      "coverage": [
+        {
+          "source": [
+            "test_database_supports_discovery_commands_used_by_odms"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_discovery_edges.py::test_sync_discovery_identifies_briskdb_filters_names_and_preserves_closed_state"
+          ],
+          "note": "Real buildInfo/server_info identify BriskDB, not a fabricated MongoDB 8.0.0/TinyMongo reply. Ping, authorized/name-only discovery, filtered collection names, unsupported serverStatus (59), unknown options (72) and closed-client refusal are checked. Unlike the source, filtered names work. Malformed command/session inputs keep pinned PyMongo StopIteration/InvalidDocument/AttributeError/TypeError behavior; a detached object.__new__ database with _client=None has no supported native equivalent."
+        },
+        {
+          "source": [
+            "test_async_database_supports_discovery_commands_used_by_odms"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_discovery_edges.py::test_async_discovery_uses_real_metadata_and_closed_client_errors"
+          ],
+          "note": "Real async driver discovery/ping and collection filters work with native identity metadata, code-59 serverStatus refusal and permanent closed-client errors. This is adapted discovery coverage, not a claim that BriskDB returns TinyMongo's hard-coded version payload. The unchanged real Beanie application fixture remains separately checked by tests/mongo_odm.rs."
         }
       ]
     }

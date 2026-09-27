@@ -1005,9 +1005,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, forty-four query/public-client suites now
-      have complete source accounting (603 functions/1,148 reference cases), backed
-      by 294 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, forty-six query/public-client suites now
+      have complete source accounting (610 functions/1,155 reference cases), backed
+      by 297 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1040,6 +1040,11 @@ requires an earlier dependency:
       memory selection rejects before storage, while explicit patch scopes own
       real SQLite roots and ignore per-client backend/host overrides. Nested
       temporary cleanup is checked without claiming private registry equivalence.
+      Discovery edges check actual sync/async BriskDB identity, filtered metadata,
+      explicit command/closed-client errors and same-field index removal without
+      weakening the remaining unique constraint. Private condition constructors,
+      detached database objects, manual legacy cursors and foreign directory
+      statistics/cleanup hooks remain explicitly distinguished.
       Update-modifier wire fixtures now cover min/max representation/order, sparse
       arrays, rename/pop validation, equality-seeded upserts, no-match preflight
       and single-record failure rollback; helper-only non-BSON inputs are explicit.
