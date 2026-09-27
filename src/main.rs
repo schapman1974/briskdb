@@ -86,6 +86,14 @@ struct Args {
     )]
     mongo_listen: ListenerSetting,
 
+    /// PEM server certificate chain for Mongo TLS; requires the `mongo-tls` Cargo feature.
+    #[arg(long, env = "BRISKDB_MONGO_TLS_CERT", value_name = "PATH")]
+    mongo_tls_cert: Option<PathBuf>,
+
+    /// PEM private key paired with --mongo-tls-cert; Mongo remains anonymous/loopback-only.
+    #[arg(long, env = "BRISKDB_MONGO_TLS_KEY", value_name = "PATH")]
+    mongo_tls_key: Option<PathBuf>,
+
     /// PEM certificate chain for TLS on the PostgreSQL listener.
     #[arg(long, env = "BRISKDB_POSTGRES_TLS_CERT", value_name = "PATH")]
     postgres_tls_cert: Option<PathBuf>,
@@ -198,11 +206,38 @@ struct Args {
 }
 
 impl Args {
+    fn validate_mongo_tls(&self) -> EngineResult<()> {
+        match (&self.mongo_tls_cert, &self.mongo_tls_key) {
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {}
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "--mongo-tls-cert and --mongo-tls-key must be set together",
+                ));
+            }
+        }
+        if self.mongo_listen == ListenerSetting::Disabled {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "Mongo TLS configuration requires an enabled --mongo-listen address",
+            ));
+        }
+        if !cfg!(feature = "mongo-tls") {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "Mongo TLS requires a build with the `mongo-tls` Cargo feature",
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert command-line input into validated server startup configuration.
     ///
     /// Keeping this conversion ahead of `server::run_with_engine_options`
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
+        self.validate_mongo_tls()?;
         #[cfg(not(feature = "mongo"))]
         if self.mongo_listen != ListenerSetting::Disabled {
             return Err(EngineError::new(
@@ -274,11 +309,23 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    // Validate pairs/feature support before moving fields or starting any I/O.
+    args.validate_mongo_tls()?;
     #[cfg(feature = "mongo")]
     let mongo_listen = args.mongo_listen.into_option();
+    #[cfg(feature = "mongo-tls")]
+    let mongo_tls = args
+        .mongo_tls_cert
+        .as_ref()
+        .zip(args.mongo_tls_key.as_ref())
+        .map(|(certificate, key)| briskdb::protocol::mongo::MongoTlsConfig::new(certificate, key));
     let (config, options) = args.into_server_parts()?;
     #[cfg(feature = "mongo")]
     if let Some(address) = mongo_listen {
+        #[cfg(feature = "mongo-tls")]
+        if let Some(tls) = mongo_tls {
+            return server::run_with_mongo_tls(config, options, address, tls).await;
+        }
         return server::run_with_mongo(config, options, address).await;
     }
     server::run_with_engine_options(config, options).await
@@ -303,6 +350,8 @@ mod tests {
         );
         assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
         assert_eq!(args.mongo_listen, ListenerSetting::Disabled);
+        assert_eq!(args.mongo_tls_cert, None);
+        assert_eq!(args.mongo_tls_key, None);
         assert_eq!(args.postgres_tls_cert, None);
         assert_eq!(args.postgres_tls_key, None);
         assert_eq!(args.postgres_user, "briskdb");
@@ -384,6 +433,104 @@ mod tests {
             ])
             .env(MARKER, "1")
             .env("BRISKDB_MONGO_LISTEN", "127.0.0.1:27017")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn mongo_tls_requires_complete_explicit_feature_gated_configuration() {
+        for flags in [
+            vec![
+                "--mongo-listen",
+                "127.0.0.1:0",
+                "--mongo-tls-cert",
+                "missing.crt",
+            ],
+            vec![
+                "--mongo-listen",
+                "127.0.0.1:0",
+                "--mongo-tls-key",
+                "missing.key",
+            ],
+            vec![
+                "--mongo-tls-cert",
+                "missing.crt",
+                "--mongo-tls-key",
+                "missing.key",
+            ],
+        ] {
+            let args = Args::try_parse_from(std::iter::once("briskdb").chain(flags)).unwrap();
+            assert_eq!(
+                args.into_server_parts().unwrap_err().kind(),
+                EngineErrorKind::InvalidArgument
+            );
+        }
+        let args = Args::try_parse_from([
+            "briskdb",
+            "--mongo-listen",
+            "127.0.0.1:0",
+            "--mongo-tls-cert",
+            "missing.crt",
+            "--mongo-tls-key",
+            "missing.key",
+        ])
+        .unwrap();
+        assert_eq!(args.mongo_tls_cert, Some(PathBuf::from("missing.crt")));
+        assert_eq!(args.mongo_tls_key, Some(PathBuf::from("missing.key")));
+        #[cfg(feature = "mongo-tls")]
+        assert!(
+            args.into_server_parts().is_ok(),
+            "conversion must not read identity files"
+        );
+        #[cfg(not(feature = "mongo-tls"))]
+        assert!(
+            args.into_server_parts()
+                .unwrap_err()
+                .to_string()
+                .contains("`mongo-tls` Cargo feature")
+        );
+    }
+
+    #[test]
+    fn mongo_tls_environment_and_cli_precedence_are_isolated_in_children() {
+        const MARKER: &str = "BRISKDB_MONGO_TLS_ENV_TEST_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(args.mongo_tls_cert, Some(PathBuf::from("environment.crt")));
+            assert_eq!(args.mongo_tls_key, Some(PathBuf::from("environment.key")));
+            let args = Args::try_parse_from([
+                "briskdb",
+                "--mongo-tls-cert",
+                "explicit.crt",
+                "--mongo-tls-key",
+                "explicit.key",
+            ])
+            .unwrap();
+            assert_eq!(args.mongo_tls_cert, Some(PathBuf::from("explicit.crt")));
+            assert_eq!(args.mongo_tls_key, Some(PathBuf::from("explicit.key")));
+            let args = Args::try_parse_from(["briskdb", "--mongo-listen", "disabled"]).unwrap();
+            assert_eq!(
+                args.into_server_parts().unwrap_err().kind(),
+                EngineErrorKind::InvalidArgument
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::mongo_tls_environment_and_cli_precedence_are_isolated_in_children",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("BRISKDB_MONGO_LISTEN", "127.0.0.1:0")
+            .env("BRISKDB_MONGO_TLS_CERT", "environment.crt")
+            .env("BRISKDB_MONGO_TLS_KEY", "environment.key")
             .output()
             .unwrap();
         assert!(

@@ -235,7 +235,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`EngineOptions::default`].
 #[cfg(feature = "server")]
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
-    run_configured(config, options, None).await
+    run_configured(config, options, DaemonMongoOptions::default()).await
 }
 
 /// Opt into loopback Mongo alongside the normal process-owned listeners.
@@ -246,15 +246,54 @@ pub async fn run_with_mongo(
     options: EngineOptions,
     address: SocketAddr,
 ) -> anyhow::Result<()> {
-    run_configured(config, options, Some(address)).await
+    run_configured(
+        config,
+        options,
+        DaemonMongoOptions {
+            address: Some(address),
+            #[cfg(feature = "mongo-tls")]
+            tls: None,
+        },
+    )
+    .await
+}
+
+/// Opt into encrypted, still-anonymous loopback Mongo in the process-owned host.
+/// All security is prepared before opening the database or binding sockets.
+/// This does not enable Mongo user authentication, remote binding or hot reload.
+#[cfg(all(feature = "server", feature = "mongo-tls"))]
+pub async fn run_with_mongo_tls(
+    config: Config,
+    options: EngineOptions,
+    address: SocketAddr,
+    tls: crate::protocol::mongo::MongoTlsConfig,
+) -> anyhow::Result<()> {
+    run_configured(
+        config,
+        options,
+        DaemonMongoOptions {
+            address: Some(address),
+            tls: Some(tls),
+        },
+    )
+    .await
+}
+
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct DaemonMongoOptions {
+    address: Option<SocketAddr>,
+    #[cfg(feature = "mongo-tls")]
+    tls: Option<crate::protocol::mongo::MongoTlsConfig>,
 }
 
 #[cfg(feature = "server")]
 async fn run_configured(
     config: Config,
     options: EngineOptions,
-    mongo_listen: Option<SocketAddr>,
+    mongo: DaemonMongoOptions,
 ) -> anyhow::Result<()> {
+    let mongo_listen = mongo.address;
     let listener_config = ListenerConfig {
         http_listen: config.listen,
         admin_listen: config.admin_listen,
@@ -262,13 +301,33 @@ async fn run_configured(
     };
     validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
     validate_optional_mongo(&listener_config, mongo_listen)?;
-    let postgres_security = config
-        .postgres_security
-        .as_ref()
-        .map(postgres::SecurityConfig::load)
-        .transpose()
-        .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?
-        .map(postgres::ReloadableSecurity::new);
+    #[cfg(feature = "mongo-tls")]
+    if mongo.tls.is_some() && mongo_listen.is_none() {
+        anyhow::bail!("Mongo TLS configuration requires an enabled Mongo listener");
+    }
+    let postgres_security = match config.postgres_security.clone() {
+        Some(config) => Some(postgres::ReloadableSecurity::new(
+            tokio::task::spawn_blocking(move || config.load())
+                .await
+                .context("PostgreSQL security preparation worker failed")?
+                .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?,
+        )),
+        None => None,
+    };
+    #[cfg(feature = "mongo-tls")]
+    let mongo_tls = match mongo.tls {
+        Some(config) => Some(crate::protocol::mongo::ReloadableTls::new(
+            tokio::task::spawn_blocking(move || config.load())
+                .await
+                .context("Mongo TLS preparation worker failed")?
+                .context("failed to prepare Mongo TLS configuration")?,
+        )),
+        None => None,
+    };
+    #[cfg(feature = "mongo-tls")]
+    let mongo_secure = mongo_tls.is_some();
+    #[cfg(not(feature = "mongo-tls"))]
+    let mongo_secure = false;
     let builder = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options);
@@ -289,6 +348,14 @@ async fn run_configured(
             }
             return Err(error);
         }
+    };
+    #[cfg(feature = "mongo-tls")]
+    let listeners = {
+        let mut listeners = listeners;
+        if let Some(mongo) = &mut listeners.mongo {
+            mongo.tls = mongo_tls;
+        }
+        listeners
     };
     #[cfg(feature = "mongo")]
     let mongo_listen = match listeners.addresses() {
@@ -329,6 +396,7 @@ async fn run_configured(
         admin_listen = ?config.admin_listen,
         postgres_listen = ?config.postgres_listen,
         mongo_listen = ?mongo_listen,
+        mongo_secure,
         postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),

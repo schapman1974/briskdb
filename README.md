@@ -369,8 +369,10 @@ Unreleased source builds also support `db.serve(mongo=..., mongo_tls_cert=...,
 mongo_tls_key=...)` in sync/async Python. Use stock PyMongo with `tls=True` and
 `tlsCAFile` for a verified connection; see the [Python TLS example](python/README.md#encrypt-the-mongo-listener-unreleased).
 Rust hosts select `mongo-tls`; see the [Rust TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
-TLS still leaves Mongo anonymous and loopback-only. The daemon and managed
-`briskdb.patch()` clients retain their existing plaintext local transport.
+The daemon can also opt into TLS with `--features mongo-tls` and paired
+`--mongo-tls-cert` / `--mongo-tls-key`; see [daemon TLS setup](docs/MONGO_PARITY.md#encrypted-daemon-mongo-unreleased).
+TLS still leaves Mongo anonymous and loopback-only. Plaintext remains the default;
+managed `briskdb.patch()` clients retain their existing plaintext local transport.
 
 ### Use existing PyMongo code with the BriskDB wheel
 

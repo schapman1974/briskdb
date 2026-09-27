@@ -446,8 +446,12 @@ database under differential/property tests.
   the wheel. Rust attached and Python sync/async handles also expose Mongo TLS
   reload, with weak engine ownership, queued Python request controls, native
   cancellation/lifecycle guards, verified client rotation and PostgreSQL isolation.
-  Plaintext/patch defaults stay unchanged. Daemon Mongo TLS configuration,
-  CLI reload, other listeners and immediate session revocation remain separate work.
+  The daemon also accepts explicit paired CLI/environment Mongo TLS paths, fails
+  closed without feature/configuration support, and prepares identities before
+  database creation or listener binding. Real-process native/PyMongo tests cover
+  certificate validation, invalid startup, bind cleanup, drain and persisted restart.
+  Plaintext/patch defaults stay unchanged. CLI reload, other listeners and immediate
+  session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

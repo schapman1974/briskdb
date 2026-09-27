@@ -614,9 +614,10 @@ the database. Builds without `mongo` reject activation before creating files.
 Every configured socket is bound before serving begins; a bind failure releases
 the sockets and closes the process-owned database. SIGINT/SIGTERM drains all
 listeners; an unexpected Mongo exit stops the common server and reports failure.
-The daemon's Mongo listener is plaintext and unauthenticated: keep it local,
-including when PostgreSQL uses TLS/SCRAM. The optional standalone Rust TLS API
-below does not add user authentication. Do not publicly proxy either listener.
+The daemon's Mongo listener defaults to plaintext and unauthenticated: keep it
+local, including when PostgreSQL uses TLS/SCRAM. Optional Mongo TLS configuration
+below encrypts connections but adds no user authentication. Do not publicly proxy
+either anonymous listener.
 
 Zlib transport is negotiated only when a valid hello/isMaster offers `zlib`.
 For example, pass `compressors="zlib"` to `MongoClient` / `AsyncMongoClient`,
@@ -719,8 +720,8 @@ reading identity files, and public proxying remains unsafe. Unreleased Python
 transport in sync/async source builds; both paths are required together and
 stock PyMongo must verify the server certificate/hostname. See the
 [Python example](../python/README.md#encrypt-the-mongo-listener-unreleased).
-The daemon and managed PyMongo patch hosts still use their existing plaintext
-loopback transport; they do not yet expose Mongo TLS. Legacy Rust
+Managed PyMongo patch hosts still use their existing plaintext loopback transport;
+the daemon can opt into TLS as described below. Legacy Rust
 `AttachedServer::*_with_mongo` constructors also remain plaintext; opt into
 attached TLS with the options API below.
 Mongo authentication, roles and remote binding remain separate work.
@@ -773,6 +774,52 @@ BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
 BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
   --features mongo-tls --test mongo_wire \
   tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
+```
+
+### Encrypted daemon Mongo (unreleased)
+
+Build the daemon with `mongo-tls` and pass both paths with an enabled Mongo
+listener. Neither TLS nor Mongo is implicitly enabled:
+
+```sh
+cargo run --locked --features mongo-tls --bin briskdb -- \
+  --data-dir ./briskdb-data --shards 4 --mongo-listen 127.0.0.1:27017 \
+  --mongo-tls-cert ./server.crt --mongo-tls-key ./server.key
+```
+
+The environment equivalents are `BRISKDB_MONGO_TLS_CERT` and
+`BRISKDB_MONGO_TLS_KEY`; explicit CLI values take precedence. Both paths must be
+set together, and `--mongo-listen disabled` with TLS paths fails instead of
+ignoring them. Builds without `mongo-tls` reject a complete TLS request instead
+of silently serving plaintext. The existing default and `mongo`-only builds do
+not gain TLS or a listener automatically.
+
+Use stock PyMongo with `mongodb://localhost:27017/?directConnection=true`,
+`tls=True` and `tlsCAFile="./ca.crt"`, trusting the issuer and checking a hostname
+in the server certificate. Do not disable certificate/hostname validation.
+The shared loader validates bounded certificate/key files before database creation
+or socket binding; Unix keys must not be group-writable or accessible to others.
+Invalid material fails startup. Non-loopback and fixed collision checks precede
+file reads. TLS/SCRAM preparation runs off the async runtime. All listeners bind
+before serving; failed binding cleans up the process-owned database and sockets.
+SIGINT/SIGTERM also drains encrypted connections and incomplete TLS handshakes.
+The readiness log reports `mongo_secure=true` for this encrypted but anonymous
+transport, **not authentication or permission to expose it publicly**.
+
+Rust process hosts can call
+`server::run_with_mongo_tls(config, engine_options, address, tls_config).await`
+with `server,mongo-tls`. Existing `Config` literals and legacy entry points are
+unchanged. There is no daemon hot-reload/SIGHUP handler yet; prepare complete
+replacement files and restart, or use the explicit standalone/attached host
+reload APIs above. This does not change PostgreSQL credentials, HTTP security,
+Mongo authentication/roles, or managed-patch behavior.
+
+The real-process gate covers verified sync/async PyMongo, zlib, CRUD, indexes,
+cursors, rejection/recovery, SIGTERM and persisted collections on restart:
+
+```sh
+BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
+  --features server-cli,mongo-tls --bin briskdb --test mongo_server -- --include-ignored
 ```
 
 ### Composed Rust listener startup

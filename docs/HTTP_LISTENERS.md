@@ -26,6 +26,10 @@ when built with the non-default `mongo` feature. `--mongo-listen` /
 It shares database ownership and shutdown with HTTP/PostgreSQL, not their data
 model or security settings. A Mongo bind failure releases all passive sockets
 before the server begins accepting requests.
+Unreleased builds with `mongo-tls` also accept paired `--mongo-tls-cert` and
+`--mongo-tls-key` (or `BRISKDB_MONGO_TLS_CERT` / `BRISKDB_MONGO_TLS_KEY`). This
+encrypts only Mongo and does not change either HTTP plane's loopback-only policy;
+see [daemon Mongo TLS](MONGO_PARITY.md#encrypted-daemon-mongo-unreleased).
 
 The data and administration addresses must be distinct when a nonzero port is
 configured. The same loopback address with port zero is valid for both; each
