@@ -617,15 +617,24 @@ impl Storage {
         let mut startup = begin_startup_coordination(&schema_coordination)?;
         startup.wait_for_quiescence_blocking();
         let manifest_path = root.join("manifest.sqlite");
-        let requires_exclusive = startup_requires_exclusive_ownership(
-            &manifest_path,
-            requested_shards,
-        )
-        .and_then(|manifest_requires_exclusive| {
-            global_index::startup_requires_upgrade(&root).map(|global_index_requires_exclusive| {
-                manifest_requires_exclusive || global_index_requires_exclusive
-            })
-        });
+        let shards_dir = root.join("shards");
+        let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
+        // Surviving shard files require their authoritative manifest. Reject
+        // before global-index upgrades or any create-capable SQLite open.
+        let required_manifest = if fresh_layout_allowed {
+            Ok(())
+        } else {
+            validate_existing_manifest_file(&manifest_path)
+        };
+        let requires_exclusive = required_manifest
+            .and_then(|()| startup_requires_exclusive_ownership(&manifest_path, requested_shards))
+            .and_then(|manifest_requires_exclusive| {
+                global_index::startup_requires_upgrade(&root).map(
+                    |global_index_requires_exclusive| {
+                        manifest_requires_exclusive || global_index_requires_exclusive
+                    },
+                )
+            });
         let requires_exclusive = match requires_exclusive {
             Ok(requires_exclusive) => requires_exclusive,
             Err(error) => {
@@ -646,9 +655,7 @@ impl Storage {
             }
             return Err(error);
         }
-        let shards_dir = root.join("shards");
-        let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
-        let mut manifest = open_manifest_for_startup(&manifest_path)?;
+        let mut manifest = open_manifest_for_startup(&manifest_path, fresh_layout_allowed)?;
         if let Err(error) = configure_manifest_connection(&manifest) {
             if error.kind() == EngineErrorKind::DataCorruption {
                 schema_coordination.mark_degraded();
@@ -4013,7 +4020,11 @@ fn validate_manifest_integrity_check(connection: &Connection) -> EngineResult<()
     }
 }
 
-fn open_manifest_for_startup(path: &Path) -> EngineResult<Connection> {
+fn open_manifest_for_startup(path: &Path, fresh_layout_allowed: bool) -> EngineResult<Connection> {
+    if !fresh_layout_allowed {
+        // Keep CREATE disabled even if the file disappears after preflight.
+        return open_existing_manifest(path);
+    }
     validate_optional_manifest_file(path)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
@@ -5182,6 +5193,79 @@ mod tests {
     }
 
     #[test]
+    fn missing_manifest_beside_existing_shards_is_not_recreated() {
+        for count in [2, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            drop(Storage::open(temp.path(), count).unwrap());
+            let manifest_path = temp.path().join("manifest.sqlite");
+            let original_manifest = fs::read(&manifest_path).unwrap();
+            let shards_before = (0..count)
+                .map(|shard| fs::read(shard_file(temp.path(), shard)).unwrap())
+                .collect::<Vec<_>>();
+            fs::remove_file(&manifest_path).unwrap();
+
+            for requested in [count, 3] {
+                let error = Storage::open(temp.path(), requested).unwrap_err();
+                assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+                assert!(
+                    !manifest_path.exists(),
+                    "startup recreated a missing manifest"
+                );
+                for shard in 0..count {
+                    assert_eq!(
+                        fs::read(shard_file(temp.path(), shard)).unwrap(),
+                        shards_before[usize::from(shard)]
+                    );
+                }
+            }
+            // Simulate restoring the exact stopped fixture, never manufacture
+            // replacement metadata or infer it from the surviving shards.
+            fs::write(&manifest_path, original_manifest).unwrap();
+            drop(Storage::open(temp.path(), count).unwrap());
+        }
+    }
+
+    #[test]
+    fn noncreating_manifest_open_rejects_a_file_removed_after_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        drop(open_manifest_for_startup(&path, true).unwrap());
+        validate_existing_manifest_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = open_manifest_for_startup(&path, false).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn missing_manifest_rejects_before_upgrading_global_index_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = fs::canonicalize(temp.path()).unwrap();
+        let mut database = setup_global_index_root(temp.path());
+        let index = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(index).unwrap();
+        drop(database);
+        global_index::downgrade_to_v3_for_test(temp.path());
+        let authority = temp.path().join("global-indexes/global.sqlite");
+        let authority_before = fs::read(&authority).unwrap();
+        let manifest = temp.path().join("manifest.sqlite");
+        let manifest_before = fs::read(&manifest).unwrap();
+        fs::remove_file(&manifest).unwrap();
+
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert!(!manifest.exists());
+        assert_eq!(fs::read(&authority).unwrap(), authority_before);
+        assert!(global_index::startup_requires_upgrade(&canonical_root).unwrap());
+
+        fs::write(&manifest, manifest_before).unwrap();
+        drop(Storage::open(temp.path(), 2).unwrap());
+        assert!(!global_index::startup_requires_upgrade(&canonical_root).unwrap());
+    }
+
+    #[test]
     fn startup_rejects_swapped_and_cross_layout_shards() {
         let swapped = tempfile::tempdir().unwrap();
         drop(Storage::open(swapped.path(), 2).unwrap());
@@ -5309,24 +5393,12 @@ mod tests {
         fs::write(temp.path().join("shards/operator-note"), b"do not adopt").unwrap();
 
         let error = Storage::open(temp.path(), 2).unwrap_err();
-        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
         assert!(!shard_file(temp.path(), 0).exists());
-        let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        assert!(!temp.path().join("manifest.sqlite").exists());
         assert_eq!(
-            manifest
-                .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            manifest
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0
+            fs::read(temp.path().join("shards/operator-note")).unwrap(),
+            b"do not adopt"
         );
     }
 
