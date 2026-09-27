@@ -442,7 +442,11 @@ database under differential/property tests.
   Standalone Rust Mongo TLS now supports bounded SCRAM-SHA-256 conversations,
   verified PyMongo sync/async clients, current document privileges and same-user
   pooled cursors with cross-user/generation isolation. Only explicit secure roots
-  may bind off loopback. Built-in roles/user commands, Python/daemon/composed-host
+  may bind off loopback. Typed user creation/deletion, password rotation and role
+  membership grants/revocations now derive realm permissions in the shared engine,
+  authorize before hashing, and bind authorization to the durable write revision.
+  Mongo exposes the corresponding five commands with strict option validation.
+  Built-in roles, broader user/role administration, Python/daemon/composed-host
   wiring, relational/admin admission and broader security release gates remain outstanding.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable

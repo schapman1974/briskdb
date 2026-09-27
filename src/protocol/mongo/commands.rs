@@ -9,6 +9,8 @@ use std::{
 mod cursors;
 mod indexes;
 mod read_options;
+#[cfg(feature = "auth-scram")]
+mod users;
 
 use tokio::sync::Mutex;
 
@@ -243,6 +245,8 @@ fn metadata_read_options(body: &BsonDocument) -> Result<DocumentReadOptions> {
 }
 
 pub(super) enum Command {
+    #[cfg(feature = "auth-scram")]
+    UserManagement(crate::core::user_management::UserManagementCommand),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -294,6 +298,10 @@ pub(super) fn prepare_with_limits(
     limits: super::MongoResourceLimits,
 ) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
+    #[cfg(feature = "auth-scram")]
+    if users::is_command(name) {
+        return Some(users::prepare(request, started, limits));
+    }
     if !matches!(
         name,
         "insert"
@@ -1436,6 +1444,21 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::UserManagement(command) => {
+                if !self.secured() {
+                    return Err(CommandError::new(
+                        115,
+                        "CommandNotSupported",
+                        "user management requires an authenticated engine",
+                    ));
+                }
+                self.database
+                    .engine()
+                    .execute_user_management(session, context, command)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             Command::DropIndexes(request) => {
                 match self
                     .call(

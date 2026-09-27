@@ -1414,6 +1414,25 @@ administration uses `update_security_catalog`; no unchecked wire administration
 command is exposed. Blocking authority I/O uses the engine's bounded workers and
 lifecycle leases, and a poisoned authority mutex fails closed.
 
+`execute_user_management(session, context, UserManagementCommand)` is the
+separate authorized path for creation, deletion, password rotation and role
+membership changes. Its opaque command derives all privileges: `CreateUser`,
+`DropUser` or `RotateCredentials` on the account's realm, plus `GrantRole` or
+`RevokeRole` on every affected role's realm. Creating an account with initial
+roles requires both creation and grant privileges. There is no implicit
+self-service password permission. Commands own zeroizing bounded passwords and
+at most 64 role references, counted before deduplication; grant/revoke require
+at least one reference, so empty requirements cannot become an existence probe.
+
+The durable authority refreshes once, authorizes the live principal against that
+revision, edits a detached catalog, and commits against the same revision. A
+concurrent revocation causes a compare-and-swap conflict, not a replay under a
+different policy. Password normalization/derivation occurs only after authorization
+on a bounded worker. Membership unions/removals validate fully before publishing.
+Queued cancellation/deadlines skip the edit; after blocking work starts the result
+can be uncertain and must not trigger automatic retries. Rotation and deletion
+invalidate retained identities; role changes affect subsequent admission.
+
 Every document command derives its complete requirements before metadata/data
 work. Database-specific commands require `ConnectDatabase`; reads, mutations,
 schema/index operations and metadata discovery have distinct privileges. An
@@ -1433,7 +1452,7 @@ generation before handoff, quota changes or removal. A fresh engine or a rotated
 recreated user cannot inherit those cursors.
 Revocation affects the next admission, not already-admitted work.
 
-This first secured engine surface supports **document commands only**. Ordinary
+This secured engine surface supports **document and typed user commands**. Ordinary
 SQL execution/preparation, transaction and schema/admin request operations reject secured engines;
 HTTP routers, SQLite-remote routers, PostgreSQL wire startup and
 composed listener startup also reject this mode. Rust-host lifecycle controls,
@@ -1441,7 +1460,7 @@ query tracking/cancellation, background-worker controls, session cleanup and
 catalog inspection remain trusted host APIs, not remotely authorized operations.
 The standalone Rust Mongo TLS listener now owns the bounded wire SCRAM conversation;
 see [its activation and limitations](MONGO_PARITY.md#authenticated-rust-mongo-unreleased).
-Built-in roles/user commands, Python/daemon/composed-host wiring and relational/admin
+Built-in roles, broader user/role commands, Python/daemon/composed-host wiring and relational/admin
 RBAC are still outstanding. Default anonymous local roots and existing Python APIs
 retain their behavior.
 

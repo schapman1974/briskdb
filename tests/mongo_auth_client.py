@@ -105,7 +105,7 @@ def sync_checks():
             assert list(pool.map(lambda _: writer.app.items.count_documents({}), range(12))) == [15] * 12
         denied(lambda: writer.other.items.find_one())
         denied(lambda: writer.list_database_names())
-        denied(lambda: writer.admin.command("createUser", "bypass", pwd="password", roles=[]), 59)
+        denied(lambda: writer.admin.command("createUser", "bypass", pwd="password", roles=[]))
         # Metadata/creation grants cannot authorize empty data results or let a
         # rejected write implicitly create a collection before its real check.
         metadata = Raw()

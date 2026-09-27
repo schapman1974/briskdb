@@ -15,6 +15,9 @@ mod capture {
     ));
 }
 
+#[path = "authentication/users.rs"]
+mod users;
+
 const PASSWORD: &str = "private test password";
 const REPLACEMENT: &str = "rotated test password";
 

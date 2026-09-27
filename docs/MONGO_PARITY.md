@@ -743,7 +743,7 @@ The standalone Rust host supports `mongo-tls,auth-scram` with an explicitly
 activated security root. This is **not** enabled in the published alpha.7 wheel,
 Python `serve`/`patch`, daemon or composed `AttachedServer` paths. Those retain
 their existing anonymous loopback boundaries. Secure roots currently support
-document commands, not SQL or shared PostgreSQL/HTTP/SQLite-remote authentication.
+document and scoped user commands, not SQL or shared PostgreSQL/HTTP/SQLite-remote authentication.
 
 First, an offline trusted Rust host must initialize/close the ordinary root,
 construct a `SecurityCatalog` containing SCRAM-SHA-256 verifiers and explicit
@@ -753,7 +753,9 @@ This is **one-way activation**: ordinary openers stop working. Close every root
 handle/process first, back up the entire consistent root including its credential
 store, and never delete/adopt an orphan store after an interrupted activation.
 See [the provisioning contract](ARCHITECTURE.md#authenticated-document-engine-unreleased-opt-in-rust-api).
-No implicit admin, public provisioning endpoint or wire user-management command exists.
+There is no implicit admin or public provisioning endpoint. Initial roles and an
+operator account must be provisioned by the trusted host; authorized users can
+then use the bounded wire commands below.
 
 Open that already-provisioned root and explicitly start TLS:
 
@@ -822,7 +824,8 @@ Security contract:
   credential generation. Another user cannot take over or remove a cursor. Current
   roles and credential generations are refreshed at each engine admission; rotation,
   removal and revocation affect subsequent work, not already-admitted operations.
-- Trusted hosts administer the catalog through `update_security_catalog`. Wire
+- Trusted hosts administer the catalog through `update_security_catalog`; the
+  five scoped user commands below use a separate authorized engine path. Broader
   user/role administration, built-in roles, per-user auditing, full fault/soak
   acceptance and Python/daemon/composed-host configuration remain separate work.
 
@@ -830,6 +833,49 @@ Local gates include real PyMongo 4.17.0 sync/async SCRAM with verified TLS and z
 escaped usernames, least-privilege denial, same-user pooled continuation, cross-user
 read/kill denial, legacy empty exchanges, live credential/role revocation, plus
 bounded parser/nonce/replay/expiry/admission and core ownership regression tests.
+
+#### Scoped user commands (unreleased)
+
+Authenticated standalone Mongo supports `createUser`, `dropUser`, password-only
+`updateUser`, `grantRolesToUser` and `revokeRolesFromUser`. Roles must already
+exist in the host-provisioned catalog; names such as `read`/`readWrite` are **not**
+automatically built-in roles. Here `client` is a verified TLS connection logged
+in as an operator granted `CreateUser`/`DropUser`/`RotateCredentials` on `accounts`
+and `GrantRole`/`RevokeRole` on `app`, where the host has created `app_reader`:
+
+```python
+client.accounts.command("createUser", "reader", pwd=os.environ["NEW_PASSWORD"],
+                        roles=[{"role": "app_reader", "db": "app"}])
+client.accounts.command("updateUser", "reader", pwd=os.environ["ROTATED_PASSWORD"])
+client.accounts.command("revokeRolesFromUser", "reader",
+                        roles=[{"role": "app_reader", "db": "app"}])
+client.accounts.command("grantRolesToUser", "reader",
+                        roles=[{"role": "app_reader", "db": "app"}])
+client.accounts.command("dropUser", "reader")
+```
+
+Creation requires `roles` (an empty array is valid); string role names refer to
+the command database. Grant/revoke arrays must be nonempty, with at most 64
+references. Account commands cannot target `local`. Passwords are bounded to
+1–1024 UTF-8 bytes and SASLprep-validated, then hashed with a random salt and
+600,000 iterations. Optional `mechanisms` must be `["SCRAM-SHA-256"]` and
+`digestPassword` must be `true`; write concern must be omitted, `{}` or `{w: 1}`.
+Unknown/duplicate fields, unacknowledged writes, SHA-1, pre-digested passwords,
+custom data, authentication restrictions, comments, role-array replacement in
+`updateUser`, role-definition commands and `usersInfo` are unsupported. Catalog
+existence/conflict errors currently use BriskDB's generic wire error mapping,
+not every MongoDB administration-specific error code.
+
+Privileges are derived by the engine, checked before password work or catalog
+existence checks, and tied to the same revision as the write. A mixed allowed/
+forbidden grant never partly applies. There is no implicit own-password right
+or protection against an authorized operator dropping its last administrator;
+retain trusted-host recovery access. Password rotation/drop invalidates existing
+authenticated sockets; reconnect with the new credentials. Role changes apply
+to subsequent operations, including on pooled sockets. Timeouts/disconnects
+after blocking work starts can have an uncertain commit outcome: do not blindly
+retry. Local tests cover these boundaries with real PyMongo and engine-level
+concurrent-revocation, restart, cancellation and redaction checks.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:

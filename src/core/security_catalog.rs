@@ -281,6 +281,38 @@ impl SecurityCatalog {
         Ok(())
     }
 
+    /// Trusted, bounded union; validate the full resulting membership before editing.
+    pub fn grant_user_roles(
+        &mut self,
+        name: &SecurityName,
+        roles: impl IntoIterator<Item = SecurityName>,
+    ) -> EngineResult<()> {
+        let additions = self.validate_roles(roles)?;
+        let mut combined = self.users.get(name).ok_or_else(not_found)?.roles.clone();
+        combined.extend(additions);
+        let combined = self.validate_roles(combined)?;
+        self.users.get_mut(name).expect("validated user").roles = combined;
+        Ok(())
+    }
+
+    /// Trusted, bounded removal. Unknown/unassigned names are harmless no-ops;
+    /// never mutate membership until the complete input has been bounded.
+    pub fn revoke_user_roles(
+        &mut self,
+        name: &SecurityName,
+        roles: impl IntoIterator<Item = SecurityName>,
+    ) -> EngineResult<()> {
+        let mut retained = self.users.get(name).ok_or_else(not_found)?.roles.clone();
+        for (index, role) in roles.into_iter().enumerate() {
+            if index >= MAX_POLICY_ROLES {
+                return Err(limit());
+            }
+            retained.remove(&role);
+        }
+        self.users.get_mut(name).expect("validated user").roles = retained;
+        Ok(())
+    }
+
     /// Invalidate pending proofs and all retained principals at their next admission,
     /// even if the replacement password/record happens to equal the previous one.
     pub fn rotate_credentials(
