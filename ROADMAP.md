@@ -1005,9 +1005,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, forty-nine query/public-client suites now
-      have complete source accounting (683 functions/1,243 reference cases), backed
-      by 309 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, fifty query/public-client suites now
+      have complete source accounting (733 functions/1,307 reference cases), backed
+      by 311 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1124,6 +1124,12 @@ requires an earlier dependency:
       shard bytes across repeated attempts and exact stopped-fixture restoration;
       empty-root creation still works. This fixes a reproduced empty-replacement
       manifest side effect, not automatic recovery of missing authoritative data.
+      Full sharded-initialization accounting distinguishes explicit native index
+      builds and finish-on-restart drops from TinyMongo pending activation and
+      compensating child-index recreation. Real process-exit recovery matrices,
+      catalog snapshots, corruption rejection, directory policy and dotted-index
+      restarts supply evidence; private cache/retry/physical-layout hooks and
+      no-rescan startup promises are not treated as native APIs.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-

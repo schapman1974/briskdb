@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 683 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 733 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -65,14 +65,14 @@ functions in the locked `test_query_more.py`,
 and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
 `test_tinymongo_coverage_edges.py`, `test_beanie_compat.py`,
 `test_sharded_sqlite_backend.py`, `test_tinymongo.py`,
-`test_remaining_coverage.py` suites
-(1,243 reference parameter cases). 309 added wheel scenarios and existing patch
+`test_remaining_coverage.py`, `test_sharded_sqlite_coverage_init.py` suites
+(1,307 reference parameter cases). 311 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,243 unchanged upstream candidate passes or complete #186 certification.
+not 1,307 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -216,6 +216,18 @@ empty replacement or changing shard bytes. The native open also omits SQLite's
 create flag for nonempty layouts. Fresh empty roots can still initialize. Tests
 cover repeated default/matching/mismatched shard-count attempts and reopening an
 exactly restored stopped fixture; automatic manifest reconstruction is unsupported.
+
+Sharded-initialization source accounting distinguishes native recovery contracts:
+Pending index declarations require explicit builds, unfinished builds clean their
+unpublished derived entries, and admitted index drops finish removal on reopen.
+They do not use TinyMongo's automatic pending activation or compensating
+child-index recreation. Actual process-exit tests cover collection/database drops,
+index creation, restartable cleanup, index drops and build commits. READY native
+indexes validate coverage/checksums and unique ownership; no private Python
+no-rescan guarantee is promised. Native directory-policy tests preserve unrelated
+root-level files, reject unclaimed shard contents without a replacement manifest,
+and verify dotted unique index enforcement/drop across separate restarts. Private
+cache/PID/retry/physical-index hooks remain explicit implementation differences.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
