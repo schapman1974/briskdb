@@ -69,9 +69,17 @@ version-22 older-writer fence and advances the semantic digest to version 14.
 It changes no application records, shard layout or credentials and does not
 enable authentication. An empty binding preserves ordinary startup. A present
 binding names one nonzero 16-byte security store ID and makes ordinary startup
-fail closed, even in builds with `auth-scram`. Authenticated startup, provisioning
-and session/listener enforcement are not yet implemented; no public activation
-API writes this row. The marker is recognized independently of feature flags.
+fail closed, even in builds with `auth-scram`. With that opt-in feature,
+`Engine::provision_security` can activate an existing ready root after all local
+and peer handles close. It exclusively creates the owner-only `security.sqlite`
+store and durably commits it before binding its ID and resealing this manifest.
+The entire root must be owner-only. Failure may leave an orphan store, which is
+never automatically adopted, replaced or deleted. Backups/restores must include
+both the manifest and its credential store as one consistent root.
+`Engine::open_authenticated` validates the binding and matching store before
+storage startup; it supports authenticated document admission only. Ordinary
+SQL/HTTP/PostgreSQL/SQLite-remote and Mongo listener paths do not yet support this
+mode and fail closed. The marker is recognized independently of feature flags.
 
 ```sql
 CREATE TABLE briskdb_manifest (

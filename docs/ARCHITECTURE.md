@@ -1288,8 +1288,8 @@ Mutation requires exclusive Rust access; a shared host must retain its lock
 through authentication completion or admission. This does not cancel already
 admitted operations, close existing cursors, bind transactions to principals, or
 make a permission check atomic with later engine work. Durable publication,
-engine/session ownership, cursor authorization and adapter enforcement remain
-under #64/#188. Debug and error output redact names, proofs and credential
+engine/session ownership and cursor authorization are supplied by the opt-in
+integration below; network adapter enforcement remains under #64/#188. Debug and error output redact names, proofs and credential
 material. No manifest upgrade, default security policy or wheel behavior changes.
 
 The catalog also exports/restores an explicit `BRKSEC01` binary record for the
@@ -1318,10 +1318,9 @@ in a **separate, explicitly chosen SQLite file**. This is a storage component,
 not an enabled engine security mode. It never changes `manifest.sqlite`, listener
 defaults or existing permissions. Manifest v22 separately reserves an empty,
 checksummed store-ID binding and downgrade fence. Ordinary startup rejects a
-present binding independently of feature flags; no public activation API or
-authenticated startup exists yet. Provisioning/root-store linkage and runtime
-session/admission publication still need engine integration before a
-listener can rely on this store. Loading returns a new catalog incarnation, not
+present binding independently of feature flags. The opt-in authenticated engine
+integration below now supplies root activation and document-session admission;
+network authentication is still outstanding. Loading returns a new catalog incarnation, not
 a live cache that can be substituted under existing sessions.
 
 The caller generates a `SecurityStoreId`, retains it in trusted configuration,
@@ -1390,8 +1389,55 @@ after that snapshot affect subsequent admissions, not already-admitted work.
 These methods perform blocking I/O and require exclusive Rust access. Hosts
 must serialize them on blocking workers and still derive complete operation
 requirements, bind root/store identity, and enforce session/cursor ownership.
-This wrapper is not yet installed in engine sessions or network listeners and
-does not activate a manifest binding or validate a wire-level SCRAM conversation.
+The wrapper alone does not activate a manifest binding or validate a wire-level
+SCRAM conversation.
+
+### Authenticated document engine (unreleased, opt-in Rust API)
+
+`Engine::provision_security(root, shards, catalog)` is an explicit, one-way offline
+operation on an initialized, current, ready root. It requires at least one user,
+an owner-only root directory, no live local root coordinators, and exclusive
+cross-process ownership under the startup lock. It creates `security.sqlite`
+exclusively, syncs the validated store, then transactionally inserts the store ID
+and reseals the manifest. Ordinary openers cannot subsequently use this root.
+An interrupted activation may leave an orphan store; retries never adopt,
+overwrite or delete it. Operators must inspect the outcome and keep consistent
+whole-root backups, including the private credential file. This is not an
+online security toggle or an automatic upgrade for existing applications.
+
+`Engine::open_authenticated(root, shards, options)` requires that binding and
+the matching store before shard startup. A missing/wrong/unsafe store or an
+unbound root fails closed. Its authentication APIs verify a host-validated SCRAM
+transcript and create a new immutable-principal session; they are **not** a wire
+SCRAM state machine. A session cannot be relabeled in place. Trusted Rust-host
+administration uses `update_security_catalog`; no unchecked wire administration
+command is exposed. Blocking authority I/O uses the engine's bounded workers and
+lifecycle leases, and a poisoned authority mutex fails closed.
+
+Every document command derives its complete requirements before metadata/data
+work. Database-specific commands require `ConnectDatabase`; reads, mutations,
+schema/index operations and metadata discovery have distinct privileges. An
+upsert also needs `InsertData`, and a returning mutation also needs `ReadData`.
+Collection creation conservatively requires `CreateDatabase` even for an
+existing database because the operation can implicitly create it after a
+concurrent drop. Listing database names requires the domain-wide listing grant;
+per-user filtered discovery is not implemented. There is no implicit administrator.
+
+Retained cursors belong to the immutable session identity. Continuation and
+deletion derive permissions from the retained cursor's real kind, not a supplied
+namespace convention, and refresh current roles/generation before admission.
+Other sessions/engines cannot take over a cursor, even for the same username.
+Revocation affects the next admission, not already-admitted work.
+
+This first secured engine surface supports **document commands only**. Ordinary
+SQL execution/preparation, transaction and schema/admin request operations reject secured engines;
+HTTP routers, SQLite-remote routers, PostgreSQL wire startup and current Mongo/
+composed listener startup also reject this mode. Rust-host lifecycle controls,
+query tracking/cancellation, background-worker controls, session cleanup and
+catalog inspection remain trusted host APIs, not remotely authorized operations.
+Mongo SCRAM conversations, built-in roles/user commands, Python/daemon wiring,
+and relational/admin RBAC are still outstanding. Default anonymous local roots
+and existing Python APIs retain their behavior.
 
 ### Bounded worker and connection-pool boundary
 

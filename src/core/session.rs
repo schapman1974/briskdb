@@ -212,6 +212,8 @@ impl fmt::Debug for SessionInner {
 pub struct Session {
     id: SessionId,
     pub(crate) owner: u64,
+    #[cfg(feature = "auth-scram")]
+    pub(crate) principal: Option<super::security_catalog::Principal>,
     pub(crate) inner: Arc<Mutex<SessionInner>>,
 }
 
@@ -221,6 +223,8 @@ impl Session {
         Self {
             id,
             owner,
+            #[cfg(feature = "auth-scram")]
+            principal: None,
             inner: Arc::new(Mutex::new(SessionInner {
                 state: SessionState::Ready,
                 routing_key: None,

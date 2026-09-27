@@ -979,6 +979,12 @@ impl Adapter {
     /// The user is a bounded session label until the later role-catalog work.
     /// Database selection is an exact lookup in the protocol-neutral catalog.
     pub fn open_connection_for(&self, user: &str, database: &str) -> EngineResult<Connection> {
+        if self.engine.security_enabled() {
+            return Err(EngineError::new(
+                crate::core::EngineErrorKind::PermissionDenied,
+                "PostgreSQL authentication for security-bound engines is not implemented",
+            ));
+        }
         if !valid_user_label(user) {
             return Err(EngineError::new(
                 crate::core::EngineErrorKind::InvalidArgument,
@@ -2008,6 +2014,12 @@ impl StartupHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.connection.state.adapter.engine.security_enabled() {
+            return Err(fatal_wire_error(
+                "08004",
+                "PostgreSQL authentication for security-bound engines is not implemented",
+            ));
+        }
         match message {
             PgWireFrontendMessage::Startup(startup) => {
                 let pending = validate_startup(&startup)?;

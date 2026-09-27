@@ -67,6 +67,11 @@ impl MongoServer {
         address: SocketAddr,
         limits: MongoResourceLimits,
     ) -> io::Result<Self> {
+        if database.engine().security_enabled() {
+            return Err(invalid(
+                "Mongo authentication for security-bound engines is not implemented",
+            ));
+        }
         if !address.ip().is_loopback() {
             return Err(invalid("Mongo listener requires loopback"));
         }
@@ -95,6 +100,11 @@ impl MongoServer {
         config: super::MongoTlsConfig,
         limits: MongoResourceLimits,
     ) -> io::Result<Self> {
+        if database.engine().security_enabled() {
+            return Err(invalid(
+                "Mongo authentication for security-bound engines is not implemented",
+            ));
+        }
         if !address.ip().is_loopback() {
             return Err(invalid(
                 "Mongo listener requires loopback; TLS does not authenticate Mongo users",
@@ -158,6 +168,11 @@ impl MongoServer {
         limits: MongoResourceLimits,
         transport: Transport,
     ) -> io::Result<Self> {
+        if database.engine().security_enabled() {
+            return Err(invalid(
+                "Mongo authentication for security-bound engines is not implemented",
+            ));
+        }
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
             return Err(invalid("Mongo listener requires loopback"));

@@ -91,6 +91,9 @@ pub fn router(database: Arc<Database>) -> Router {
 /// This compatibility constructor is useful to in-process Tower hosts. The
 /// BriskDB server binds the two planes separately.
 pub fn router_with_engine(engine: Engine) -> Router {
+    if engine.security_enabled() {
+        return unsupported_security_router();
+    }
     let state = HttpState::new(engine);
     Router::new()
         .route("/health", get(health))
@@ -117,6 +120,9 @@ pub fn data_router(database: Arc<Database>) -> Router {
 ///
 /// This plane contains only HTTP v1 discovery and SQL query/execute routes.
 pub fn data_router_with_engine(engine: Engine) -> Router {
+    if engine.security_enabled() {
+        return unsupported_security_router();
+    }
     Router::new()
         .merge(v1::data_routes())
         .layer(middleware::from_fn(request_controls))
@@ -138,6 +144,9 @@ pub fn admin_router(database: Arc<Database>) -> Router {
 /// This plane contains operational health and metrics, the versioned
 /// administration routes, and the embedded browser.
 pub fn admin_router_with_engine(engine: Engine) -> Router {
+    if engine.security_enabled() {
+        return unsupported_security_router();
+    }
     let state = HttpState::new(engine);
     Router::new()
         .route("/health", get(health))
@@ -147,6 +156,15 @@ pub fn admin_router_with_engine(engine: Engine) -> Router {
         .merge(admin::routes(state.clone()))
         .layer(middleware::from_fn(request_controls))
         .with_state(state)
+}
+
+fn unsupported_security_router() -> Router {
+    Router::new().fallback(|| async {
+        (
+            StatusCode::FORBIDDEN,
+            "HTTP authentication for security-bound engines is not implemented",
+        )
+    })
 }
 
 async fn request_controls(mut request: Request, next: Next) -> Response {

@@ -3,7 +3,7 @@ use crate::core::authorization::{DataDomain, MAX_POLICY_PRIVILEGES, Privilege, S
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 
-pub(super) const PASSWORD: &str = "private password";
+pub(crate) const PASSWORD: &str = "private password";
 
 fn copy_catalog(catalog: &SecurityCatalog) -> SecurityCatalog {
     SecurityCatalog::from_record(catalog.to_record().unwrap().as_bytes()).unwrap()
@@ -67,7 +67,7 @@ fn successor_rejects_credential_rewind_or_changed_verifier_without_a_new_generat
 pub(super) fn name(realm: &str, name: &str) -> SecurityName {
     SecurityName::new(realm, name).unwrap()
 }
-pub(super) fn credential() -> ScramSha256Verifier {
+pub(crate) fn credential() -> ScramSha256Verifier {
     ScramSha256Verifier::from_password_with_iterations(PASSWORD, 4096).unwrap()
 }
 pub(super) fn target() -> Resource {
@@ -76,7 +76,7 @@ pub(super) fn target() -> Resource {
 pub(super) fn policy(action: Action) -> Policy {
     Policy::new([Privilege::new(action, Scope::exact(target())).unwrap()]).unwrap()
 }
-pub(super) fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
+pub(crate) fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
     let mut catalog = SecurityCatalog::new();
     let user = name("app", "alice");
     let role = name("app", "reader");
@@ -90,7 +90,7 @@ pub(super) fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
 }
 
 // Independent client both generates the proof and validates the server signature.
-pub(super) fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, String, Vec<u8>) {
+pub(crate) fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, String, Vec<u8>) {
     let mut client = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
     let first = std::str::from_utf8(client.message())
         .unwrap()

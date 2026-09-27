@@ -1609,10 +1609,20 @@ fn load_or_create_manifest(
     load_or_create_manifest_with_fresh_layout(connection, requested_shards, true)
 }
 
+#[cfg(test)]
 pub(super) fn load_or_create_manifest_with_fresh_layout(
     connection: &mut Connection,
     requested_shards: u16,
     fresh_layout_allowed: bool,
+) -> EngineResult<LoadedManifest> {
+    load_or_create_manifest_with_security(connection, requested_shards, fresh_layout_allowed, None)
+}
+
+pub(super) fn load_or_create_manifest_with_security(
+    connection: &mut Connection,
+    requested_shards: u16,
+    fresh_layout_allowed: bool,
+    security_store_id: Option<[u8; 16]>,
 ) -> EngineResult<LoadedManifest> {
     let mut snapshot = load_or_create_snapshot_with_plan(
         connection,
@@ -1621,7 +1631,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         fresh_layout_allowed,
         &mut |_| Ok(()),
     )?;
-    reject_security_bound_ordinary_startup(&snapshot)?;
+    require_security_binding(&snapshot, security_store_id)?;
     let active_native_id_table_ids = std::mem::take(&mut snapshot.active_native_id_table_ids);
     let active_hilo_id_table_ids = std::mem::take(&mut snapshot.active_hilo_id_table_ids);
     let catalog = catalog_snapshot_from_parts(
@@ -1658,15 +1668,30 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
 /// A current, steady manifest can be validated while peer processes retain
 /// shared root leases. Every initialization, format upgrade, or recovery shape
 /// requires sole-process ownership before the normal startup path proceeds.
+#[cfg(any(test, feature = "auth-scram"))]
 pub(super) fn startup_requires_exclusive_ownership(
     connection: &Connection,
     requested_shards: u16,
 ) -> EngineResult<bool> {
+    startup_requires_exclusive_ownership_with_security(connection, requested_shards, None)
+}
+
+pub(super) fn startup_requires_exclusive_ownership_with_security(
+    connection: &Connection,
+    requested_shards: u16,
+    security_store_id: Option<[u8; 16]>,
+) -> EngineResult<bool> {
     let state = inspect_with_plan(connection, requested_shards, CURRENT_PLAN)?;
     let ManifestState::Versioned { version, snapshot } = state else {
+        if security_store_id.is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "authenticated startup requires a security-bound manifest",
+            ));
+        }
         return Ok(true);
     };
-    reject_security_bound_ordinary_startup(&snapshot)?;
+    require_security_binding(&snapshot, security_store_id)?;
     if version != CURRENT_SCHEMA_VERSION {
         return Ok(true);
     }
@@ -8116,11 +8141,73 @@ fn validate_security_binding(connection: &Connection) -> EngineResult<Option<[u8
     Ok(Some(id))
 }
 
-fn reject_security_bound_ordinary_startup(snapshot: &ManifestSnapshot) -> EngineResult<()> {
-    if snapshot.security_store_id.is_some() {
+#[cfg(feature = "auth-scram")]
+pub(super) fn security_binding(
+    connection: &Connection,
+    shards: u16,
+) -> EngineResult<Option<[u8; 16]>> {
+    match inspect_with_plan(connection, shards, CURRENT_PLAN)? {
+        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+            Ok(snapshot.security_store_id)
+        }
+        _ => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "security requires an initialized current-version root",
+        )),
+    }
+}
+
+#[cfg(feature = "auth-scram")]
+pub(super) fn validate_security_activation(
+    connection: &Connection,
+    shards: u16,
+) -> EngineResult<()> {
+    if security_binding(connection, shards)?.is_some()
+        || startup_requires_exclusive_ownership(connection, shards)?
+        || current_integrity(connection, shards)?.state() != DatabaseIntegrityState::Ready
+    {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
-            "security-bound root requires authenticated engine startup",
+            "security activation requires a ready, unbound current-version root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "auth-scram")]
+pub(super) fn activate_security_binding(
+    connection: &mut Connection,
+    shards: u16,
+    id: [u8; 16],
+) -> EngineResult<()> {
+    if id == [0; 16] {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "security store ID is invalid",
+        ));
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    validate_security_activation(&transaction, shards)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_security_binding VALUES (1, 1, ?1)",
+            [id.as_slice()],
+        )
+        .map_err(sqlite_error::storage)?;
+    refresh_manifest_digest(&transaction)?;
+    transaction.commit().map_err(sqlite_error::storage)
+}
+
+fn require_security_binding(
+    snapshot: &ManifestSnapshot,
+    expected: Option<[u8; 16]>,
+) -> EngineResult<()> {
+    if snapshot.security_store_id != expected {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "security-bound root requires authenticated engine startup with its matching catalog",
         ));
     }
     Ok(())

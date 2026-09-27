@@ -110,6 +110,9 @@ impl AttachedServer {
         config: ListenerConfig,
         options: AttachedServerOptions,
     ) -> anyhow::Result<Self> {
+        if database.engine().security_enabled() {
+            anyhow::bail!("configured listeners do not support security-bound engines yet");
+        }
         validate_listener_addresses(&config, options.postgres_security.is_some())?;
         if options.admin_tls.is_some() && config.admin_listen.is_none() {
             anyhow::bail!("admin HTTP TLS requires an enabled admin listener");

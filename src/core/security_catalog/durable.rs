@@ -84,6 +84,11 @@ impl DurableSecurityCatalog {
         self.fenced
     }
 
+    pub(crate) fn validate_principal(&mut self, principal: &Principal) -> EngineResult<()> {
+        self.refresh()?;
+        self.catalog.current_user(principal).map(|_| ())
+    }
+
     pub fn begin_scram(&mut self, name: &SecurityName) -> EngineResult<ScramAttempt> {
         self.refresh()?;
         self.catalog.begin_scram(name)

@@ -17,6 +17,8 @@ mod process_lock;
 mod schema_gate;
 #[cfg(feature = "auth-scram")]
 pub mod security_catalog;
+#[cfg(feature = "auth-scram")]
+pub(crate) mod security_root;
 mod shard;
 mod shard_summary;
 #[cfg(feature = "experimental-vtab")]
@@ -600,6 +602,14 @@ impl Storage {
     }
 
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
+        Self::open_with_security_binding(root, requested_shards, None)
+    }
+
+    pub(crate) fn open_with_security_binding(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        security_store_id: Option<[u8; 16]>,
+    ) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
 
         let root = root.as_ref().to_path_buf();
@@ -629,7 +639,13 @@ impl Storage {
             validate_existing_manifest_file(&manifest_path)
         };
         let requires_exclusive = required_manifest
-            .and_then(|()| startup_requires_exclusive_ownership(&manifest_path, requested_shards))
+            .and_then(|()| {
+                startup_requires_exclusive_ownership_with_security(
+                    &manifest_path,
+                    requested_shards,
+                    security_store_id,
+                )
+            })
             .and_then(|manifest_requires_exclusive| {
                 global_index::startup_requires_upgrade(&root).map(
                     |global_index_requires_exclusive| {
@@ -694,10 +710,11 @@ impl Storage {
             }
         }
 
-        let loaded = match manifest::load_or_create_manifest_with_fresh_layout(
+        let loaded = match manifest::load_or_create_manifest_with_security(
             &mut manifest,
             requested_shards,
             fresh_layout_allowed,
+            security_store_id,
         ) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -4041,14 +4058,28 @@ fn open_manifest_for_startup(path: &Path, fresh_layout_allowed: bool) -> EngineR
     Ok(connection)
 }
 
-fn startup_requires_exclusive_ownership(path: &Path, requested_shards: u16) -> EngineResult<bool> {
+fn startup_requires_exclusive_ownership_with_security(
+    path: &Path,
+    requested_shards: u16,
+    security_store_id: Option<[u8; 16]>,
+) -> EngineResult<bool> {
     validate_optional_manifest_file(path)?;
     if !path.exists() {
+        if security_store_id.is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "authenticated startup requires an existing security-bound manifest",
+            ));
+        }
         return Ok(true);
     }
     let connection = open_existing_manifest(path)?;
     configure_manifest_connection(&connection)?;
-    manifest::startup_requires_exclusive_ownership(&connection, requested_shards)
+    manifest::startup_requires_exclusive_ownership_with_security(
+        &connection,
+        requested_shards,
+        security_store_id,
+    )
 }
 
 pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {

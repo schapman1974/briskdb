@@ -392,7 +392,7 @@ fn read_snapshot(
 }
 
 #[cfg(unix)]
-fn private_path(path: &Path) -> EngineResult<PathBuf> {
+pub(super) fn private_path(path: &Path) -> EngineResult<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let parent = path
         .parent()
@@ -436,7 +436,7 @@ fn private_file(path: &Path, create: bool) -> EngineResult<File> {
 }
 
 #[cfg(not(unix))]
-fn private_path(_: &Path) -> EngineResult<PathBuf> {
+pub(super) fn private_path(_: &Path) -> EngineResult<PathBuf> {
     Err(failure(
         EngineErrorKind::Unsupported,
         "security store requires platform access-control validation",
