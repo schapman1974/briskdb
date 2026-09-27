@@ -44,6 +44,39 @@ The default or explicit process-only `disabled` spelling is converted to `None`
 before entering the server library. `server::run` and
 `server::run_with_engine_options` retain their existing signatures.
 
+## Explicit attached-server security reload
+
+Rust hosts using `AttachedServer::start_secure` (including
+`start_secure_with_mongo`) can replace PostgreSQL's certificate, key, username
+and password without rebinding the listener:
+
+```rust,ignore
+server.reload_postgres_security(
+    briskdb::protocol::postgres::SecurityConfig::new(
+        "next/server.crt", "next/server.key", "briskdb", "next/password",
+    )?,
+).await?;
+```
+
+The complete candidate is loaded and validated on a blocking worker before one
+publication replaces the active identity. Failed validation or cancellation
+before publication leaves the previous identity active. A listener that was
+started anonymously, is closing, or has stopped cannot be upgraded by reload.
+A cancelled request may finish its blocking preparation work in the background,
+but cannot publish that candidate.
+Concurrent successful reloads publish in completion order; callers needing a
+specific order should await each reload before starting the next.
+
+Each accepted connection retains one snapshot for TLS, SCRAM channel binding,
+password proof and username checks. Established sessions and handshakes already
+admitted before publication retain that snapshot; new connections use the new
+one. **Reload is not immediate session revocation.** Stop/drain the listener if
+existing sessions must be removed. Safely publish complete secret files first;
+the loader does not snapshot several files atomically. No filesystem watcher,
+SIGHUP handler, CLI/Python reload method, role catalog, or Mongo/HTTP security is
+added by this Rust-host API. Issue #65 remains open for the other listener and
+host surfaces.
+
 ## Startup and failure order
 
 Startup has one deterministic order:
@@ -330,9 +363,10 @@ The shared loader uses the same ring-backed Rustls stack, validates PEM files
 and Unix private-key permissions, retains certificate bytes for SCRAM channel
 binding, and takes ALPN values from its caller. It opens no socket and does not
 authenticate users. PostgreSQL still selects `postgresql` ALPN and retains its
-existing TLS/SCRAM configuration and non-loopback checks. This is groundwork
-for issues #65/#188, not certificate reload, a shared user/role catalog, or Mongo
-TLS/authentication; Mongo remains anonymous-loopback-only.
+existing TLS/SCRAM configuration and non-loopback checks. The Rust attached-server
+reload API above uses complete validated identities; shared users/roles and
+Mongo TLS/authentication under #64/#188 remain outstanding. Mongo remains
+anonymous-loopback-only.
 
 TLS keys, certificates, plaintext passwords, and derived SCRAM material are
 process configuration only; none is written to the BriskDB data root. The
@@ -350,7 +384,8 @@ targets are validated. Unix opens are nonblocking so a substituted FIFO is rejec
 without waiting for a writer. Non-Unix hosts still require appropriate OS ACLs;
 no Unix-mode-equivalent ACL validation is added. Operators must still publish
 complete files atomically and control the secret directory: this is not a
-multi-file snapshot, a guarantee against concurrent in-place writes, or reload.
+multi-file snapshot or a guarantee against concurrent in-place writes. Reload
+must be explicitly requested through the host API above.
 This work changes no
 HTTP route, JSON body, SQL subset, planner rule, manifest table, shard header,
 migration journal, stored row, or storage-format version.

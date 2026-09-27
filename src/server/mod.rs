@@ -2,6 +2,8 @@
 
 #[cfg(feature = "mongo")]
 mod mongo;
+#[cfg(test)]
+mod security_reload_tests;
 
 use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -246,7 +248,8 @@ async fn run_configured(
         .as_ref()
         .map(postgres::SecurityConfig::load)
         .transpose()
-        .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
+        .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?
+        .map(postgres::ReloadableSecurity::new);
     let builder = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options);
@@ -390,6 +393,7 @@ fn validate_listener_addresses(
 #[derive(Debug)]
 pub struct AttachedServer {
     addresses: ListenerAddresses,
+    postgres_security: Option<postgres::ReloadableSecurity>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -443,7 +447,14 @@ impl AttachedServer {
         let security = security
             .load()
             .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-        Self::start_with_security(database, config, Some(security), None, mongo_address).await
+        Self::start_with_security(
+            database,
+            config,
+            Some(postgres::ReloadableSecurity::new(security)),
+            None,
+            mongo_address,
+        )
+        .await
     }
 
     /// Start a dedicated authenticated SQLite remote data plane instead of
@@ -484,7 +495,7 @@ impl AttachedServer {
     async fn start_with_security(
         database: &BriskDb,
         config: ListenerConfig,
-        security: Option<postgres::LoadedSecurity>,
+        security: Option<postgres::ReloadableSecurity>,
         data_router: Option<axum::Router>,
         mongo_address: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
@@ -492,6 +503,7 @@ impl AttachedServer {
         let listeners = bind_configured_listeners(&config, database, mongo_address).await?;
         let addresses = listeners.addresses()?;
         let engine = database.engine().clone();
+        let postgres_security = security.clone();
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             serve_listeners_with_shutdown_mode(
@@ -509,6 +521,7 @@ impl AttachedServer {
         });
         Ok(Self {
             addresses,
+            postgres_security,
             shutdown: Some(shutdown),
             task: Some(task),
         })
@@ -520,6 +533,50 @@ impl AttachedServer {
 
     pub fn is_closed(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Reload PostgreSQL's certificate, key, user and password as one identity.
+    ///
+    /// Only already-secure, running attached servers support this operation.
+    /// File I/O and SCRAM derivation run on a blocking worker. Invalid input or
+    /// cancellation before publication leaves the active identity unchanged.
+    /// Newly accepted connections use the published identity; established and
+    /// in-progress connections retain their original snapshot. This is not
+    /// session revocation or a user/role catalog, and does not secure Mongo/HTTP.
+    /// Concurrent successful reloads publish in completion order.
+    pub async fn reload_postgres_security(
+        &self,
+        config: postgres::SecurityConfig,
+    ) -> anyhow::Result<()> {
+        self.reload_postgres_security_with(async move {
+            tokio::task::spawn_blocking(move || config.load())
+                .await
+                .context("PostgreSQL security reload worker failed")?
+                .context("failed to reload PostgreSQL TLS and SCRAM configuration")
+        })
+        .await
+    }
+
+    async fn reload_postgres_security_with(
+        &self,
+        prepare: impl Future<Output = anyhow::Result<postgres::LoadedSecurity>>,
+    ) -> anyhow::Result<()> {
+        let target = self
+            .postgres_security
+            .as_ref()
+            .context("PostgreSQL security reload requires an already-secure attached listener")?;
+        self.require_running_for_reload()?;
+        let loaded = prepare.await?;
+        self.require_running_for_reload()?;
+        target.replace(loaded);
+        Ok(())
+    }
+
+    fn require_running_for_reload(&self) -> anyhow::Result<()> {
+        if self.shutdown.is_none() || self.is_closed() {
+            anyhow::bail!("PostgreSQL security reload requires a running attached listener");
+        }
+        Ok(())
     }
 
     /// Request listener shutdown. Returns whether shutdown was already begun.
@@ -558,7 +615,7 @@ async fn serve_listeners_with_shutdown<F>(
     listeners: BoundListeners,
     engine: Engine,
     signal: F,
-    postgres_security: Option<postgres::LoadedSecurity>,
+    postgres_security: Option<postgres::ReloadableSecurity>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
@@ -631,7 +688,7 @@ async fn serve_listeners_with_shutdown_mode<F>(
     signal: F,
     accepted: Option<Arc<Notify>>,
     engine_shutdown: EngineShutdown,
-    postgres_security: Option<postgres::LoadedSecurity>,
+    postgres_security: Option<postgres::ReloadableSecurity>,
     data_router: Option<axum::Router>,
 ) -> anyhow::Result<()>
 where
@@ -699,7 +756,7 @@ async fn serve_listeners_with_shutdown_plain<F>(
     signal: F,
     accepted: Option<Arc<Notify>>,
     engine_shutdown: EngineShutdown,
-    postgres_security: Option<postgres::LoadedSecurity>,
+    postgres_security: Option<postgres::ReloadableSecurity>,
     data_router: Option<axum::Router>,
 ) -> anyhow::Result<()>
 where
@@ -715,7 +772,7 @@ where
     let postgres_adapter = listeners.postgres.as_ref().map(|_| {
         postgres_security.map_or_else(
             || postgres::Adapter::new(engine.clone()),
-            |security| postgres::Adapter::with_loaded_security(engine.clone(), security),
+            |security| postgres::Adapter::with_reloadable_security(engine.clone(), security),
         )
     });
     let (graceful_tx, _graceful_rx) = watch::channel(false);

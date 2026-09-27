@@ -1,0 +1,111 @@
+use super::*;
+
+fn security_files() -> (tempfile::TempDir, postgres::SecurityConfig) {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = directory.path().join("server.crt");
+    let key = directory.path().join("server.key");
+    let password = directory.path().join("password");
+    std::fs::write(
+        &certificate,
+        include_bytes!("../../tests/fixtures/postgres-tls/server.crt"),
+    )
+    .unwrap();
+    std::fs::write(
+        &key,
+        include_bytes!("../../tests/fixtures/postgres-tls/server.key"),
+    )
+    .unwrap();
+    std::fs::write(&password, b"test-secret").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&key, &password] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let config = postgres::SecurityConfig::new(certificate, key, "briskdb", password).unwrap();
+    (directory, config)
+}
+
+async fn attached(db: &BriskDb, config: postgres::SecurityConfig) -> AttachedServer {
+    AttachedServer::start_secure(
+        db,
+        ListenerConfig {
+            http_listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: None,
+            postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
+        },
+        config,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cancelled_reload_never_publishes_and_a_later_reload_succeeds() {
+    let data = tempfile::tempdir().unwrap();
+    let (_secrets, config) = security_files();
+    let db = BriskDb::builder(data.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = attached(&db, config.clone()).await;
+    let original = server.postgres_security.as_ref().unwrap().snapshot();
+    let (release, ready) = oneshot::channel::<()>();
+    let loaded = config.load().unwrap();
+    let mut operation = Box::pin(server.reload_postgres_security_with(async {
+        ready.await.unwrap();
+        Ok(loaded)
+    }));
+    assert!(futures::poll!(operation.as_mut()).is_pending());
+    drop(operation);
+    assert!(release.send(()).is_err());
+    assert!(Arc::ptr_eq(
+        &original,
+        &server.postgres_security.as_ref().unwrap().snapshot()
+    ));
+    server.reload_postgres_security(config).await.unwrap();
+    assert!(!Arc::ptr_eq(
+        &original,
+        &server.postgres_security.as_ref().unwrap().snapshot()
+    ));
+    server.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn listener_exit_during_preparation_prevents_publication() {
+    let data = tempfile::tempdir().unwrap();
+    let (_secrets, config) = security_files();
+    let db = BriskDb::builder(data.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = attached(&db, config.clone()).await;
+    let original = server.postgres_security.as_ref().unwrap().snapshot();
+    let (release, ready) = oneshot::channel::<()>();
+    let loaded = config.load().unwrap();
+    let mut operation = Box::pin(server.reload_postgres_security_with(async {
+        ready.await.unwrap();
+        Ok(loaded)
+    }));
+    assert!(futures::poll!(operation.as_mut()).is_pending());
+    server.task.as_ref().unwrap().abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !server.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    assert!(operation.await.unwrap_err().to_string().contains("running"));
+    assert!(Arc::ptr_eq(
+        &original,
+        &server.postgres_security.as_ref().unwrap().snapshot()
+    ));
+    assert!(server.close().await.is_err());
+    db.close().await.unwrap();
+}
