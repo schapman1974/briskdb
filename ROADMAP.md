@@ -1153,14 +1153,16 @@ requires an earlier dependency:
       integer overflow, ordered array operations, exact BSON retention and
       error/cancellation atomicity, plus a bounded libFuzzer target that reaches
       every supported update operator without requiring a valid input envelope.
-      Fuzz crash minimization/replay is documented. Matcher/projection differential
+      Fuzz crash minimization/replay is documented. Matcher/projection/update differential
       harness additionally retains confirmed original failures and bounded,
       deletion-reduced BSON reproducers, refreshing the locked reference on
       every probe and preserving the original outcome pair. Diagnostic replay
       is separate from the full matrix; source-backed fault-injection verifies
-      the reducer without claiming a real product mismatch. Projection reduction
+      the reducer without claiming a real product mismatch. Projection/update reduction
       preserves exact BSON output/error pairs; bounded replay rejects stale
-      expectations and mismatched source/surface metadata. Other differential
+      expectations and mismatched source/surface metadata. Update probes retain
+      reference-required identity/operator shape and do not expand the documented
+      per-operator comparison domain or waive intentional differences. Other differential
       surfaces and longer fault-soak/CI tiers remain separate requirements.
       Generated routing checks also cover full-width hashes, immutable bucket
       ownership snapshots, numeric BSON aliases and conservative logical-ID
