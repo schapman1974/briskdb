@@ -585,6 +585,9 @@ jobs:
           python -m venv "${{ runner.temp }}/mongo-model-oracle"
           "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install -r compat/mongo/v1/runner/requirements.txt
           "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install --no-build-isolation --no-deps ./target/tinymongo-model-source
+          # Source-only collection imports DuckDB; never install it in the candidate.
+          # 1.4.4 retains Python 3.9 wheels for this reference job.
+          "$BRISKDB_MONGO_ORACLE_PYTHON" -m pip install duckdb==1.4.4
           python -m unittest discover -s python/tests -p test_index_models_reference.py -v
           python -m unittest discover -s python/tests -p test_index_suite_inventory.py -v
           python -m unittest discover -s python/tests -p test_query_suite_inventory.py -v
