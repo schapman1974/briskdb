@@ -1,6 +1,8 @@
 //! Bounded, eagerly validated field updates. No storage or protocol policy.
 
 mod increment;
+#[cfg(test)]
+mod properties;
 mod push;
 
 use std::{cmp::Ordering, error::Error, fmt};

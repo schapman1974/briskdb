@@ -1149,6 +1149,12 @@ requires an earlier dependency:
       imports. Foreign backend SQL/private migration hooks remain explicit
       differences. Top-level accounting is complete; fuzz, fault-soak, external
       application, CI-tier and release requirements are not thereby completed.
+      Update hardening now includes four shrinkable generated properties for
+      integer overflow, ordered array operations, exact BSON retention and
+      error/cancellation atomicity, plus a bounded libFuzzer target that reaches
+      every supported update operator without requiring a valid input envelope.
+      Fuzz crash minimization/replay is documented; differential mismatch
+      minimization and longer fault-soak/CI tiers remain separate requirements.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-
