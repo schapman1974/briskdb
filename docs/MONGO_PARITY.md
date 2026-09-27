@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 516 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 539 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -61,14 +61,14 @@ functions in the locked `test_query_more.py`,
 `test_warning_attribution.py`, `test_mongo_like.py` and
 `test_bulk_insert_planning.py`, `test_storage_backends.py` and
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
-`test_sharded_sqlite_coverage_mutations.py` suites
-(1,046 reference parameter cases). 278 added wheel scenarios and existing patch
+`test_sharded_sqlite_coverage_mutations.py` and `test_table_backend_id_and_error_edges.py` suites
+(1,073 reference parameter cases). 280 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,046 unchanged upstream candidate passes or complete #186 certification.
+not 1,073 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -203,6 +203,15 @@ commit behavior rather than private prepared-batch rollback. Existing native
 SQLite FULL and before/after-commit process-death gates cover actual transaction
 rollback and prior-commit durability; they do not impersonate Python connection
 proxies or guarantee whole-batch atomicity.
+
+ID/error-edge cases preserve nested numeric container and current datetime
+aliases, distinct nonfinite IDs and exact stored representations through reopen.
+Duplicates return redacted code 11000; missing replacements create no records
+or namespaces. Legacy import rejects malformed/missing/mismatched IDs and wrapped
+JSON documents as corruption, and unverifiable legacy datetime spellings as
+unsupported, without source writes. This is deliberately stricter than private
+TinyMongo scan/skip/unwrap fallbacks. Its mocked RemoteSQL/MySQL upgrade behavior
+is not a BriskDB storage adapter or a claim about the separate MySQL connector.
 
 Common-client coverage includes sync/async dotted collection selection, private-name
 brackets and typo errors, sorted/projected find-and-modify, concern-dictionary

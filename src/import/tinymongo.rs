@@ -4298,6 +4298,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes() {
+        let temporary = TempDir::new().unwrap();
+        for (number, (physical_id, payload, expected)) in [
+            ("invalid-json", "{", EngineErrorKind::DataCorruption),
+            ("missing-id", r#"{"value":1}"#, EngineErrorKind::DataCorruption),
+            ("1", r#"{"_id":2}"#, EngineErrorKind::DataCorruption),
+            ("1", r#""{\"_id\":1}""#, EngineErrorKind::DataCorruption),
+            (
+                "2026-07-29 12:30:00",
+                r#"{"_id":{"__tinymongo_type_v1__":"datetime","value":"2026-07-29T12:30:00.000"},"value":"legacy"}"#,
+                EngineErrorKind::Unsupported,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temporary.path().join(format!("case-{number}.sqlite"));
+            let connection = Connection::open(&path).unwrap();
+            create_collection(&connection, "users", false);
+            connection
+                .execute("INSERT INTO users VALUES (?1, ?2)", params![physical_id, payload])
+                .unwrap();
+            drop(connection);
+            let before = fs::read(&path).unwrap();
+            assert_eq!(
+                read_tinymongo_source(&path, &plan(&["users"]))
+                    .unwrap_err()
+                    .kind(),
+                expected,
+                "case {number}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn legacy_scalar_spellings_follow_tinymongo_numeric_and_binary_identity() {
         assert_eq!(provable_python_float_text(1.0).as_deref(), Some("1.0"));
         assert_eq!(provable_python_float_text(1e20), None);

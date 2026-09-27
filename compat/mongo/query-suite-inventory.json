@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-one locked suites is classified; 1046 reference parameter cases are not 1046 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-two locked suites is classified; 1073 reference parameter cases are not 1073 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4094,6 +4094,157 @@
             "python/tests/test_upstream_shard_mutations.py::test_natural_first_targeted_updates_and_grouped_deletes_keep_exact_counts"
           ],
           "note": "Public empty-membership updates/deletes return zero without changes, and grouped deletion removes both proven-shard IDs with exact counts and empty reopen. A monkeypatched empty _target_shards tuple and private delete_ids return value are not native APIs."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_table_backend_id_and_error_edges.py",
+      "sha256": "676653d29c42e4d4bcf18bcb90a1f42555def080bc2ebb297c9d72d3d3dbc60f",
+      "reference_case_count": 27,
+      "function_count": 23,
+      "coverage": [
+        {
+          "source": [
+            "test_physical_id_keys_cover_nonfinite_container_and_fallback_values"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity"
+          ],
+          "note": "Positive/negative infinity and NaN stay distinct and addressable through reopen; tuple/list and nested numeric container aliases retain canonical identity. TinyMongo's private prefix/JSON canonical key representation and monkeypatched no-registry fallback are not native on-disk interfaces."
+        },
+        {
+          "source": [
+            "test_legacy_id_candidate_and_scan_edge_cases",
+            "test_legacy_id_candidate_and_scan_routing_edges"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_duplicate_errors_and_missing_replacements_preserve_stored_rows",
+            "python/tests/test_upstream_bulk_planning.py::test_bulk_numeric_aliases_and_distinctions_match_bson_precision",
+            "tests/mongo_operating_drill/typed_ids.rs::legacy_typed_ids_import_then_query_mutate_and_reopen_without_source_changes"
+          ],
+          "note": "Exact numeric alias/precision and genuine imported zero/string distinctions have native evidence. Source 10^400 IDs/filters reject at real BSON encoding before writes rather than using unbounded Python fallback strings. Private candidate spelling/order and scan-selection flags are not exported."
+        },
+        {
+          "source": [
+            "test_legacy_id_comparison_and_temporary_remote_wrapper_compatibility",
+            "test_legacy_id_recovery_and_wrapped_remote_payload_edges"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "Nested numeric container equality is checked with real BSON. Double-encoded JSON unwrapping belongs to TinyMongo's private RemoteSQLTableBackend, not BriskDB. Foreign storage adapters reject before acquisition, and a wrapped-string document in native legacy SQLite import fails closed without source changes."
+        },
+        {
+          "source": [
+            "test_local_matching_id_falls_back_to_a_legacy_container_scan"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "src/import/tinymongo.rs::unverifiable_legacy_container_alias_is_rejected_without_source_writes"
+          ],
+          "note": "Current ordered document/array IDs are addressed canonically; legacy import requires verifiable physical identity. An unrelated arbitrary legacy container alias rejects without writes instead of being accepted through an injected full-table fallback scan."
+        },
+        {
+          "source": [
+            "test_legacy_scan_detection_and_postfilter_fallbacks"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "python/tests/test_upstream_point_reads.py::test_regex_logical_and_typed_id_queries_keep_exact_identities"
+          ],
+          "note": "Private _id_condition_requires_legacy_scan/_postfilter_id_candidates decisions and invalid-filter sentinels are not native APIs. Real direct/$eq filters and nested container/date aliases retain exact current BSON identities; legacy formats use explicit strict import."
+        },
+        {
+          "source": [
+            "test_matching_physical_row_id_skips_malformed_and_mismatched_rows"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes"
+          ],
+          "note": "Native source import rejects malformed JSON, absent logical IDs and mismatched physical/logical IDs as DataCorruption, preserving source bytes. It does not silently skip damaged rows or reinterpret them as a harmless ID miss."
+        },
+        {
+          "source": [
+            "test_sql_compiler_supports_explicit_id_equality"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "Explicit _id equality preserves projected/count/bounded results and native point routing/read counters. TinyMongo's SQL WHERE text and list of physical-key candidates are not BriskDB SQL compiler output contracts."
+        },
+        {
+          "source": [
+            "test_sqlite_maps_native_insert_conflicts_and_ignores_missing_replacements"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_duplicate_errors_and_missing_replacements_preserve_stored_rows"
+          ],
+          "note": "Actual duplicate numeric IDs return redacted code 11000 and preserve original data, while replacement of a missing ID/namespace returns real matched=0/modified=0/upserted_id=None and creates nothing. Private mocked sqlite3 error text and a None replacement return are not copied."
+        },
+        {
+          "source": [
+            "test_duckdb_maps_native_insert_conflicts_and_ignores_missing_replacements",
+            "test_parquet_rejects_a_physical_id_collision_in_inconsistent_rows",
+            "test_remote_backend_maps_insert_conflicts_and_ignores_missing_replacements"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_upstream_backend_id_edges.py::test_duplicate_errors_and_missing_replacements_preserve_stored_rows",
+            "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes"
+          ],
+          "note": "DuckDB/Parquet/RemoteSQL storage adapters are not supported and selection rejects before acquisition. Native duplicate/missing-replacement results are verified separately; forged or inconsistent native legacy rows are corruption, not ordinary duplicate-key conflicts. These are not foreign-backend execution passes."
+        },
+        {
+          "source": [
+            "test_remote_stored_row_lookup_skips_a_mismatched_current_row",
+            "test_remote_missing_scalar_id_does_not_scan_the_complete_table",
+            "test_remote_stored_row_lookup_recovers_a_legacy_numeric_equivalent",
+            "test_remote_stored_row_lookup_scans_legacy_container_ids",
+            "test_remote_stored_row_lookup_scans_for_legacy_datetime_ids",
+            "test_remote_legacy_scan_skips_rows_without_an_id"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes",
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "These source cases mock private RemoteSQL connection/cursor methods; no actual remote service is exercised. BriskDB does not expose that storage adapter or its scan/skip heuristics. Native current-ID results, bounded point misses and strict no-write import rejection are tested independently, not represented as RemoteSQL compatibility."
+        },
+        {
+          "source": [
+            "test_mysql_ordered_column_upgrade_tolerates_duplicate_column_races",
+            "test_mysql_ordered_column_upgrade_propagates_unrelated_errors",
+            "test_mysql_ordered_column_upgrade_handles_only_duplicate_races"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "TinyMongo's private MySQL LONGTEXT/ordered-column upgrade, information_schema probes and injected 1060/message-matching races belong to an unsupported storage adapter. BriskDB rejects backend=mysql before acquisition; these are not its separate MySQL protocol roadmap and do not justify remote DDL or silently swallowed database errors."
+        },
+        {
+          "source": [
+            "test_local_stored_row_lookup_scans_for_legacy_datetime_ids"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes"
+          ],
+          "note": "Current naive/UTC datetime IDs share canonical BSON identity through reopen. A legacy physical datetime string cannot be validated losslessly by the importer and explicitly rejects as Unsupported without changing source bytes, rather than silently scanning and accepting it."
         }
       ]
     }
