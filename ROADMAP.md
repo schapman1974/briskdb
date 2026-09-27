@@ -454,6 +454,10 @@ database under differential/property tests.
   as groundwork for built-in data roles, with explicit exact-grant exceptions.
   Catalogs needing it use canonical security-catalog record v2; existing v1 catalogs
   remain byte-compatible and older readers reject the new scope/version.
+  Trusted hosts can now atomically provision supported per-database `read` and
+  `readWrite` profiles, rejecting name collisions/capacity failures without edits.
+  They are stored flat roles assignable through authorized Mongo user commands,
+  not automatic built-in resolution or new default privileges.
   Payload-free Mongo tracing now distinguishes authentication/user-command
   outcomes and correlates immutable accounts across pooled sockets with
   listener-scoped keyed labels and explicit credential generations. Failed
