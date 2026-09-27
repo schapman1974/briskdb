@@ -539,6 +539,14 @@ jobs:
             exit 1
           fi
 
+      - name: Test HTTP TLS without Mongo or daemon features
+        if: matrix.surface == 'listeners'
+        run: |
+          cargo test --locked --no-default-features --features listeners,tokio/rt-multi-thread \
+            --lib server::http_tls
+          cargo test --locked --no-default-features --features listeners,tokio/rt-multi-thread \
+            --lib core::engine::tests::weak_readiness_probe_tracks_live_gates_without_retaining_engine
+
   quality:
     name: Format and Clippy (stable)
     runs-on: ubuntu-24.04

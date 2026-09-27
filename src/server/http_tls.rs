@@ -6,8 +6,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tokio_rustls::TlsAcceptor;
+
+mod reload;
+pub(super) use reload::Target;
 
 const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const MAX_HTTP_CONNECTIONS_PER_PLANE: usize = 256;
@@ -79,10 +82,29 @@ impl std::fmt::Debug for Loaded {
     }
 }
 
-#[derive(Default, Debug)]
+/// Publish the certificate, key and handshake budget as one immutable generation.
+#[derive(Clone, Debug)]
+pub(super) struct Reloadable(watch::Sender<Arc<Loaded>>);
+
+impl Reloadable {
+    pub fn new(identity: Arc<Loaded>) -> Self {
+        let (sender, _) = watch::channel(identity);
+        Self(sender)
+    }
+
+    pub fn snapshot(&self) -> Arc<Loaded> {
+        self.0.borrow().clone()
+    }
+
+    pub fn replace(&self, identity: Arc<Loaded>) {
+        drop(self.0.send_replace(identity));
+    }
+}
+
+#[derive(Default, Debug, Clone)]
 pub(super) struct Planes {
-    pub data: Option<Arc<Loaded>>,
-    pub admin: Option<Arc<Loaded>>,
+    pub data: Option<Reloadable>,
+    pub admin: Option<Reloadable>,
 }
 
 /// Keep independent finite admission for data/admin, including handshakes and

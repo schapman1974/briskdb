@@ -512,6 +512,7 @@ fn validate_listener_addresses(
 #[derive(Debug)]
 pub struct AttachedServer {
     addresses: ListenerAddresses,
+    http_tls: http_tls::Target,
     postgres_security: Option<postgres::ReloadableSecurity>,
     #[cfg(feature = "mongo-tls")]
     mongo_tls: Option<mongo_tls_reload::Target>,
@@ -660,6 +661,8 @@ impl AttachedServer {
             anyhow::bail!("admin HTTP TLS requires an enabled admin listener");
         }
         let mut listeners = bind_configured_listeners(&config, database, mongo_address).await?;
+        let http_tls_target =
+            http_tls::Target::new(http_tls.clone(), database.engine().readiness_probe());
         listeners.http_tls = http_tls;
         #[cfg(feature = "mongo-tls")]
         let mongo_tls_target = mongo_tls.as_ref().map(|identity| {
@@ -693,6 +696,7 @@ impl AttachedServer {
         });
         Ok(Self {
             addresses,
+            http_tls: http_tls_target,
             postgres_security,
             #[cfg(feature = "mongo-tls")]
             mongo_tls: mongo_tls_target,
@@ -1051,7 +1055,8 @@ where
                             debug!(%peer, "HTTP data connection rejected at the finite socket limit");
                             continue;
                         };
-                        let identity = listeners.http_tls.data.clone();
+                        // Snapshot at admission, before scheduling the handshake task.
+                        let identity = listeners.http_tls.data.as_ref().map(http_tls::Reloadable::snapshot);
                         let accepted = accepted.clone();
                         let service = TowerToHyperService::new(data_router.clone().map_request(
                             move |request: Request<Incoming>| {
@@ -1078,7 +1083,7 @@ where
                             debug!(%peer, "HTTP admin connection rejected at the finite socket limit");
                             continue;
                         };
-                        let identity = listeners.http_tls.admin.clone();
+                        let identity = listeners.http_tls.admin.as_ref().map(http_tls::Reloadable::snapshot);
                         let accepted = accepted.clone();
                         let router = admin_router
                             .as_ref()

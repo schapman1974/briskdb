@@ -167,14 +167,14 @@ impl AttachedServer {
 
 async fn prepare_http_identity(
     config: Option<HttpTlsConfig>,
-) -> anyhow::Result<Option<Arc<http_tls::Loaded>>> {
+) -> anyhow::Result<Option<http_tls::Reloadable>> {
     match config {
-        Some(config) => Ok(Some(
+        Some(config) => Ok(Some(http_tls::Reloadable::new(
             tokio::task::spawn_blocking(move || config.load())
                 .await
                 .context("HTTP TLS preparation worker failed")?
                 .context("failed to prepare HTTP TLS configuration")?,
-        )),
+        ))),
         None => Ok(None),
     }
 }

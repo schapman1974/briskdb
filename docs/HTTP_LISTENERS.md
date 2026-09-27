@@ -143,8 +143,36 @@ identity; PostgreSQL credentials do not authenticate HTTP callers.
 Its bearer-token and table-allowlist requirements stay in force; the TLS
 certificate alone does not authorize remote-table access. Administration remains
 separate. Both addresses still require loopback. Python/daemon HTTP TLS options
-and HTTP identity reload are not exposed by this increment; existing SIGHUP
-reload currently covers only configured PostgreSQL/Mongo identities.
+are not exposed by this increment; existing SIGHUP reload currently covers only
+configured PostgreSQL/Mongo identities.
+
+### Reload attached Rust HTTP identities (unreleased)
+
+An attached host can replace an already-encrypted plane independently, without
+rebinding or changing routes:
+
+```rust,ignore
+server.reload_http_tls(HttpTlsConfig::new("./next-data.crt", "./next-data.key")).await?;
+server.reload_admin_tls(HttpTlsConfig::new("./next-admin.crt", "./next-admin.key")).await?;
+```
+
+Each successful publication replaces one complete certificate/key/handshake-budget
+generation. Newly admitted sockets use it; established connections and handshakes
+already admitted before publication retain the original generation and deadline.
+Reloading one plane does not modify the other plane or PostgreSQL/Mongo identities.
+It cannot enable a disabled listener or upgrade a plaintext listener to TLS.
+
+`reload_http_tls_with_context(config, RequestContext)` and
+`reload_admin_tls_with_context(config, RequestContext)` support cancellation and
+absolute deadlines before preparation, while waiting, and immediately before
+publication. Query result limits do not apply. Invalid material, cancellation,
+deadline expiry, or listener/engine shutdown before publication preserves the
+active identity. File loading runs off-runtime and the worker cannot publish a
+late result after the waiting future is dropped. The reload handle only weakly
+observes the borrowed engine, so retaining a closed handle does not retain its
+storage pools. Concurrent successful reloads publish in completion order; a later
+cancellation cannot undo an identity already published. This is not client
+authentication, session revocation, a file watcher, or cross-plane atomic rotation.
 
 ### Finite socket admission (unreleased)
 
