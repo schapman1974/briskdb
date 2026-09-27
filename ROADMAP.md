@@ -1005,9 +1005,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, fifty query/public-client suites now
-      have complete source accounting (733 functions/1,307 reference cases), backed
-      by 311 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, fifty-three query/public-client suites now
+      have complete source accounting (769 functions/1,345 reference cases), backed
+      by 316 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1130,6 +1130,12 @@ requires an earlier dependency:
       catalog snapshots, corruption rejection, directory policy and dotted-index
       restarts supply evidence; private cache/retry/physical-layout hooks and
       no-rescan startup promises are not treated as native APIs.
+      Remaining edge checks cover lazy query errors without namespace creation,
+      exact query IDs/counts, no-match/no-op writes, update-error preservation,
+      before/after mutation images and closed sync/async metadata calls. Private
+      result/cursor/GridFS/backend helpers and CLI/acceptance-runner internals are
+      explicitly distinguished; staged native import is not live compensating
+      replacement, and source accounting is not the deferred external-app pass.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-

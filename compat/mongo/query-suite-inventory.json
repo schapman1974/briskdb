@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty locked suites is classified; 1307 reference parameter cases are not 1307 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty-three locked suites is classified; 1345 reference parameter cases are not 1345 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks/CLI/runner utilities, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -5502,6 +5502,263 @@
             "python/tests/test_upstream_startup.py::test_dotted_unique_index_reopens_and_drop_remains_durable"
           ],
           "note": "A real dotted unique index is idempotent, retains exact metadata/enforcement after reopen, and remains dropped across later reopens while duplicate values become legal. TinyMongo's private scalar type-index SQL object is not part of native storage."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_coverage_edges.py",
+      "sha256": "8772524885f61b6d6a6f648611ae4307779435d58526d109315efbbd0be4cb2d",
+      "reference_case_count": 32,
+      "function_count": 31,
+      "coverage": [
+        {
+          "source": [
+            "test_result_properties_and_error_classes"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_crud_results_replacements_and_duplicate_batches_keep_exact_state"
+          ],
+          "note": "Real PyMongo CRUD results and duplicate error details are tested. TinyMongo result constructors accepting arbitrary raw shapes, eid/eids aliases and local fallback exception classes are not exported by BriskDB."
+        },
+        {
+          "source": [
+            "test_cli_json_helpers_and_errors",
+            "test_cli_main_module_entrypoint"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/import/tinymongo.rs::atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt",
+            "tests/mongo_operating_drill.rs::stopped_import_backup_restore_and_source_rollback_preserve_mongo_data"
+          ],
+          "note": "TinyMongo JSON stdin/stdout helpers, hidden-file enumeration, append/replace CLI modes and its module entrypoint are not BriskDB APIs. BriskDB's separately tested stopped-source SQLite importer stages a fresh destination and preserves source bytes; this is not CLI compatibility."
+        },
+        {
+          "source": [
+            "test_storage_backend_helpers_and_sqlite_edge_paths",
+            "test_atomic_json_corruption_is_not_silently_ignored"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_default_and_sqlite_aliases_use_native_collection_storage_and_reopen",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_mongo_missing_manifest.py::test_missing_manifest_rejects_default_and_explicit_startup_without_recreation"
+          ],
+          "note": "Native shared document tables and authoritative manifest validation replace TinyDB single-blob/AtomicJSON storage, backend class factories and file-extension/URI helpers. JSON corruption and private Python fsync/replace/remove callbacks are not native fixtures; genuine missing-manifest corruption fails without replacement."
+        },
+        {
+          "source": [
+            "test_duckdb_storage_with_fake_driver",
+            "test_parquet_storage_read_write_and_merge",
+            "test_parquet_storage_missing_pyarrow_message",
+            "test_parquet_storage_fake_arrow_edge_paths",
+            "test_parquet_lock_helpers_and_fsync_failures",
+            "test_backend_duckdb_selection_with_fake_driver"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "DuckDB, Parquet/PyArrow, their missing-dependency messages, JSON-in-Parquet merge representation, fake drivers and private fsync/RLock helpers are not shipped storage choices. Both native Mongo constructors reject alternative backend selections before acquiring storage; no source fake-driver execution is claimed as a native pass."
+        },
+        {
+          "source": [
+            "test_client_database_contexts_and_idempotent_close",
+            "test_engine_context_close_and_missing_update"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_closed_metadata_and_listing_do_not_revive_client",
+            "python/tests/test_upstream_coverage_edges.py::test_invalid_queries_and_no_match_writes_do_not_create_collections"
+          ],
+          "note": "Native client context exit/idempotent close permanently disables operations, and missing-target updates do not create a collection. TinyMongo's database context manager and reentering a closed client are not native driver compatibility promises."
+        },
+        {
+          "source": [
+            "test_local_replace_noop_and_lock_acquire_failure",
+            "test_remaining_query_update_and_cursor_branches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_update_errors_preserve_rows_and_find_modify_returns_exact_images",
+            "python/tests/test_upstream_core_client.py::test_negation_uses_current_conjunction_not_stale_legacy_expectation",
+            "python/tests/test_upstream_queries.py::test_pagination_uses_modern_pymongo_not_legacy_cursor_helpers"
+          ],
+          "note": "Exact replacement no-op and two-matched/one-modified counts, negation and modern cursor pagination have native evidence. Private portalocker injection, manual TinyMongoCursor construction/paginate/count/_order and sorting unencodable object() values are not native interfaces."
+        },
+        {
+          "source": [
+            "test_upsert_helpers_database_compatibility_and_find_and_modify"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_update_errors_preserve_rows_and_find_modify_returns_exact_images",
+            "python/tests/test_upstream_driver_contract.py::test_noop_counts_and_single_multi_replacement_upserts",
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Native before/after find-and-modify images, upserts, filtered equality seeds and drops are tested. Public writes reject changing _id (code 66), unlike the source private helper; real collection.name replaces tablename and drops return None, not boolean."
+        },
+        {
+          "source": [
+            "test_cursor_and_gridfs_edges",
+            "test_cursor_sort_order_branches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_queries.py::test_pagination_uses_modern_pymongo_not_legacy_cursor_helpers",
+            "python/tests/test_upstream_core_client.py::test_locked_ninety_row_mixed_sort_matches_current_reference_order",
+            "python/tests/test_upstream_core_client.py::test_direct_id_operator_routes_and_invalid_values_use_real_bson_driver"
+          ],
+          "note": "BSON sorting, modern cursor iteration/windowing and malformed driver inputs are tested. Manual TinyMongoCursor, string cursor indexing, hasNext/has_next/count/private _order, object() sort keys, TinyGridFS placeholder wrappers and generate_id are not BriskDB exports. No GridFS compatibility certification is inferred."
+        },
+        {
+          "source": [
+            "test_collection_error_and_compatibility_edges"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_core_client.py::test_crud_results_replacements_and_duplicate_batches_keep_exact_state",
+            "python/tests/test_upstream_core_client.py::test_direct_id_operator_routes_and_invalid_values_use_real_bson_driver",
+            "python/tests/test_upstream_typed_ids.py::test_distinct_bson_ids_coexist_and_stay_addressable_after_reopen",
+            "python/tests/test_upstream_coverage_edges.py::test_closed_metadata_and_listing_do_not_revive_client"
+          ],
+          "note": "Real driver BSON IDs, generated IDs, duplicate batches, malformed inserts and closed-operation rejection are tested. TinyMongo collection repr/tablename, eager closed-handle selection errors, deprecated insert/update/remove calls and per-stage result lists differ from modern PyMongo."
+        },
+        {
+          "source": [
+            "test_direct_helper_and_lock_edges"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_array_updates.py::test_pull_push_missing_numeric_sparse_paths_and_nonarray_errors",
+            "python/tests/test_upstream_array_updates.py::test_add_to_set_uses_bson_equality_and_initializes_an_empty_array",
+            "python/tests/test_upstream_queries.py::test_equality_index_results_follow_insert_update_delete_and_drop"
+          ],
+          "note": "Public missing-array initialization/nonarray errors and index results have native evidence. Private _unset_nested/_get_index, suppressed makedirs failure, cached empty Python maps and collection lock acquire/release monkeypatches do not exist in the native engine."
+        },
+        {
+          "source": [
+            "test_query_operator_branches_without_mongo"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_three_row_query_edges_return_exact_ids_and_counts",
+            "python/tests/test_upstream_coverage_edges.py::test_invalid_queries_and_no_match_writes_do_not_create_collections"
+          ],
+          "note": "The exact three-row fixture checks 11 range, negation, regex, logical, array and missing-field filters with exact IDs and counts. Unknown operators reject explicitly; modern count_documents/iteration replaces removed Cursor.count."
+        },
+        {
+          "source": [
+            "test_unknown_query_operator_fails_before_collection_storage_is_created"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_invalid_queries_and_no_match_writes_do_not_create_collections"
+          ],
+          "note": "Real PyMongo find is lazy: an unsupported operator raises OperationFailure code 115 during cursor consumption, not eager TinyMongoNotSupportedError. Neither invalid queries nor no-match writes create the logical collection."
+        },
+        {
+          "source": [
+            "test_tinydb_native_search_errors_remain_empty_results"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result"
+          ],
+          "note": "BriskDB fails closed on genuine corrupt catalog reads rather than swallowing storage failure into an empty query result. TinyDB search monkeypatches raising AttributeError/TypeError are not native extension points."
+        },
+        {
+          "source": [
+            "test_collection_write_and_no_match_edges",
+            "test_update_operator_error_edges"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_invalid_queries_and_no_match_writes_do_not_create_collections",
+            "python/tests/test_upstream_coverage_edges.py::test_update_errors_preserve_rows_and_find_modify_returns_exact_images",
+            "python/tests/test_upstream_queries.py::test_invalid_updates_leave_records_unchanged",
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Native missing-target counts/images, replacement preservation, malformed and nonnumeric update errors are tested. Physical build_table/drop_table/_refresh_table monkeypatches and boolean drop results differ; count_documents requires an explicit filter and modern errors are retained."
+        },
+        {
+          "source": [
+            "test_database_refresh_ignores_close_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_patching.py::test_one_close_failure_does_not_skip_other_clients_or_native_cleanup"
+          ],
+          "note": "No TinyDB database _refresh_table hook or suppressed fake TinyDB.close error exists. Native patch-scope cleanup independently verifies that one client close failure does not skip the other clients or native resource cleanup."
+        },
+        {
+          "source": [
+            "test_parquet_storage_uri_client_paths_and_listing",
+            "test_parquet_storage_uri_env_var",
+            "test_nonlocal_clients_skip_placeholder_folders_and_validate_eagerly",
+            "test_mysql_dsn_env_var"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition",
+            "python/tests/test_upstream_driver_contract.py::test_local_folder_and_environment_configuration_do_not_use_tinydb_files"
+          ],
+          "note": "Remote SQL/Parquet storage selection, TinyMongo DSN/storage-URI environment variables, fake object-store collection discovery and source directory naming are not native backend features. Native SQLite and BRISKDB_HOME/local folders are tested; unsupported backends reject before local storage acquisition. The PostgreSQL wire connector is not a remote SQL storage backend."
+        },
+        {
+          "source": [
+            "test_closed_client_rejects_metadata_and_listing_operations"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_closed_metadata_and_listing_do_not_revive_client",
+            "python/tests/test_upstream_coverage_edges.py::test_async_closed_metadata_and_listing_do_not_revive_client",
+            "python/tests/test_upstream_driver_contract.py::test_backend_and_unsupported_calls_keep_native_boundaries"
+          ],
+          "note": "Real sync/async server_info, list databases/collections, drop_database and retained collection reads reject after close and preserve stored rows. TinyMongo capabilities/supports/database_names helper methods are not installed on the real PyMongo client."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_acceptance_runner.py",
+      "sha256": "fd585d35e3b932ea8d89a6d841dbec1ea333cf9cd8dc7c5dcd21d153b9e07a13",
+      "function_count": 4,
+      "reference_case_count": 4,
+      "coverage": [
+        {
+          "source": [
+            "test_metadata_plugin_adds_dimensions_without_replacing_existing_values",
+            "test_main_patches_embedded_backend_and_adds_default_junit",
+            "test_main_leaves_real_mongodb_unpatched_and_keeps_explicit_junit",
+            "test_main_reports_missing_pytest"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/test_mongo_contract_runner.py::test_briskdb_adapter_requires_an_explicit_candidate_uri",
+            "tests/test_mongo_contract_runner.py::test_briskdb_adapter_forwards_uri_through_pymongo_transport",
+            "tests/mongo_candidate_contract.rs::frozen_supported_contracts_against_real_briskdb_endpoint",
+            "python/tests/test_upstream_driver_contract.py::test_stock_pymongo_application_runs_inside_native_patch_scope"
+          ],
+          "note": "TinyMongo's private acceptance script, metadata plugin, default JUnit filenames, fake pytest/import hooks and missing-pytest hint are not shipped BriskDB interfaces. The independent native runner requires an explicit candidate endpoint and validates all 456 exact case/API outcomes; native patch scope is separately exercised with real PyMongo. These are not the deferred external codebase acceptance run."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_cli_replacement_safety.py",
+      "sha256": "bc35053068b3eda5307899019c74397898e7e81b060052f1e6f588b46b7cef64",
+      "function_count": 1,
+      "reference_case_count": 2,
+      "coverage": [
+        {
+          "source": [
+            "test_replace_collection_restores_previous_data_after_destructive_failure"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt",
+            "tests/mongo_operating_drill.rs::stopped_import_backup_restore_and_source_rollback_preserve_mongo_data"
+          ],
+          "note": "TinyMongo's live CLI delete/insert compensating restore after partial fake mutations is not a BriskDB feature. Native migration reads a stopped source and stages/publishes a fresh destination, removes failed unpublished stages and preserves source bytes. Reopening an unchanged source is a pre-cutover fallback, not reverse migration of subsequent native writes."
         }
       ]
     }
