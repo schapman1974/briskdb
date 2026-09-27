@@ -1834,12 +1834,12 @@ input; rerun the resulting artifact with `cargo +nightly fuzz run
 document_update <minimized-artifact-path>`. Promote confirmed minimal failures
 to deterministic native regressions. Property tests use proptest's shrinking and
 failure-seed persistence. These mechanisms do not substitute for minimizing
-cross-implementation differential mismatches; the matcher reducer below adds
-that support for filters, while other differential surfaces remain separate work.
+cross-implementation differential mismatches; the reducer below adds that support
+for filters and projections, while other differential surfaces remain separate work.
 
-### Matcher differential reproducers
+### Matcher and projection differential reproducers
 
-The full source-locked matcher matrix now saves a confirmed mismatch under
+The full source-locked matcher and projection matrices save confirmed mismatches under
 `target/mongo-parity/reproducers` (override with `BRISKDB_MONGO_REPRO_DIR`). It keeps
 the original before trying BSON field/array deletions. Every probe recomputes the
 reference result with the isolated, source-hash-checked interpreter and must retain
@@ -1850,8 +1850,11 @@ in-flight worker has a separate 10-second deadline. The diagnostic input limit i
 reduction fails or becomes unstable. Budget exhaustion is recorded explicitly;
 deletion reduction is not a claim of globally minimal input.
 
-Artifacts retain exact BSON, source commit, original candidate outcome and probe
-metadata. They are atomically published without overwriting existing files, and
+Artifacts retain exact input/reference BSON, source commit, original candidate
+outcome summary and probe metadata. Projection outcomes are compared byte-for-byte
+during reduction (including field order and BSON numeric representations); their
+saved candidate summary uses byte length and BLAKE3, not an unbounded debug dump.
+They are atomically published without overwriting existing files, and
 the existing CI parity-artifact upload retains them on failure. They contain input
 data; review before sharing. The unchanged full matrix remains the conformance
 gate. To replay one saved case after a fix:
@@ -1861,12 +1864,17 @@ BRISKDB_MONGO_ORACLE_PYTHON=/path/to/locked-oracle/bin/python \
 BRISKDB_MONGO_REPLAY_BSON=/path/to/matcher-reproducer.bson \
 cargo test --locked --all-features --test mongo_matcher_reproducer \
   replay_saved_matcher_case -- --exact --ignored --nocapture
+
+BRISKDB_MONGO_ORACLE_PYTHON=/path/to/locked-oracle/bin/python \
+BRISKDB_MONGO_REPLAY_BSON=/path/to/projection-reproducer.bson \
+cargo test --locked --all-features --test mongo_projection_reproducer \
+  replay_saved_projection_case -- --exact --ignored --nocapture
 ```
 
 Replay refreshes the reference result, rejects changed expectations and checks
-the current native matcher. Passing one saved case is diagnostic evidence, not
-a full-matrix pass. A separate source-backed fault-injection self-test deliberately
-uses a wrong callback to exercise reduction, stale-expectation rejection, actual
+the current native matcher/projector. Passing one saved case is diagnostic evidence,
+not a full-matrix pass. Source-backed fault-injection self-tests deliberately
+use wrong callbacks to exercise reduction, stale-expectation rejection, actual
 subprocess replay, original retention and non-overwrite behavior; it does not
 claim a real BriskDB mismatch.
 

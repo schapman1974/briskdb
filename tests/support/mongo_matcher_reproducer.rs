@@ -12,7 +12,8 @@ use std::{
 };
 
 use briskdb::document::{
-    BsonDocument, BsonValue, DocumentMatcher, DocumentQueryError, decode_document, encode_document,
+    BsonDocument, BsonValue, DocumentMatcher, DocumentProjector, DocumentQueryError,
+    decode_document, encode_document,
 };
 
 pub const SOURCE_COMMIT: &str = "53cbf44e98b8caa036163725d195fd29592e1cc0";
@@ -21,104 +22,214 @@ const INPUT_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Match(bool),
+    Document(Vec<u8>),
     Code(i32),
     NativeFailure(String),
 }
 
+#[derive(Clone, Copy)]
+pub enum Surface {
+    Matcher,
+    Projection,
+}
+
+// Keep the matcher entry points stable for existing regression/replay callers.
 pub fn inputs(case: &BsonDocument) -> Result<(&BsonDocument, &BsonDocument), String> {
-    match (case.get_first("document"), case.get_first("query")) {
-        (Some(BsonValue::Document(document)), Some(BsonValue::Document(query))) => {
-            Ok((document, query))
-        }
-        _ => Err("matcher case requires document and query objects".into()),
-    }
+    Surface::Matcher.inputs(case)
 }
-
 pub fn expected(case: &BsonDocument) -> Result<Outcome, String> {
-    match (case.get_first("matches"), case.get_first("error")) {
-        (Some(BsonValue::Boolean(value)), None) => Ok(Outcome::Match(*value)),
-        (None, Some(BsonValue::Int32(code))) => Ok(Outcome::Code(*code)),
-        _ => Err("matcher case requires exactly one reference outcome".into()),
-    }
+    Surface::Matcher.expected(case)
 }
-
 pub fn candidate(case: &BsonDocument) -> Outcome {
-    let (document, query) = inputs(case).expect("validated matcher inputs");
-    match DocumentMatcher::compile(query).and_then(|matcher| matcher.matches(document)) {
-        Ok(value) => Outcome::Match(value),
-        Err(error) => error
-            .source()
-            .and_then(|source| source.downcast_ref::<DocumentQueryError>())
-            .map_or_else(
-                || Outcome::NativeFailure(format!("{:?}", error.kind())),
-                |error| Outcome::Code(error.mongo_code()),
-            ),
-    }
+    Surface::Matcher.candidate(case)
+}
+pub fn reference(python: &str, case: &BsonDocument) -> Result<BsonDocument, String> {
+    Surface::Matcher.reference(python, case)
 }
 
-pub fn reference(python: &str, case: &BsonDocument) -> Result<BsonDocument, String> {
-    inputs(case)?;
-    let payload = encode_document(case).map_err(|error| error.to_string())?;
-    if payload.len() > INPUT_LIMIT {
-        return Err("matcher diagnostic input exceeds 64 KiB".into());
+impl Surface {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Matcher => "matcher",
+            Self::Projection => "projection",
+        }
     }
-    // Files avoid pipe-buffer deadlocks and let the parent enforce the worker
-    // deadline even if the reference stalls before reading its input.
-    let mut input = tempfile::tempfile().map_err(|error| error.to_string())?;
-    input
-        .write_all(&payload)
-        .map_err(|error| error.to_string())?;
-    input.rewind().map_err(|error| error.to_string())?;
-    let mut output = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let mut child = Command::new(python)
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/document_matcher_oracle.py"
-        ))
-        .arg("--evaluate-one")
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(
-            output.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => (),
-            Err(error) => {
+    const fn field(self) -> &'static str {
+        match self {
+            Self::Matcher => "query",
+            Self::Projection => "projection",
+        }
+    }
+    pub fn inputs(self, case: &BsonDocument) -> Result<(&BsonDocument, &BsonDocument), String> {
+        match (case.get_first("document"), case.get_first(self.field())) {
+            (Some(BsonValue::Document(document)), Some(BsonValue::Document(query))) => {
+                Ok((document, query))
+            }
+            _ => Err(format!(
+                "{} case requires document and {} objects",
+                self.kind(),
+                self.field()
+            )),
+        }
+    }
+
+    pub fn expected(self, case: &BsonDocument) -> Result<Outcome, String> {
+        let field = match self {
+            Self::Matcher => "matches",
+            Self::Projection => "result",
+        };
+        match (self, case.get_first(field), case.get_first("error")) {
+            (Self::Matcher, Some(BsonValue::Boolean(value)), None) => Ok(Outcome::Match(*value)),
+            (Self::Projection, Some(BsonValue::Document(value)), None) => encode_document(value)
+                .map(Outcome::Document)
+                .map_err(|error| error.to_string()),
+            (_, None, Some(BsonValue::Int32(code))) => Ok(Outcome::Code(*code)),
+            _ => Err(format!(
+                "{} case requires exactly one reference outcome",
+                self.kind()
+            )),
+        }
+    }
+
+    pub fn candidate(self, case: &BsonDocument) -> Outcome {
+        let (document, spec) = self.inputs(case).expect("validated differential inputs");
+        let result = match self {
+            Self::Matcher => DocumentMatcher::compile(spec)
+                .and_then(|matcher| matcher.matches(document))
+                .map(Outcome::Match),
+            Self::Projection => DocumentProjector::compile(spec)
+                .and_then(|projector| projector.project(document))
+                .map(|result| {
+                    Outcome::Document(encode_document(&result).expect("bounded projection output"))
+                }),
+        };
+        match result {
+            Ok(value) => value,
+            Err(error) => error
+                .source()
+                .and_then(|source| source.downcast_ref::<DocumentQueryError>())
+                .map_or_else(
+                    || Outcome::NativeFailure(format!("{:?}", error.kind())),
+                    |error| Outcome::Code(error.mongo_code()),
+                ),
+        }
+    }
+
+    pub fn reference(self, python: &str, case: &BsonDocument) -> Result<BsonDocument, String> {
+        self.inputs(case)?;
+        let payload = encode_document(case).map_err(|error| error.to_string())?;
+        if payload.len() > INPUT_LIMIT {
+            return Err("differential diagnostic input exceeds 64 KiB".into());
+        }
+        // Files avoid pipe-buffer deadlocks and let the parent enforce the worker
+        // deadline even if the reference stalls before reading its input.
+        let mut input = tempfile::tempfile().map_err(|error| error.to_string())?;
+        input
+            .write_all(&payload)
+            .map_err(|error| error.to_string())?;
+        input.rewind().map_err(|error| error.to_string())?;
+        let mut output = tempfile::tempfile().map_err(|error| error.to_string())?;
+        let mut child = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(match self {
+                Self::Matcher => "tests/document_matcher_oracle.py",
+                Self::Projection => "tests/document_projection_oracle.py",
+            }))
+            .arg("--evaluate-one")
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(
+                output.try_clone().map_err(|error| error.to_string())?,
+            ))
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => (),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(error.to_string());
+                return Err("source-locked differential diagnostic timed out".into());
             }
+            thread::sleep(Duration::from_millis(5));
+        };
+        if !status.success() {
+            return Err("source-locked differential diagnostic failed".into());
         }
-        if started.elapsed() >= Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("source-locked matcher diagnostic timed out".into());
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        output
+            .take((INPUT_LIMIT + 1025) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > INPUT_LIMIT + 1024 {
+            return Err("differential diagnostic output exceeded its bound".into());
         }
-        thread::sleep(Duration::from_millis(5));
-    };
-    if !status.success() {
-        return Err("source-locked matcher diagnostic failed".into());
+        let result = decode_document(&bytes).map_err(|error| error.to_string())?;
+        self.inputs(&result)?;
+        self.expected(&result)?;
+        Ok(result)
     }
-    output
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
-    output
-        .take((INPUT_LIMIT + 1025) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > INPUT_LIMIT + 1024 {
-        return Err("matcher diagnostic output exceeded its bound".into());
+
+    pub fn reduce(
+        self,
+        case: &BsonDocument,
+        max_probes: usize,
+        max_time: Duration,
+        preserves: impl FnMut(&BsonDocument) -> Result<bool, String>,
+    ) -> Result<Reduction, String> {
+        reduce_for(self, case, max_probes, max_time, preserves)
     }
-    let result = decode_document(&bytes).map_err(|error| error.to_string())?;
-    inputs(&result)?;
-    expected(&result)?;
-    Ok(result)
+    pub fn save_mismatch(
+        self,
+        python: &str,
+        original: &BsonDocument,
+        directory: &Path,
+        candidate: impl Fn(&BsonDocument) -> Outcome,
+    ) -> Result<PathBuf, String> {
+        save_for(self, python, original, directory, candidate)
+    }
+
+    pub fn replay(self, python: &str, path: &Path) -> Result<(), String> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .map_err(|error| error.to_string())?
+            .take(68 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() >= 68 * 1024 {
+            return Err("reproducer exceeds its bounded envelope".into());
+        }
+        let artifact = decode_document(&bytes).map_err(|error| error.to_string())?;
+        if artifact.get_first("schema") != Some(&BsonValue::Int32(1))
+            || artifact.get_first("kind") != Some(&BsonValue::from(self.kind()))
+            || artifact.get_first("sourceCommit") != Some(&BsonValue::from(SOURCE_COMMIT))
+        {
+            return Err("reproducer metadata does not match this diagnostic".into());
+        }
+        let Some(BsonValue::Document(case)) = artifact.get_first("case") else {
+            return Err("reproducer is missing its case".into());
+        };
+        let saved = self.expected(case)?;
+        let refreshed = self.reference(python, case)?;
+        let expected = self.expected(&refreshed)?;
+        if saved != expected {
+            return Err("saved reference outcome changed".into());
+        }
+        if self.candidate(&refreshed) != expected {
+            return Err("saved mismatch still reproduces".into());
+        }
+        Ok(())
+    }
 }
 
 enum Decision {
@@ -231,15 +342,25 @@ pub fn reduce(
     case: &BsonDocument,
     max_probes: usize,
     max_time: Duration,
+    preserves: impl FnMut(&BsonDocument) -> Result<bool, String>,
+) -> Result<Reduction, String> {
+    Surface::Matcher.reduce(case, max_probes, max_time, preserves)
+}
+
+fn reduce_for(
+    surface: Surface,
+    case: &BsonDocument,
+    max_probes: usize,
+    max_time: Duration,
     mut preserves: impl FnMut(&BsonDocument) -> Result<bool, String>,
 ) -> Result<Reduction, String> {
     if max_probes == 0 {
         return Err("reduction requires a positive probe budget".into());
     }
-    let (row, query) = inputs(case)?;
+    let (row, query) = surface.inputs(case)?;
     let mut value = document(vec![
         ("document".into(), BsonValue::Document(row.clone())),
-        ("query".into(), BsonValue::Document(query.clone())),
+        (surface.field().into(), BsonValue::Document(query.clone())),
     ]);
     let BsonValue::Document(initial) = &value else {
         unreachable!()
@@ -249,7 +370,7 @@ pub fn reduce(
         .len()
         > INPUT_LIMIT
     {
-        return Err("matcher diagnostic input exceeds 64 KiB".into());
+        return Err("differential diagnostic input exceeds 64 KiB".into());
     }
     let started = Instant::now();
     if !preserves(initial)? {
@@ -265,7 +386,7 @@ pub fn reduce(
             let BsonValue::Document(case) = candidate else {
                 return Decision::Reject;
             };
-            if inputs(case).is_err() {
+            if surface.inputs(case).is_err() {
                 return Decision::Reject;
             }
             probes += 1;
@@ -302,31 +423,53 @@ pub fn save_mismatch(
     directory: &Path,
     candidate: impl Fn(&BsonDocument) -> Outcome,
 ) -> Result<PathBuf, String> {
-    let initial = reference(python, original)?;
-    let signature = (expected(&initial)?, candidate(&initial));
+    Surface::Matcher.save_mismatch(python, original, directory, candidate)
+}
+
+fn save_for(
+    surface: Surface,
+    python: &str,
+    original: &BsonDocument,
+    directory: &Path,
+    candidate: impl Fn(&BsonDocument) -> Outcome,
+) -> Result<PathBuf, String> {
+    let initial = surface.reference(python, original)?;
+    let signature = (surface.expected(&initial)?, candidate(&initial));
     if signature.0 == signature.1 {
         return Err("input has no confirmed differential mismatch".into());
     }
     // Keep the confirmed original even if a later probe fails or becomes flaky.
-    let original_path = persist(&initial, directory, 0, false, "original", &signature.1)?;
+    let original_path = persist(
+        surface,
+        &initial,
+        directory,
+        0,
+        false,
+        "original",
+        &signature.1,
+    )?;
     let failure = |error: String| {
         format!(
             "{error}; confirmed original retained at {}",
             original_path.display()
         )
     };
-    let reduction = reduce(&initial, 128, Duration::from_secs(20), |case| {
-        let refreshed = reference(python, case)?;
-        Ok((expected(&refreshed)?, candidate(&refreshed)) == signature)
-    })
-    .map_err(&failure)?;
-    let refreshed = reference(python, &reduction.case).map_err(&failure)?;
-    if (expected(&refreshed)?, candidate(&refreshed)) != signature {
+    let reduction = surface
+        .reduce(&initial, 128, Duration::from_secs(20), |case| {
+            let refreshed = surface.reference(python, case)?;
+            Ok((surface.expected(&refreshed)?, candidate(&refreshed)) == signature)
+        })
+        .map_err(&failure)?;
+    let refreshed = surface
+        .reference(python, &reduction.case)
+        .map_err(&failure)?;
+    if (surface.expected(&refreshed)?, candidate(&refreshed)) != signature {
         return Err(failure(
             "reduced mismatch did not reproduce on final verification".into(),
         ));
     }
     persist(
+        surface,
         &refreshed,
         directory,
         reduction.probes,
@@ -338,6 +481,7 @@ pub fn save_mismatch(
 }
 
 fn persist(
+    surface: Surface,
     case: &BsonDocument,
     directory: &Path,
     probes: usize,
@@ -348,19 +492,30 @@ fn persist(
     let artifact = BsonDocument::from_entries([
         ("schema", BsonValue::Int32(1)),
         ("sourceCommit", BsonValue::from(SOURCE_COMMIT)),
-        ("kind", BsonValue::from("matcher")),
+        ("kind", BsonValue::from(surface.kind())),
         ("case", BsonValue::Document(case.clone())),
         ("probes", BsonValue::Int64(probes as i64)),
         ("budgetExhausted", BsonValue::Boolean(exhausted)),
         ("phase", BsonValue::from(phase)),
         (
             "originalCandidateOutcome",
-            BsonValue::from(format!("{actual:?}")),
+            BsonValue::from(match actual {
+                Outcome::Document(bytes) => format!(
+                    "Document({} bytes, blake3={})",
+                    bytes.len(),
+                    blake3::hash(bytes)
+                ),
+                other => format!("{other:?}"),
+            }),
         ),
     ])
     .map_err(|error| error.to_string())?;
     let bytes = encode_document(&artifact).map_err(|error| error.to_string())?;
-    let path = directory.join(format!("matcher-{}.bson", blake3::hash(&bytes).to_hex()));
+    let path = directory.join(format!(
+        "{}-{}.bson",
+        surface.kind(),
+        blake3::hash(&bytes).to_hex()
+    ));
     fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let mut staged =
         tempfile::NamedTempFile::new_in(directory).map_err(|error| error.to_string())?;

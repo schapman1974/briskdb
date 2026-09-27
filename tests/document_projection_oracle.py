@@ -34,6 +34,18 @@ def main():
         (bson_types, "a4b070ef1937b82f740ddb0c07279f4128d95ae3e75ba63ebec9e2068cdc9973"),
     ]:
         assert hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() == digest
+    if sys.argv[1:] == ["--evaluate-one"]:
+        raw = sys.stdin.buffer.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("projection diagnostic input exceeds 64 KiB")
+        case = BSON(raw).decode()
+        if not isinstance(case.get("document"), dict) or not isinstance(case.get("projection"), dict):
+            raise ValueError("projection diagnostic requires document and projection objects")
+        # Never reuse expected output from the supplied case.
+        emit(case["document"], case["projection"])
+        return
+    if sys.argv[1:]:
+        raise ValueError("unknown projection oracle mode")
     values = [
         None, False, True, -10, 0, 2, Int64(7), Int64(2**63 - 1),
         1.25, float("nan"), float("inf"), -0.0, Decimal128("0E-6000"),
