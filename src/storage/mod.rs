@@ -8265,8 +8265,16 @@ mod tests {
                 .unwrap();
             assert_eq!(before, after);
             release_shared_root_peer(peer, &release);
-            drop(Storage::open(temp.path(), 2).unwrap());
-            assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            if cfg!(feature = "documents") {
+                drop(Storage::open(temp.path(), 2).unwrap());
+                assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            } else {
+                assert_eq!(
+                    Storage::open(temp.path(), 2).unwrap_err().kind(),
+                    EngineErrorKind::FailedPrecondition
+                );
+                assert!(manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
+            }
         }
     }
 
