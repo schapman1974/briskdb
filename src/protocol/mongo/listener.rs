@@ -126,6 +126,22 @@ impl MongoServer {
         Self::from_bound_with_limits(database, listener, shutdown, MongoResourceLimits::default())
     }
 
+    #[cfg(all(feature = "listeners", feature = "mongo-tls"))]
+    pub(crate) fn from_bound_tls(
+        database: &BriskDb,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+        identity: super::ReloadableTls,
+    ) -> io::Result<Self> {
+        Self::from_bound_with_transport(
+            database,
+            listener,
+            shutdown,
+            MongoResourceLimits::default(),
+            Transport::Tls(identity),
+        )
+    }
+
     fn from_bound_with_limits(
         database: &BriskDb,
         listener: TcpListener,

@@ -332,7 +332,7 @@ jobs:
           shared-key: mongo-wire-1.85
 
       - name: Install pinned driver
-        run: python -m pip install pymongo==4.17.0
+        run: python -m pip install pymongo==4.17.0 'psycopg[binary]==3.2.13'
 
       - name: Test framing and loopback lifecycle
         run: |
@@ -364,6 +364,13 @@ jobs:
             tls::real_pymongo_sync_async_tls_validation_and_crud -- --ignored --exact
           cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
             tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
+
+      - name: Require composed Mongo TLS, PostgreSQL SCRAM and SQLite-remote listeners
+        env:
+          BRISKDB_MONGO_WIRE_PYTHON: python
+        run: |
+          cargo test --locked --no-default-features --features listeners,mongo-tls,tokio/rt-multi-thread \
+            --lib server::options::tests -- --include-ignored
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications

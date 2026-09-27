@@ -715,8 +715,10 @@ with MongoClient("mongodb://localhost:27017/?directConnection=true",
 hostname verification. TLS authenticates the **server**, not Mongo users: local
 processes must still be trusted, all non-loopback binds are rejected before
 reading identity files, and public proxying remains unsafe. The daemon,
-`AttachedServer`, Python `db.serve()` and managed PyMongo patch hosts still use
-their existing plaintext loopback transport; they do not yet expose Mongo TLS.
+Python `db.serve()` and managed PyMongo patch hosts still use their existing
+plaintext loopback transport; they do not yet expose Mongo TLS. Legacy Rust
+`AttachedServer::*_with_mongo` constructors also remain plaintext; opt into
+attached TLS with the options API below.
 Mongo authentication, roles and remote binding remain separate work.
 
 Certificate/key files use the shared bounded, opened-descriptor-validated loader.
@@ -767,6 +769,55 @@ BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
 BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
   --features mongo-tls --test mongo_wire \
   tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
+```
+
+### Composed Rust listener startup
+
+With `listeners,mongo-tls`, the unreleased `AttachedServer::start_with_options`
+API attaches encrypted Mongo to the same lifecycle as the other connectors:
+
+```rust,ignore
+use briskdb::server::{AttachedServer, AttachedServerOptions, ListenerConfig};
+use briskdb::protocol::mongo::MongoTlsConfig;
+
+let options = AttachedServerOptions::new().with_mongo_tls(
+    "127.0.0.1:27017".parse()?,
+    MongoTlsConfig::new("./server.crt", "./server.key"),
+);
+let mut server = AttachedServer::start_with_options(&database, ListenerConfig {
+    http_listen: "127.0.0.1:8080".parse()?,
+    admin_listen: None,
+    postgres_listen: None,
+}, options).await?;
+println!("Mongo: {:?}", server.addresses().mongo());
+server.close().await?; // Joins all listeners; borrowed database stays open.
+```
+
+Add `.with_postgres_security(SecurityConfig)` for PostgreSQL TLS/SCRAM (and
+enable its address in `ListenerConfig`), or `.with_sqlite_remote(Config)` to
+replace ordinary SQL HTTP with the authenticated read-only SQLite-remote router.
+They can be combined; each connector retains its own credentials and trust
+boundary. Mongo still has **no user authentication** and remains loopback-only.
+HTTP/admin remain loopback-only too; SQLite-remote network use still requires a
+separately secured HTTPS proxy. SQL tables and BSON collections remain distinct.
+
+Addresses, collisions and document enablement are checked before reading secrets.
+All TLS/SCRAM preparation runs off the async runtime, and every configured socket
+is bound before serving. Invalid security or bind failure releases sockets without
+closing the caller's database. Closing/dropping the server also drains pending TLS
+handshakes. `with_mongo(address)` preserves an already-selected Mongo TLS identity
+when changing its address. Existing `ListenerConfig` literals and legacy start
+methods remain compatible; defaults do not enable Mongo or TLS implicitly.
+The standalone `MongoServer::reload_tls` API above is not yet exposed through the
+composed `AttachedServer` handle.
+
+The real composed gate requires PyMongo 4.17.0 and `psycopg[binary]` 3.2.13:
+
+```sh
+BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
+  --features listeners,mongo-tls,tokio/rt-multi-thread --lib \
+  server::options::tests::real_clients_compose_mongo_tls_postgres_scram_and_sqlite_remote \
+  -- --ignored --exact
 ```
 
 ### Bounded driver metadata

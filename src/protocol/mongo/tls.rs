@@ -52,7 +52,7 @@ impl MongoTlsConfig {
         self.handshake_timeout
     }
 
-    pub(super) fn load(&self) -> io::Result<LoadedTls> {
+    pub(crate) fn load(&self) -> io::Result<LoadedTls> {
         // Mongo clients use direct TLS and do not require a PostgreSQL ALPN.
         let identity = crate::protocol::tls::load_server_identity(
             &self.certificate,
@@ -69,13 +69,21 @@ impl MongoTlsConfig {
 
 /// One immutable handshake generation; never publish its fields separately.
 #[derive(Clone)]
-pub(super) struct LoadedTls {
+pub(crate) struct LoadedTls {
     pub acceptor: TlsAcceptor,
     pub handshake_timeout: Duration,
 }
 
 #[derive(Clone)]
-pub(super) struct ReloadableTls(tokio::sync::watch::Sender<Arc<LoadedTls>>);
+pub(crate) struct ReloadableTls(tokio::sync::watch::Sender<Arc<LoadedTls>>);
+
+impl std::fmt::Debug for ReloadableTls {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReloadableTls")
+            .finish_non_exhaustive()
+    }
+}
 
 impl ReloadableTls {
     pub fn new(identity: LoadedTls) -> Self {
