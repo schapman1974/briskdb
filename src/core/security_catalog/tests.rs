@@ -5,19 +5,19 @@ use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 
 const PASSWORD: &str = "private password";
 
-fn name(realm: &str, name: &str) -> SecurityName {
+pub(super) fn name(realm: &str, name: &str) -> SecurityName {
     SecurityName::new(realm, name).unwrap()
 }
-fn credential() -> ScramSha256Verifier {
+pub(super) fn credential() -> ScramSha256Verifier {
     ScramSha256Verifier::from_password_with_iterations(PASSWORD, 4096).unwrap()
 }
-fn target() -> Resource {
+pub(super) fn target() -> Resource {
     Resource::object(DataDomain::Document, "app", "items").unwrap()
 }
-fn policy(action: Action) -> Policy {
+pub(super) fn policy(action: Action) -> Policy {
     Policy::new([Privilege::new(action, Scope::exact(target())).unwrap()]).unwrap()
 }
-fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
+pub(super) fn setup() -> (SecurityCatalog, SecurityName, SecurityName) {
     let mut catalog = SecurityCatalog::new();
     let user = name("app", "alice");
     let role = name("app", "reader");
@@ -54,7 +54,7 @@ fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, String, Vec
     (client, transcript, proof)
 }
 
-fn login(catalog: &SecurityCatalog, user: &SecurityName) -> Principal {
+pub(super) fn login(catalog: &SecurityCatalog, user: &SecurityName) -> Principal {
     let attempt = catalog.begin_scram(user).unwrap();
     let (mut client, transcript, proof) = exchange(&attempt, PASSWORD);
     let (principal, signature) = catalog

@@ -425,8 +425,10 @@ database under differential/property tests.
   with exact bounded scopes, explicit actions and bounded flat role-policy unions.
   An opt-in in-memory user/flat-role catalog now binds proof-verified principals
   to one catalog incarnation and credential generation, checks current roles at
-  admission, and invalidates retained identities on rotation/drop. Catalog
-  persistence, engine/session integration and listener enforcement are still
+  admission, and invalidates retained identities on rotation/drop. Bounded,
+  versioned, zeroizing records preserve users/roles across explicit export/restore
+  with checksum and strict structural validation, creating a fresh incarnation.
+  Durable storage/publication, engine/session integration and listener enforcement are still
   outstanding; these foundations do not enable network authentication or RBAC.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable

@@ -269,7 +269,7 @@ impl fmt::Debug for Resource {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum ScopeValue {
+pub(super) enum ScopeValue {
     Exact(Resource),
     Database(DataDomain, String),
     AllDatabases(DataDomain),
@@ -283,6 +283,11 @@ enum ScopeValue {
 pub struct Scope(ScopeValue);
 
 impl Scope {
+    #[cfg(feature = "auth-scram")]
+    pub(super) fn stored_value(&self) -> &ScopeValue {
+        &self.0
+    }
+
     pub fn exact(resource: Resource) -> Self {
         Self(ScopeValue::Exact(resource))
     }
@@ -397,6 +402,11 @@ pub struct Policy {
 }
 
 impl Policy {
+    #[cfg(feature = "auth-scram")]
+    pub(super) fn privileges(&self) -> impl ExactSizeIterator<Item = &Privilege> {
+        self.privileges.iter()
+    }
+
     /// Bound work before deduplication, including an infinite duplicate iterator.
     pub fn new(privileges: impl IntoIterator<Item = Privilege>) -> EngineResult<Self> {
         let mut policy = Self::default();
