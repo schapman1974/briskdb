@@ -9,7 +9,7 @@ use std::{
 
 use bytes::BytesMut;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
@@ -29,6 +29,9 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+mod transport;
+use transport::Transport;
+
 #[cfg(test)]
 mod tests;
 
@@ -46,6 +49,7 @@ pub struct MongoServer {
     health: Arc<readiness::ListenerHealth>,
     engine_readiness: crate::core::EngineReadinessProbe,
     document_support: crate::DocumentSupport,
+    security: super::MongoSecurityMode,
 }
 
 impl MongoServer {
@@ -69,6 +73,49 @@ impl MongoServer {
         Self::from_bound_with_limits(database, listener, CancellationToken::new(), limits)
     }
 
+    /// Encrypt the standalone Mongo listener. Authentication/roles are not yet
+    /// implemented, so even with TLS the address must be loopback.
+    #[cfg(feature = "mongo-tls")]
+    pub async fn start_tls(
+        database: &BriskDb,
+        address: SocketAddr,
+        config: super::MongoTlsConfig,
+    ) -> io::Result<Self> {
+        Self::start_tls_with_limits(database, address, config, MongoResourceLimits::default()).await
+    }
+
+    #[cfg(feature = "mongo-tls")]
+    pub async fn start_tls_with_limits(
+        database: &BriskDb,
+        address: SocketAddr,
+        config: super::MongoTlsConfig,
+        limits: MongoResourceLimits,
+    ) -> io::Result<Self> {
+        if !address.ip().is_loopback() {
+            return Err(invalid(
+                "Mongo listener requires loopback; TLS does not authenticate Mongo users",
+            ));
+        }
+        if database.engine().state() != EngineState::Running {
+            return Err(invalid("Mongo listener requires a running engine"));
+        }
+        let handshake_timeout = config.handshake_timeout();
+        let acceptor = tokio::task::spawn_blocking(move || config.load())
+            .await
+            .map_err(|_| io::Error::other("Mongo TLS configuration worker failed"))??;
+        let listener = TcpListener::bind(address).await?;
+        Self::from_bound_with_transport(
+            database,
+            listener,
+            CancellationToken::new(),
+            limits,
+            Transport::Tls {
+                acceptor,
+                handshake_timeout,
+            },
+        )
+    }
+
     /// Start only after the owning server has bound every configured listener.
     #[cfg(feature = "listeners")]
     pub(crate) fn from_bound(
@@ -85,6 +132,16 @@ impl MongoServer {
         shutdown: CancellationToken,
         limits: MongoResourceLimits,
     ) -> io::Result<Self> {
+        Self::from_bound_with_transport(database, listener, shutdown, limits, Transport::Plain)
+    }
+
+    fn from_bound_with_transport(
+        database: &BriskDb,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+        limits: MongoResourceLimits,
+        transport: Transport,
+    ) -> io::Result<Self> {
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
             return Err(invalid("Mongo listener requires loopback"));
@@ -97,6 +154,7 @@ impl MongoServer {
         let clients = Arc::new(client_metadata::Registry::default());
         let health = Arc::new(readiness::ListenerHealth::default());
         let guard = health.guard();
+        let security = transport.security();
         let run = run(
             listener,
             database.clone(),
@@ -104,6 +162,7 @@ impl MongoServer {
             Arc::clone(&metrics),
             Arc::clone(&clients),
             limits,
+            transport,
         );
         let task = tokio::spawn(
             async move {
@@ -123,6 +182,7 @@ impl MongoServer {
             health,
             engine_readiness: database.engine().readiness_probe(),
             document_support: database.document_support(),
+            security,
         })
     }
 
@@ -143,7 +203,7 @@ impl MongoServer {
             listener: self.health.state(self.shutdown.is_cancelled()),
             engine: self.engine_readiness.snapshot(),
             document_support: self.document_support,
-            security: super::MongoSecurityMode::AnonymousLoopback,
+            security: self.security,
         }
     }
 
@@ -204,6 +264,7 @@ async fn run(
     metrics: Arc<metrics::Metrics>,
     clients: Arc<client_metadata::Registry>,
     limits: MongoResourceLimits,
+    transport: Transport,
 ) -> io::Result<()> {
     let executor = Arc::new(commands::Executor::new(
         database.clone(),
@@ -237,12 +298,13 @@ async fn run(
                 let metrics = Arc::clone(&metrics);
                 let admission = metrics.admit();
                 let clients = Arc::clone(&clients);
+                let transport = transport.clone();
                 connections.spawn(async move {
                     // This slot remains held while the blocking parser is awaited,
                     // including during shutdown; malformed clients cannot grow the queue.
                     let _permit = permit;
                     let _admission = admission;
-                    if let Err(error) = connection(stream, token, executor, Arc::clone(&metrics), clients, limits).await {
+                    if let Err(error) = transport.serve(stream, token, executor, Arc::clone(&metrics), clients, limits).await {
                         metrics.connection_error(error.kind());
                     }
                 }.with_current_subscriber());
@@ -259,8 +321,8 @@ async fn run(
     outcome
 }
 
-async fn connection(
-    mut stream: TcpStream,
+async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     shutdown: CancellationToken,
     executor: Arc<commands::Executor>,
     metrics: Arc<metrics::Metrics>,

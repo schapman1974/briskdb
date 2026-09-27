@@ -12,6 +12,8 @@ mod limits;
 mod listener;
 mod metrics;
 mod readiness;
+#[cfg(feature = "mongo-tls")]
+mod tls;
 mod wire;
 
 pub use client_metadata::{MongoClientMetadata, MongoDriverKind};
@@ -25,6 +27,8 @@ pub use metrics::{
 pub use readiness::{
     MongoListenerState, MongoReadinessReason, MongoReadinessSnapshot, MongoSecurityMode,
 };
+#[cfg(feature = "mongo-tls")]
+pub use tls::MongoTlsConfig;
 pub use wire::{DocumentSequence, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request};
 
 use std::io;

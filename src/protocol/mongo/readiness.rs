@@ -37,12 +37,15 @@ impl MongoListenerState {
 pub enum MongoSecurityMode {
     /// Loopback only; no Mongo authentication or TLS. Trust local processes.
     AnonymousLoopback,
+    /// TLS server identity, but no Mongo user authentication. Loopback only.
+    AnonymousTlsLoopback,
 }
 
 impl MongoSecurityMode {
     pub const fn code(self) -> &'static str {
         match self {
             Self::AnonymousLoopback => "anonymous_loopback",
+            Self::AnonymousTlsLoopback => "anonymous_tls_loopback",
         }
     }
 }

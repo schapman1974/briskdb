@@ -614,8 +614,9 @@ the database. Builds without `mongo` reject activation before creating files.
 Every configured socket is bound before serving begins; a bind failure releases
 the sockets and closes the process-owned database. SIGINT/SIGTERM drains all
 listeners; an unexpected Mongo exit stops the common server and reports failure.
-Mongo has no authentication/TLS boundary yet: keep it local, including when
-PostgreSQL uses TLS/SCRAM. Do not publicly proxy the Mongo listener.
+The daemon's Mongo listener is plaintext and unauthenticated: keep it local,
+including when PostgreSQL uses TLS/SCRAM. The optional standalone Rust TLS API
+below does not add user authentication. Do not publicly proxy either listener.
 
 Zlib transport is negotiated only when a valid hello/isMaster offers `zlib`.
 For example, pass `compressors="zlib"` to `MongoClient` / `AsyncMongoClient`,
@@ -679,6 +680,64 @@ let mut mongo = briskdb::protocol::mongo::MongoServer::start(
 mongo.close().await?;
 database.close().await?;
 ```
+
+### Encrypted Rust Mongo listener
+
+Unreleased source builds can select `mongo-tls` (which selects `mongo` and the
+shared `transport-tls` loader, without PostgreSQL). The standalone Rust API
+accepts PEM certificate/key files and uses direct TLS, not PostgreSQL negotiation
+or ALPN:
+
+```rust,ignore
+use briskdb::protocol::mongo::{MongoServer, MongoTlsConfig};
+
+let mut mongo = MongoServer::start_tls(
+    &database, // Running BriskDb opened with DocumentSupport::Enabled.
+    "127.0.0.1:27017".parse()?,
+    MongoTlsConfig::new("./server.crt", "./server.key"),
+).await?;
+// Keep the runtime and listener alive while clients connect.
+mongo.close().await?;
+```
+
+Use a certificate valid for the client's hostname, and trust its issuing CA.
+For example, with a certificate whose SAN includes `localhost`:
+
+```python
+from pymongo import MongoClient
+
+with MongoClient("mongodb://localhost:27017/?directConnection=true",
+                 tls=True, tlsCAFile="./ca.crt") as client:
+    print(client.demo.users.find_one({"_id": 123}))
+```
+
+`AsyncMongoClient` accepts the same TLS options. Do not disable certificate or
+hostname verification. TLS authenticates the **server**, not Mongo users: local
+processes must still be trusted, all non-loopback binds are rejected before
+reading identity files, and public proxying remains unsafe. The daemon,
+`AttachedServer`, Python `db.serve()` and managed PyMongo patch hosts still use
+their existing plaintext loopback transport; they do not yet expose Mongo TLS.
+Mongo authentication, roles, TLS reload and remote binding remain separate work.
+
+Certificate/key files use the shared bounded, opened-descriptor-validated loader.
+On Unix, private keys must not be group-writable or accessible by others; `0600`
+is suitable. A listener rejects invalid/mismatched identities before binding.
+`with_handshake_timeout(Duration)` narrows the default 15-second deadline to a
+positive value no greater than 15 seconds. `start_tls_with_limits` also accepts
+the ordinary connection/command limits: incomplete TLS handshakes consume the
+same finite socket slots, allocate no command session/client metadata, and are
+cancelled during shutdown. TLS failures use existing transport failure counters.
+Readiness reports `anonymous_tls_loopback`, never authenticated network readiness.
+
+Run the real-driver gate explicitly with pinned PyMongo 4.17.0 installed:
+
+```sh
+BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
+  --features mongo-tls --test mongo_wire \
+  tls::real_pymongo_sync_async_tls_validation_and_crud -- --ignored --exact
+```
+
+### Bounded driver metadata
 
 Rust hosts can inspect `MongoServer::client_metadata()` for at most 32 active
 connections, sorted by listener-local connection ID. The first successful modern
@@ -1262,8 +1321,9 @@ are not one atomic system snapshot. The schema gate reflects **detected** catalo
 or shard corruption as `schema_degraded` but does not identify the failed file
 or probe for new on-disk corruption; global-index health is a separate engine
 surface. `ping`/discovery can succeed when document support is disabled. Security
-is explicitly `anonymous_loopback`: Mongo authentication and TLS are not implemented,
-local processes must be trusted, and non-loopback binding still fails. This is
+is explicitly `anonymous_loopback` for plaintext or `anonymous_tls_loopback` for
+the standalone Rust TLS API. Mongo authentication is not implemented, local
+processes must be trusted, and non-loopback binding still fails. This is
 not readiness for exposing Mongo to a network. No admin endpoint, Python readiness
 API, automatic repair or security-policy change is added.
 

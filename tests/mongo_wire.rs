@@ -9,7 +9,7 @@ use briskdb::{
 };
 use bytes::{BufMut, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
 };
@@ -33,6 +33,9 @@ mod readiness;
 mod resource_churn;
 #[path = "mongo_wire/resource_limits.rs"]
 mod resource_limits;
+#[cfg(feature = "mongo-tls")]
+#[path = "mongo_wire/tls.rs"]
+mod tls;
 #[path = "mongo_wire/uuid_widths.rs"]
 mod uuid_widths;
 
@@ -100,7 +103,7 @@ fn insert_sequence(collection: &str, documents: &[BsonDocument]) -> BytesMut {
     bytes
 }
 
-async fn response(stream: &mut TcpStream) -> (Frame, BsonDocument) {
+async fn response<S: AsyncRead + Unpin>(stream: &mut S) -> (Frame, BsonDocument) {
     timeout(Duration::from_secs(5), async {
         let mut length = [0; 4];
         stream.read_exact(&mut length).await.unwrap();
