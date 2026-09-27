@@ -132,6 +132,8 @@ pub(crate) fn initial_physical_shard(bucket_id: u16, shard_count: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    mod properties;
+
     use std::{sync::Arc, thread};
 
     use super::*;

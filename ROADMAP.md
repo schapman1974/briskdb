@@ -1155,6 +1155,11 @@ requires an earlier dependency:
       every supported update operator without requiring a valid input envelope.
       Fuzz crash minimization/replay is documented; differential mismatch
       minimization and longer fault-soak/CI tiers remain separate requirements.
+      Generated routing checks also cover full-width hashes, immutable bucket
+      ownership snapshots, numeric BSON aliases and conservative logical-ID
+      pruning against the authoritative matcher across 2/3/8/64-shard layouts.
+      These invariants complement real-engine shard-checkout/restart tests;
+      they do not implement live resharding or certify long-running soak.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-

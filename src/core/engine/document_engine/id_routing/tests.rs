@@ -1,6 +1,7 @@
 use super::*;
 mod aggregation;
 mod logical;
+mod properties;
 use crate::{
     core::RequestContext,
     document::{

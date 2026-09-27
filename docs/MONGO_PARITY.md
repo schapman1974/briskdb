@@ -1743,7 +1743,7 @@ operator validation, regex boundaries, and numeric families. This separate
 matcher matrix does not mark the full frozen candidate command corpus as passed.
 The broader #167 consumer/dialect conformance work remains open.
 
-## Update property and fuzz checks
+## Update/routing property and fuzz checks
 
 The document updater has four shrinkable property tests (256 generated cases
 each): checked Int64 arithmetic/overflow, ordered array-operation sequences,
@@ -1752,6 +1752,17 @@ cancellation atomicity. Generated values include arbitrary double/Decimal128
 encodings and bounded nested documents/arrays. These tests run in the ordinary
 native unit suite; they compare arithmetic and array results with independent
 models, not with a second call to the same updater.
+
+Routing has three additional 256-case properties: full-width hashes retain the
+generation-one owner and bucket bounds, arbitrary keys consult a changed owner
+map without mutating the original snapshot, and numeric BSON aliases route
+identically as scalars and inside arrays/documents. A separate shrinkable matcher
+check generates 256 logical ID filters for each of 2, 3, 8 and 64 shards. Every
+selected bitmap must retain all authoritative matches across 81 BSON fixtures,
+including numeric aliases, typed IDs, negation, nested logic and non-ID clauses.
+It uses real native routing metadata but in-memory matcher fixtures, not a new
+concurrent/resharding or wire-compatibility guarantee. Existing real-engine tests
+separately verify actual shard checkouts, mutations, pipeline results and restart.
 
 The `document_update` libFuzzer target accepts a BSON envelope with `update` and
 `document` fields. Every input also exercises all eleven supported update
@@ -1764,6 +1775,8 @@ or a complete differential/release certification.
 
 ```sh
 cargo test --locked --all-features --lib document::update::properties
+cargo test --locked --all-features --lib core::routing::tests
+cargo test --locked --all-features --lib id_routing::tests
 cargo check --locked --manifest-path fuzz/Cargo.toml --bins
 cargo install cargo-fuzz --version 0.13.2 --locked
 rustup toolchain install nightly --profile minimal
