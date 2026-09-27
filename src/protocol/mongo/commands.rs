@@ -10,6 +10,8 @@ mod cursors;
 mod indexes;
 mod read_options;
 #[cfg(feature = "auth-scram")]
+mod role_info;
+#[cfg(feature = "auth-scram")]
 mod user_info;
 #[cfg(feature = "auth-scram")]
 mod users;
@@ -251,6 +253,8 @@ pub(super) enum Command {
     UserManagement(crate::core::user_management::UserManagementCommand),
     #[cfg(feature = "auth-scram")]
     UserInfo(crate::core::security_catalog::UserInfoRequest),
+    #[cfg(feature = "auth-scram")]
+    RoleInfo(crate::core::security_catalog::RoleInfoRequest),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -302,6 +306,10 @@ pub(super) fn prepare_with_limits(
     limits: super::MongoResourceLimits,
 ) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
+    #[cfg(feature = "auth-scram")]
+    if name == "rolesInfo" {
+        return Some(role_info::prepare(request, started, limits));
+    }
     #[cfg(feature = "auth-scram")]
     if name == "usersInfo" {
         return Some(user_info::prepare(request, started, limits));
@@ -1452,6 +1460,18 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::RoleInfo(request) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                let roles = self
+                    .database
+                    .engine()
+                    .role_info(session, context, request)
+                    .await?;
+                Ok(role_info::reply(roles))
+            }
             #[cfg(feature = "auth-scram")]
             Command::UserInfo(request) => {
                 if !self.secured() {

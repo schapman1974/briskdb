@@ -1302,6 +1302,15 @@ forgery, rollback or wrong-root substitution**. It is not encrypted. File access
 atomic publication, root binding, freshness and downgrade protection still need
 storage integration; exporting a record writes no files and changes no manifest.
 
+`RoleInfoRequest` and `Engine::role_info` provide read-only stored-role metadata.
+Direct assignments permit exact inspection; all other selected names (including
+absent roles) and whole-realm listings require current `ViewRoles` authority.
+All permissions are checked before lookup; conservative row/byte limits are
+charged before cloning. Durable refresh, immutable identity/generation, session
+ownership and queued request controls match account inspection. The result
+contains names only, never policies or credentials; Mongo represents these
+stored flat roles with empty inheritance and `isBuiltin: false`.
+
 `Scope::non_system_document_collections(database)` covers only document objects
 in one exact database. It excludes every `system.*` name, and also `replset.*`
 when the database is exactly `local`. An exception such as `system.js` needs a

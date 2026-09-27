@@ -67,6 +67,7 @@ pub enum MongoCommandKind {
     GrantRolesToUser,
     RevokeRolesFromUser,
     UsersInfo,
+    RolesInfo,
     Other,
 }
 
@@ -103,6 +104,7 @@ impl MongoCommandKind {
         Self::GrantRolesToUser,
         Self::RevokeRolesFromUser,
         Self::UsersInfo,
+        Self::RolesInfo,
         Self::Other,
     ];
 
@@ -139,6 +141,7 @@ impl MongoCommandKind {
             "grantRolesToUser" => Self::GrantRolesToUser,
             "revokeRolesFromUser" => Self::RevokeRolesFromUser,
             "usersInfo" => Self::UsersInfo,
+            "rolesInfo" => Self::RolesInfo,
             _ => Self::Other,
         }
     }
@@ -177,6 +180,7 @@ impl MongoCommandKind {
             Self::GrantRolesToUser => "grantRolesToUser",
             Self::RevokeRolesFromUser => "revokeRolesFromUser",
             Self::UsersInfo => "usersInfo",
+            Self::RolesInfo => "rolesInfo",
             Self::Other => "other",
         }
     }
@@ -299,7 +303,6 @@ struct CursorCounters {
     rejected: AtomicU64,
 }
 
-#[derive(Default)]
 pub(super) struct Metrics {
     accepted: AtomicU64,
     admitted: AtomicU64,
@@ -318,6 +321,31 @@ pub(super) struct Metrics {
     commands: [CommandCounters; COMMANDS],
     error_codes: [AtomicU64; ERROR_CODES.len()],
     other_codes: AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            accepted: AtomicU64::default(),
+            admitted: AtomicU64::default(),
+            rejected: AtomicU64::default(),
+            active: AtomicU64::default(),
+            closed: AtomicU64::default(),
+            peak: AtomicU64::default(),
+            accept_failures: AtomicU64::default(),
+            task_failures: AtomicU64::default(),
+            transport: std::array::from_fn(|_| AtomicU64::default()),
+            write_errors: AtomicU64::default(),
+            response_limits: AtomicU64::default(),
+            cursors: CursorCounters::default(),
+            read_metrics_enabled: AtomicBool::default(),
+            reads: reads::ReadCounters::default(),
+            // Array Default is limited to 32 elements on supported toolchains.
+            commands: std::array::from_fn(|_| CommandCounters::default()),
+            error_codes: std::array::from_fn(|_| AtomicU64::default()),
+            other_codes: AtomicU64::default(),
+        }
+    }
 }
 
 fn add(counter: &AtomicU64, amount: u64) {

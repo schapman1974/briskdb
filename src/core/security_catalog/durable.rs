@@ -99,6 +99,16 @@ impl DurableSecurityCatalog {
         self.catalog.user_info(principal, request, limits)
     }
 
+    pub(crate) fn role_info(
+        &mut self,
+        principal: &Principal,
+        request: &super::RoleInfoRequest,
+        limits: crate::core::ResultLimits,
+    ) -> EngineResult<Vec<super::RoleInfo>> {
+        self.refresh()?;
+        self.catalog.role_info(principal, request, limits)
+    }
+
     pub fn begin_scram(&mut self, name: &SecurityName) -> EngineResult<ScramAttempt> {
         self.refresh()?;
         self.catalog.begin_scram(name)

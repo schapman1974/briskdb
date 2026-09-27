@@ -26,10 +26,12 @@ use super::{
 mod durable;
 mod mongo_data_roles;
 mod record;
+mod role_info;
 mod user_info;
 pub use durable::DurableSecurityCatalog;
 pub use mongo_data_roles::MongoDataRole;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
+pub use role_info::{MAX_ROLE_INFO_SELECTORS, RoleInfo, RoleInfoRequest};
 pub use user_info::{MAX_USER_INFO_SELECTORS, UserInfo, UserInfoRequest};
 
 pub const MAX_SECURITY_USERS: usize = 1_024;
