@@ -100,6 +100,8 @@ mongo = [
     "tokio/io-util",
     "tokio/net",
 ]
+# Encrypted Mongo loopback transport only; authentication/roles are separate.
+mongo-tls = ["mongo", "transport-tls"]
 # This reserved name establishes the intended package boundary without
 # claiming that the listener is implemented.
 mysql = []

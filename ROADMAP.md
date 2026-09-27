@@ -428,9 +428,13 @@ database under differential/property tests.
   TLS/SCRAM identity without rebinding; failed/cancelled reloads retain the
   previous identity, and existing connections keep one consistent snapshot.
   Python sync/async wrappers expose reload with queued/preparation cancellation,
-  deadlines and a final publication guard. CLI reload, other listeners and immediate session revocation remain
-  separate work. This does not enable Mongo TLS/authentication; Mongo still
-  refuses non-loopback binds.
+  deadlines and a final publication guard. Standalone Rust Mongo hosts can select
+  `mongo-tls` for direct TLS using the same hardened identity loader, independently
+  of PostgreSQL. Stock sync/async PyMongo validates certificates and performs
+  encrypted CRUD; native tests cover hostname/trust failures, plaintext rejection,
+  bounded handshakes, slot recovery and shutdown. Mongo remains anonymous and
+  refuses non-loopback binds. Mongo reload, daemon/Python Mongo TLS configuration,
+  CLI reload, other listeners and immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

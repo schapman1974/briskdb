@@ -354,6 +354,15 @@ jobs:
           cargo test --locked --no-default-features --features mongo --test mongo_wire \
             resource_churn::bounded_resource_soak -- --ignored --exact --nocapture
 
+      - name: Require independent Mongo TLS and verified PyMongo clients
+        env:
+          BRISKDB_MONGO_WIRE_PYTHON: python
+        run: |
+          cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
+            tls:: -- --skip real_pymongo
+          cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
+            tls::real_pymongo_sync_async_tls_validation_and_crud -- --ignored --exact
+
   mongo-odm:
     name: Mongo real ODM and Talk Python applications
     runs-on: ubuntu-24.04
