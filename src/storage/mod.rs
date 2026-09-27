@@ -15,6 +15,8 @@ mod manifest;
 mod migration;
 mod process_lock;
 mod schema_gate;
+#[cfg(feature = "auth-scram")]
+pub mod security_catalog;
 mod shard;
 mod shard_summary;
 #[cfg(feature = "experimental-vtab")]

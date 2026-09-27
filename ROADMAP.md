@@ -428,7 +428,10 @@ database under differential/property tests.
   admission, and invalidates retained identities on rotation/drop. Bounded,
   versioned, zeroizing records preserve users/roles across explicit export/restore
   with checksum and strict structural validation, creating a fresh incarnation.
-  Durable storage/publication, engine/session integration and listener enforcement are still
+  A separate opt-in Unix catalog store now adds private-file validation,
+  revision-checked transactional replacement, explicit store-ID binding and
+  failure fencing with crash recovery tests. Root-manifest/downgrade binding,
+  runtime publication, engine/session integration and listener enforcement are still
   outstanding; these foundations do not enable network authentication or RBAC.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup
   defaults. PostgreSQL now consumes an internal, independently selectable

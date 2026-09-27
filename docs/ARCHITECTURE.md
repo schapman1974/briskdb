@@ -1311,6 +1311,50 @@ actions retain their exact stable codes. All parse failures have a fixed redacte
 diagnostic. A successful restore creates a fresh catalog incarnation: old
 principals and pending attempts cannot carry over, even with identical contents.
 
+### Transactional security catalog store (unreleased, Unix)
+
+The opt-in `storage::security_catalog::SecurityCatalogStore` persists a catalog
+in a **separate, explicitly chosen SQLite file**. This is a storage component,
+not an enabled engine security mode. It never changes `manifest.sqlite`, listener
+defaults or existing permissions. Root-manifest binding/downgrade fences and
+runtime session/admission publication still need engine integration before a
+listener can rely on this store. Loading returns a new catalog incarnation, not
+a live cache that can be substituted under existing sessions.
+
+The caller generates a `SecurityStoreId`, retains it in trusted configuration,
+and supplies it for creation/reopen. The store validates its application ID,
+format, exact schema, singleton row, expected store ID, revision and complete
+credential/policy record. Creation is exclusive: existing, incomplete or unrelated
+files are never initialized, truncated, adopted or repaired. If creation has an
+uncertain outcome, the caller still has the chosen ID for explicit inspection.
+
+The immediate parent directory must be owned by the effective user and deny
+group/other access. Files must be regular, owned by that user and mode 0600;
+creation requests 0600 without changing the process umask. Descriptor-based
+checks, nonblocking/no-follow opens, a retained file identity and SQLite's VFS
+identity probe reject symlinks, FIFOs, replacements and unsafe permissions.
+Checks run at admission and around publication. Unsupported identity probes or
+platforms without equivalent ACL validation fail closed. This currently supports
+Unix, not a claim of implemented Windows ACL enforcement. The host/OS and trusted
+parent path remain part of the trust boundary.
+
+Reads use one SQLite snapshot. Whole-catalog replacements use an immediate
+transaction and compare-and-swap revision; stale writers cannot overwrite newer
+changes. The revision is bounded to signed 64-bit storage, and an open handle
+rejects revisions below any revision it has observed, including conflict reads.
+This does not detect malicious rollback across a fresh process/reopen or replace
+an external freshness/recovery policy. Two-second busy admission and SQLite's
+row-length limit bound lock waiting and pre-parser blob allocation.
+
+Full synchronous rollback-journal commits precede success. Any failure after a
+write starts fences the handle until explicit reopen, including a busy/uncertain
+commit or file replacement. Tests cover concurrent writers, precommit rollback,
+busy commit, retained-handle replacement and abrupt process exit before commit
+followed by recovery. These are local crash checks, not a hardware power-loss
+certification. Returned Rust records zeroize their owned buffers; SQLite's page
+cache, journal, file storage and library-internal copies are not erased or
+encrypted by this component. Protect the directory and backups accordingly.
+
 ### Bounded worker and connection-pool boundary
 
 The local engine owns one independent pool per physical shard. `EngineOptions`

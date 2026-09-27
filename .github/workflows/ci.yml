@@ -560,6 +560,10 @@ jobs:
             --lib core::security_catalog
           cargo test --locked --no-default-features --features auth-scram \
             --doc core::security_catalog
+          cargo test --locked --no-default-features --features auth-scram,tokio/rt-multi-thread \
+            --lib storage::security_catalog
+          cargo test --locked --no-default-features --features auth-scram \
+            --doc storage::security_catalog
           forbidden_dependencies="$(
             cargo tree --locked --no-default-features --features auth-scram --edges normal --prefix none |
               awk '$1 ~ /^(anyhow|axum|bson|clap|flate2|hyper|hyper-util|pgwire|tokio-rustls|tokio-util|tower|tracing-subscriber|utoipa|utoipa-axum|utoipa-gen)$/ { print $1 }' |
