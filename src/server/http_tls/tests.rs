@@ -13,7 +13,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsConnector, rustls};
 
-fn identity(root: &Path, rotated: bool) -> HttpTlsConfig {
+pub(super) fn identity(root: &Path, rotated: bool) -> HttpTlsConfig {
     let certificate = root.join("server.crt");
     let key = root.join("server.key");
     let (cert_bytes, key_bytes): (&[u8], &[u8]) = if rotated {
@@ -37,7 +37,7 @@ fn identity(root: &Path, rotated: bool) -> HttpTlsConfig {
     HttpTlsConfig::new(certificate, key)
 }
 
-fn config() -> ListenerConfig {
+pub(super) fn config() -> ListenerConfig {
     ListenerConfig {
         http_listen: "127.0.0.1:0".parse().unwrap(),
         admin_listen: Some("127.0.0.1:0".parse().unwrap()),
@@ -45,7 +45,7 @@ fn config() -> ListenerConfig {
     }
 }
 
-async fn database() -> (tempfile::TempDir, BriskDb) {
+pub(super) async fn database() -> (tempfile::TempDir, BriskDb) {
     let root = tempfile::tempdir().unwrap();
     let db = BriskDb::builder(root.path())
         .with_shard_count(2)
@@ -60,8 +60,19 @@ async fn database() -> (tempfile::TempDir, BriskDb) {
     (root, db)
 }
 
-async fn tls(
+pub(super) async fn tls(
     address: SocketAddr,
+    certificate: Option<&Path>,
+    name: &'static str,
+) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let stream = timeout(Duration::from_secs(3), TcpStream::connect(address))
+        .await
+        .unwrap()?;
+    tls_stream(stream, certificate, name).await
+}
+
+pub(super) async fn tls_stream(
+    stream: TcpStream,
     certificate: Option<&Path>,
     name: &'static str,
 ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
@@ -78,15 +89,13 @@ async fn tls(
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let connector = TlsConnector::from(Arc::new(config));
     timeout(Duration::from_secs(3), async {
-        connector
-            .connect(name.try_into().unwrap(), TcpStream::connect(address).await?)
-            .await
+        connector.connect(name.try_into().unwrap(), stream).await
     })
     .await
     .unwrap()
 }
 
-async fn request(
+pub(super) async fn request(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     path: &str,
     headers: &str,
@@ -110,7 +119,7 @@ async fn request(
     .unwrap()
 }
 
-async fn closed(stream: &mut (impl AsyncRead + Unpin)) {
+pub(super) async fn closed(stream: &mut (impl AsyncRead + Unpin)) {
     match timeout(Duration::from_secs(3), stream.read(&mut [0]))
         .await
         .unwrap()
@@ -127,7 +136,7 @@ async fn closed(stream: &mut (impl AsyncRead + Unpin)) {
     }
 }
 
-async fn permits(slots: &Semaphore, expected: usize) {
+pub(super) async fn permits(slots: &Semaphore, expected: usize) {
     timeout(Duration::from_secs(3), async {
         while slots.available_permits() != expected {
             tokio::task::yield_now().await;
@@ -393,8 +402,8 @@ async fn encrypted_and_plain_admission_are_finite_and_admin_slots_stay_independe
         let data_slots = listeners.http_slots.data.clone();
         let admin_slots = listeners.http_slots.admin.clone();
         if encrypted {
-            listeners.http_tls.data = Some(identity.clone().load().unwrap());
-            listeners.http_tls.admin = Some(identity.clone().load().unwrap());
+            listeners.http_tls.data = Some(Reloadable::new(identity.clone().load().unwrap()));
+            listeners.http_tls.admin = Some(Reloadable::new(identity.clone().load().unwrap()));
         }
         let addresses = listeners.addresses().unwrap();
         let (stop, stopped) = oneshot::channel();

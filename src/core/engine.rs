@@ -536,10 +536,10 @@ pub struct Engine {
 }
 
 /// Internal observation only: never keeps a database or its pools alive.
-#[cfg(feature = "mongo")]
+#[cfg(any(feature = "mongo", feature = "listeners"))]
 pub(crate) struct EngineReadinessProbe(std::sync::Weak<EngineInner>);
 
-#[cfg(feature = "mongo")]
+#[cfg(any(feature = "mongo", feature = "listeners"))]
 impl EngineReadinessProbe {
     pub(crate) fn snapshot(&self) -> Option<ReadinessSnapshot> {
         self.0.upgrade().map(|inner| Engine { inner }.readiness())
@@ -885,7 +885,7 @@ impl Engine {
         self.inner.lifecycle.state()
     }
 
-    #[cfg(feature = "mongo")]
+    #[cfg(any(feature = "mongo", feature = "listeners"))]
     pub(crate) fn readiness_probe(&self) -> EngineReadinessProbe {
         EngineReadinessProbe(Arc::downgrade(&self.inner))
     }
@@ -6310,7 +6310,7 @@ mod tests {
         assert_eq!(draining.lifecycle_state(), EngineState::Draining);
     }
 
-    #[cfg(feature = "mongo")]
+    #[cfg(any(feature = "mongo", feature = "listeners"))]
     #[test]
     fn weak_readiness_probe_tracks_live_gates_without_retaining_engine() {
         let (_temp, engine) = engine_with_options(2, 1, 1);

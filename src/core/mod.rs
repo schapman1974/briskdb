@@ -35,7 +35,7 @@ pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
 };
 pub use control::{CancellationToken, RequestContext};
-#[cfg(feature = "mongo")]
+#[cfg(any(feature = "mongo", feature = "listeners"))]
 pub(crate) use engine::EngineReadinessProbe;
 pub use engine::{
     CheckpointDatabase, CheckpointDatabaseReport, CheckpointReport, CheckpointShardReport, Engine,

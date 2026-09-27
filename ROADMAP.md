@@ -458,8 +458,10 @@ database under differential/property tests.
   identities through the shared loader, with finite handshakes, separate bounded
   socket admission, close/drop cleanup and unchanged loopback/route boundaries.
   Authenticated SQLite-remote routing retains its bearer checks over HTTPS.
-  HTTP reload/Python/daemon configuration, authorization and immediate session
-  revocation remain separate work.
+  Attached HTTP/admin identities now also reload independently with admission-time
+  snapshots, cancellation/deadline and engine-lifecycle guards; failed preparation
+  preserves active identities. HTTP Python/daemon configuration, authorization and
+  immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined
