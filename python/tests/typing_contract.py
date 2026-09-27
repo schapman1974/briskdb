@@ -7,6 +7,8 @@ import briskdb
 
 
 def server_reload_contract(server: briskdb.Server) -> None:
+    server.reload_http_tls(tls_cert=Path("server.crt"), tls_key="server.key", timeout_ms=5000)
+    server.reload_admin_tls(tls_cert="admin.crt", tls_key=Path("admin.key"), cancellation=briskdb.CancellationToken())
     server.reload_mongo_tls(tls_cert=Path("server.crt"), tls_key="server.key", timeout_ms=5000)
     server.reload_postgres_security(
         tls_cert=Path("server.crt"), tls_key="server.key", user="briskdb",
@@ -16,6 +18,8 @@ def server_reload_contract(server: briskdb.Server) -> None:
 
 
 async def async_server_reload_contract(server: briskdb.AsyncServer) -> None:
+    await server.reload_http_tls(tls_cert="server.crt", tls_key=Path("server.key"), timeout_ms=5000)
+    await server.reload_admin_tls(tls_cert=Path("admin.crt"), tls_key="admin.key", cancellation=briskdb.CancellationToken())
     await server.reload_mongo_tls(tls_cert="server.crt", tls_key=Path("server.key"),
                                  cancellation=briskdb.CancellationToken())
     await server.reload_postgres_security(
@@ -87,6 +91,11 @@ def sync_contract(path: str) -> None:
     conflict_type: type[briskdb.IntegrityError] = briskdb.IdempotencyConflictError
     config: briskdb.Config = briskdb.Config(shards=2)
     database: briskdb.Database = briskdb.open(path, config=config)
+    encrypted: briskdb.Server = database.serve(
+        http_tls_cert=Path("server.crt"), http_tls_key="server.key",
+        admin_tls_cert="admin.crt", admin_tls_key=Path("admin.key"),
+    )
+    encrypted.close()
     server: briskdb.Server = database.serve()
     address: str = server.http_address
     data_address: str = server.data_address
@@ -204,6 +213,11 @@ def sync_contract(path: str) -> None:
 
 async def async_contract(path: str) -> None:
     database: briskdb.AsyncDatabase = await briskdb.open_async(path, shards=2)
+    encrypted: briskdb.AsyncServer = await database.serve(
+        http_tls_cert="server.crt", http_tls_key=Path("server.key"),
+        admin_tls_cert=Path("admin.crt"), admin_tls_key="admin.key",
+    )
+    await encrypted.close()
     server: briskdb.AsyncServer = await database.serve()
     address: str = server.http_address
     data_address: str = server.data_address

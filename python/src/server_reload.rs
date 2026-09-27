@@ -5,11 +5,13 @@ use std::{future::Future, sync::TryLockError, time::Duration};
 use briskdb::{EngineError, EngineErrorKind, RequestContext};
 
 use super::{
-    MongoTlsConfig, PostgresSecurityConfig, ServerShared,
+    HttpTlsConfig, MongoTlsConfig, PostgresSecurityConfig, ServerShared,
     error::{NativeError, NativeResult, listener_error},
 };
 
 enum ReloadIdentity {
+    Http(HttpTlsConfig),
+    Admin(HttpTlsConfig),
     Postgres(PostgresSecurityConfig),
     Mongo(MongoTlsConfig),
 }
@@ -17,6 +19,8 @@ enum ReloadIdentity {
 impl ReloadIdentity {
     const fn label(&self) -> &'static str {
         match self {
+            Self::Http(_) => "HTTP data TLS",
+            Self::Admin(_) => "HTTP admin TLS",
             Self::Postgres(_) => "PostgreSQL security",
             Self::Mongo(_) => "Mongo TLS",
         }
@@ -24,6 +28,22 @@ impl ReloadIdentity {
 }
 
 impl ServerShared {
+    pub(crate) fn reload_http_tls_native(
+        &self,
+        config: HttpTlsConfig,
+        context: RequestContext,
+        admin: bool,
+    ) -> NativeResult<()> {
+        self.reload_identity_native(
+            if admin {
+                ReloadIdentity::Admin(config)
+            } else {
+                ReloadIdentity::Http(config)
+            },
+            context,
+        )
+    }
+
     pub(crate) fn reload_security_native(
         &self,
         config: PostgresSecurityConfig,
@@ -73,6 +93,16 @@ impl ServerShared {
         };
         let server = slot.as_ref().ok_or(NativeError::Closed("server"))?;
         let result = match config {
+            ReloadIdentity::Http(config) => {
+                server
+                    .reload_http_tls_with_context(config, context.clone())
+                    .await
+            }
+            ReloadIdentity::Admin(config) => {
+                server
+                    .reload_admin_tls_with_context(config, context.clone())
+                    .await
+            }
             ReloadIdentity::Postgres(config) => {
                 server
                     .reload_postgres_security_with_context(config, context.clone())
@@ -182,6 +212,8 @@ mod tests {
             )
             .unwrap();
             for identity in [
+                ReloadIdentity::Http(HttpTlsConfig::new("unused.crt", "unused.key")),
+                ReloadIdentity::Admin(HttpTlsConfig::new("unused.crt", "unused.key")),
                 ReloadIdentity::Postgres(config),
                 ReloadIdentity::Mongo(MongoTlsConfig::new("unused.crt", "unused.key")),
             ] {
@@ -192,12 +224,14 @@ mod tests {
                 done.send(matches!(result, Err(NativeError::Engine(error)) if error.kind() == EngineErrorKind::DeadlineExceeded)).unwrap();
             }
         });
-        let first = finished.recv_timeout(Duration::from_secs(5));
-        let second = finished.recv_timeout(Duration::from_secs(5));
+        let results: Vec<_> = (0..4)
+            .map(|_| finished.recv_timeout(Duration::from_secs(5)))
+            .collect();
         drop(held);
         worker.join().unwrap();
-        assert!(first.unwrap());
-        assert!(second.unwrap());
+        for result in results {
+            assert!(result.unwrap());
+        }
         shared.close_native().unwrap();
         shared.runtime.runtime.block_on(db.close()).unwrap();
     }

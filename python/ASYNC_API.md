@@ -70,6 +70,18 @@ async with await database.serve(postgres="127.0.0.1:0") as server:
 
 `AsyncServer.close()` drains its listeners but leaves the database running.
 
+Unreleased: `await database.serve(http_tls_cert=..., http_tls_key=...,
+admin_tls_cert=..., admin_tls_key=...)` accepts independent optional HTTP pairs.
+Each pair must be complete, paths accept strings/`PathLike`, and admin TLS
+requires an enabled admin address. Both planes remain loopback-only; TLS does not
+authenticate HTTP callers. Await `server.reload_http_tls(tls_cert=..., tls_key=...)`
+or `reload_admin_tls(...)` to replace an already-encrypted identity. Both accept
+`timeout_ms=`/`cancellation=` and signal the native token on asyncio task
+cancellation, including while queued. Invalid/cancelled preparation preserves the
+active identity; admitted connections retain their generation. Cancellation cannot
+undo publication or revoke sessions. See the
+[verified HTTPS example](README.md#encrypt-and-reload-httpadmin-unreleased).
+
 Unreleased: `await server.reload_postgres_security(tls_cert=..., tls_key=...,
 user=..., password_file=..., timeout_ms=5_000)` replaces an already-secure
 PostgreSQL identity without rebinding. It supports `cancellation=` and signals

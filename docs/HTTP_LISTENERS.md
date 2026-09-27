@@ -183,8 +183,11 @@ identity; PostgreSQL credentials do not authenticate HTTP callers.
 `with_http_tls(...)` also encrypts a selected `with_sqlite_remote(...)` router.
 Its bearer-token and table-allowlist requirements stay in force; the TLS
 certificate alone does not authorize remote-table access. Administration remains
-separate. Both addresses still require loopback. Python HTTP TLS configuration
-is not exposed by this increment; daemon configuration is described above.
+separate. Both addresses still require loopback. Python exposes the same explicit
+pairs as `http_tls_cert`/`http_tls_key` and `admin_tls_cert`/`admin_tls_key` on
+sync/async `serve()`, plus `reload_http_tls(...)` and `reload_admin_tls(...)`
+with request controls. See the [Python HTTPS example](../python/README.md#encrypt-and-reload-httpadmin-unreleased).
+Daemon configuration is described above.
 
 ### Reload attached Rust HTTP identities (unreleased)
 

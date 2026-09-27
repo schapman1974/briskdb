@@ -995,6 +995,10 @@ class AsyncDatabase:
         mongo: Optional[str] = None,
         mongo_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         mongo_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        http_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        http_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        admin_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        admin_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
@@ -1013,6 +1017,10 @@ class AsyncDatabase:
             mongo=mongo,
             mongo_tls_cert=mongo_tls_cert,
             mongo_tls_key=mongo_tls_key,
+            http_tls_cert=http_tls_cert,
+            http_tls_key=http_tls_key,
+            admin_tls_cert=admin_tls_cert,
+            admin_tls_key=admin_tls_key,
             postgres_tls_cert=postgres_tls_cert,
             postgres_tls_key=postgres_tls_key,
             postgres_user=postgres_user,
@@ -1067,6 +1075,40 @@ class AsyncServer:
     @property
     def closed(self) -> bool:
         return self._server.closed
+
+    async def reload_http_tls(
+        self,
+        *,
+        tls_cert: Union[str, PathLike[str]],
+        tls_key: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> None:
+        """Reload data-plane TLS without rebinding or authenticating callers.
+
+        Already-admitted connections retain their identity. Cancellation before
+        publication preserves the active identity; it cannot undo publication.
+        """
+        await _cancelable_call(
+            self._server.reload_http_tls,
+            tls_cert=tls_cert, tls_key=tls_key,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+        )
+
+    async def reload_admin_tls(
+        self,
+        *,
+        tls_cert: Union[str, PathLike[str]],
+        tls_key: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> None:
+        """Reload only already-encrypted administration TLS, without revocation."""
+        await _cancelable_call(
+            self._server.reload_admin_tls,
+            tls_cert=tls_cert, tls_key=tls_key,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+        )
 
     async def reload_mongo_tls(
         self,
