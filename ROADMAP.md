@@ -432,7 +432,9 @@ database under differential/property tests.
   revision-checked transactional replacement, explicit store-ID binding and
   failure fencing with crash recovery tests. Replacements preserve user-ID and
   credential-generation history, rejecting stale/reused identities before writes.
-  Root-manifest/downgrade binding,
+  Manifest v22 reserves a checksummed store-ID binding, fences older binaries,
+  and rejects ordinary startup for bound roots on every feature surface. No public
+  activation/authenticated-startup API exists yet. Provisioning/root-store linkage,
   runtime publication, engine/session integration and listener enforcement are still
   outstanding; these foundations do not enable network authentication or RBAC.
 - [x] TLS configuration and reload for every implemented listener; safe non-loopback startup

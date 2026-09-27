@@ -30,7 +30,7 @@ compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
 All eight document catalog tables and the index-storage layout and operation journals participate
-in semantic manifest digest version 13. Every supported mutation uses an immediate SQLite transaction,
+in semantic manifest digest version 14. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -182,7 +182,7 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 21 and validate its physical schema, but
+understand current manifest format 22 and validate its physical schema, but
 refuse to open a root containing collections or a pending deletion.
 
 Every built-in and declared index also has a durable root-wide `DocumentIndexId`.

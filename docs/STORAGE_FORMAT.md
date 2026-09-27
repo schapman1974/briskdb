@@ -23,21 +23,21 @@ used, while idempotency stripes are retained after first use so unlink cannot
 create competing inodes. None may be replaced while a process is live. See the
 [multi-process contract](MULTIPROCESS.md).
 
-## Current format: version 21
+## Current format: version 22 (unreleased)
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `21` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `22` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it and the unkeyed checksums
 described below.
 
-Version 21 has twenty-nine strict manifest tables and the partial unique
+Version 22 has thirty strict manifest tables and the partial unique
 allocation-owner index. It retains the routing, authoritative
 logical and document catalogs, physical layout, application-schema migration,
 integrity, generated-ID activation, allocation-owner lifecycle, recoverable
@@ -64,6 +64,15 @@ older binaries and advances the semantic digest to version 13 before allowing
 record-bound non-unique `BDIF` fallback candidate markers. Existing `BDIK` keys,
 unique enforcement and journal kinds are unchanged; see [document storage](DOCUMENT_STORAGE.md).
 
+The v21-to-v22 step adds an empty security-catalog binding table, installs the
+version-22 older-writer fence and advances the semantic digest to version 14.
+It changes no application records, shard layout or credentials and does not
+enable authentication. An empty binding preserves ordinary startup. A present
+binding names one nonzero 16-byte security store ID and makes ordinary startup
+fail closed, even in builds with `auth-scram`. Authenticated startup, provisioning
+and session/listener enforcement are not yet implemented; no public activation
+API writes this row. The marker is recognized independently of feature flags.
+
 ```sql
 CREATE TABLE briskdb_manifest (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -72,7 +81,13 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 21)
+        CHECK (requires_manifest_version >= 22)
+) STRICT;
+
+CREATE TABLE briskdb_security_binding (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    store_id BLOB NOT NULL CHECK (typeof(store_id) = 'blob' AND length(store_id) = 16)
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -674,18 +689,19 @@ CREATE TABLE briskdb_integrity (
 
 The manifest, metadata, routing, schema-catalog, shard-layout, and integrity
 tables each contain exactly one row, as does `briskdb_document_identities`.
-The version-21 downgrade-fence row is exactly `21`. The
+The version-22 downgrade-fence row is exactly `22`. The
 `briskdb_document_index_allocator` and `briskdb_document_index_storage` also
 contain exactly one row each.
 `briskdb_generated_table_ddl`, `briskdb_table_provisioning`,
-`briskdb_document_provisioning`, `briskdb_document_index_operation`, and `briskdb_document_deletion` each
+`briskdb_document_provisioning`, `briskdb_document_index_operation`,
+`briskdb_document_deletion`, and `briskdb_security_binding` each
 contain zero or one row. A completed generated-table bridge is retained;
 table-provisioning declaration rows exist only while their transient parent row
 exists.
 The two integrity-version columns deliberately accept any positive integer so
 a future digest encoding can remain structurally readable long enough for an
-older binary to reject it as `FailedPrecondition`; v21 writers emit manifest
-digest version `13` and schema digest version `1`.
+older binary to reject it as `FailedPrecondition`; v22 writers emit manifest
+digest version `14` and schema digest version `1`.
 Zero or negative versions are malformed and are `DataCorruption`.
 `briskdb_manifest.shard_count` is immutable and is the initial routing modulus;
 it is also the live physical-shard count. Physical IDs are exactly
@@ -1251,8 +1267,8 @@ restart as repair after any reported `DataCorruption`; whole-shard corruption
 drills and failure handling remain issue #68. Those storage failures retain
 their own error kinds and do not themselves justify rebaselining data.
 
-Manifest digest version 13 is a full 32-byte, unkeyed BLAKE3 digest. The stream
-begins with `briskdb.manifest.semantic-root.v13` plus its terminating NUL. It
+Manifest digest version 14 is a full 32-byte, unkeyed BLAKE3 digest. The stream
+begins with `briskdb.manifest.semantic-root.v14` plus its terminating NUL. It
 then encodes the length-prefixed name `application_id` and its tagged integer,
 followed by the length-prefixed name `user_version` and its tagged integer.
 These tables and columns follow in fixed order:
@@ -1276,6 +1292,7 @@ These tables and columns follow in fixed order:
 | `briskdb_document_index_allocator` | `singleton`, `index_high_water` |
 | `briskdb_document_index_storage` | `singleton`, `entry_format_version`, `lifecycle_state`, `shard_count`, `next_shard` |
 | `briskdb_document_index_operation` | `singleton`, `index_id`, `operation_kind`, `operation_id`, `shard_count`, `next_shard` |
+| `briskdb_security_binding` | `singleton`, `format_version`, `store_id` |
 | `briskdb_schema_catalog` | `singleton`, `identifier_encoding_version`, `schema_generation`, `default_database_id` |
 | `briskdb_tables` | `table_id`, `database_id`, `table_name`, `placement`, `shard_key_column`, `shard_key_type` |
 | `briskdb_generated_ids` | `table_id`, `policy`, `generated_column`, `encoding_version`, `activation_state` |
@@ -1302,7 +1319,7 @@ self-reference; its version, database state, and schema digest fields are
 covered. Frozen SQL definitions, STRICT flags, indexes, and foreign keys are
 validated separately rather than encoded as semantic rows.
 
-Every BriskDB-owned v21 manifest mutation recalculates the root after its row
+Every BriskDB-owned v22 manifest mutation recalculates the root after its row
 changes and before the same transaction commits. Progress acknowledgement,
 migration publication/finalization, provisioning intent/progress/finalization,
 generated-table bridge transitions, layout publication, owner/activation state
@@ -1312,6 +1329,9 @@ semantic values instead of the raw SQLite file makes the root stable across WAL
 checkpoints, page relocation, and `VACUUM`; it deliberately does not cover
 SQLite page bytes, rollback journals, WAL, or shared memory.
 
+Digest versions 12 and 13 remain frozen for version-20 and version-21 manifests;
+they omit the security binding and retain their original domains. The v22 binding
+schema and bounded 16-byte ID are validated before generic checksum traversal.
 Digest version 11 remains frozen solely to verify and migrate version-19
 manifests. It covers the same tables as version 12 but retains its v11 domain.
 Digest version 10 verifies version-18 manifests and omits the index-operation
@@ -1481,7 +1501,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 21 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 22 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -2274,6 +2294,8 @@ returning:
    digest version 12, without adding tables or rewriting records/entries.
    The v20-to-v21 step fences older readers/writers before non-unique fallback
    candidates and reseals with digest version 13, also without rewriting data.
+   The v21-to-v22 step adds the empty security binding, installs its downgrade
+   fence and reseals with digest version 14 without enabling authentication.
    Older formats therefore cannot be mistaken for checksummed,
    authoritative-catalog, allocator-authority, recoverable provisioning, or
    durable logical-to-physical DDL identity.

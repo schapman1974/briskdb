@@ -1316,8 +1316,11 @@ principals and pending attempts cannot carry over, even with identical contents.
 The opt-in `storage::security_catalog::SecurityCatalogStore` persists a catalog
 in a **separate, explicitly chosen SQLite file**. This is a storage component,
 not an enabled engine security mode. It never changes `manifest.sqlite`, listener
-defaults or existing permissions. Root-manifest binding/downgrade fences and
-runtime session/admission publication still need engine integration before a
+defaults or existing permissions. Manifest v22 separately reserves an empty,
+checksummed store-ID binding and downgrade fence. Ordinary startup rejects a
+present binding independently of feature flags; no public activation API or
+authenticated startup exists yet. Provisioning/root-store linkage and runtime
+session/admission publication still need engine integration before a
 listener can rely on this store. Loading returns a new catalog incarnation, not
 a live cache that can be substituted under existing sessions.
 
