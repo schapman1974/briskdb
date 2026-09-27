@@ -1359,7 +1359,16 @@ This exposes uneven row work separately from request distribution; zero-row
 probes and buffered pages do not fabricate row observations. All totals saturate,
 and live listener snapshots are best-effort independent atomic loads, not an
 atomic multi-counter transaction. Native/Python per-request `shard_work` reports
-only actually-read shards and charges a bounded 2,048-byte diagnostic budget.
+only actually-read shards and charges a bounded 4,096-byte diagnostic budget.
+The additional `storage_read_nanos` total and fixed 64-slot
+`shard_storage_read_nanos` array measure elapsed monotonic time inside record-read
+storage calls, including SQLite execution and BSON decoding, misses and rereads.
+Native/Python snapshots also expose this integer timing on each shard summary.
+Pool/worker admission, catalog checks, candidate-probe selection, matching,
+engine sort-key/merge work and later result work are excluded. Concurrent shard
+calls overlap, so the sum is not query wall time or physical disk latency. Empty/buffered pages
+have zero time, and disabled requests read no timing clock. Error/unwind paths
+drop their timer but failed engine requests still expose no snapshot or metrics.
 They do not measure unique matched rows, per-shard CPU skew, physical SQLite page or
 byte I/O, or pipeline-predicate evaluations. Enabled requests use the existing
 bounded engine diagnostics and account for their result metadata; protocol replies

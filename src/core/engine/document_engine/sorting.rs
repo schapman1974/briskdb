@@ -282,20 +282,22 @@ impl Engine {
                         cancellation.clone(),
                         deadline,
                         move |storage, connection, cancellation| {
-                            if let Some(stats) = &fetch_stats {
-                                stats.storage_read(shard);
-                            }
-                            let record = storage
-                                .scan_document_shard_on_connection(
-                                    connection,
-                                    collection_id,
-                                    shard,
-                                    natural_order.checked_sub(1).filter(|after| *after > 0),
-                                    1,
-                                    cancellation,
-                                )?
-                                .into_iter()
-                                .next();
+                            let record = ReadStats::observe_storage_read(
+                                fetch_stats.as_deref(),
+                                shard,
+                                || {
+                                    storage.scan_document_shard_on_connection(
+                                        connection,
+                                        collection_id,
+                                        shard,
+                                        natural_order.checked_sub(1).filter(|after| *after > 0),
+                                        1,
+                                        cancellation,
+                                    )
+                                },
+                            )?
+                            .into_iter()
+                            .next();
                             if let Some(stats) = &fetch_stats {
                                 stats.examine(shard, u64::from(record.is_some()));
                             }

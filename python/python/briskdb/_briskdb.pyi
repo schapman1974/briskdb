@@ -83,9 +83,11 @@ class DocumentShardReadStats(TypedDict):
     shard: int
     documents_examined: int
     source_matches: int
+    storage_read_nanos: int
 
 class DocumentReadStats(TypedDict):
     storage_reads: int
+    storage_read_nanos: int
     documents_examined: int
     matcher_evaluations: int
     source_matches: int

@@ -9,25 +9,30 @@ fn execution(plan: Option<DocumentPlan>, shards: u64) -> DocumentExecution {
     let observed = u64::from(shards != 0);
     let mut documents = [0; 64];
     let mut matches = [0; 64];
+    let mut nanos = [0; 64];
     if shards != 0 {
         let first = shards.trailing_zeros() as usize;
         documents[first] = 5;
         matches[first] = 2;
+        nanos[first] = 70;
     }
     DocumentExecution::new(
         DocumentRequestId::new([1; 16]).unwrap(),
         plan,
         DocumentResult::Distinct(vec![BsonValue::from("private-value")].into_boxed_slice()),
     )
-    .with_read_stats(Some(DocumentReadStats::from_counters(
-        7 * observed,
-        5 * observed,
-        3 * observed,
-        2 * observed,
-        shards,
-        documents,
-        matches,
-    )))
+    .with_read_stats(Some(
+        DocumentReadStats::from_counters(
+            7 * observed,
+            5 * observed,
+            3 * observed,
+            2 * observed,
+            shards,
+            documents,
+            matches,
+        )
+        .with_storage_read_nanos(nanos),
+    ))
 }
 
 #[test]
@@ -103,6 +108,13 @@ fn read_metrics_classify_plans_without_retaining_payloads_or_counting_unobserved
     assert!(snapshot.shard_requests[3..].iter().all(|count| *count == 0));
     assert_eq!(&snapshot.shard_documents_examined[..3], &[25, 5, 5]);
     assert_eq!(&snapshot.shard_source_matches[..3], &[10, 2, 2]);
+    assert_eq!(snapshot.storage_read_nanos, 490);
+    assert_eq!(&snapshot.shard_storage_read_nanos[..3], &[350, 70, 70]);
+    assert!(
+        snapshot.shard_storage_read_nanos[3..]
+            .iter()
+            .all(|n| *n == 0)
+    );
     assert!(
         snapshot.shard_documents_examined[3..]
             .iter()
@@ -147,6 +159,10 @@ fn read_metrics_bucket_every_bounded_fanout_and_saturate_totals() {
     counters.shards[63].store(u64::MAX, Ordering::Relaxed);
     counters.shard_documents[63].store(u64::MAX - 1, Ordering::Relaxed);
     counters.shard_matches[63].store(u64::MAX - 1, Ordering::Relaxed);
+    counters
+        .storage_nanos
+        .store(u64::MAX - 1, Ordering::Relaxed);
+    counters.shard_storage_nanos[63].store(u64::MAX - 1, Ordering::Relaxed);
     counters.observe(&execution(None, u64::MAX));
     counters.observe(&execution(None, 1 << 63));
     let snapshot = counters.snapshot();
@@ -157,6 +173,8 @@ fn read_metrics_bucket_every_bounded_fanout_and_saturate_totals() {
     assert_eq!(snapshot.shard_requests[63], u64::MAX);
     assert_eq!(snapshot.shard_documents_examined[63], u64::MAX);
     assert_eq!(snapshot.shard_source_matches[63], u64::MAX);
+    assert_eq!(snapshot.storage_read_nanos, u64::MAX);
+    assert_eq!(snapshot.shard_storage_read_nanos[63], u64::MAX);
 }
 
 #[test]
@@ -186,6 +204,13 @@ fn read_metrics_toggle_preserves_inflight_observations_and_concurrent_totals() {
     assert_eq!(snapshot.reads.source_matches, 8000);
     assert_eq!(snapshot.reads.shard_documents_examined[0], 20000);
     assert_eq!(snapshot.reads.shard_source_matches[0], 8000);
+    assert_eq!(snapshot.reads.storage_read_nanos, 280000);
+    assert_eq!(snapshot.reads.shard_storage_read_nanos[0], 280000);
+    assert!(
+        snapshot.reads.shard_storage_read_nanos[1..]
+            .iter()
+            .all(|n| *n == 0)
+    );
     assert!(
         snapshot.reads.shard_documents_examined[1..]
             .iter()

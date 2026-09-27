@@ -12,6 +12,7 @@ pub struct DocumentReadStats {
     shard_mask: u64,
     documents_by_shard: [u64; 64],
     matches_by_shard: [u64; 64],
+    storage_nanos_by_shard: [u64; 64],
 }
 
 impl DocumentReadStats {
@@ -32,12 +33,29 @@ impl DocumentReadStats {
             shard_mask,
             documents_by_shard,
             matches_by_shard,
+            storage_nanos_by_shard: [0; 64],
         }
+    }
+
+    pub(crate) const fn with_storage_read_nanos(mut self, nanos: [u64; 64]) -> Self {
+        self.storage_nanos_by_shard = nanos;
+        self
     }
 
     /// Point/candidate record-read calls, including calls that find no record.
     pub const fn storage_reads(&self) -> u64 {
         self.storage_reads
+    }
+
+    /// Sum of elapsed monotonic nanoseconds inside record-read storage calls,
+    /// including SQLite execution and BSON decoding, misses and repeated reads.
+    /// Excludes pool/worker admission, catalog checks, source matching and later
+    /// result processing. Parallel shard calls overlap: this is neither query
+    /// wall time, CPU time nor physical I/O latency. Saturates on overflow.
+    pub fn storage_read_nanos(&self) -> u64 {
+        self.storage_nanos_by_shard
+            .iter()
+            .fold(0_u64, |total, nanos| total.saturating_add(*nanos))
     }
 
     /// Stored BSON records delivered to the read engine, before matching,
@@ -68,22 +86,24 @@ impl DocumentReadStats {
     /// Per-physical-shard row observations, in ascending ordinal order, only
     /// for shards actually read. Empty probes have zero rows; buffered output
     /// has no entries. Repeated reads retain the same semantics as the totals.
-    /// This measures read-row distribution, not CPU time or SQLite page I/O.
+    /// Includes storage-call elapsed time, not CPU time or SQLite page I/O.
     pub fn shard_work(&self) -> impl Iterator<Item = DocumentShardReadStats> + '_ {
         self.shards_read().map(|shard| DocumentShardReadStats {
             shard,
             documents_examined: self.documents_by_shard[usize::from(shard)],
             source_matches: self.matches_by_shard[usize::from(shard)],
+            storage_read_nanos: self.storage_nanos_by_shard[usize::from(shard)],
         })
     }
 }
 
-/// Bounded, payload-free row observations for one physical shard ordinal.
+/// Bounded, payload-free read observations for one physical shard ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocumentShardReadStats {
     shard: u16,
     documents_examined: u64,
     source_matches: u64,
+    storage_read_nanos: u64,
 }
 
 impl DocumentShardReadStats {
@@ -99,5 +119,11 @@ impl DocumentShardReadStats {
     /// Source predicate acceptances before pagination/projection/pipeline output.
     pub const fn source_matches(&self) -> u64 {
         self.source_matches
+    }
+
+    /// Elapsed nanoseconds inside this shard's record-read storage calls; see
+    /// [`DocumentReadStats::storage_read_nanos`] for scope and exclusions.
+    pub const fn storage_read_nanos(&self) -> u64 {
+        self.storage_read_nanos
     }
 }

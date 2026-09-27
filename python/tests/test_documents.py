@@ -51,6 +51,11 @@ def bson_bytes(
     return BSON.encode(document, codec_options=codec_options(representation))
 
 
+def shard_rows_without_timing(stats: dict) -> list:
+    return [{k: v for k, v in row.items() if k != "storage_read_nanos"}
+            for row in stats["shard_work"]]
+
+
 class PythonDocumentApiTests(unittest.TestCase):
     def test_string_range_plan_and_reduced_bson_reads_survive_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -77,26 +82,26 @@ class PythonDocumentApiTests(unittest.TestCase):
                         session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": identity % 3})
                     self.assertNotIn("read_stats", session.find(DATABASE, COLLECTION))
                     result = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True)
-                    self.assertEqual({k: v for k, v in result["read_stats"].items() if k != "shard_work"}, {"storage_reads": 16, "documents_examined": 12, "matcher_evaluations": 12, "source_matches": 4, "shards_read": [0, 1, 2, 3]})
+                    self.assertEqual({k: v for k, v in result["read_stats"].items() if k not in ("shard_work", "storage_read_nanos")}, {"storage_reads": 16, "documents_examined": 12, "matcher_evaluations": 12, "source_matches": 4, "shards_read": [0, 1, 2, 3]})
                     by_shard = [{"shard": i, "documents_examined": 0, "source_matches": 0} for i in range(4)]
                     for identity in range(12):
                         located = session.find(DATABASE, COLLECTION, {"_id": identity})
                         shard = located["plan"]["shards"][0]
                         by_shard[shard]["documents_examined"] += 1
                         by_shard[shard]["source_matches"] += int(identity % 3 == 1)
-                    self.assertEqual(result["read_stats"]["shard_work"], by_shard)
+                    self.assertEqual(shard_rows_without_timing(result["read_stats"]), by_shard)
                     self.assertNotIn("read_access", result["plan"])
                     session.create_built_index(DATABASE, COLLECTION, {"v": 1})
                     indexed = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True, plan_diagnostics=True)
                     self.assertEqual(indexed["read_stats"]["documents_examined"], 4)
                     self.assertEqual(indexed["read_stats"]["source_matches"], 4)
-                    self.assertEqual(indexed["read_stats"]["shard_work"], [{"shard": row["shard"], "documents_examined": row["source_matches"], "source_matches": row["source_matches"]} for row in by_shard])
+                    self.assertEqual(shard_rows_without_timing(indexed["read_stats"]), [{"shard": row["shard"], "documents_examined": row["source_matches"], "source_matches": row["source_matches"]} for row in by_shard])
                     self.assertEqual(indexed["documents"], result["documents"])
                     point = session.find(DATABASE, COLLECTION, {"_id": 1}, execution_stats=True)
                     self.assertEqual(point["read_stats"]["storage_reads"], 1)
                     self.assertEqual(point["read_stats"]["matcher_evaluations"], 0)
                     self.assertEqual(point["read_stats"]["source_matches"], 1)
-                    self.assertEqual(point["read_stats"]["shard_work"], [{"shard": point["plan"]["shards"][0], "documents_examined": 1, "source_matches": 1}])
+                    self.assertEqual(shard_rows_without_timing(point["read_stats"]), [{"shard": point["plan"]["shards"][0], "documents_examined": 1, "source_matches": 1}])
                     self.assertEqual(point["read_stats"]["shards_read"], point["plan"]["shards"])
                     first = session.find(DATABASE, COLLECTION, batch_size=0, execution_stats=True)
                     self.assertEqual(first["read_stats"]["storage_reads"], 0)
@@ -123,8 +128,14 @@ class PythonDocumentApiTests(unittest.TestCase):
                     for execution in (result, indexed, point, first, next_page, distinct, aggregate, skipped, filtered):
                         observed = execution["read_stats"]
                         self.assertEqual([row["shard"] for row in observed["shard_work"]], observed["shards_read"])
-                        for field in ("documents_examined", "source_matches"):
+                        for field in ("documents_examined", "source_matches", "storage_read_nanos"):
                             self.assertEqual(sum(row[field] for row in observed["shard_work"]), observed[field])
+                        self.assertIs(type(observed["storage_read_nanos"]), int)
+                        if observed["storage_reads"]:
+                            self.assertGreater(observed["storage_read_nanos"], 0)
+                            self.assertTrue(all(row["storage_read_nanos"] > 0 for row in observed["shard_work"]))
+                        else:
+                            self.assertEqual(observed["storage_read_nanos"], 0)
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.find(DATABASE, COLLECTION, execution_stats=True, max_result_bytes=1)
 
@@ -2168,6 +2179,12 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     aggregate = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], execution_stats=True)
                     self.assertEqual(aggregate["documents"], [{"n": 3}])
                     self.assertGreaterEqual(aggregate["read_stats"]["documents_examined"], 3)
+                    for execution in (first, second, distinct, aggregate):
+                        stats = execution["read_stats"]
+                        self.assertIs(type(stats["storage_read_nanos"]), int)
+                        self.assertGreater(stats["storage_read_nanos"], 0)
+                        self.assertEqual(sum(row["storage_read_nanos"] for row in stats["shard_work"]), stats["storage_read_nanos"])
+                        self.assertTrue(all(row["storage_read_nanos"] > 0 for row in stats["shard_work"]))
 
     async def test_async_opt_in_plan_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as root:

@@ -42,6 +42,13 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     let observed = send_command(&mut stream, &find_by_a()).await;
     assert!(observed.representation_eq(&plain));
     let scan = server.metrics().reads;
+    assert!(scan.storage_read_nanos > 0);
+    assert!(scan.shard_storage_read_nanos[..2].iter().all(|n| *n > 0));
+    assert!(scan.shard_storage_read_nanos[2..].iter().all(|n| *n == 0));
+    assert_eq!(
+        scan.shard_storage_read_nanos.iter().sum::<u64>(),
+        scan.storage_read_nanos
+    );
     assert_eq!(
         scan.shard_documents_examined.iter().sum::<u64>(),
         scan.documents_examined
@@ -78,6 +85,20 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     )
     .await;
     let point = server.metrics().reads;
+    assert!(point.storage_read_nanos > scan.storage_read_nanos);
+    assert_eq!(
+        point.shard_storage_read_nanos.iter().sum::<u64>(),
+        point.storage_read_nanos
+    );
+    assert_eq!(
+        point
+            .shard_storage_read_nanos
+            .iter()
+            .zip(&scan.shard_storage_read_nanos)
+            .filter(|(after, before)| after > before)
+            .count(),
+        1
+    );
     assert_eq!(
         point.shard_documents_examined.iter().sum::<u64>()
             - scan.shard_documents_examined.iter().sum::<u64>(),
@@ -235,6 +256,8 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     assert_eq!(empty.source_matches, 0);
     assert_eq!(empty.shard_documents_examined, [0; 64]);
     assert_eq!(empty.shard_source_matches, [0; 64]);
+    assert_eq!(empty.storage_read_nanos, 0);
+    assert_eq!(empty.shard_storage_read_nanos, [0; 64]);
     server.set_read_metrics_enabled(false);
     assert_eq!(
         live_cursor_id(&send_command(&mut stream, &cursor_more("read_metrics", id, 1)).await),
@@ -272,6 +295,12 @@ async fn read_metrics_capture_each_cursor_page_and_distinguish_buffered_aggregat
     assert_eq!(buffered.executions, 4);
     assert_eq!(buffered.output_items - aggregated.output_items, 6);
     assert_eq!(buffered.storage_reads, aggregated.storage_reads);
+    assert!(aggregated.storage_read_nanos > continued.storage_read_nanos);
+    assert_eq!(buffered.storage_read_nanos, aggregated.storage_read_nanos);
+    assert_eq!(
+        buffered.shard_storage_read_nanos,
+        aggregated.shard_storage_read_nanos
+    );
     assert_eq!(buffered.source_matches, aggregated.source_matches);
     assert_eq!(
         buffered.shard_documents_examined,

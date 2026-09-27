@@ -46,6 +46,20 @@ fn stats(execution: &DocumentExecution) -> DocumentReadStats {
             .shard_work()
             .all(|row| row.source_matches() <= row.documents_examined())
     );
+    assert_eq!(
+        stats
+            .shard_work()
+            .map(|row| row.storage_read_nanos())
+            .sum::<u64>(),
+        stats.storage_read_nanos()
+    );
+    if stats.storage_reads() == 0 {
+        assert_eq!(stats.storage_read_nanos(), 0);
+    } else {
+        // A real SQLite/BSON read must be measured, without a latency threshold.
+        assert!(stats.storage_read_nanos() > 0);
+        assert!(stats.shard_work().all(|row| row.storage_read_nanos() > 0));
+    }
     stats
 }
 
@@ -409,7 +423,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     for _ in 0..12 {
         let request = DocumentRequest::new(
             DocumentRequestId::new([2; 16]).unwrap(),
-            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 2047).unwrap()),
+            RequestContext::new().with_result_limits(ResultLimits::new(1, base + 4095).unwrap()),
             command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
         );
         assert_eq!(
@@ -423,7 +437,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
     }
     let request = DocumentRequest::new(
         DocumentRequestId::new([3; 16]).unwrap(),
-        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 2048).unwrap()),
+        RequestContext::new().with_result_limits(ResultLimits::new(1, base + 4096).unwrap()),
         command(&namespace, doc([]), options().with_batch_size(0).unwrap()),
     );
     assert_eq!(
@@ -439,7 +453,7 @@ async fn read_stats_charge_bounded_metadata_and_cleanup_failed_empty_pages() {
         .await;
         let documents = page(result).1;
         let row = 17 + encode_document(&documents[0]).unwrap().len() as u64;
-        let read = options().with_batch_byte_limit(base + 2048 + row).unwrap();
+        let read = options().with_batch_byte_limit(base + 4096 + row).unwrap();
         let command = if aggregate {
             DocumentCommand::Aggregate(
                 DocumentAggregateRequest::new(

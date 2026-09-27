@@ -60,8 +60,8 @@ const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
 const DOCUMENT_READ_ACCESS_BYTES: u64 = 32;
-// Aggregate counters, shard IDs and at most 64 bounded per-shard row summaries.
-const DOCUMENT_READ_STATS_BYTES: u64 = 2048;
+// Aggregate counters, shard IDs and at most 64 bounded row/timing summaries.
+const DOCUMENT_READ_STATS_BYTES: u64 = 4096;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
 const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
@@ -1752,16 +1752,16 @@ impl Engine {
                         cancellation.clone(),
                         deadline,
                         move |storage, connection, cancellation| {
-                            if let Some(stats) = &stats {
-                                stats.storage_read(shard);
-                            }
-                            let record = storage.get_document_on_connection(
-                                connection,
-                                collection_id,
-                                shard,
-                                &id_key,
-                                cancellation,
-                            )?;
+                            let record =
+                                ReadStats::observe_storage_read(stats.as_deref(), shard, || {
+                                    storage.get_document_on_connection(
+                                        connection,
+                                        collection_id,
+                                        shard,
+                                        &id_key,
+                                        cancellation,
+                                    )
+                                })?;
                             if let Some(stats) = &stats {
                                 stats.examine(shard, u64::from(record.is_some()));
                             }
@@ -2102,11 +2102,8 @@ fn next_matching_document(
         .flatten();
     loop {
         check()?;
-        if let Some(stats) = stats {
-            stats.storage_read(shard);
-        }
-        let record = storage
-            .scan_document_candidates_on_connection(
+        let record = ReadStats::observe_storage_read(stats, shard, || {
+            storage.scan_document_candidates_on_connection(
                 connection,
                 collection_id,
                 shard,
@@ -2114,9 +2111,10 @@ fn next_matching_document(
                 DOCUMENT_MERGE_PAGE_SIZE,
                 probe.as_ref(),
                 cancellation,
-            )?
-            .into_iter()
-            .next();
+            )
+        })?
+        .into_iter()
+        .next();
         let Some(record) = record else {
             return Ok(None);
         };
