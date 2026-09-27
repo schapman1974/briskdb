@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-two locked suites is classified; 1073 reference parameter cases are not 1073 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these forty-three locked suites is classified; 1119 reference parameter cases are not 1119 candidate passes. Private helpers/backend hooks/SQL traces/cache/locks, backend variants, open metadata/introspection/live-file-replacement gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -4245,6 +4245,278 @@
             "src/import/tinymongo.rs::malformed_or_unverifiable_legacy_rows_fail_closed_without_source_changes"
           ],
           "note": "Current naive/UTC datetime IDs share canonical BSON identity through reopen. A legacy physical datetime string cannot be validated losslessly by the importer and explicitly rejects as Unsupported without changing source bytes, rather than silently scanning and accepting it."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_sharded_sqlite_point_read_optimizations.py",
+      "sha256": "cb5c09a8f57444593f9ed841fd15f09976f1221380a63de2c0f06b2c7f12749a",
+      "reference_case_count": 46,
+      "function_count": 42,
+      "coverage": [
+        {
+          "source": [
+            "test_point_reads_reuse_child_connection_and_invalidate_on_close_and_pid_change"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_closed_client_cannot_revive_retained_collection_but_peer_and_reopen_work",
+            "src/storage/pool.rs::connections_open_lazily_and_keep_stable_ids_when_reused",
+            "python/tests/test_mongo_process_ownership.py::test_sync_inherited_operations_reject_before_driver_topology"
+          ],
+          "note": "Native pools reuse idle handles, but a real PyMongo client stays closed: retained collections do not reopen it. A peer or new client still reads committed data. PID changes reject inherited ownership instead of silently reusing/rebuilding a TinyMongo child connection."
+        },
+        {
+          "source": [
+            "test_point_read_pool_is_thread_safe_and_bounded_by_simultaneous_readers"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_four_concurrent_readers_keep_copies_isolated_and_observe_committed_updates",
+            "src/storage/pool.rs::exact_active_and_queue_capacity_apply_backpressure_and_recover"
+          ],
+          "note": "Four simultaneous real-driver readers each perform 20 point reads before and after a committed update, retaining independent decoded copies. Native pool capacity/queue/recovery counters are verified separately; Python sqlite3.connect interception is not a Rust connection count."
+        },
+        {
+          "source": [
+            "test_database_error_discards_persistent_child_read_connection"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::explicit_broken_and_panicking_connections_are_discarded",
+            "src/storage/pool.rs::ordinary_sql_errors_return_a_clean_connection_to_the_pool",
+            "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity"
+          ],
+          "note": "Native broken/panicking connections retire and failed replacements recover capacity; ordinary constraint errors can reuse a clean connection. TinyMongo's Python authorizer-injected SELECT denial and exact two-connect retry policy do not define BriskDB pool hygiene."
+        },
+        {
+          "source": [
+            "test_close_during_leased_point_read_retires_connection_after_result"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::checked_out_connection_from_a_stale_generation_is_retired_on_checkin",
+            "src/storage/pool.rs::stale_idle_generation_is_retired_before_checkout",
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_closed_client_cannot_revive_retained_collection_but_peer_and_reopen_work"
+          ],
+          "note": "Native stale-generation leases retire on return or before checkout, while managed client close permanently closes that driver owner without stopping a live peer. This does not claim TinyMongo's private paused _point_read_connection interleaving or retained-database reopen behavior."
+        },
+        {
+          "source": [
+            "test_pooled_point_reader_is_query_only_and_does_not_pin_wal_checkpoint"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_warmed_readers_release_wal_snapshots_before_external_checkpoint",
+            "src/storage/pool.rs::document_authority_is_narrow_and_cleared_before_pool_reuse"
+          ],
+          "note": "After 50 point reads spanning an update, a separate stdlib SQLite process successfully truncates manifest and both shard WALs while the client remains live; reads and reopen retain the record. BriskDB pools also serve writes and enforce narrow document authority, not a permanent PRAGMA query_only=1 point-only pool."
+        },
+        {
+          "source": [
+            "test_warmed_point_reader_is_not_reused_after_real_fork",
+            "test_manifest_connect_rejects_simulated_forked_owner"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_mongo_process_ownership.py::test_real_fork_rejects_warmed_reads_writes_and_getmore_and_preserves_parent",
+            "python/tests/test_mongo_process_ownership.py::test_sync_inherited_operations_reject_before_driver_topology",
+            "python/tests/test_mongo_process_ownership.py::test_async_inherited_operations_reject_before_driver_topology"
+          ],
+          "note": "An isolated real POSIX fork rejects inherited find/update/insert/getMore/close without changing parent data or cursor state. Sync/async owner-change cases reject before the pinned driver's topology hook, including unopened clients. BriskDB uses RuntimeError with spawn guidance, not TinyMongo ConfigurationError or inherited SQLite-connection counts."
+        },
+        {
+          "source": [
+            "test_warmed_reader_rejects_shard_file_replaced_by_another_shard"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/storage/mod.rs::startup_rejects_swapped_and_cross_layout_shards",
+            "src/storage/mod.rs::ready_layout_never_recreates_a_missing_shard_at_startup_or_runtime",
+            "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity"
+          ],
+          "note": "Native startup rejects swapped/cross-layout shard files, required runtime opens never recreate missing shards, and failed fresh pool replacement retires its lease. A disposable native diagnostic nevertheless confirmed that a warmed point read can return old data after a checkpointed cross-shard file replacement, while reopen rejects the swapped identity. This is an open #186/#187 hardening gap, not a candidate pass; follow-up must reject stale leased-file identity."
+        },
+        {
+          "source": [
+            "test_manifest_catalog_join_is_cached_across_unchanged_point_reads"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded"
+          ],
+          "note": "Actual native point plans read one routed shard and one record slot with exact hit/miss counters. TinyMongo's traced LEFT JOIN count and private manifest catalog cache are not exported native performance contracts."
+        },
+        {
+          "source": [
+            "test_manifest_cache_observes_drop_recreate_from_another_backend"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state"
+          ],
+          "note": "A retained real-driver collection observes peer logical drop, absence, recreation and replacement index state, followed by durable reopen. No private generation token or SQL trace is substituted for the public results."
+        },
+        {
+          "source": [
+            "test_manifest_cache_fails_closed_after_external_state_change",
+            "test_manifest_generation_revalidates_immutable_config"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result",
+            "src/storage/manifest.rs::ready_transition_rejects_different_layout_identity_or_state_without_mutation"
+          ],
+          "note": "Native manifest corruption produces bounded errors, no cursor and degraded readiness, including absent collections and zero batches; immutable layout/state validation rejects drift. Private TinyMongo state/config rewrites and in-place restore-to-healthy behavior are not claimed for a fail-closed native root."
+        },
+        {
+          "source": [
+            "test_exact_id_find_one_bypasses_generic_find_with_projection_and_typed_ids",
+            "test_exact_id_find_one_computes_one_physical_key",
+            "test_exact_id_find_one_uses_one_row_primary_key_select",
+            "test_exact_id_count_uses_the_single_shard_point_read"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_point_hits_misses_projection_and_native_work_remain_bounded",
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_point_projection_typed_ids_fallback_and_nested_datetime_fidelity"
+          ],
+          "note": "Real numeric/boolean identities, projection/count/misses and independent nested results are tested. Native diagnostics prove one shard/record-slot read and no generic matcher evaluations for simple exact IDs; private Python helper call counts and SELECT text are not exposed."
+        },
+        {
+          "source": [
+            "test_exact_id_fast_path_preserves_configured_read_fidelity",
+            "test_non_exact_find_one_keeps_generic_fallback"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_point_projection_typed_ids_fallback_and_nested_datetime_fidelity"
+          ],
+          "note": "Exact-ID reads preserve recursive OrderedDict values and timezone-normalized millisecond datetimes; non-ID predicates return the correct record. Returned nested arrays are detached. No monkeypatched generic-find dispatch count is asserted."
+        },
+        {
+          "source": [
+            "test_module_import_without_register_at_fork_covers_portable_path",
+            "test_manifest_pid_sync_without_an_inherited_connection_clears_cache"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_mongo_process_ownership.py::test_sync_inherited_operations_reject_before_driver_topology",
+            "python/tests/test_mongo_process_ownership.py::test_async_inherited_operations_reject_before_driver_topology"
+          ],
+          "note": "BriskDB checks native store PID directly before sync/async topology work rather than exposing TinyMongo's register_at_fork branch, cache epoch, manifest PID synchronization or private _PointReadConnection class. Owner refusal is not a claim that inherited native handles can be repaired."
+        },
+        {
+          "source": [
+            "test_setting_the_same_point_read_identity_is_a_noop",
+            "test_standalone_point_reader_skips_uninstalled_shard_identity"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::connections_open_lazily_and_keep_stable_ids_when_reused",
+            "src/storage/pool.rs::document_authority_is_narrow_and_cleared_before_pool_reuse"
+          ],
+          "note": "Stable native idle reuse and narrow storage authority have direct tests. BriskDB does not expose standalone identity-free child backends or a setter for TinyMongo's private point-read identity, and does not waive shard layout validation."
+        },
+        {
+          "source": [
+            "test_point_read_file_identity_rejects_missing_and_non_file_paths"
+          ],
+          "kind": "native_equivalent",
+          "evidence": [
+            "src/storage/mod.rs::ready_layout_never_recreates_a_missing_shard_at_startup_or_runtime",
+            "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity"
+          ],
+          "note": "Missing required shards reject without file recreation at runtime/startup; a directory substituted at a fresh pool-open path preserves the storage error and frees capacity. Native classifications differ from the private Python StorageCorruptionError text."
+        },
+        {
+          "source": [
+            "test_point_reader_retries_one_file_identity_change",
+            "test_point_reader_rejects_repeated_file_identity_changes",
+            "test_idle_point_reader_closes_when_file_identity_check_fails"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::failed_fresh_replacement_preserves_storage_error_and_recovers_capacity",
+            "src/storage/pool.rs::explicit_broken_and_panicking_connections_are_discarded"
+          ],
+          "note": "Native failed fresh opens and explicitly broken leases retire safely and recover bounded capacity. Injected inode sequences, exact two-attempt policy and TinyMongo idle-list mutation are private mechanisms, not certified detection of hot inode replacement on every native read."
+        },
+        {
+          "source": [
+            "test_in_transaction_reader_is_poisoned_when_rollback_fails"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/pool.rs::non_autocommit_state_is_rolled_back_before_a_tainted_connection_retires",
+            "src/storage/pool.rs::explicit_broken_and_panicking_connections_are_discarded"
+          ],
+          "note": "Native unfinished transactions roll back and retire before reuse; broken/panicking leases also retire. The fake Python connection whose rollback method raises is not injected into a Rust SQLite handle or claimed as a real rollback-I/O-failure execution."
+        },
+        {
+          "source": [
+            "test_point_read_recovers_once_from_a_missing_collection",
+            "test_point_read_wraps_repeated_missing_collection_errors",
+            "test_point_read_defensive_unreachable_guard"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state",
+            "src/storage/document/index_storage/tests.rs::ready_roots_reject_missing_or_malformed_entry_schema_without_repair"
+          ],
+          "note": "Logical collection absence/drop/recreate works through real clients. Missing or malformed native physical storage fails closed without repair rather than private no-such-table retries; replacing Python range with an empty iterator has no native counterpart."
+        },
+        {
+          "source": [
+            "test_exact_point_read_scans_an_unpredictable_legacy_container_id",
+            "test_exact_point_read_skips_a_nonmatching_legacy_scan_row"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::unverifiable_legacy_container_alias_is_rejected_without_source_writes",
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_point_projection_typed_ids_fallback_and_nested_datetime_fidelity"
+          ],
+          "note": "Current canonical document IDs match numeric aliases and distinguish misses. Native explicit legacy import rejects unrelated/unverifiable physical container keys without source writes; it does not silently scan/skip injected legacy rows in a current shard."
+        },
+        {
+          "source": [
+            "test_exact_point_read_checks_later_candidates_after_filter_mismatch",
+            "test_exact_point_read_handles_an_empty_legacy_scan"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_sharded_point_lifecycle.py::test_point_projection_typed_ids_fallback_and_nested_datetime_fidelity"
+          ],
+          "note": "An exact ID plus a mismatching secondary predicate returns None, as do missing document IDs; current document-ID aliases work. Private physical-candidate order and legacy fallback-scan invocation are not exposed native APIs."
+        },
+        {
+          "source": [
+            "test_manifest_data_version_rejects_unavailable_values",
+            "test_manifest_data_version_rejects_non_integer_values",
+            "test_changed_generation_wraps_an_unavailable_manifest_identity"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result",
+            "src/storage/manifest.rs::ready_transition_rejects_different_layout_identity_or_state_without_mutation"
+          ],
+          "note": "Malformed fake PRAGMA data_version rows and mocked manifest execute errors are private Python hooks. Native integrity/layout validation and real-wire fail-closed catalog errors provide separate evidence, not unchanged execution of those mock values."
+        },
+        {
+          "source": [
+            "test_manifest_cache_retries_one_generation_change",
+            "test_manifest_cache_rejects_repeated_generation_changes",
+            "test_collection_read_generation_returns_none_when_creation_stays_missing",
+            "test_exact_id_read_exhausts_missing_generation_retries",
+            "test_collection_reads_continue_after_one_missing_generation"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_point_reads.py::test_peer_logical_drop_invalidates_retained_collection_and_index_state",
+            "tests/mongo_wire/find_catalog.rs::missing_find_remains_empty_across_drop_recreate_and_batch_modes",
+            "tests/mongo_wire/find_catalog.rs::find_never_turns_a_corrupt_catalog_into_an_empty_result"
+          ],
+          "note": "Real logical lifecycle and every native find batch mode preserve correct absence/cursor ownership; corruption is never converted to an empty result. Private cache token sequences, creation monkeypatches and exact retry counts are not native implementations or guarantees."
         }
       ]
     }

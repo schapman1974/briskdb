@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 539 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 581 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -61,14 +61,15 @@ functions in the locked `test_query_more.py`,
 `test_warning_attribution.py`, `test_mongo_like.py` and
 `test_bulk_insert_planning.py`, `test_storage_backends.py` and
 `test_sqlite_complex_read_candidates.py`, `test_sqlite_read_optimizations.py` and
-`test_sharded_sqlite_coverage_mutations.py` and `test_table_backend_id_and_error_edges.py` suites
-(1,073 reference parameter cases). 280 added wheel scenarios and existing patch
+`test_sharded_sqlite_coverage_mutations.py`, `test_table_backend_id_and_error_edges.py`
+and `test_sharded_sqlite_point_read_optimizations.py` suites
+(1,119 reference parameter cases). 287 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,073 unchanged upstream candidate passes or complete #186 certification.
+not 1,119 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
@@ -136,6 +137,19 @@ unchanged parent data/cursor state; simulated owner changes also check both driv
 paths before topology work. Use multiprocessing `spawn` and open a fresh client
 inside each child. This does not make inherited engines fork-safe or prohibit
 inspection of already-decoded Python objects.
+
+Sharded point-read coverage adds four concurrent readers before/after a committed
+update, detached nested copies, typed/projection/date fidelity, and permanent
+closed-client refusal while live peers and new clients remain usable. After 50
+point reads spanning an update, an independent SQLite process truncates the
+manifest and shard WALs with the client still live. Native pool tests cover
+bounded admission, generation retirement, broken leases and transaction cleanup;
+they do not emulate TinyMongo's private Python pool/cache/SQL retry hooks. Native
+startup and fresh opens reject swapped/missing files. A disposable native
+diagnostic nevertheless confirmed that a warmed point reader can return the old
+file's data after checkpointed cross-shard replacement, while reopen rejects the
+identity. This remains an explicit #186/#187 hardening gap, not a passed source
+assertion; follow-up must reject stale leased-file identity.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
