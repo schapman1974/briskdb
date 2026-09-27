@@ -997,9 +997,9 @@ requires an earlier dependency:
       natural frontier refill stays sequential. No partial-page or new snapshot
       guarantee is introduced; broader fault-soak/release gates remain separate.
     - [ ] [#186](https://github.com/schapman1974/briskdb/issues/186) — beyond the
-      frozen corpus and index inventory, forty-two query/public-client suites now
-      have complete source accounting (539 functions/1,073 reference cases), backed
-      by 280 added wheel scenarios and existing patch regressions, including
+      frozen corpus and index inventory, forty-three query/public-client suites now
+      have complete source accounting (581 functions/1,119 reference cases), backed
+      by 287 added wheel scenarios and existing patch regressions, including
       recursive document classes,
       async reads and timezone/millisecond fidelity. Legacy cursor/index
       representations, non-BSON Python values and private-helper exclusions
@@ -1076,6 +1076,11 @@ requires an earlier dependency:
       cursor getMore before driver topology work, not only close/custom bulk
       helpers. Real-fork checks preserve the parent's data and live cursor;
       children must use spawn and create their own client.
+      Sharded point-read accounting also verifies four concurrent readers,
+      detached nested copies, peer/closed-client lifetime and external WAL
+      truncation with a live client. Private pool/cache retry hooks differ;
+      hot inode replacement can still leave warmed leases reading the old file;
+      rejecting that stale leased identity remains an explicit hardening gap.
       A bounded native SQLite-full drill covers insert/replacement failures at
       record and secondary-index allocation, rollback of earlier transaction
       mutations, exact record/index snapshots, unique-fence release, same-
