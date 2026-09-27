@@ -4095,6 +4095,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_legacy_and_table_collections_survive_staged_import_and_reopen() {
+        for legacy in [true, false] {
+            let temporary = TempDir::new().unwrap();
+            let source_path = temporary.path().join("app.sqlite");
+            let destination = temporary.path().join("imported");
+            let connection = Connection::open(&source_path).unwrap();
+            if legacy {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE tinydb(id INTEGER PRIMARY KEY, data TEXT);
+                         INSERT INTO tinydb VALUES (1, '{\"empty\":{}}');",
+                    )
+                    .unwrap();
+            } else {
+                create_collection(&connection, "empty", false);
+            }
+            drop(connection);
+            let before = fs::read(&source_path).unwrap();
+            let import_plan = plan(&["empty"]);
+            let source = read_tinymongo_source(&source_path, &import_plan).unwrap();
+            let report = import_tinymongo_database(
+                &source_path,
+                &destination,
+                &import_plan,
+                TinyMongoImportOptions::new(2).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report.collections(), 1);
+            assert_eq!(report.documents(), 0);
+            for _ in 0..2 {
+                let reopened = Storage::open(&destination, 2).unwrap();
+                verify_imported_destination(&source, &reopened).unwrap();
+                let catalog = reopened.document_catalog().unwrap();
+                assert_eq!(catalog.collections().len(), 1);
+                let collection = catalog.collection("app", "empty").unwrap();
+                assert_eq!(collection.indexes().len(), 1);
+                assert!(collection.indexes()[0].is_built_in());
+                assert_eq!(fs::read(&source_path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
     fn mixed_legacy_and_table_native_layout_is_rejected() {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("app.sqlite");

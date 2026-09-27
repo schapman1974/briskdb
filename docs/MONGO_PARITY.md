@@ -41,7 +41,7 @@ explicit index builds, stock PyMongo reads/writes across restore, and an unchang
 original source for pre-cutover rollback. It does not provide online backup or
 reverse migration of writes made after cutover.
 
-`compat/mongo/query-suite-inventory.json` separately accounts for all 818 test
+`compat/mongo/query-suite-inventory.json` separately accounts for all 883 test
 functions in the locked `test_query_more.py`,
 `test_query_operator_coverage_edges.py`, `test_client_read_fidelity.py`,
 `test_insert_many_semantics.py`, `test_client_configuration.py`,
@@ -68,17 +68,24 @@ and `test_sharded_sqlite_point_read_optimizations.py`, `test_memory_backend.py`,
 `test_remaining_coverage.py`, `test_sharded_sqlite_coverage_init.py`,
 `test_coverage_edges.py`, `test_acceptance_runner.py`,
 `test_cli_replacement_safety.py`, `test_cli.py`, `test_compatibility_report.py`,
-`test_storage_benchmark.py`, `test_sqlite_comparison_benchmark.py` suites
-(1,411 reference parameter cases). 316 added wheel scenarios and existing patch
+`test_storage_benchmark.py`, `test_sqlite_comparison_benchmark.py`,
+`test_table_backends.py` suites
+(1,504 reference parameter cases). 320 added wheel scenarios and existing patch
 regressions check public
 query/write/index results, Mongo
 error codes, numeric path fanout, missing versus zero candidates, Decimal128 and
 regex behavior. Hashes, exact function membership, reference collection counts
 and actual candidate test symbols are validated; these are adapted scenarios,
-not 1,411 unchanged upstream candidate passes or complete #186 certification.
+not 1,504 unchanged upstream candidate passes or complete #186 certification.
 Private bulk-planner monkeypatches, fake backend retry counts and TinyMongo's
 no-PyMongo fallback errors module are excluded with explicit rationales; real
 BriskDB duplicate/concurrency outcomes and single-pass client encoders are tested.
+An exact source-tree gate now requires every top-level test suite in the locked
+checkout to appear in the query inventory, the index inventory, or the pinned
+Beanie/MongoEngine application harness: 58 + 5 + 2 suites, respectively. It checks
+the ODM source hashes/function names without loading reference dependencies into
+the candidate wheel. This closes top-level source accounting, not the separate
+fuzz, fault-soak, external application, CI-tier or release gates.
 
 The original Talk Python regressions additionally cover every generated-ID write
 path, no-match invalid-payload rejection and ObjectId/datetime/binary/compound
@@ -252,6 +259,16 @@ raw-sample, trial-rotation, result-digest and baseline validation likewise does 
 copy TinyMongo's private Markdown format or per-phase process runner. Migration
 preserves recognized BSON/index metadata into a fresh staged destination; it does
 not implement TinyMongo's live JSON import/replace or remote-backend CLI.
+
+Table-backend checks exercise all eight null/missing/array negation rows and five
+filters before/after indexing and restart, scalar/array equality unions, broader
+partial-index queries, malformed-filter errors and exact numeric uniqueness.
+Out-of-Int64 Python values reject at BSON encoding; Decimal128 and supported native
+multikey indexes are not subject to TinyMongo remote-SQL backend exclusions.
+Empty legacy/table-native SQLite collections survive staged import and repeated
+reopen without source changes. SQL compiler strings, private type-index objects,
+in-place foreign token migrations and DuckDB/Parquet/remote SQL hooks remain
+explicit implementation or contract differences.
 
 Unique-index update scenarios verify no-op/miss counts on 10/100/1000-row fixtures,
 scalar conflict rollback, array-order changes with unchanged multikey entries,
@@ -893,6 +910,13 @@ BRISKDB_MONGO_ORACLE_SOURCE_ROOT=/path/to/locked/tinymongo \
 BRISKDB_MONGO_ORACLE_PYTHON=/path/to/oracle/bin/python \
   python -m unittest discover -s python/tests -p test_index_suite_inventory.py -v
 ```
+
+The complete query/source-tree inventory uses the same variables with
+`-p test_query_suite_inventory.py`. Its isolated **reference** interpreter also
+needs `duckdb==1.4.4` to collect the locked table-backend module (this version
+[retains Python 3.9 support](https://pypi.org/project/duckdb/1.4.4/)). This is a
+test-only dependency: do not add DuckDB or TinyMongo to the BriskDB
+candidate/runtime environment.
 
 Successful commands with reduced behavior include `briskdbIndexWarnings`, an
 ordered array of `{name, reducedBehavior}` documents (plus `skipped: true` for

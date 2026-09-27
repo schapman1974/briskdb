@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
-  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty-seven locked suites is classified; 1411 reference parameter cases are not 1411 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks/CLI/runner/reporting/benchmark utilities, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
+  "purpose": "Coverage inventory, not a pass report or unchanged-upstream execution claim. Every function in these fifty-eight locked suites is classified; 1504 reference parameter cases are not 1504 candidate passes. Legacy source failures/skips, private helpers/backend hooks/SQL traces/cache/locks/CLI/runner/reporting/benchmark utilities, backend variants, open metadata/introspection gaps and BSON/client/diagnostic/configuration/clock-allocation differences are explicit.",
   "suites": [
     {
       "path": "tests/test_query_more.py",
@@ -6108,6 +6108,327 @@
             "tests/test_mongo_benchmark.py::test_summaries_and_regression_ratios_use_verified_raw_measurements"
           ],
           "note": "TinyMongo's private SQLite-comparison Markdown point-update/unavailable column layout is not a native API. Native reports validate point-update raw samples and derive checked summaries; no fabricated formatting fixture is counted as measured performance."
+        }
+      ]
+    },
+    {
+      "path": "tests/test_table_backends.py",
+      "sha256": "3119cc2dd799785343aee8644d354eb36e48db09278a8ddc41cec513f2029cc4",
+      "function_count": 65,
+      "reference_case_count": 93,
+      "coverage": [
+        {
+          "source": [
+            "test_json_loader_accepts_remote_driver_decoded_documents"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_decimal_codec_edges.py::test_builtin_and_subclass_values_use_bson_without_tagged_json"
+          ],
+          "note": "Native clients exchange BSON and decode independent Python documents. TinyMongo's private JSON loader returning the identical remote-driver dictionary object is not a native API."
+        },
+        {
+          "source": [
+            "test_successful_filter_operator_branches",
+            "test_matches_filter_operator_edges"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_three_row_query_edges_return_exact_ids_and_counts",
+            "python/tests/test_upstream_table_backends.py::test_array_equality_and_nor_results_keep_driver_error_boundaries",
+            "python/tests/test_upstream_queries.py::test_membership_logical_existence_and_filtered_counts"
+          ],
+          "note": "Native public logical/range/membership/regex/existence results are tested. The private matches_filter helper's malformed-filter/unknown-operator false return and SQLCompiler text are not native contracts; real driver queries reject malformed/unsupported input."
+        },
+        {
+          "source": [
+            "test_null_negation_matches_mongodb_missing_and_array_semantics"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_null_negation_matrix_is_stable_before_index_and_after_reopen"
+          ],
+          "note": "All eight source missing/null/scalar/array documents and five negated filters have exact native ID/count checks before indexing, after indexing and after reopen; nested missing-null negation also matches."
+        },
+        {
+          "source": [
+            "test_array_equality_supports_exact_arrays_and_scalar_membership",
+            "test_table_backends_support_nor_operator"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_array_equality_and_nor_results_keep_driver_error_boundaries"
+          ],
+          "note": "Exact arrays, scalar membership, nested array equality, reordered-array rejection and the three-row NOR fixture have native public-query checks. Alternate source backend parameterizations are not additional BriskDB storage engines."
+        },
+        {
+          "source": [
+            "test_python_filter_error_and_option_edges"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_array_equality_and_nor_results_keep_driver_error_boundaries",
+            "python/tests/test_upstream_queries.py::test_malformed_queries_and_known_unsupported_operators_are_explicit"
+          ],
+          "note": "Native mixed-type ranges do not match, but malformed regex/options and unsupported operators raise explicit errors rather than the source private helper's false return. No Python requires_python_filter switch is exposed."
+        },
+        {
+          "source": [
+            "test_local_table_find_falls_back_when_sql_compilation_fails",
+            "test_sql_compiler_branches"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_complex_reads.py::test_or_negative_exists_and_large_membership_do_not_lose_candidates",
+            "python/tests/test_upstream_table_backends.py::test_scalar_array_union_and_broader_partial_queries_survive_reopen"
+          ],
+          "note": "Native indexed candidate selection plus residual matching preserve complete results. Private Python compiler monkeypatches, SQLite/DuckDB SQL snippets, parameter lists and forced compilation exceptions are not native interfaces or exact fallback guarantees."
+        },
+        {
+          "source": [
+            "test_backend_noop_update_and_object_store_initialization"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_coverage_edges.py::test_update_errors_preserve_rows_and_find_modify_returns_exact_images",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "Real native no-op matched/modified counts are tested, not the private backend's empty list of changed IDs. Object-store TableBackend initialization/write-lock helpers are not shipped native storage features."
+        },
+        {
+          "source": [
+            "test_legacy_migration_empty_collection_branches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::empty_legacy_and_table_collections_survive_staged_import_and_reopen"
+          ],
+          "note": "Empty legacy single-blob and table-native SQLite collections survive actual native staged import and repeated reopen with built-in ID metadata and unchanged source bytes. Native migration does not rewrite the original file in place or read DuckDB storage."
+        },
+        {
+          "source": [
+            "test_table_backend_abstract_methods"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_index_creation_is_idempotent_and_rejects_conflicts",
+            "python/tests/test_upstream_durable_indexes.py::test_index_metadata_is_collection_scoped_and_drop_persists"
+          ],
+          "note": "Concrete native index creation/conflicts/listing/removal are tested. TinyMongo's abstract TableBackend, ephemeral dictionary catalog, monkeypatched find/all_docs and NotImplementedError hooks do not exist in BriskDB."
+        },
+        {
+          "source": [
+            "test_object_store_uri_helpers_and_env_config",
+            "test_parquet_temporary_file_cleanup_branch",
+            "test_duckdb_backend_threads_duplicate_bypass_drop",
+            "test_duckdb_does_not_mask_non_constraint_insert_errors",
+            "test_parquet_backend_empty_and_duplicate_paths",
+            "test_parquet_empty_index_collection_and_corrupt_catalog_fail_closed",
+            "test_parquet_object_store_paths_and_fake_listing",
+            "test_parquet_object_store_missing_and_drop_paths",
+            "test_duckdb_object_store_connection_configuration",
+            "test_duckdb_object_store_configuration_ignores_setup_errors",
+            "test_parquet_object_store_extension_loading",
+            "test_parquet_object_store_connect_loads_extensions",
+            "test_optional_driver_error_messages"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "DuckDB/Parquet storage, fake object-store connections/listings, environment-to-SQL setup/secret helpers, extension loading, fsync/temporary cleanup, optional-driver import messages and their specific failure suppression are not native BriskDB backend features. Both native client constructors reject these choices before acquiring storage; no fake or alternative-engine result is labeled a native pass."
+        },
+        {
+          "source": [
+            "test_sqlite_backend_duplicate_bypass_drop_and_indexes",
+            "test_tinymongo_table_backend_api_branches"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_indexes.py::test_validation_bypass_never_bypasses_id_or_secondary_uniqueness",
+            "python/tests/test_upstream_coverage_edges.py::test_update_errors_preserve_rows_and_find_modify_returns_exact_images",
+            "python/tests/test_upstream_core_client.py::test_handle_selection_is_lazy_and_legacy_cursor_methods_are_not_installed"
+          ],
+          "note": "Native duplicates remain enforced under bypass, real CRUD/no-match/preimage results and index/drop lifecycle are tested. Public driver drops return None, delete results carry counts, index metadata keys use driver representation, and private database refresh is not available."
+        },
+        {
+          "source": [
+            "test_sqlite_schema_mutations_reuse_catalog_transaction"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document/enabled/index_operations/tests.rs::every_combined_creation_boundary_removes_only_unfinished_new_declarations",
+            "src/storage/document/enabled/index_operations/tests.rs::every_built_drop_boundary_recovers_without_rewriting_surviving_authority",
+            "src/storage/document.rs::every_document_drop_commit_boundary_recovers_after_process_exit"
+          ],
+          "note": "Actual native collection/index creation/drop process-exit boundaries have durable recovery tests. A Python _ensure_index_catalog monkeypatch starting BEGIN IMMEDIATE, exact transaction_states and child SQLite connection reuse are not native hooks."
+        },
+        {
+          "source": [
+            "test_sqlite_unique_index_uses_durable_native_ddl"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_index_and_enforcement_survive_client_restart",
+            "python/tests/test_upstream_durable_indexes.py::test_index_metadata_is_collection_scoped_and_drop_persists",
+            "python/tests/test_upstream_table_backends.py::test_unique_numeric_identity_retains_decimal_precision_and_bson_bounds"
+          ],
+          "note": "Native unique enforcement and drop are durable, with exact BSON numeric identity. BriskDB uses its own index-entry authority, not TinyMongo generated SQL expression indexes/UDFs or physical lookup names; its EXPLAIN text is not copied."
+        },
+        {
+          "source": [
+            "test_sqlite_unique_index_keeps_distinct_arbitrary_precision_integers"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_unique_numeric_identity_retains_decimal_precision_and_bson_bounds"
+          ],
+          "note": "Real BSON accepts signed Int64, not arbitrary-precision Python integers. Values 2**63, 2**63+1 and 10**23 fail encoding without changing rows; valid exact integers/doubles/Decimal128 remain distinct where appropriate."
+        },
+        {
+          "source": [
+            "test_sqlite_migrates_legacy_unique_float_tokens_before_decimal_writes",
+            "test_sqlite_numeric_token_migration_reports_existing_exact_duplicates",
+            "test_sqlite_upgrades_legacy_index_catalog_without_token_version"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "src/import/tinymongo.rs::source_reads_are_immutable_and_active_sqlite_sidecars_fail_closed",
+            "src/import/tinymongo.rs::advanced_import_envelopes_match_native_declarations_without_rewriting",
+            "python/tests/test_upstream_durable_indexes.py::test_unique_build_rejects_existing_duplicates_without_adding_metadata",
+            "python/tests/test_upstream_table_backends.py::test_unique_numeric_identity_retains_decimal_precision_and_bson_bounds"
+          ],
+          "note": "Native migration leaves a stopped legacy source unchanged and imports supported declarations as Pending for explicit builds. It does not upgrade TinyMongo token columns/UDFs in place, drop a conflicting legacy SQL index, or globally block writes under that private repair protocol. Native exact double/Decimal identities and duplicate build rejection have separate tests."
+        },
+        {
+          "source": [
+            "test_sqlite_current_index_catalog_reads_do_not_take_the_write_lock"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "src/storage/document.rs::manifest_snapshot_reads_remain_coherent_across_concurrent_catalog_commit"
+          ],
+          "note": "Native catalog reads use coherent manifest snapshots. This is not TinyMongo's monkeypatched _write_lock prohibition or a blanket promise that all native catalog calls are lock-free."
+        },
+        {
+          "source": [
+            "test_sqlite_public_index_lookup_unions_scalar_and_array_matches",
+            "test_sqlite_complex_planner_does_not_use_partial_index_for_broader_query"
+          ],
+          "kind": "public_scenarios",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_scalar_array_union_and_broader_partial_queries_survive_reopen"
+          ],
+          "note": "Exact scalar-plus-array equality results and broader partial-index queries include all source fixture rows through live/peer/reopened native clients. Private json_type SQL traces, candidate helper return values and physical EXPLAIN names are not asserted."
+        },
+        {
+          "source": [
+            "test_sqlite_sparse_unique_index_allows_missing_values_and_filters_type_index"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_sparse_index_skips_missing_but_indexes_explicit_null",
+            "python/tests/test_upstream_advanced_indexes.py::test_conditional_unique_single_field_multikey_indexes"
+          ],
+          "note": "Native sparse unique membership and flat multikey enforcement are tested. There is no source private _sqlite_index_token or generated type-index SQL object to inspect."
+        },
+        {
+          "source": [
+            "test_sqlite_maps_native_replace_and_index_integrity_errors"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_update_replace_and_upsert_fail_atomically_within_one_shard",
+            "python/tests/test_upstream_durable_indexes.py::test_unique_build_rejects_existing_duplicates_without_adding_metadata"
+          ],
+          "note": "Actual native unique write/build failures map to Mongo duplicate errors and preserve data. Fake Python SQLite connection exceptions and their literal diagnostic payloads are not native driver hooks."
+        },
+        {
+          "source": [
+            "test_remote_sql_backend_requires_dsn",
+            "test_remote_sql_backend_defensive_edges",
+            "test_postgres_indexes_are_native_durable_unique_and_droppable",
+            "test_remote_unique_creation_preflights_and_drop_cleans_catalog",
+            "test_remote_native_errors_are_mapped_without_hiding_other_failures",
+            "test_remote_schema_races_and_cleanup_errors_preserve_original_failure",
+            "test_remote_delete_and_drop_index_errors_roll_back",
+            "test_mysql_materializes_every_compound_index_component",
+            "test_remote_base_schema_hooks_and_migration_errors",
+            "test_remote_upgrades_legacy_catalog_token_version_column",
+            "test_mysql_token_schema_defensive_branches",
+            "test_postgres_table_backend_with_fake_driver",
+            "test_mysql_table_backend_with_fake_driver",
+            "test_remote_sql_client_paths_and_env_dsn"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "PostgreSQL/MySQL remote storage drivers and FakeRemoteStore SQL/DDL/schema locks, DSN parsing, token columns, catalog upgrades, commits/rollbacks and injected driver exceptions are not native Mongo backend APIs. Native storage remains BriskDB SQLite; the PostgreSQL wire frontend does not provide this alternative storage architecture."
+        },
+        {
+          "source": [
+            "test_remote_unique_tokens_preserve_exact_bson_numeric_identity",
+            "test_remote_unique_tokens_handle_large_numeric_writes_and_replacements"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_table_backends.py::test_unique_numeric_identity_retains_decimal_precision_and_bson_bounds",
+            "python/tests/test_upstream_decimal_codec_edges.py::test_unique_numeric_index_uses_exact_double_decimal_identity"
+          ],
+          "note": "Native valid BSON numeric uniqueness preserves exact integer/double/Decimal/boolean distinctions; out-of-Int64 Python integers reject before storage. Remote backend 64-character token hashes, fake SQL token columns and arbitrary-precision integer fixtures are not native format promises."
+        },
+        {
+          "source": [
+            "test_mysql_uses_materialized_unique_token_and_rejects_multikey_unique",
+            "test_remote_unique_token_rejects_future_multitoken_expansion",
+            "test_remote_array_guard_ignores_nonunique_specs",
+            "test_remote_unique_array_writes_fail_closed_across_clients",
+            "test_remote_unique_decimal128_values_fail_closed_across_clients"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_durable_indexes.py::test_unique_array_semantics_include_deduplication_overlap_and_empty_arrays",
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_compound_index_supports_one_flat_multikey_component",
+            "python/tests/test_upstream_decimal_codec_edges.py::test_unique_numeric_index_uses_exact_double_decimal_identity",
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "BriskDB supports its documented native flat multikey and Decimal128 unique keys, unlike the source remote SQL backends' array/Decimal rejection. Parallel/nested unsupported shapes still reject explicitly. Private scalar-token guards and fake MySQL generated-column SQL are not native features."
+        },
+        {
+          "source": [
+            "test_remote_unique_tokens_omit_documents_outside_index_membership",
+            "test_remote_sparse_unique_index_leaves_token_nullable"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_advanced_indexes.py::test_unique_sparse_index_skips_missing_but_indexes_explicit_null",
+            "python/tests/test_upstream_advanced_indexes.py::test_partial_unique_membership_transitions_on_update_and_upsert"
+          ],
+          "note": "Native sparse/partial membership outcomes are tested, but no nullable remote SQL token-column representation or private helper is exposed."
+        },
+        {
+          "source": [
+            "test_remote_unique_token_migration_backfills_and_advances_catalog",
+            "test_remote_unique_token_migration_retries_conflicts_fail_closed"
+          ],
+          "kind": "implementation_specific",
+          "evidence": [
+            "python/tests/test_upstream_storage_backends.py::test_alternative_backends_reject_before_storage_acquisition"
+          ],
+          "note": "Remote SQL storage/token migration/backfill retry and fake catalog version transitions are not supported native backend workflows. These are not native startup recovery tests or proof of their private exactly-retried migration behavior."
+        },
+        {
+          "source": [
+            "test_remote_dual_payload_preserves_order_and_nonfinite_values",
+            "test_remote_dual_payload_upgrades_and_recovers_legacy_rows"
+          ],
+          "kind": "contract_difference",
+          "evidence": [
+            "python/tests/test_upstream_backend_id_edges.py::test_nested_container_datetime_and_nonfinite_ids_keep_canonical_identity",
+            "src/import/tinymongo.rs::legacy_physical_ids_are_validated_and_restore_container_order"
+          ],
+          "note": "Native BSON preserves ordered identities and nonfinite values; stopped SQLite import validates provable legacy ID order. Remote SQL JSON/data_ordered dual columns, schema ALTER/backfill and same-source in-place updates are not native format or migration features."
         }
       ]
     }
