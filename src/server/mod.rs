@@ -4,6 +4,8 @@
 mod daemon;
 #[cfg(feature = "server")]
 pub use daemon::DaemonOptions;
+mod http_tls;
+pub use http_tls::HttpTlsConfig;
 #[cfg(feature = "mongo")]
 mod mongo;
 #[cfg(feature = "mongo-tls")]
@@ -102,6 +104,8 @@ struct BoundListeners {
     http: tokio::net::TcpListener,
     admin: Option<tokio::net::TcpListener>,
     postgres: Option<tokio::net::TcpListener>,
+    http_tls: http_tls::Planes,
+    http_slots: http_tls::Slots,
     #[cfg(feature = "mongo")]
     mongo: Option<BoundMongo>,
 }
@@ -140,6 +144,8 @@ impl BoundListeners {
             http,
             admin,
             postgres,
+            http_tls: Default::default(),
+            http_slots: Default::default(),
             #[cfg(feature = "mongo")]
             mongo: None,
         })
@@ -179,6 +185,8 @@ impl BoundListeners {
             http,
             admin: None,
             postgres: None,
+            http_tls: Default::default(),
+            http_slots: Default::default(),
             #[cfg(feature = "mongo")]
             mongo: None,
         }
@@ -622,6 +630,7 @@ impl AttachedServer {
                 postgres: security,
                 data_router,
                 mongo_address,
+                http_tls: Default::default(),
                 #[cfg(feature = "mongo-tls")]
                 mongo_tls: None,
             },
@@ -638,6 +647,7 @@ impl AttachedServer {
             postgres: security,
             data_router,
             mongo_address,
+            http_tls,
             #[cfg(feature = "mongo-tls")]
             mongo_tls,
         } = prepared;
@@ -646,7 +656,11 @@ impl AttachedServer {
             anyhow::bail!("Mongo TLS configuration requires an enabled Mongo listener");
         }
         validate_listener_addresses(&config, security.is_some())?;
-        let listeners = bind_configured_listeners(&config, database, mongo_address).await?;
+        if http_tls.admin.is_some() && config.admin_listen.is_none() {
+            anyhow::bail!("admin HTTP TLS requires an enabled admin listener");
+        }
+        let mut listeners = bind_configured_listeners(&config, database, mongo_address).await?;
+        listeners.http_tls = http_tls;
         #[cfg(feature = "mongo-tls")]
         let mongo_tls_target = mongo_tls.as_ref().map(|identity| {
             mongo_tls_reload::Target::new(identity.clone(), database.engine().readiness_probe())
@@ -1033,6 +1047,11 @@ where
             accepted_connection = accept_next_connection(&listeners) => {
                 match accepted_connection {
                     ListenerAccept::Http(Ok((stream, peer))) => {
+                        let Ok(slot) = listeners.http_slots.admit(false) else {
+                            debug!(%peer, "HTTP data connection rejected at the finite socket limit");
+                            continue;
+                        };
+                        let identity = listeners.http_tls.data.clone();
                         let accepted = accepted.clone();
                         let service = TowerToHyperService::new(data_router.clone().map_request(
                             move |request: Request<Incoming>| {
@@ -1044,7 +1063,8 @@ where
                         ));
                         let graceful_rx = graceful_tx.subscribe();
                         http_connections.spawn(async move {
-                            serve_http_connection(stream, peer, service, graceful_rx).await;
+                            serve_http_connection(stream, peer, service, graceful_rx, identity).await;
+                            drop(slot);
                         });
                     }
                     ListenerAccept::Http(Err(error)) => {
@@ -1054,6 +1074,11 @@ where
                         break;
                     }
                     ListenerAccept::Admin(Ok((stream, peer))) => {
+                        let Ok(slot) = listeners.http_slots.admit(true) else {
+                            debug!(%peer, "HTTP admin connection rejected at the finite socket limit");
+                            continue;
+                        };
+                        let identity = listeners.http_tls.admin.clone();
                         let accepted = accepted.clone();
                         let router = admin_router
                             .as_ref()
@@ -1068,7 +1093,8 @@ where
                         ));
                         let graceful_rx = graceful_tx.subscribe();
                         http_connections.spawn(async move {
-                            serve_http_connection(stream, peer, service, graceful_rx).await;
+                            serve_http_connection(stream, peer, service, graceful_rx, identity).await;
+                            drop(slot);
                         });
                     }
                     ListenerAccept::Admin(Err(error)) => {
@@ -1306,7 +1332,40 @@ async fn serve_http_connection<S>(
     peer: SocketAddr,
     service: S,
     mut graceful_rx: watch::Receiver<bool>,
+    identity: Option<Arc<http_tls::Loaded>>,
 ) where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    match identity {
+        Some(identity) => {
+            let accepted = tokio::select! {
+                biased;
+                _ = wait_for_connection_shutdown(&mut graceful_rx) => return,
+                result = tokio::time::timeout(identity.handshake_timeout, identity.acceptor.accept(stream)) => result,
+            };
+            match accepted {
+                Ok(Ok(stream)) => serve_http_stream(stream, peer, service, graceful_rx).await,
+                Ok(Err(_)) => debug!(%peer, "HTTP TLS handshake rejected"),
+                Err(_) => debug!(%peer, "HTTP TLS handshake deadline elapsed"),
+            }
+        }
+        None => serve_http_stream(stream, peer, service, graceful_rx).await,
+    }
+}
+
+async fn serve_http_stream<S, T>(
+    stream: T,
+    peer: SocketAddr,
+    service: S,
+    mut graceful_rx: watch::Receiver<bool>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: hyper::service::Service<
             Request<Incoming>,
             Response = axum::response::Response,
@@ -2120,6 +2179,8 @@ mod tests {
                     http,
                     admin: Some(admin),
                     postgres: Some(postgres),
+                    http_tls: Default::default(),
+                    http_slots: Default::default(),
                     #[cfg(feature = "mongo")]
                     mongo: None,
                 },
@@ -2170,6 +2231,8 @@ mod tests {
                 http,
                 admin: None,
                 postgres: Some(postgres),
+                http_tls: Default::default(),
+                http_slots: Default::default(),
                 #[cfg(feature = "mongo")]
                 mongo: None,
             },
@@ -2234,6 +2297,8 @@ mod tests {
                 http,
                 admin: None,
                 postgres: Some(postgres),
+                http_tls: Default::default(),
+                http_slots: Default::default(),
                 #[cfg(feature = "mongo")]
                 mongo: None,
             },
@@ -2292,6 +2357,8 @@ mod tests {
                     http,
                     admin: Some(admin),
                     postgres: Some(postgres),
+                    http_tls: Default::default(),
+                    http_slots: Default::default(),
                     #[cfg(feature = "mongo")]
                     mongo: None,
                 },
@@ -2384,6 +2451,8 @@ mod tests {
                 http: listener,
                 admin: None,
                 postgres: Some(postgres),
+                http_tls: Default::default(),
+                http_slots: Default::default(),
                 #[cfg(feature = "mongo")]
                 mongo: None,
             },

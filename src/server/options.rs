@@ -7,6 +7,8 @@ use super::*;
 /// Credentials apply only to their own connector; Mongo always remains loopback.
 #[derive(Default)]
 pub struct AttachedServerOptions {
+    pub(super) http_tls: Option<HttpTlsConfig>,
+    pub(super) admin_tls: Option<HttpTlsConfig>,
     pub(super) postgres_security: Option<postgres::SecurityConfig>,
     pub(super) sqlite_remote: Option<crate::protocol::sqlite_remote::Config>,
     pub(super) mongo_address: Option<SocketAddr>,
@@ -17,6 +19,21 @@ pub struct AttachedServerOptions {
 impl AttachedServerOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Encrypt the data HTTP plane, including a selected SQLite-remote router.
+    /// This does not grant network-bind permission or authenticate HTTP callers.
+    #[must_use]
+    pub fn with_http_tls(mut self, config: HttpTlsConfig) -> Self {
+        self.http_tls = Some(config);
+        self
+    }
+
+    /// Encrypt the separate admin plane; its address must already be enabled.
+    #[must_use]
+    pub fn with_admin_tls(mut self, config: HttpTlsConfig) -> Self {
+        self.admin_tls = Some(config);
+        self
     }
 
     /// Enable PostgreSQL TLS/SCRAM; the PostgreSQL address must also be enabled.
@@ -62,6 +79,8 @@ impl std::fmt::Debug for AttachedServerOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("AttachedServerOptions");
         debug
+            .field("http_tls", &self.http_tls.is_some())
+            .field("admin_tls", &self.admin_tls.is_some())
             .field("postgres_security", &self.postgres_security.is_some())
             .field("sqlite_remote", &self.sqlite_remote.is_some())
             .field("mongo_address", &self.mongo_address);
@@ -73,6 +92,7 @@ impl std::fmt::Debug for AttachedServerOptions {
 
 #[derive(Default)]
 pub(super) struct PreparedOptions {
+    pub http_tls: http_tls::Planes,
     pub postgres: Option<postgres::ReloadableSecurity>,
     pub data_router: Option<axum::Router>,
     pub mongo_address: Option<SocketAddr>,
@@ -91,6 +111,9 @@ impl AttachedServer {
         options: AttachedServerOptions,
     ) -> anyhow::Result<Self> {
         validate_listener_addresses(&config, options.postgres_security.is_some())?;
+        if options.admin_tls.is_some() && config.admin_listen.is_none() {
+            anyhow::bail!("admin HTTP TLS requires an enabled admin listener");
+        }
         validate_optional_mongo(&config, options.mongo_address)?;
         #[cfg(feature = "mongo")]
         if options.mongo_address.is_some() {
@@ -122,10 +145,15 @@ impl AttachedServer {
                     .map_err(anyhow::Error::msg)
             })
             .transpose()?;
+        let http_tls = http_tls::Planes {
+            data: prepare_http_identity(options.http_tls).await?,
+            admin: prepare_http_identity(options.admin_tls).await?,
+        };
         Self::start_prepared(
             database,
             config,
             PreparedOptions {
+                http_tls,
                 postgres,
                 data_router,
                 mongo_address: options.mongo_address,
@@ -134,6 +162,20 @@ impl AttachedServer {
             },
         )
         .await
+    }
+}
+
+async fn prepare_http_identity(
+    config: Option<HttpTlsConfig>,
+) -> anyhow::Result<Option<Arc<http_tls::Loaded>>> {
+    match config {
+        Some(config) => Ok(Some(
+            tokio::task::spawn_blocking(move || config.load())
+                .await
+                .context("HTTP TLS preparation worker failed")?
+                .context("failed to prepare HTTP TLS configuration")?,
+        )),
+        None => Ok(None),
     }
 }
 
