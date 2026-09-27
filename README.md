@@ -334,7 +334,7 @@ with MongoClient("mongodb://127.0.0.1:27017/?directConnection=true") as client:
 `BRISKDB_MONGO_LISTEN` is the environment equivalent; `--mongo-listen disabled`
 overrides it. Mongo is disabled by default, including in Mongo-enabled builds.
 Builds without the feature reject activation before opening database files.
-The listener is **unauthenticated and loopback-only**; do not expose it through
+This daemon path is **unauthenticated and loopback-only**; do not expose it through
 a public proxy. HTTP/PostgreSQL and Mongo share the engine and lifecycle, but
 SQL tables and BSON collections remain separate data models. Ctrl-C/SIGTERM
 drains all enabled listeners and closes the database. See the
@@ -373,8 +373,15 @@ The daemon can also opt into TLS with `--features mongo-tls` and paired
 `--mongo-tls-cert` / `--mongo-tls-key`; see [daemon TLS setup](docs/MONGO_PARITY.md#encrypted-daemon-mongo-unreleased).
 Unix daemons can opt into `--reload-on-sighup` for configured Mongo/PostgreSQL
 identity rotation; see the [reload contract](docs/POSTGRES_LISTENER.md#daemon-security-reload-unreleased).
-TLS still leaves Mongo anonymous and loopback-only. Plaintext remains the default;
+Those daemon/Python paths still leave Mongo anonymous and loopback-only. Plaintext remains the default;
 managed `briskdb.patch()` clients retain their existing plaintext local transport.
+
+Unreleased standalone **Rust hosts** can now opt into an activated security root
+with `mongo-tls,auth-scram`: verified TLS, Mongo SCRAM-SHA-256, current
+document permissions and identity-bound pooled cursors. This is not enabled by
+installing the wheel or setting the TLS flags above. See
+[authenticated Mongo setup](docs/MONGO_PARITY.md#authenticated-rust-mongo-unreleased)
+for the one-way provisioning boundary and a stock PyMongo login example.
 
 ### Use existing PyMongo code with the BriskDB wheel
 

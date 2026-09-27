@@ -365,6 +365,15 @@ jobs:
           cargo test --locked --no-default-features --features mongo-tls --test mongo_wire \
             tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
 
+      - name: Require authenticated Mongo TLS, roles, pooling and credential rotation
+        env:
+          BRISKDB_MONGO_WIRE_PYTHON: python
+        run: |
+          cargo test --locked --no-default-features --features mongo-tls,auth-scram,tokio/rt-multi-thread \
+            --lib protocol::mongo
+          cargo test --locked --no-default-features --features mongo-tls,auth-scram \
+            --test mongo_wire tls::authentication:: -- --include-ignored
+
       - name: Require composed Mongo TLS, PostgreSQL SCRAM and SQLite-remote listeners
         env:
           BRISKDB_MONGO_WIRE_PYTHON: python

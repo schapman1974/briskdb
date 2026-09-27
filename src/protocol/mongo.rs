@@ -4,6 +4,8 @@
 //! The standalone public codec is uncompressed; listeners separately negotiate
 //! bounded zlib transport without changing this envelope API.
 
+#[cfg(feature = "auth-scram")]
+mod authentication;
 mod client_metadata;
 mod commands;
 mod compression;

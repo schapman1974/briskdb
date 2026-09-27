@@ -46,7 +46,7 @@ postgres = [
 ]
 # Shared transport identity loading; does not open a listener or authenticate users.
 transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:zeroize"]
-# Shared credential primitives only; this does not enable listener authentication.
+# Shared credentials/authority; enabling this alone never activates a secured root.
 auth-scram = ["dep:ring", "dep:stringprep", "dep:subtle", "dep:zeroize"]
 # Compatibility alias for the PostgreSQL transport-security surface. The
 # adapter always includes TLS and SCRAM so a downstream listener cannot compile
@@ -95,6 +95,7 @@ documents = [
 # Opt-in Mongo transport foundation. No listener is enabled by default.
 mongo = [
     "documents",
+    "dep:base64",
     "dep:bytes",
     "dep:flate2",
     "dep:tokio-util",
@@ -102,7 +103,8 @@ mongo = [
     "tokio/io-util",
     "tokio/net",
 ]
-# Encrypted Mongo loopback transport only; authentication/roles are separate.
+# Mongo TLS transport. Anonymous roots remain loopback-only; activated roots
+# additionally require auth-scram and the explicit authenticated Rust builder.
 mongo-tls = ["mongo", "transport-tls"]
 # This reserved name establishes the intended package boundary without
 # claiming that the listener is implemented.

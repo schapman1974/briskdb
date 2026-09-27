@@ -88,6 +88,14 @@ pub struct Principal {
 }
 
 impl Principal {
+    #[cfg(feature = "mongo")]
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.catalog, &other.catalog)
+            && self.user == other.user
+            && self.user_id == other.user_id
+            && self.credential_generation == other.credential_generation
+    }
+
     /// Exact name for trusted audit context; Debug intentionally omits it.
     pub fn name(&self) -> &SecurityName {
         &self.user

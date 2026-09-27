@@ -1,4 +1,4 @@
-//! Host-owned, loopback-only Mongo listener over the shared document engine.
+//! Host-owned Mongo listener over the shared document engine.
 
 use std::{
     io,
@@ -68,9 +68,7 @@ impl MongoServer {
         limits: MongoResourceLimits,
     ) -> io::Result<Self> {
         if database.engine().security_enabled() {
-            return Err(invalid(
-                "Mongo authentication for security-bound engines is not implemented",
-            ));
+            return Err(invalid("security-bound Mongo engines require TLS"));
         }
         if !address.ip().is_loopback() {
             return Err(invalid("Mongo listener requires loopback"));
@@ -82,8 +80,9 @@ impl MongoServer {
         Self::from_bound_with_limits(database, listener, CancellationToken::new(), limits)
     }
 
-    /// Encrypt the standalone Mongo listener. Authentication/roles are not yet
-    /// implemented, so even with TLS the address must be loopback.
+    /// Encrypt the standalone Mongo listener. Anonymous roots remain loopback
+    /// only. Explicitly activated security roots require SCRAM authentication
+    /// and document privileges; they may bind non-loopback with `auth-scram`.
     #[cfg(feature = "mongo-tls")]
     pub async fn start_tls(
         database: &BriskDb,
@@ -100,12 +99,7 @@ impl MongoServer {
         config: super::MongoTlsConfig,
         limits: MongoResourceLimits,
     ) -> io::Result<Self> {
-        if database.engine().security_enabled() {
-            return Err(invalid(
-                "Mongo authentication for security-bound engines is not implemented",
-            ));
-        }
-        if !address.ip().is_loopback() {
+        if !address.ip().is_loopback() && !database.engine().security_enabled() {
             return Err(invalid(
                 "Mongo listener requires loopback; TLS does not authenticate Mongo users",
             ));
@@ -168,13 +162,17 @@ impl MongoServer {
         limits: MongoResourceLimits,
         transport: Transport,
     ) -> io::Result<Self> {
-        if database.engine().security_enabled() {
+        let secured = database.engine().security_enabled();
+        if secured
+            && (!cfg!(feature = "auth-scram")
+                || transport.security() != super::MongoSecurityMode::AnonymousTlsLoopback)
+        {
             return Err(invalid(
-                "Mongo authentication for security-bound engines is not implemented",
+                "security-bound Mongo engines require TLS and auth-scram",
             ));
         }
         let address = listener.local_addr()?;
-        if !address.ip().is_loopback() {
+        if !address.ip().is_loopback() && !secured {
             return Err(invalid("Mongo listener requires loopback"));
         }
         if database.engine().state() != EngineState::Running {
@@ -185,12 +183,24 @@ impl MongoServer {
         let clients = Arc::new(client_metadata::Registry::default());
         let health = Arc::new(readiness::ListenerHealth::default());
         let guard = health.guard();
-        let security = transport.security();
+        let security = if secured {
+            super::MongoSecurityMode::AuthenticatedTls
+        } else {
+            transport.security()
+        };
+        #[allow(unused_mut)]
+        let mut executor = commands::Executor::new(database.clone(), Arc::clone(&metrics), limits);
+        #[cfg(feature = "auth-scram")]
+        if secured {
+            executor.authentication = Some(super::authentication::Authentication::new(
+                database.engine().clone(),
+            )?);
+        }
         #[cfg(feature = "mongo-tls")]
         let tls = transport.tls();
         let run = run(
             listener,
-            database.clone(),
+            Arc::new(executor),
             token,
             Arc::clone(&metrics),
             Arc::clone(&clients),
@@ -294,18 +304,13 @@ impl Drop for MongoServer {
 
 async fn run(
     listener: TcpListener,
-    database: BriskDb,
+    executor: Arc<commands::Executor>,
     shutdown: CancellationToken,
     metrics: Arc<metrics::Metrics>,
     clients: Arc<client_metadata::Registry>,
     limits: MongoResourceLimits,
     transport: Transport,
 ) -> io::Result<()> {
-    let executor = Arc::new(commands::Executor::new(
-        database.clone(),
-        Arc::clone(&metrics),
-        limits,
-    ));
     let slots = Arc::new(Semaphore::new(limits.max_connections()));
     let mut connections = JoinSet::new();
     let mut lifecycle = tokio::time::interval(Duration::from_millis(100));
@@ -316,7 +321,7 @@ async fn run(
             _ = shutdown.cancelled() => break,
             _ = lifecycle.tick() => {
                 executor.prune_cursors();
-                if database.engine().state() != EngineState::Running { break; }
+                if !executor.running() { break; }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if matches!(joined, Some(Err(_))) { metrics.task_failed(); }
@@ -365,9 +370,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     clients: Arc<client_metadata::Registry>,
     limits: MongoResourceLimits,
 ) -> io::Result<()> {
-    let session = executor.session();
-    let mut client = clients.connection(session.id().get());
-    let _cursors = executor.connection_cursors(session.id().get());
+    #[allow(unused_mut)]
+    let mut session = executor.session();
+    // A successful proof creates a new engine session. TCP ownership must not
+    // change with it: registry cleanup, cursor quotas and telemetry stay stable.
+    let connection_id = session.id().get();
+    let mut client = clients.connection(connection_id);
+    let _cursors = executor.connection_cursors(connection_id);
+    #[cfg(feature = "auth-scram")]
+    let mut authentication = super::authentication::Conversation::default();
     let mut codec = compression::TransportCodec::new()?;
     let mut source = BytesMut::with_capacity(8192);
     let mut response_id = 0i32;
@@ -376,12 +387,26 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         if shutdown.is_cancelled() {
             return Ok(());
         }
+        #[cfg(feature = "auth-scram")]
+        if authentication
+            .deadline()
+            .is_some_and(|expires| expires <= tokio::time::Instant::now())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Mongo authentication timeout",
+            ));
+        }
         let mut deadline = tokio::time::Instant::now()
             + if source.is_empty() {
                 IDLE_TIMEOUT
             } else {
                 IO_TIMEOUT
             };
+        #[cfg(feature = "auth-scram")]
+        if let Some(expires) = authentication.deadline() {
+            deadline = deadline.min(expires);
+        }
         let frame = loop {
             if let Some(frame) = codec.decode(&mut source)? {
                 break frame;
@@ -400,6 +425,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             }
             if source.is_empty() {
                 deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+                #[cfg(feature = "auth-scram")]
+                if let Some(expires) = authentication.deadline() {
+                    deadline = deadline.min(expires);
+                }
             }
             source.extend_from_slice(&chunk[..read]);
         };
@@ -425,15 +454,39 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 request.body.iter().next().map_or("", |(name, _)| name),
                 started,
             )
-            .with_correlation(session.id().get(), request.request_id, sequence);
-        let body = match prepared {
-            Some(Ok(prepared)) => {
-                executor
-                    .execute(&session, request.request_id, prepared, shutdown.clone())
-                    .await
+            .with_correlation(connection_id, request.request_id, sequence);
+        #[cfg(feature = "auth-scram")]
+        let auth_reply = if let Some(service) = &executor.authentication {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Ok(()),
+                reply = authentication.handle(service, &request, &mut session) => reply,
             }
-            Some(Err(error)) => error.document(),
-            None => dispatch(&request),
+        } else {
+            None
+        };
+        #[cfg(not(feature = "auth-scram"))]
+        let auth_reply: Option<BsonDocument> = None;
+        let body = if let Some(reply) = auth_reply {
+            reply
+        } else if prepared.is_some() && executor.authentication_required(&session) {
+            error(13, "Unauthorized", "authentication required")
+        } else {
+            match prepared {
+                Some(Ok(prepared)) => {
+                    executor
+                        .execute_on_connection(
+                            &session,
+                            connection_id,
+                            request.request_id,
+                            prepared,
+                            shutdown.clone(),
+                        )
+                        .await
+                }
+                Some(Err(error)) => error.document(),
+                None => dispatch(&request, executor.secured()),
+            }
         };
         client.observe(&request.body, &body);
         if compression::negotiated_zlib(&request, &body) {
@@ -470,22 +523,32 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
         if let Some(destination) = result {
+            #[allow(unused_mut)]
+            let mut write_deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+            #[cfg(feature = "auth-scram")]
+            if let Some(expires) = authentication.deadline() {
+                write_deadline = write_deadline.min(expires);
+            }
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return Ok(()),
-                written = tokio::time::timeout(IO_TIMEOUT, stream.write_all(&destination)) => {
+                written = tokio::time::timeout_at(write_deadline, stream.write_all(&destination)) => {
                     written.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Mongo write timeout"))??;
                 }
             }
         }
+        #[cfg(feature = "auth-scram")]
+        if authentication.failed() {
+            return Ok(());
+        }
     }
 }
 
-fn fields(entries: &[(&str, BsonValue)]) -> BsonDocument {
+pub(super) fn fields(entries: &[(&str, BsonValue)]) -> BsonDocument {
     BsonDocument::from_entries(entries.iter().cloned()).expect("static Mongo reply field names")
 }
 
-fn error(code: i32, name: &str, message: &str) -> BsonDocument {
+pub(super) fn error(code: i32, name: &str, message: &str) -> BsonDocument {
     fields(&[
         ("ok", BsonValue::Double(0.0)),
         ("code", BsonValue::Int32(code)),
@@ -494,7 +557,7 @@ fn error(code: i32, name: &str, message: &str) -> BsonDocument {
     ])
 }
 
-fn dispatch(request: &Request) -> BsonDocument {
+fn dispatch(request: &Request, secured: bool) -> BsonDocument {
     let Some((command, value)) = request.body.iter().next() else {
         return error(2, "BadValue", "missing command");
     };
@@ -530,6 +593,14 @@ fn dispatch(request: &Request) -> BsonDocument {
             // offer, but do not advertise support or emit backpressure replies.
             "backpressure" if hello => matches!(value, BsonValue::Boolean(_)),
             "client" if hello => matches!(value, BsonValue::Document(_)),
+            "saslSupportedMechs" if hello && secured => {
+                matches!(value, BsonValue::String(name) if name.len() <= 1024)
+            }
+            // No speculative optimization yet. Per the handshake specification,
+            // omitting its reply makes clients use the ordinary SASL exchange.
+            "speculativeAuthenticate" if hello && secured => {
+                matches!(value, BsonValue::Document(_))
+            }
             "compression" if hello => {
                 matches!(value, BsonValue::Array(items) if items.iter().all(|item| matches!(item, BsonValue::String(_))))
             }
@@ -545,7 +616,7 @@ fn dispatch(request: &Request) -> BsonDocument {
         }
     }
     if hello {
-        fields(&[
+        let mut entries = vec![
             ("ok", BsonValue::Double(1.0)),
             ("ismaster", BsonValue::Boolean(true)),
             ("isWritablePrimary", BsonValue::Boolean(true)),
@@ -573,7 +644,14 @@ fn dispatch(request: &Request) -> BsonDocument {
                     Vec::new()
                 }),
             ),
-        ])
+        ];
+        if secured && request.body.get_first("saslSupportedMechs").is_some() {
+            entries.push((
+                "saslSupportedMechs",
+                BsonValue::Array(vec![BsonValue::from("SCRAM-SHA-256")]),
+            ));
+        }
+        fields(&entries)
     } else if command == "ping" {
         fields(&[("ok", BsonValue::Double(1.0))])
     } else {

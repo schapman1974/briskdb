@@ -79,6 +79,31 @@ async fn security_is_explicit_and_never_falls_back_to_anonymous_startup() {
     assert!(engine.security_enabled());
 }
 
+#[cfg(feature = "mongo")]
+#[tokio::test]
+async fn retained_cursor_sessions_copy_only_a_current_identity_from_the_same_engine() {
+    let (root, engine) = secure(&[Action::ReadData]).await;
+    let session = login(&engine).await;
+    let cursor = engine.cursor_session(&session).await.unwrap();
+    assert_ne!(cursor.id(), session.id());
+    assert!(cursor.same_authentication(&session));
+    assert!(engine.cursor_session(&engine.session()).await.is_err());
+    let peer = Engine::open_authenticated(root.path(), 2, EngineOptions::default())
+        .await
+        .unwrap();
+    assert!(peer.cursor_session(&session).await.is_err());
+    engine
+        .update_security_catalog(|catalog| {
+            catalog.rotate_credentials(&user(), fixtures::credential())
+        })
+        .await
+        .unwrap();
+    assert!(engine.cursor_session(&session).await.is_err());
+    assert!(engine.cursor_session(&cursor).await.is_err());
+    let replacement = login(&engine).await;
+    assert!(!replacement.same_authentication(&cursor));
+}
+
 #[tokio::test]
 async fn authenticated_identity_cannot_unlock_unimplemented_sql_or_admin_paths() {
     let (_temp, engine) = secure(&[Action::ReadData]).await;

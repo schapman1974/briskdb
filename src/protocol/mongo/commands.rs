@@ -1225,6 +1225,8 @@ pub(super) struct Executor {
     metrics: Arc<metrics::Metrics>,
     creation: Mutex<()>,
     cursors: Arc<cursors::WireCursors>,
+    #[cfg(feature = "auth-scram")]
+    pub(super) authentication: Option<super::authentication::Authentication>,
 }
 
 impl Executor {
@@ -1238,6 +1240,28 @@ impl Executor {
             metrics: Arc::clone(&metrics),
             creation: Mutex::new(()),
             cursors: Arc::new(cursors::WireCursors::with_limits(metrics, limits)),
+            #[cfg(feature = "auth-scram")]
+            authentication: None,
+        }
+    }
+
+    pub(super) fn running(&self) -> bool {
+        self.database.engine().state() == crate::EngineState::Running
+    }
+
+    pub(super) fn secured(&self) -> bool {
+        self.database.engine().security_enabled()
+    }
+
+    pub(super) fn authentication_required(&self, session: &Session) -> bool {
+        #[cfg(feature = "auth-scram")]
+        {
+            self.secured() && !session.is_authenticated()
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        {
+            let _ = session;
+            self.secured()
         }
     }
 
@@ -1257,9 +1281,22 @@ impl Executor {
         self.cursors.discard(id);
     }
 
+    #[cfg(test)]
     pub(super) async fn execute(
         &self,
         session: &Session,
+        request_id: i32,
+        prepared: Prepared,
+        shutdown: CancellationToken,
+    ) -> BsonDocument {
+        self.execute_on_connection(session, session.id().get(), request_id, prepared, shutdown)
+            .await
+    }
+
+    pub(super) async fn execute_on_connection(
+        &self,
+        session: &Session,
+        connection: u64,
         request_id: i32,
         prepared: Prepared,
         shutdown: CancellationToken,
@@ -1291,7 +1328,10 @@ impl Executor {
         identity[8..12].copy_from_slice(&request_id.to_le_bytes());
         identity[12..].copy_from_slice(&1u32.to_le_bytes());
         let identity = DocumentRequestId::new(identity).expect("nonzero request identity");
-        match self.run(session, identity, context, prepared.command).await {
+        match self
+            .run(session, connection, identity, context, prepared.command)
+            .await
+        {
             Ok(reply) => read_options::reply(reply, prepared.advisory_hint),
             Err(error) => error.document(),
         }
@@ -1365,6 +1405,7 @@ impl Executor {
     async fn run(
         &self,
         session: &Session,
+        connection: u64,
         identity: DocumentRequestId,
         context: RequestContext,
         command: Command,
@@ -1966,7 +2007,8 @@ impl Executor {
                 }
                 // Mongo drivers may use a different pooled socket for getMore.
                 // Retain this cursor's engine ownership separately from TCP.
-                let cursor_session = Arc::new(self.session());
+                let cursor_session =
+                    Arc::new(self.database.engine().cursor_session(session).await?);
                 match self
                     .call(&cursor_session, identity, &context, command)
                     .await
@@ -1983,7 +2025,7 @@ impl Executor {
                                 id,
                                 namespace.clone(),
                                 cursor_session,
-                                session.id().get(),
+                                connection,
                                 budget.map(|budget| budget.saturating_sub(started.elapsed())),
                             )?;
                         }
@@ -1999,7 +2041,9 @@ impl Executor {
             Command::GetMore(next) => {
                 let namespace = next.namespace().clone();
                 let id = next.cursor_id();
-                let lease = self.cursors.lookup(id, &namespace, session.id().get())?;
+                let lease = self
+                    .cursors
+                    .lookup_for_session(id, &namespace, connection, session)?;
                 let started = Instant::now();
                 let context = if let Some(remaining) = lease.remaining {
                     let deadline = context
@@ -2041,7 +2085,9 @@ impl Executor {
                 let mut killed = Vec::new();
                 let mut missing = Vec::new();
                 for id in ids {
-                    let Some(cursor_session) = self.cursors.take(id, &namespace) else {
+                    let Some(cursor_session) =
+                        self.cursors.take_for_session(id, &namespace, session)
+                    else {
                         missing.push(BsonValue::Int64(id.get() as i64));
                         continue;
                     };

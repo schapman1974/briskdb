@@ -1426,18 +1426,24 @@ per-user filtered discovery is not implemented. There is no implicit administrat
 Retained cursors belong to the immutable session identity. Continuation and
 deletion derive permissions from the retained cursor's real kind, not a supplied
 namespace convention, and refresh current roles/generation before admission.
-Other sessions/engines cannot take over a cursor, even for the same username.
+Other core sessions/engines cannot take over a cursor, even for the same username.
+The Mongo adapter separately retains one dedicated core session per wire cursor;
+pooled sockets must match its exact catalog incarnation, user ID and credential
+generation before handoff, quota changes or removal. A fresh engine or a rotated/
+recreated user cannot inherit those cursors.
 Revocation affects the next admission, not already-admitted work.
 
 This first secured engine surface supports **document commands only**. Ordinary
 SQL execution/preparation, transaction and schema/admin request operations reject secured engines;
-HTTP routers, SQLite-remote routers, PostgreSQL wire startup and current Mongo/
+HTTP routers, SQLite-remote routers, PostgreSQL wire startup and
 composed listener startup also reject this mode. Rust-host lifecycle controls,
 query tracking/cancellation, background-worker controls, session cleanup and
 catalog inspection remain trusted host APIs, not remotely authorized operations.
-Mongo SCRAM conversations, built-in roles/user commands, Python/daemon wiring,
-and relational/admin RBAC are still outstanding. Default anonymous local roots
-and existing Python APIs retain their behavior.
+The standalone Rust Mongo TLS listener now owns the bounded wire SCRAM conversation;
+see [its activation and limitations](MONGO_PARITY.md#authenticated-rust-mongo-unreleased).
+Built-in roles/user commands, Python/daemon/composed-host wiring and relational/admin
+RBAC are still outstanding. Default anonymous local roots and existing Python APIs
+retain their behavior.
 
 ### Bounded worker and connection-pool boundary
 

@@ -7,6 +7,28 @@ use crate::core::security_catalog::{
 use crate::storage::{security_catalog::SecurityStoreId, security_root};
 
 impl Engine {
+    #[cfg(feature = "mongo")]
+    pub(super) async fn copy_session_identity(
+        &self,
+        source: &Session,
+        target: &mut Session,
+    ) -> EngineResult<()> {
+        let principal = source.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        target.principal = Some(
+            self.security_call(move |authority| {
+                authority.validate_principal(&principal)?;
+                Ok(principal)
+            })
+            .await?,
+        );
+        Ok(())
+    }
+
     /// Offline, one-way activation of an existing ready root. Close **all**
     /// handles first. The root must be owner-only on a supported platform.
     /// Creates `security.sqlite` exclusively, then binds its ID in the manifest.
@@ -30,7 +52,8 @@ impl Engine {
     /// Open an activated root with its matching durable authority. Unlike
     /// ordinary startup this never initializes an unbound root or missing store.
     /// Only explicitly authenticated document commands are currently supported;
-    /// SQL, anonymous sessions and existing network adapters fail closed.
+    /// SQL and anonymous sessions fail closed. The standalone Mongo TLS adapter
+    /// can authenticate document clients; other adapters still reject this mode.
     /// Rust host administration is trusted, not a wire user-management API.
     pub async fn open_authenticated(
         root: impl AsRef<Path>,

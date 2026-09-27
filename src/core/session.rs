@@ -218,6 +218,30 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(all(feature = "mongo", feature = "auth-scram"))]
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.principal.is_some()
+    }
+
+    #[cfg(feature = "mongo")]
+    pub(crate) fn same_authentication(&self, other: &Self) -> bool {
+        if self.owner != other.owner {
+            return false;
+        }
+        #[cfg(feature = "auth-scram")]
+        {
+            match (&self.principal, &other.principal) {
+                (Some(left), Some(right)) => left.same_identity(right),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        {
+            true
+        }
+    }
+
     pub(crate) fn new(owner: u64, prepared_limits: PreparedStatementLimits) -> Self {
         let id = SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
         Self {

@@ -724,7 +724,8 @@ Managed PyMongo patch hosts still use their existing plaintext loopback transpor
 the daemon can opt into TLS as described below. Legacy Rust
 `AttachedServer::*_with_mongo` constructors also remain plaintext; opt into
 attached TLS with the options API below.
-Mongo authentication, roles and remote binding remain separate work.
+Explicitly activated Rust security roots can instead select the authenticated
+mode below. TLS alone never enables it.
 
 Certificate/key files use the shared bounded, opened-descriptor-validated loader.
 On Unix, private keys must not be group-writable or accessible by others; `0600`
@@ -734,7 +735,99 @@ positive value no greater than 15 seconds. `start_tls_with_limits` also accepts
 the ordinary connection/command limits: incomplete TLS handshakes consume the
 same finite socket slots, allocate no command session/client metadata, and are
 cancelled during shutdown. TLS failures use existing transport failure counters.
-Readiness reports `anonymous_tls_loopback`, never authenticated network readiness.
+For an ordinary root, readiness reports `anonymous_tls_loopback`.
+
+### Authenticated Rust Mongo (unreleased)
+
+The standalone Rust host supports `mongo-tls,auth-scram` with an explicitly
+activated security root. This is **not** enabled in the published alpha.7 wheel,
+Python `serve`/`patch`, daemon or composed `AttachedServer` paths. Those retain
+their existing anonymous loopback boundaries. Secure roots currently support
+document commands, not SQL or shared PostgreSQL/HTTP/SQLite-remote authentication.
+
+First, an offline trusted Rust host must initialize/close the ordinary root,
+construct a `SecurityCatalog` containing SCRAM-SHA-256 verifiers and explicit
+flat role policies, then call `Engine::provision_security(root, shards, catalog)`.
+On Unix the root must be owner-only (`0700`); at least one user is required.
+This is **one-way activation**: ordinary openers stop working. Close every root
+handle/process first, back up the entire consistent root including its credential
+store, and never delete/adopt an orphan store after an interrupted activation.
+See [the provisioning contract](ARCHITECTURE.md#authenticated-document-engine-unreleased-opt-in-rust-api).
+No implicit admin, public provisioning endpoint or wire user-management command exists.
+
+Open that already-provisioned root and explicitly start TLS:
+
+```rust,ignore
+use briskdb::{BriskDb, DocumentSupport};
+use briskdb::protocol::mongo::{MongoServer, MongoTlsConfig};
+
+let database = BriskDb::builder("./secured-data")
+    .with_shard_count(4)
+    .with_document_support(DocumentSupport::Enabled)
+    .with_authenticated_root()
+    .open().await?;
+let mut mongo = MongoServer::start_tls(
+    &database, "0.0.0.0:27017".parse()?,
+    MongoTlsConfig::new("./server.crt", "./server.key"),
+).await?;
+// Keep the runtime alive while serving; close before dropping the database.
+mongo.close().await?;
+database.close().await?;
+```
+
+Given a provisioned `admin`-realm user named `app_reader` with `ConnectDatabase`
+on `app` and `ReadData` on its `items` collection:
+
+```python
+import os
+from pymongo import MongoClient
+
+with MongoClient("mongodb://db.example.com:27017/?directConnection=true",
+                 username="app_reader", password=os.environ["BRISKDB_PASSWORD"],
+                 authSource="admin", authMechanism="SCRAM-SHA-256",
+                 tls=True, tlsCAFile="./ca.crt") as client:
+    print(list(client.app.items.find({}).batch_size(100)))
+```
+
+`AsyncMongoClient` accepts the same credentials/TLS options. Keep certificate and
+hostname verification enabled. Authentication proves identity, not blanket access:
+document/schema/metadata actions require explicit current privileges. Adapter
+commands with collection-existence probes also require `ListObjects`; implicit
+creation needs `CreateObject` and `CreateDatabase`, upserts need `InsertData`,
+and returning mutations need `ReadData`. Domain-wide database-name discovery is
+not yet filtered to the user's grants. Built-in Mongo roles are not implemented.
+
+Security contract:
+
+- Secure roots reject plaintext even on loopback; only TLS plus enabled authentication
+  permits an explicit non-loopback bind. Readiness reports `authenticated_tls`;
+  it does not certify network deployment or a healthy credential store.
+- Monitoring hello/ping/build-info remains available without login. Hello advertises
+  SHA-256 without disclosing account existence. Speculative authentication is ignored
+  with normal-SASL fallback; SHA-1, channel binding and same-socket reauthentication
+  are unsupported. Modern `skipEmptyExchange` and the older final empty step work.
+- Each socket retains at most one conversation, with a ten-second absolute deadline
+  and 4-KiB SASL payload bound. Nonces are fresh, proofs bind the exact transcript,
+  and authentication failures return a fixed redacted error then close the socket.
+  A shared per-listener admission bucket allows a burst of 64 starts, refilling at
+  32/second, alongside existing connection/parser/engine-worker limits. There is
+  no per-user lockout or unbounded username map.
+- Unknown users receive synthetic, stable-per-listener/name salted challenges and the same
+  final failure shape. This is not a claim of indistinguishable timing or costs
+  when real users have different configured iteration counts.
+- Socket metadata/cleanup uses a stable connection ID even when successful login
+  installs a new core session. Pooled cursors require the same engine/catalog/user/
+  credential generation. Another user cannot take over or remove a cursor. Current
+  roles and credential generations are refreshed at each engine admission; rotation,
+  removal and revocation affect subsequent work, not already-admitted operations.
+- Trusted hosts administer the catalog through `update_security_catalog`. Wire
+  user/role administration, built-in roles, per-user auditing, full fault/soak
+  acceptance and Python/daemon/composed-host configuration remain separate work.
+
+Local gates include real PyMongo 4.17.0 sync/async SCRAM with verified TLS and zlib,
+escaped usernames, least-privilege denial, same-user pooled continuation, cross-user
+read/kill denial, legacy empty exchanges, live credential/role revocation, plus
+bounded parser/nonce/replay/expiry/admission and core ownership regression tests.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -857,7 +950,7 @@ Add `.with_postgres_security(SecurityConfig)` for PostgreSQL TLS/SCRAM (and
 enable its address in `ListenerConfig`), or `.with_sqlite_remote(Config)` to
 replace ordinary SQL HTTP with the authenticated read-only SQLite-remote router.
 They can be combined; each connector retains its own credentials and trust
-boundary. Mongo still has **no user authentication** and remains loopback-only.
+boundary. This composed Mongo path still has **no user authentication** and remains loopback-only.
 HTTP/admin remain loopback-only too; SQLite-remote network use still requires a
 separately secured HTTPS proxy. SQL tables and BSON collections remain distinct.
 
@@ -1473,10 +1566,11 @@ are not one atomic system snapshot. The schema gate reflects **detected** catalo
 or shard corruption as `schema_degraded` but does not identify the failed file
 or probe for new on-disk corruption; global-index health is a separate engine
 surface. `ping`/discovery can succeed when document support is disabled. Security
-is explicitly `anonymous_loopback` for plaintext or `anonymous_tls_loopback` for
-the standalone Rust TLS API. Mongo authentication is not implemented, local
-processes must be trusted, and non-loopback binding still fails. This is
-not readiness for exposing Mongo to a network. No admin endpoint, Python readiness
+is explicitly `anonymous_loopback` for plaintext, `anonymous_tls_loopback` for
+ordinary-root TLS, or `authenticated_tls` for the opt-in secured standalone Rust
+listener. Anonymous modes still require trusted local processes and reject
+non-loopback binding. These observations alone do not certify network deployment
+or credential-store health. No admin endpoint, Python readiness
 API, automatic repair or security-policy change is added.
 
 The raw-wire resource-churn gate repeatedly fills all 32 shared native/wire cursor

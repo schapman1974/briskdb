@@ -3,6 +3,9 @@ use briskdb::protocol::mongo::{MongoResourceLimits, MongoSecurityMode, MongoTlsC
 use std::{fs, path::Path, sync::Arc};
 use tokio_rustls::{TlsConnector, rustls};
 
+#[cfg(all(feature = "auth-scram", unix))]
+#[path = "tls/authentication.rs"]
+mod authentication;
 #[path = "tls/reload.rs"]
 mod reload;
 
