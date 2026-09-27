@@ -1790,7 +1790,41 @@ input; rerun the resulting artifact with `cargo +nightly fuzz run
 document_update <minimized-artifact-path>`. Promote confirmed minimal failures
 to deterministic native regressions. Property tests use proptest's shrinking and
 failure-seed persistence. These mechanisms do not substitute for minimizing
-cross-implementation differential mismatches, which remains a separate gate.
+cross-implementation differential mismatches; the matcher reducer below adds
+that support for filters, while other differential surfaces remain separate work.
+
+### Matcher differential reproducers
+
+The full source-locked matcher matrix now saves a confirmed mismatch under
+`target/mongo-parity/reproducers` (override with `BRISKDB_MONGO_REPRO_DIR`). It keeps
+the original before trying BSON field/array deletions. Every probe recomputes the
+reference result with the isolated, source-hash-checked interpreter and must retain
+the same reference/candidate outcome pair; stale expected values are never reused.
+The search admits up to 128 probes within a 20-second admission budget; an
+in-flight worker has a separate 10-second deadline. The diagnostic input limit is
+64 KiB. A confirmed original remains available if
+reduction fails or becomes unstable. Budget exhaustion is recorded explicitly;
+deletion reduction is not a claim of globally minimal input.
+
+Artifacts retain exact BSON, source commit, original candidate outcome and probe
+metadata. They are atomically published without overwriting existing files, and
+the existing CI parity-artifact upload retains them on failure. They contain input
+data; review before sharing. The unchanged full matrix remains the conformance
+gate. To replay one saved case after a fix:
+
+```sh
+BRISKDB_MONGO_ORACLE_PYTHON=/path/to/locked-oracle/bin/python \
+BRISKDB_MONGO_REPLAY_BSON=/path/to/matcher-reproducer.bson \
+cargo test --locked --all-features --test mongo_matcher_reproducer \
+  replay_saved_matcher_case -- --exact --ignored --nocapture
+```
+
+Replay refreshes the reference result, rejects changed expectations and checks
+the current native matcher. Passing one saved case is diagnostic evidence, not
+a full-matrix pass. A separate source-backed fault-injection self-test deliberately
+uses a wrong callback to exercise reduction, stale-expectation rejection, actual
+subprocess replay, original retention and non-overwrite behavior; it does not
+claim a real BriskDB mismatch.
 
 The existing CI workflow also has an opt-in `mongo_fuzz` dispatch input. Once CI
 is re-enabled, selecting it runs every declared fuzz target with AddressSanitizer
