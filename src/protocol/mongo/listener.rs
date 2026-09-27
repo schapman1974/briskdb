@@ -31,6 +31,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 mod transport;
 use transport::Transport;
+#[cfg(feature = "mongo-tls")]
+mod tls_reload;
 
 #[cfg(test)]
 mod tests;
@@ -50,6 +52,8 @@ pub struct MongoServer {
     engine_readiness: crate::core::EngineReadinessProbe,
     document_support: crate::DocumentSupport,
     security: super::MongoSecurityMode,
+    #[cfg(feature = "mongo-tls")]
+    tls: Option<super::tls::ReloadableTls>,
 }
 
 impl MongoServer {
@@ -99,8 +103,7 @@ impl MongoServer {
         if database.engine().state() != EngineState::Running {
             return Err(invalid("Mongo listener requires a running engine"));
         }
-        let handshake_timeout = config.handshake_timeout();
-        let acceptor = tokio::task::spawn_blocking(move || config.load())
+        let identity = tokio::task::spawn_blocking(move || config.load())
             .await
             .map_err(|_| io::Error::other("Mongo TLS configuration worker failed"))??;
         let listener = TcpListener::bind(address).await?;
@@ -109,10 +112,7 @@ impl MongoServer {
             listener,
             CancellationToken::new(),
             limits,
-            Transport::Tls {
-                acceptor,
-                handshake_timeout,
-            },
+            Transport::Tls(super::tls::ReloadableTls::new(identity)),
         )
     }
 
@@ -155,6 +155,8 @@ impl MongoServer {
         let health = Arc::new(readiness::ListenerHealth::default());
         let guard = health.guard();
         let security = transport.security();
+        #[cfg(feature = "mongo-tls")]
+        let tls = transport.tls();
         let run = run(
             listener,
             database.clone(),
@@ -183,6 +185,8 @@ impl MongoServer {
             engine_readiness: database.engine().readiness_probe(),
             document_support: database.document_support(),
             security,
+            #[cfg(feature = "mongo-tls")]
+            tls,
         })
     }
 
@@ -298,7 +302,8 @@ async fn run(
                 let metrics = Arc::clone(&metrics);
                 let admission = metrics.admit();
                 let clients = Arc::clone(&clients);
-                let transport = transport.clone();
+                // Freeze identity at admission, before spawning/polling a handshake.
+                let transport = transport.snapshot();
                 connections.spawn(async move {
                     // This slot remains held while the blocking parser is awaited,
                     // including during shutdown; malformed clients cannot grow the queue.

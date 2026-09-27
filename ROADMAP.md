@@ -433,7 +433,11 @@ database under differential/property tests.
   of PostgreSQL. Stock sync/async PyMongo validates certificates and performs
   encrypted CRUD; native tests cover hostname/trust failures, plaintext rejection,
   bounded handshakes, slot recovery and shutdown. Mongo remains anonymous and
-  refuses non-loopback binds. Mongo reload, daemon/Python Mongo TLS configuration,
+  refuses non-loopback binds. Standalone Mongo reload now atomically replaces
+  the certificate/key and handshake budget without rebinding, preserving each
+  admitted socket's original generation. Invalid/cancelled/expired reloads cannot
+  publish; shutdown and engine lifecycle are checked, with real verified PyMongo
+  rotation and native race/resource coverage. Daemon/Python Mongo TLS configuration,
   CLI reload, other listeners and immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.

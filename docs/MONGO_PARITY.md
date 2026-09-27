@@ -717,7 +717,7 @@ processes must still be trusted, all non-loopback binds are rejected before
 reading identity files, and public proxying remains unsafe. The daemon,
 `AttachedServer`, Python `db.serve()` and managed PyMongo patch hosts still use
 their existing plaintext loopback transport; they do not yet expose Mongo TLS.
-Mongo authentication, roles, TLS reload and remote binding remain separate work.
+Mongo authentication, roles and remote binding remain separate work.
 
 Certificate/key files use the shared bounded, opened-descriptor-validated loader.
 On Unix, private keys must not be group-writable or accessible by others; `0600`
@@ -729,12 +729,44 @@ same finite socket slots, allocate no command session/client metadata, and are
 cancelled during shutdown. TLS failures use existing transport failure counters.
 Readiness reports `anonymous_tls_loopback`, never authenticated network readiness.
 
+An already-encrypted, running standalone listener can explicitly reload its
+certificate, private key and handshake budget together, without rebinding:
+
+```rust,ignore
+mongo.reload_tls(MongoTlsConfig::new("./next.crt", "./next.key")).await?;
+// Optional cancellation/deadline uses the ordinary host request controls.
+mongo.reload_tls_with_context(
+    MongoTlsConfig::new("./next.crt", "./next.key"),
+    briskdb::RequestContext::new().with_timeout(std::time::Duration::from_secs(5))?,
+).await?;
+```
+
+Prepare complete files before invoking reload; this is not a filesystem watcher
+or an atomic multi-file deployment mechanism. Validation/file I/O runs on a
+blocking worker, and invalid input or cancellation before publication preserves
+the previous identity. Cancellation/deadline is checked before loading, during
+preparation and immediately before publication (`Interrupted` / `TimedOut` I/O
+errors). A cancelled worker may finish loading but cannot publish. Concurrent
+successful reloads publish in completion order. Query result limits do not apply.
+Closing/stopped/failed listeners and stopped engines reject reload; plaintext
+listeners cannot be upgraded implicitly.
+
+Every socket freezes one complete identity **at admission**, before the TLS
+handshake task is polled. New admissions use the replacement, while established
+sockets and pending handshakes retain their old certificate and timeout. This is
+not immediate revocation; arrange connection draining separately if required.
+Cancellation after publication cannot undo the replacement. No Mongo credentials,
+roles, bind permissions or other listener configuration changes with this API.
+
 Run the real-driver gate explicitly with pinned PyMongo 4.17.0 installed:
 
 ```sh
 BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
   --features mongo-tls --test mongo_wire \
   tls::real_pymongo_sync_async_tls_validation_and_crud -- --ignored --exact
+BRISKDB_MONGO_WIRE_PYTHON=python3 cargo test --locked --no-default-features \
+  --features mongo-tls --test mongo_wire \
+  tls::reload::real_pymongo_uses_rotated_certificate_with_full_validation -- --ignored --exact
 ```
 
 ### Bounded driver metadata
