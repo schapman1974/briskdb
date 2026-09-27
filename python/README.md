@@ -332,6 +332,45 @@ Closing a server leaves the database usable; closing the database first closes
 all of its attached servers. The asyncio API provides `await db.serve()` and
 an `AsyncServer` context manager with the same lifecycle.
 
+### Encrypt and reload HTTP/admin (unreleased)
+
+Current main can encrypt either HTTP plane independently, including SQLite-remote:
+
+```python
+import http.client
+import ssl
+
+with briskdb.open("./data") as db:
+    with db.serve(http_tls_cert="data.crt", http_tls_key="data.key",
+                  admin_tls_cert="admin.crt", admin_tls_key="admin.key") as server:
+        trust = ssl.create_default_context(cafile="data-ca.crt")
+        client = http.client.HTTPSConnection(
+            "localhost", int(server.http_address.rsplit(":", 1)[1]), context=trust)
+        client.request("GET", "/v1")
+        print(client.getresponse().read())
+        client.close()
+        server.reload_http_tls(tls_cert="next-data.crt", tls_key="next-data.key")
+        server.reload_admin_tls(tls_cert="next-admin.crt", tls_key="next-admin.key")
+```
+
+Use a certificate-matching hostname and trusted CA; never disable verification.
+Certificate/key arguments accept strings or `PathLike`. Each pair must be complete;
+admin TLS requires an enabled admin address. Defaults stay plaintext, and both
+addresses remain **loopback-only**: TLS authenticates the server, not HTTP callers.
+It does not change routes, cookies, or SQLite-remote bearer/table checks. The
+ordinary `sqlite3` addon continues to verify HTTPS using platform trust settings.
+
+`AsyncDatabase.serve()` accepts the same keywords. Await
+`AsyncServer.reload_http_tls(...)` and `reload_admin_tls(...)`; both sync/async
+reload methods accept `timeout_ms=` and `cancellation=`. Controls apply while
+queued and preparing, with a final check before publication. Failed/cancelled
+preparation keeps the active identity; admitted handshakes/connections keep their
+old identity after success. Async task cancellation signals the native token;
+cancellation cannot undo a completed publication. Plaintext/disabled listeners
+cannot be upgraded with reload. This is not session revocation or authentication.
+HTTP/1.1, finite handshakes and per-plane socket bounds follow the
+[shared HTTP listener contract](../docs/HTTP_LISTENERS.md).
+
 ### Reload PostgreSQL security
 
 Current main (unreleased) can reload an **already-secure** attached server without

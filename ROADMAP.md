@@ -462,8 +462,10 @@ database under differential/property tests.
   snapshots, cancellation/deadline and engine-lifecycle guards; failed preparation
   preserves active identities. Daemon HTTP/admin certificate/key options now share
   the same startup preflight and opt-in SIGHUP complete-candidate validation as
-  PostgreSQL/Mongo. HTTP Python configuration, authorization and immediate session
-  revocation remain separate work.
+  PostgreSQL/Mongo. Python sync/async hosts expose independent HTTP/admin TLS pairs
+  and guarded reload, including typed queued cancellation and verified HTTPS
+  SQLite-remote access. Authorization and immediate session revocation remain
+  separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.
 - [ ] Coordinated online backup using SQLite backup APIs plus a manifest-defined

@@ -34,7 +34,9 @@ use briskdb::{
     EngineOptions, EngineState, EngineStatus, PreparedStatementLimits, RequestContext,
     ResultLimits, SessionState, Statement, TransactionExecution, Value,
     protocol::{mongo::MongoTlsConfig, postgres::SecurityConfig as PostgresSecurityConfig},
-    server::{AttachedServer, AttachedServerOptions, ListenerAddresses, ListenerConfig},
+    server::{
+        AttachedServer, AttachedServerOptions, HttpTlsConfig, ListenerAddresses, ListenerConfig,
+    },
 };
 use pyo3::{
     prelude::*,
@@ -881,6 +883,10 @@ impl Database {
         mongo = None,
         mongo_tls_cert = None,
         mongo_tls_key = None,
+        http_tls_cert = None,
+        http_tls_key = None,
+        admin_tls_cert = None,
+        admin_tls_key = None,
         postgres_tls_cert = None,
         postgres_tls_key = None,
         postgres_user = "briskdb",
@@ -900,6 +906,10 @@ impl Database {
         mongo: Option<&str>,
         mongo_tls_cert: Option<PathBuf>,
         mongo_tls_key: Option<PathBuf>,
+        http_tls_cert: Option<PathBuf>,
+        http_tls_key: Option<PathBuf>,
+        admin_tls_cert: Option<PathBuf>,
+        admin_tls_key: Option<PathBuf>,
         postgres_tls_cert: Option<PathBuf>,
         postgres_tls_key: Option<PathBuf>,
         postgres_user: &str,
@@ -980,6 +990,13 @@ impl Database {
                 )));
             }
         }
+        let http_tls = python_http_tls(http_tls_cert, http_tls_key, "http", true)?;
+        let admin_tls = python_http_tls(
+            admin_tls_cert,
+            admin_tls_key,
+            "admin",
+            admin_listen.is_some(),
+        )?;
         let postgres_security = match (postgres_tls_cert, postgres_tls_key, postgres_password_file)
         {
             (None, None, None) => None,
@@ -1013,6 +1030,12 @@ impl Database {
                 postgres_listen,
             };
             let mut options = AttachedServerOptions::new();
+            if let Some(identity) = http_tls {
+                options = options.with_http_tls(identity);
+            }
+            if let Some(identity) = admin_tls {
+                options = options.with_admin_tls(identity);
+            }
             if let Some(remote) = remote {
                 options = options.with_sqlite_remote(remote);
             }
@@ -1127,8 +1150,62 @@ struct Server {
     shared: Arc<ServerShared>,
 }
 
+fn python_http_tls(
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+    label: &'static str,
+    enabled: bool,
+) -> PyResult<Option<HttpTlsConfig>> {
+    match (certificate, key) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(key)) if enabled => Ok(Some(HttpTlsConfig::new(certificate, key))),
+        (Some(_), Some(_)) => Err(crate::error::invalid_value(format!(
+            "{label}_tls_cert and {label}_tls_key require the enabled {label} listener"
+        ))),
+        _ => Err(crate::error::invalid_value(format!(
+            "{label}_tls_cert and {label}_tls_key must be set together"
+        ))),
+    }
+}
+
 #[pymethods]
 impl Server {
+    /// Reload already-encrypted data HTTP; this does not change authorization.
+    #[pyo3(signature = (*, tls_cert, tls_key, timeout_ms=None, cancellation=None))]
+    fn reload_http_tls(
+        &self,
+        py: Python<'_>,
+        tls_cert: PathBuf,
+        tls_key: PathBuf,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<()> {
+        let config = HttpTlsConfig::new(tls_cert, tls_key);
+        let context = request_context(timeout_ms, cancellation)?;
+        let shared = Arc::clone(&self.shared);
+        run_native(py, move || {
+            shared.reload_http_tls_native(config, context, false)
+        })
+    }
+
+    /// Reload only the already-encrypted administration plane's identity.
+    #[pyo3(signature = (*, tls_cert, tls_key, timeout_ms=None, cancellation=None))]
+    fn reload_admin_tls(
+        &self,
+        py: Python<'_>,
+        tls_cert: PathBuf,
+        tls_key: PathBuf,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<()> {
+        let config = HttpTlsConfig::new(tls_cert, tls_key);
+        let context = request_context(timeout_ms, cancellation)?;
+        let shared = Arc::clone(&self.shared);
+        run_native(py, move || {
+            shared.reload_http_tls_native(config, context, true)
+        })
+    }
+
     /// Reload already-encrypted Mongo; admitted sockets retain their old identity.
     #[pyo3(signature = (*, tls_cert, tls_key, timeout_ms=None, cancellation=None))]
     fn reload_mongo_tls(

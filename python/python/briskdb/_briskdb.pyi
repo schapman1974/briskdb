@@ -352,6 +352,10 @@ class Database:
         mongo: Optional[str] = None,
         mongo_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         mongo_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        http_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        http_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        admin_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        admin_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
@@ -365,6 +369,14 @@ class Database:
     def __exit__(self, *exception: object) -> bool: ...
 
 class Server:
+    def reload_http_tls(
+        self, *, tls_cert: Union[str, PathLike[str]], tls_key: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+    ) -> None: ...
+    def reload_admin_tls(
+        self, *, tls_cert: Union[str, PathLike[str]], tls_key: Union[str, PathLike[str]],
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+    ) -> None: ...
     def reload_mongo_tls(
         self, *, tls_cert: Union[str, PathLike[str]], tls_key: Union[str, PathLike[str]],
         timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,

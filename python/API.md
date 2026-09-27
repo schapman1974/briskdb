@@ -521,7 +521,7 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
 
 ## Attached listeners
 
-- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, mongo=None, mongo_tls_cert=None, mongo_tls_key=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None, sqlite_remote_token=None, sqlite_remote_tables=None, sqlite_remote_routing_key=None) -> Server`; pass `admin=None` to disable administration
+- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, mongo=None, mongo_tls_cert=None, mongo_tls_key=None, http_tls_cert=None, http_tls_key=None, admin_tls_cert=None, admin_tls_key=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None, sqlite_remote_token=None, sqlite_remote_tables=None, sqlite_remote_routing_key=None) -> Server`; pass `admin=None` to disable administration
 - `await async_db.serve(...) -> AsyncServer`
 - `Server.data_address` reports the data address and `Server.http_address`
   remains its compatibility alias. `.admin_address`, `.postgres_address`, and `.mongo_address`
@@ -546,6 +546,12 @@ and aggregation, `estimated_document_count()`, and aggregation-backed
   `OperationalError`. Each admitted socket, including a pending handshake,
   retains its original identity. Mongo remains anonymous and loopback-only;
   PostgreSQL's identity is independent.
+- Unreleased: `Server.reload_http_tls(*, tls_cert, tls_key, timeout_ms=None,
+  cancellation=None) -> None` and `reload_admin_tls(...)` replace only the
+  selected already-encrypted HTTP plane. Await the same `AsyncServer` methods.
+  The queued/preparation controls, typed errors and retained-admission semantics
+  above apply. HTTP remains loopback-only; no plaintext upgrade, authentication,
+  cross-plane atomic rotation or revocation is implied.
 - Database close first drains every attached server, then stops the engine.
 
 Data HTTP, administration HTTP, and unauthenticated PostgreSQL accept only
@@ -557,6 +563,15 @@ permit a non-loopback PostgreSQL address. This is single-identity
 authentication, not roles or authorization. The PostgreSQL endpoint supports
 BriskDB's documented bounded SQL subset. See the repository's
 [HTTP listener contract](../docs/HTTP_LISTENERS.md).
+
+Unreleased HTTP pairs `http_tls_cert`/`http_tls_key` and
+`admin_tls_cert`/`admin_tls_key` accept `str` or `PathLike[str]`. Partial pairs or
+admin TLS with `admin=None` raise `InvalidArgumentError`. Invalid identities or
+bind failure raise `OperationalError`, leaving the borrowed database usable.
+Preparation uses the bounded shared loader before any sockets bind. Both default
+to plaintext; TLS does not change numeric loopback enforcement or HTTP caller
+authorization. Clients must trust the issuing CA and verify the hostname. See
+the [HTTP TLS example](README.md#encrypt-and-reload-httpadmin-unreleased).
 
 `mongo="127.0.0.1:0"` enables the shared Mongo subset and reports the OS-assigned
 port through `mongo_address`. It requires opening with `documents=True`; it
