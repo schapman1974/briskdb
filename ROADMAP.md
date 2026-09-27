@@ -437,7 +437,10 @@ database under differential/property tests.
   the certificate/key and handshake budget without rebinding, preserving each
   admitted socket's original generation. Invalid/cancelled/expired reloads cannot
   publish; shutdown and engine lifecycle are checked, with real verified PyMongo
-  rotation and native race/resource coverage. Daemon/Python Mongo TLS configuration,
+  rotation and native race/resource coverage. Rust `AttachedServerOptions` composes
+  Mongo TLS, PostgreSQL TLS/SCRAM and SQLite-remote configuration with preflight,
+  off-runtime security preparation and all-socket binding before serving. Existing
+  constructors remain compatible. Daemon/Python Mongo TLS configuration,
   CLI reload, other listeners and immediate session revocation remain separate work.
 - [ ] Structured logs, metrics, traces, slow-query log, pool saturation, shard
   skew, WAL size, migration state, and readiness reasons.

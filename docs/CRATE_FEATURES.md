@@ -39,7 +39,7 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 | `experimental-vtab` | Sharded virtual-table prototype | Experimental |
 | `documents` | BSON values and codec, catalog/storage, TinyMongo-ready semantic keys, protocol-neutral document commands, and their `BriskDb`/`BriskSession` facade; also selects `embedded` | Experimental document engine; no listener selected |
 | `mongo` | Host-owned Mongo wire listener and document commands; selects `documents` | Experimental, anonymous loopback only |
-| `mongo-tls` | Standalone Rust Mongo listener with verified server identity, bounded TLS handshakes and explicit atomic identity reload; selects `mongo` and `transport-tls`, not PostgreSQL | Unreleased; encrypted but anonymous loopback only |
+| `mongo-tls` | Rust Mongo TLS with verified server identity, bounded handshakes and standalone atomic identity reload; combines with `listeners` for composed attached startup; selects `mongo` and `transport-tls`, not PostgreSQL | Unreleased; encrypted but anonymous loopback only |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Compatibility alias for the secure `postgres` surface | Alpha-supported; selected by `listeners` |
 | `transport-tls` | Internal shared certificate/key loading with descriptor validation, bounded secret buffers and caller-selected ALPN | Foundation selected by `postgres` and `mongo-tls`; does not enable a listener or Mongo authentication |

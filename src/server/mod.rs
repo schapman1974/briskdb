@@ -2,6 +2,9 @@
 
 #[cfg(feature = "mongo")]
 mod mongo;
+mod options;
+pub use options::AttachedServerOptions;
+use options::PreparedOptions;
 #[cfg(test)]
 mod security_reload_tests;
 
@@ -94,7 +97,16 @@ struct BoundListeners {
     admin: Option<tokio::net::TcpListener>,
     postgres: Option<tokio::net::TcpListener>,
     #[cfg(feature = "mongo")]
-    mongo: Option<(tokio::net::TcpListener, BriskDb)>,
+    mongo: Option<BoundMongo>,
+}
+
+#[cfg(feature = "mongo")]
+#[derive(Debug)]
+struct BoundMongo {
+    listener: tokio::net::TcpListener,
+    database: BriskDb,
+    #[cfg(feature = "mongo-tls")]
+    tls: Option<crate::protocol::mongo::ReloadableTls>,
 }
 
 impl BoundListeners {
@@ -149,7 +161,7 @@ impl BoundListeners {
             mongo: self
                 .mongo
                 .as_ref()
-                .map(|(listener, _)| listener.local_addr())
+                .map(|mongo| mongo.listener.local_addr())
                 .transpose()
                 .context("failed to read the bound Mongo listener address")?,
         })
@@ -196,7 +208,12 @@ async fn bind_configured_listeners(
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .with_context(|| format!("failed to bind Mongo listener {address}"))?;
-        listeners.mongo = Some((listener, database.clone()));
+        listeners.mongo = Some(BoundMongo {
+            listener,
+            database: database.clone(),
+            #[cfg(feature = "mongo-tls")]
+            tls: None,
+        });
         return Ok(listeners);
     }
     #[cfg(not(feature = "mongo"))]
@@ -442,17 +459,14 @@ impl AttachedServer {
         security: postgres::SecurityConfig,
         mongo_address: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
-        validate_listener_addresses(&config, true)?;
-        validate_optional_mongo(&config, mongo_address)?;
-        let security = security
-            .load()
-            .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-        Self::start_with_security(
+        Self::start_with_options(
             database,
             config,
-            Some(postgres::ReloadableSecurity::new(security)),
-            None,
-            mongo_address,
+            AttachedServerOptions {
+                postgres_security: Some(security),
+                mongo_address,
+                ..AttachedServerOptions::default()
+            },
         )
         .await
     }
@@ -486,10 +500,16 @@ impl AttachedServer {
         remote: crate::protocol::sqlite_remote::Config,
         mongo_address: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
-        validate_optional_mongo(&config, mongo_address)?;
-        let router = crate::protocol::sqlite_remote::router(database.engine().clone(), remote)
-            .map_err(anyhow::Error::msg)?;
-        Self::start_with_security(database, config, None, Some(router), mongo_address).await
+        Self::start_with_options(
+            database,
+            config,
+            AttachedServerOptions {
+                sqlite_remote: Some(remote),
+                mongo_address,
+                ..AttachedServerOptions::default()
+            },
+        )
+        .await
     }
 
     async fn start_with_security(
@@ -499,8 +519,42 @@ impl AttachedServer {
         data_router: Option<axum::Router>,
         mongo_address: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
+        Self::start_prepared(
+            database,
+            config,
+            PreparedOptions {
+                postgres: security,
+                data_router,
+                mongo_address,
+                #[cfg(feature = "mongo-tls")]
+                mongo_tls: None,
+            },
+        )
+        .await
+    }
+
+    async fn start_prepared(
+        database: &BriskDb,
+        config: ListenerConfig,
+        prepared: PreparedOptions,
+    ) -> anyhow::Result<Self> {
+        let PreparedOptions {
+            postgres: security,
+            data_router,
+            mongo_address,
+            #[cfg(feature = "mongo-tls")]
+            mongo_tls,
+        } = prepared;
         validate_listener_addresses(&config, security.is_some())?;
         let listeners = bind_configured_listeners(&config, database, mongo_address).await?;
+        #[cfg(feature = "mongo-tls")]
+        let listeners = {
+            let mut listeners = listeners;
+            if let Some(mongo) = &mut listeners.mongo {
+                mongo.tls = mongo_tls;
+            }
+            listeners
+        };
         let addresses = listeners.addresses()?;
         let engine = database.engine().clone();
         let postgres_security = security.clone();
@@ -665,7 +719,7 @@ fn check_security_reload_context(context: &crate::RequestContext) -> crate::Engi
     Ok(())
 }
 
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", test))]
 async fn serve_listeners_with_shutdown<F>(
     listeners: BoundListeners,
     engine: Engine,
@@ -752,16 +806,35 @@ where
     #[cfg(feature = "mongo")]
     let mut listeners = listeners;
     #[cfg(feature = "mongo")]
-    if let Some((listener, database)) = listeners.mongo.take() {
+    if let Some(mongo) = listeners.mongo.take() {
+        let BoundMongo {
+            listener,
+            database,
+            #[cfg(feature = "mongo-tls")]
+            tls,
+        } = mongo;
         let shutdown = crate::CancellationToken::new();
         // A listener cancels its own token even on failure. Keep the request
         // marker separate so an unexpected Mongo exit cannot look intentional.
         let requested = crate::CancellationToken::new();
-        let mongo = match crate::protocol::mongo::MongoServer::from_bound(
-            &database,
-            listener,
-            shutdown.clone(),
-        ) {
+        #[cfg(feature = "mongo-tls")]
+        let started = match tls {
+            Some(identity) => crate::protocol::mongo::MongoServer::from_bound_tls(
+                &database,
+                listener,
+                shutdown.clone(),
+                identity,
+            ),
+            None => crate::protocol::mongo::MongoServer::from_bound(
+                &database,
+                listener,
+                shutdown.clone(),
+            ),
+        };
+        #[cfg(not(feature = "mongo-tls"))]
+        let started =
+            crate::protocol::mongo::MongoServer::from_bound(&database, listener, shutdown.clone());
+        let mongo = match started {
             Ok(mongo) => mongo,
             Err(error) => {
                 if engine_shutdown == EngineShutdown::Owned {
@@ -1302,6 +1375,7 @@ fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use crate::EngineOptions;
     use axum::body::to_bytes;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1440,6 +1514,7 @@ mod tests {
         .into_bytes()
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn default_entry_point_validates_before_database_or_listener_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1460,6 +1535,7 @@ mod tests {
         assert!(!data_dir.exists());
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn non_loopback_postgres_activation_fails_before_database_or_listener_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1482,6 +1558,7 @@ mod tests {
         assert!(!data_dir.exists());
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn non_loopback_http_activation_fails_before_database_or_listener_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1504,6 +1581,7 @@ mod tests {
         assert!(!data_dir.exists());
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn non_loopback_admin_activation_fails_before_database_or_listener_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1526,6 +1604,7 @@ mod tests {
         assert!(!data_dir.exists());
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn duplicate_fixed_http_addresses_fail_before_database_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1592,6 +1671,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn aggregate_pool_limit_fails_before_database_or_listener_startup() {
         let temp = tempfile::tempdir().unwrap();
@@ -1831,6 +1911,7 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn http_bind_failure_precedes_postgres_bind_and_cleans_up_the_engine() {
         let temp = tempfile::tempdir().unwrap();
@@ -1855,6 +1936,7 @@ mod tests {
         reopened.shutdown().await.unwrap();
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn postgres_bind_failure_releases_http_listener_and_engine() {
         let temp = tempfile::tempdir().unwrap();

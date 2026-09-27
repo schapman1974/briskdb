@@ -365,7 +365,7 @@ the server leaves the database running; closing the database drains its servers.
 Mongo remains loopback-only even alongside TLS/SCRAM PostgreSQL or authenticated
 SQLite remote. Their credentials do not secure the Mongo port.
 
-Unreleased Rust hosts can also opt into an encrypted standalone Mongo listener
+Unreleased Rust hosts can also opt into an encrypted standalone or attached Mongo listener
 with the `mongo-tls` feature. See the [TLS example](docs/MONGO_PARITY.md#encrypted-rust-mongo-listener).
 It remains anonymous and loopback-only; the daemon and Python hosting APIs do
 not yet expose Mongo TLS configuration.
