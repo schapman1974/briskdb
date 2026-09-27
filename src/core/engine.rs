@@ -540,6 +540,15 @@ pub struct Engine {
 pub(crate) struct EngineReadinessProbe(std::sync::Weak<EngineInner>);
 
 #[cfg(any(feature = "mongo", feature = "listeners"))]
+impl std::fmt::Debug for EngineReadinessProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineReadinessProbe")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(feature = "mongo", feature = "listeners"))]
 impl EngineReadinessProbe {
     pub(crate) fn snapshot(&self) -> Option<ReadinessSnapshot> {
         self.0.upgrade().map(|inner| Engine { inner }.readiness())

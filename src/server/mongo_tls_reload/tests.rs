@@ -240,29 +240,13 @@ async fn closed_handle_is_non_owning_and_plaintext_cannot_be_upgraded() {
     server.close().await.unwrap();
     db.close().await.unwrap();
     drop(db);
-    assert!(
-        server
-            .mongo_tls
-            .as_ref()
-            .unwrap()
-            .engine
-            .snapshot()
-            .is_none()
-    );
+    assert!(server.engine_readiness.snapshot().is_none());
     let reopened = BriskDb::builder(root.path())
         .with_document_support(crate::DocumentSupport::Enabled)
         .open()
         .await
         .unwrap();
     assert!(server.reload_mongo_tls(config).await.is_err());
-    assert!(
-        server
-            .mongo_tls
-            .as_ref()
-            .unwrap()
-            .engine
-            .snapshot()
-            .is_none()
-    );
+    assert!(server.engine_readiness.snapshot().is_none());
     reopened.close().await.unwrap();
 }

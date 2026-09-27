@@ -43,6 +43,74 @@ async fn attached(db: &BriskDb, config: postgres::SecurityConfig) -> AttachedSer
 }
 
 #[tokio::test]
+async fn postgres_reload_rejects_engine_exit_before_and_during_preparation() {
+    for stop_before_preparation in [true, false] {
+        for fully_close in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let (_secrets, config) = security_files();
+            let db = BriskDb::builder(data.path())
+                .with_shard_count(2)
+                .open()
+                .await
+                .unwrap();
+            let mut server = attached(&db, config.clone()).await;
+            let original = server.postgres_security.as_ref().unwrap().snapshot();
+            let prepared = std::sync::atomic::AtomicBool::new(false);
+            let stop = async {
+                if fully_close {
+                    db.close().await.unwrap();
+                } else {
+                    db.begin_close();
+                }
+            };
+            let result = if stop_before_preparation {
+                stop.await;
+                server
+                    .reload_postgres_security_with(RequestContext::new(), async {
+                        prepared.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(config.load().unwrap())
+                    })
+                    .await
+            } else {
+                let loaded = config.load().unwrap();
+                let (release, ready) = oneshot::channel();
+                let mut operation = Box::pin(server.reload_postgres_security_with(
+                    RequestContext::new(),
+                    async {
+                        ready.await.unwrap();
+                        Ok(loaded)
+                    },
+                ));
+                assert!(futures::poll!(operation.as_mut()).is_pending());
+                stop.await;
+                release.send(()).unwrap();
+                operation.await
+            };
+            assert!(
+                result.is_err(),
+                "a draining/closed borrowed engine must reject PostgreSQL reload"
+            );
+            assert!(
+                !prepared.load(std::sync::atomic::Ordering::SeqCst),
+                "preflight must precede file I/O and derivation"
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                &server.postgres_security.as_ref().unwrap().snapshot()
+            ));
+            server.close().await.unwrap();
+            db.close().await.unwrap();
+            drop(db);
+            assert!(server.engine_readiness.snapshot().is_none());
+            let reopened = BriskDb::builder(data.path()).open().await.unwrap();
+            assert!(server.reload_postgres_security(config).await.is_err());
+            assert!(server.engine_readiness.snapshot().is_none());
+            reopened.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn cancelled_reload_never_publishes_and_a_later_reload_succeeds() {
     let data = tempfile::tempdir().unwrap();
     let (_secrets, config) = security_files();

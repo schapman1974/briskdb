@@ -529,6 +529,7 @@ fn validate_listener_addresses(
 #[derive(Debug)]
 pub struct AttachedServer {
     addresses: ListenerAddresses,
+    engine_readiness: crate::core::EngineReadinessProbe,
     http_tls: http_tls::Target,
     postgres_security: Option<postgres::ReloadableSecurity>,
     #[cfg(feature = "mongo-tls")]
@@ -678,13 +679,13 @@ impl AttachedServer {
             anyhow::bail!("admin HTTP TLS requires an enabled admin listener");
         }
         let mut listeners = bind_configured_listeners(&config, database, mongo_address).await?;
-        let http_tls_target =
-            http_tls::Target::new(http_tls.clone(), database.engine().readiness_probe());
+        let engine_readiness = database.engine().readiness_probe();
+        let http_tls_target = http_tls::Target::new(http_tls.clone());
         listeners.http_tls = http_tls;
         #[cfg(feature = "mongo-tls")]
-        let mongo_tls_target = mongo_tls.as_ref().map(|identity| {
-            mongo_tls_reload::Target::new(identity.clone(), database.engine().readiness_probe())
-        });
+        let mongo_tls_target = mongo_tls
+            .as_ref()
+            .map(|identity| mongo_tls_reload::Target::new(identity.clone()));
         #[cfg(feature = "mongo-tls")]
         let listeners = {
             let mut listeners = listeners;
@@ -713,6 +714,7 @@ impl AttachedServer {
         });
         Ok(Self {
             addresses,
+            engine_readiness,
             http_tls: http_tls_target,
             postgres_security,
             #[cfg(feature = "mongo-tls")]
@@ -732,7 +734,8 @@ impl AttachedServer {
 
     /// Reload PostgreSQL's certificate, key, user and password as one identity.
     ///
-    /// Only already-secure, running attached servers support this operation.
+    /// Only already-secure, running attached servers with a running borrowed
+    /// engine support this operation. Both lifecycles are rechecked before publication.
     /// File I/O and SCRAM derivation run on a blocking worker. Invalid input or
     /// cancellation before publication leaves the active identity unchanged.
     /// Newly accepted connections use the published identity; established and
@@ -774,7 +777,7 @@ impl AttachedServer {
             .postgres_security
             .as_ref()
             .context("PostgreSQL security reload requires an already-secure attached listener")?;
-        self.require_running_for_reload()?;
+        self.require_running_for_reload("PostgreSQL security")?;
         let cancellation = context.cancellation_token();
         let deadline = async {
             if let Some(deadline) = context.deadline() {
@@ -789,15 +792,21 @@ impl AttachedServer {
             _ = deadline => return Err(security_reload_timed_out("PostgreSQL security").into()),
             result = prepare => result?,
         };
-        self.require_running_for_reload()?;
+        self.require_running_for_reload("PostgreSQL security")?;
         check_security_reload_context(&context, "PostgreSQL security")?;
         target.replace(loaded);
         Ok(())
     }
 
-    fn require_running_for_reload(&self) -> anyhow::Result<()> {
-        if self.shutdown.is_none() || self.is_closed() {
-            anyhow::bail!("PostgreSQL security reload requires a running attached listener");
+    fn require_running_for_reload(&self, operation: &'static str) -> anyhow::Result<()> {
+        if self.shutdown.is_none()
+            || self.is_closed()
+            || self
+                .engine_readiness
+                .snapshot()
+                .is_none_or(|engine| engine.lifecycle_state() != crate::EngineState::Running)
+        {
+            anyhow::bail!("{operation} reload requires a running attached listener and engine");
         }
         Ok(())
     }

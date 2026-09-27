@@ -268,7 +268,7 @@ async fn lifecycle_exit_during_preparation_rejects_publication_without_owning_th
             let _ = server.close().await;
             db.close().await.unwrap();
             drop(db);
-            assert!(server.http_tls.engine.snapshot().is_none());
+            assert!(server.engine_readiness.snapshot().is_none());
             let reopened = crate::BriskDb::builder(root.path()).open().await.unwrap();
             assert!(
                 server
@@ -276,7 +276,7 @@ async fn lifecycle_exit_during_preparation_rejects_publication_without_owning_th
                     .await
                     .is_err()
             );
-            assert!(server.http_tls.engine.snapshot().is_none());
+            assert!(server.engine_readiness.snapshot().is_none());
             reopened.close().await.unwrap();
         }
     }

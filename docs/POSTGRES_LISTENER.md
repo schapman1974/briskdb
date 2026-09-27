@@ -62,6 +62,10 @@ The complete candidate is loaded and validated on a blocking worker before one
 publication replaces the active identity. Failed validation or cancellation
 before publication leaves the previous identity active. A listener that was
 started anonymously, is closing, or has stopped cannot be upgraded by reload.
+The borrowed database engine must also be running, both before preparation and
+immediately before publication. A draining/closed engine rejects the candidate
+without changing the active identity. The handle only weakly observes the engine;
+retaining a closed server does not keep the database alive or target a reopened one.
 A cancelled request may finish its blocking preparation work in the background,
 but cannot publish that candidate.
 Concurrent successful reloads publish in completion order; callers needing a
@@ -75,10 +79,12 @@ password proof and username checks. Established sessions and handshakes already
 admitted before publication retain that snapshot; new connections use the new
 one. **Reload is not immediate session revocation.** Stop/drain the listener if
 existing sessions must be removed. Safely publish complete secret files first;
-the loader does not snapshot several files atomically. No filesystem watcher,
-role catalog or HTTP security is added. Python's sync/async wrappers expose the same explicit reload with
+the loader does not snapshot several files atomically. No filesystem watcher or
+role catalog is added; this operation does not change other listener identities.
+Python's sync/async wrappers expose the same explicit reload with
 request controls; see the [Python example](../python/README.md#reload-postgresql-security).
-Issue #65 remains open for the other listener surfaces.
+HTTP/admin and Mongo have independent TLS startup/reload controls documented in
+[HTTP listeners](HTTP_LISTENERS.md) and [Mongo parity](MONGO_PARITY.md).
 
 ## Daemon security reload (unreleased)
 

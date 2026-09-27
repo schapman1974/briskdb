@@ -2,18 +2,17 @@
 
 use super::*;
 use crate::{
-    EngineState, RequestContext,
+    RequestContext,
     protocol::mongo::{LoadedTls, MongoTlsConfig, ReloadableTls},
 };
 
 pub(super) struct Target {
     identity: ReloadableTls,
-    engine: crate::core::EngineReadinessProbe,
 }
 
 impl Target {
-    pub(super) fn new(identity: ReloadableTls, engine: crate::core::EngineReadinessProbe) -> Self {
-        Self { identity, engine }
+    pub(super) fn new(identity: ReloadableTls) -> Self {
+        Self { identity }
     }
 }
 
@@ -63,7 +62,7 @@ impl AttachedServer {
             .mongo_tls
             .as_ref()
             .context("Mongo TLS reload requires an already-encrypted attached Mongo listener")?;
-        self.require_running_for_mongo_reload(target)?;
+        self.require_running_for_reload("Mongo TLS")?;
         let cancellation = context.cancellation_token();
         let deadline = async {
             if let Some(deadline) = context.deadline() {
@@ -78,22 +77,9 @@ impl AttachedServer {
             _ = deadline => return Err(security_reload_timed_out("Mongo TLS").into()),
             result = prepare => result?,
         };
-        self.require_running_for_mongo_reload(target)?;
+        self.require_running_for_reload("Mongo TLS")?;
         check_security_reload_context(&context, "Mongo TLS")?;
         target.identity.replace(loaded);
-        Ok(())
-    }
-
-    fn require_running_for_mongo_reload(&self, target: &Target) -> anyhow::Result<()> {
-        if self.shutdown.is_none()
-            || self.is_closed()
-            || target
-                .engine
-                .snapshot()
-                .is_none_or(|engine| engine.lifecycle_state() != EngineState::Running)
-        {
-            anyhow::bail!("Mongo TLS reload requires a running attached listener and engine");
-        }
         Ok(())
     }
 }
