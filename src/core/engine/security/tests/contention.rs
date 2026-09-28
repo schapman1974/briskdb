@@ -6,6 +6,8 @@ use crate::core::{
 };
 use std::sync::{atomic::AtomicUsize, mpsc};
 
+mod sqlite;
+
 struct HeldAuthority {
     release: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
