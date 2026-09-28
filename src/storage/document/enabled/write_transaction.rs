@@ -142,28 +142,30 @@ impl<'c> DocumentWriteTransaction<'c> {
         let mut check = || unique::check_active(self.control.as_deref(), &self.cancellation);
         for shard in 0..self.storage.shard_count() {
             check()?;
-            let peer;
-            let connection = if shard == self.shard {
-                self.connection
+            let validate = |connection: &Connection| {
+                unique::validate_on_shard(
+                    &self.storage,
+                    connection,
+                    self.collection,
+                    shard,
+                    self.shard,
+                    owner,
+                    entries,
+                    &mut check,
+                )
+            };
+            let result = if shard == self.shard {
+                let mut validate = validate;
+                validate(self.connection)
             } else {
-                peer = unique::open_peer(
+                unique::with_peer(
                     &self.storage,
                     shard,
                     self.control.clone(),
                     self.cancellation.clone(),
-                )?;
-                &peer
+                    validate,
+                )
             };
-            let result = unique::validate_on_shard(
-                &self.storage,
-                connection,
-                self.collection,
-                shard,
-                self.shard,
-                owner,
-                entries,
-                &mut check,
-            );
             unique::normalize(result, self.control.as_deref(), &self.cancellation)?;
         }
         check()

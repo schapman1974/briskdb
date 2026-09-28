@@ -186,6 +186,7 @@ mod enabled {
         collections::{HashMap, HashSet},
         sync::Arc,
     };
+    pub(in crate::storage) use unique::PeerReaders;
     pub(crate) use write_transaction::DocumentWriteTransaction;
 
     use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -5991,9 +5992,9 @@ mod enabled {
 }
 
 #[cfg(feature = "documents")]
-pub(super) use enabled::DocumentIndexPreparations;
-#[cfg(feature = "documents")]
 pub(super) use enabled::recover_or_validate;
+#[cfg(feature = "documents")]
+pub(super) use enabled::{DocumentIndexPreparations, PeerReaders};
 #[cfg(feature = "documents")]
 pub(crate) use enabled::{
     DocumentStorageRecord, DocumentWriteTransaction, MAX_DOCUMENT_SHARD_SCAN_RECORDS,

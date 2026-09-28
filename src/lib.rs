@@ -49,7 +49,7 @@ pub use core::{
     ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId, SessionState,
     ShardSummaryPredicateKind, ShardSummaryPrunedShard, ShardSummaryPruningReason,
     ShardSummaryRoutingFallback, ShardSummaryRoutingPlan, ShutdownReport, Statement,
-    TransactionExecution, UniqueNullSemantics, Value, WriteResult,
+    StorageProfile, TransactionExecution, UniqueNullSemantics, Value, WriteResult,
 };
 #[cfg(feature = "embedded")]
 pub use embedded::{

@@ -35,11 +35,12 @@ replace busy handlers, disable SQLite's native locks, or change transaction scop
 | --- | --- | --- | --- |
 | Local manifest, data/document shards, global-index store | WAL | FULL | Existing default, unchanged |
 | Local security store | DELETE | FULL, plus existing `fullfsync` | Existing opt-in authentication contract, unchanged |
-| NFS rollback candidates | DELETE or PERSIST | EXTRA | Internal tests only; not a selectable storage profile |
+| NFS rollback candidates | DELETE or PERSIST | EXTRA | Internal tests only; public NFS opens reject as unsupported |
 
-This refactor does not change manifest version 22 or authorize local/NFS mode
-conversion. Persisted profile selection, older-writer fencing, NFS-safe lifecycle
-and stale-client handling, checkpoint/backup integration, and independent-host
+Local roots remain on manifest version 22; ordinary opens never convert between
+local and NFS profiles. The reserved NFS format below establishes inspection and
+rejection fences only. Runtime journal integration, NFS-safe lifecycle and
+stale-client handling, checkpoint/backup integration, and independent-host
 qualification remain required by [#511](https://github.com/schapman1974/briskdb/issues/511)
 and the [NFS epic](https://github.com/schapman1974/briskdb/issues/509).
 Existing local initialization/recovery paths retain their journal behavior;
@@ -55,6 +56,51 @@ requires real EFS operation counts, latency and multi-host fault/recovery result
 neither candidate permits disabling sync or native locking. See SQLite's
 [journal modes](https://www.sqlite.org/pragma.html#pragma_journal_mode) and
 [synchronous policy](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
+### Explicit profile selection and reserved NFS format
+
+`StorageProfile::Local` is the Rust default. `EngineOptions::with_storage_profile`
+and `Database::open_with_profile` make the choice explicit. Python exposes
+`Config(storage_profile="local")`; the daemon accepts `--storage-profile local`
+or `BRISKDB_STORAGE_PROFILE=local` (an explicit flag wins over the environment).
+Only the exact names `local` and `nfs` are recognized. `nfs` currently returns
+`Unsupported` before database access/creation, including authenticated and
+embedded opens; it does not enable a network-filesystem deployment.
+
+`Database::detect_storage_profile(root)` validates an existing manifest through
+a read-only connection, without creating/migrating its format or changing its
+journal mode. A hot rollback journal may require a compatible recovery opener
+first. Detection describes the manifest, not the mount's NFS version or safety.
+
+Reserved NFS manifests use application ID `BRDB`, `user_version=23`, a
+`requires_manifest_version >= 23` fence, and semantic digest version 15 with
+domain `briskdb.manifest.semantic-root.v15\0`. They retain the v22 catalog and
+add this strict table, included in the semantic checksum:
+
+```sql
+CREATE TABLE briskdb_storage_profile (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+    storage_mode INTEGER NOT NULL CHECK (storage_mode > 0),
+    journal_mode INTEGER NOT NULL CHECK (journal_mode > 0),
+    synchronous INTEGER NOT NULL CHECK (synchronous > 0)
+) STRICT;
+```
+
+Exactly one row is required: singleton `1`, profile version `1`, storage mode
+`2` (NFS), journal `1` (DELETE) or `2` (PERSIST), synchronous `3` (EXTRA).
+Unsealed changes are corruption; correctly sealed unknown policy values are
+unsupported. Inspection rejects WAL without attempting conversion. Since
+PERSIST is connection-local, a read-only connection may report DELETE; the
+persisted policy remains authoritative for future compatible writers.
+
+Only test fixtures initialize this format today. The local migration plan stays
+at v22 and rejects v23 before managed manifest/shard mutations. Both the
+inspection plan's initializer and the v22-to-v23 migration slot reject
+conversion. SQLite's own hot-journal recovery is a separate safety boundary,
+not an old-client guarantee established by these local format tests. There is
+no supported in-place local/NFS conversion: retain a complete stopped-owner
+backup and use export/import into a new compatible root once NFS is enabled.
 
 ## Current format: version 22 (unreleased)
 

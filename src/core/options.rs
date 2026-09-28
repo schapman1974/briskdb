@@ -207,6 +207,7 @@ impl Default for PreparedStatementLimits {
 /// for one request through `RequestContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
+    storage_profile: super::StorageProfile,
     contention_policy: Option<super::ContentionPolicy>,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
@@ -240,6 +241,7 @@ impl EngineOptions {
         }
 
         Ok(Self {
+            storage_profile: super::StorageProfile::Local,
             contention_policy: None,
             connections_per_shard,
             queue_capacity_per_shard,
@@ -298,6 +300,19 @@ impl EngineOptions {
     /// Return the opt-in controlled-storage contention policy.
     pub const fn contention_policy(&self) -> Option<super::ContentionPolicy> {
         self.contention_policy
+    }
+
+    /// Return the requested storage contract, independently of wire protocols.
+    pub const fn storage_profile(&self) -> super::StorageProfile {
+        self.storage_profile
+    }
+
+    /// Select the storage contract without converting an existing root.
+    /// NFS is reserved but public opens fail closed until it is safe to enable.
+    #[must_use]
+    pub const fn with_storage_profile(mut self, profile: super::StorageProfile) -> Self {
+        self.storage_profile = profile;
+        self
     }
 
     /// Configure controlled SQLite locks, document collection fences, and
@@ -378,6 +393,7 @@ impl EngineOptions {
     /// This performs no filesystem access and allows builders and other hosts
     /// to reject a complete configuration before opening or creating storage.
     pub fn validate_for_shards(self, shard_count: u16) -> EngineResult<()> {
+        self.storage_profile.require_available()?;
         crate::storage::validate_shard_count(shard_count)?;
         self.worker_limit(shard_count).map(|_| ())
     }
@@ -386,6 +402,7 @@ impl EngineOptions {
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
+            storage_profile: super::StorageProfile::Local,
             contention_policy: None,
             connections_per_shard: DEFAULT_CONNECTIONS_PER_SHARD,
             queue_capacity_per_shard: DEFAULT_QUEUE_CAPACITY_PER_SHARD,

@@ -1,9 +1,66 @@
 //! Global secondary-key validation. Callers own collection or schema fencing.
 
 use super::*;
+use std::sync::{Mutex, MutexGuard};
 
 #[cfg(test)]
 mod tests;
+
+/// Private OS-read-only handles, never public SQL connections or cached read
+/// authority. At most one idle handle per shard and sixteen per Storage root.
+/// Active readers are still bounded by admitted document workers; checking out
+/// a child never waits for another shard's connection permit while holding a
+/// collection fence. No filesystem I/O occurs while holding this mutex.
+#[derive(Debug, Default)]
+pub(in crate::storage) struct PeerReaders {
+    idle: Mutex<Vec<(u16, Connection)>>,
+    #[cfg(test)]
+    opened: std::sync::atomic::AtomicUsize,
+}
+
+const MAX_IDLE_PEER_READERS: usize = 16;
+
+impl PeerReaders {
+    fn lock(&self) -> EngineResult<MutexGuard<'_, Vec<(u16, Connection)>>> {
+        self.idle.lock().map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "document peer reader pool is poisoned",
+            )
+        })
+    }
+
+    fn take(&self, shard: u16) -> EngineResult<Option<Connection>> {
+        let mut idle = self.lock()?;
+        Ok(idle
+            .iter()
+            .position(|(id, _)| *id == shard)
+            .map(|index| idle.swap_remove(index).1))
+    }
+
+    fn put(&self, shard: u16, connection: Connection) {
+        // Allocation pressure or a poisoned cache must not turn a completed
+        // read into an error. Drop the handle instead. A caller only returns
+        // successful, idle handles with its request's progress hook removed.
+        let mut idle = match self.lock() {
+            Ok(idle) => idle,
+            Err(_) => return,
+        };
+        if idle.len() < MAX_IDLE_PEER_READERS
+            && !idle.iter().any(|(id, _)| *id == shard)
+            && idle.try_reserve(1).is_ok()
+        {
+            idle.push((shard, connection));
+        }
+    }
+
+    pub(in crate::storage) fn close_idle(&self) -> EngineResult<usize> {
+        let closing = std::mem::take(&mut *self.lock()?);
+        let count = closing.len();
+        drop(closing);
+        Ok(count)
+    }
+}
 
 /// Private temporary SQLite storage bounds the resident key set during offline
 /// build/startup validation. The empty filename is a disk-backed temporary
@@ -103,16 +160,42 @@ pub(super) fn duplicate() -> EngineError {
 /// A child read never re-arms the parent's interrupt handle or installs another
 /// thread-local busy registration. Its own progress hook observes the same
 /// cancellation/deadline, and lock contention fails promptly with Busy.
-pub(super) fn open_peer(
+/// Validation and the subsequent key probe share one fresh read transaction.
+/// Otherwise every metadata query starts and ends its own SQLite read, repeating
+/// file/lock checks and permitting validation and the probe to see different
+/// snapshots. Only a successfully completed read can return its handle to the
+/// bounded cache: no snapshot, lock, or cancellation hook survives that read.
+pub(super) fn with_peer<T>(
     storage: &Storage,
     shard: u16,
     control: Option<Arc<OperationControl>>,
     cancellation: CancellationToken,
-) -> EngineResult<Connection> {
+    read: impl FnOnce(&Connection) -> EngineResult<T>,
+) -> EngineResult<T> {
     storage.ensure_shard_in_range(shard)?;
     check_active(control.as_deref(), &cancellation)?;
-    let connection =
-        crate::storage::shard::open_required_file_read_only(&storage.shard_path(shard))?;
+    let path = storage.shard_path(shard);
+    let cached = storage.document_peer_readers.take(shard)?;
+    let connection = match cached {
+        Some(connection)
+            if connection.is_autocommit()
+                && crate::storage::shard::pooled_file_is_current(&connection, &path)? =>
+        {
+            connection
+        }
+        _ => {
+            // An unavailable VFS identity probe falls back to a strict fresh
+            // open. A missing/replaced/symlinked path fails rather than trusting
+            // the old descriptor. Never cache a file-identity failure.
+            let connection = crate::storage::shard::open_required_file_read_only(&path)?;
+            #[cfg(test)]
+            storage
+                .document_peer_readers
+                .opened
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            connection
+        }
+    };
     connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(sqlite_error::storage)?;
@@ -133,22 +216,34 @@ pub(super) fn open_peer(
     // queries. Do not install the public SQL authorizer: standalone imports do
     // not carry the engine pool's thread-local document callback registration.
     let result = (|| {
+        let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
+            .map_err(sqlite_error::storage)?;
         let generation = storage.catalog.logical().schema_generation();
         crate::storage::shard::validate_open_read_only_connection(
-            &connection,
-            &storage.shard_path(shard),
+            &transaction,
+            &path,
             shard,
             generation,
             &storage.shard_layout,
         )?;
         let digest = storage.schema_coordination.committed_schema_digest()?;
-        crate::storage::shard::verify_schema_digest(&connection, generation, &digest)?;
-        storage.validate_native_range_v1_state(&connection, shard)?;
-        require_schema(&connection)
+        crate::storage::shard::verify_schema_digest(&transaction, generation, &digest)?;
+        storage.validate_native_range_v1_state(&transaction, shard)?;
+        require_schema(&transaction)?;
+        let value = read(&transaction)?;
+        check_active(control.as_deref(), &cancellation)?;
+        transaction.commit().map_err(sqlite_error::storage)?;
+        Ok(value)
     })();
-    normalize(result, control.as_deref(), &cancellation)?;
+    let value = normalize(result, control.as_deref(), &cancellation)?;
+    connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(sqlite_error::storage)?;
     check_active(control.as_deref(), &cancellation)?;
-    Ok(connection)
+    if connection.is_autocommit() {
+        storage.document_peer_readers.put(shard, connection);
+    }
+    Ok(value)
 }
 
 pub(super) fn check_active(

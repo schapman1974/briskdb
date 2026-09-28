@@ -6,6 +6,11 @@ import sqlite3
 import briskdb
 
 
+def storage_profile_contract() -> Literal["local", "nfs"]:
+    config = briskdb.Config(storage_profile="local")
+    return config.storage_profile
+
+
 def server_reload_contract(server: briskdb.Server) -> None:
     server.reload_http_tls(tls_cert=Path("server.crt"), tls_key="server.key", timeout_ms=5000)
     server.reload_admin_tls(tls_cert="admin.crt", tls_key=Path("admin.key"), cancellation=briskdb.CancellationToken())

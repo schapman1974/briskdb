@@ -432,6 +432,258 @@ fn damaged_foreign_unique_entries_are_corruption_not_duplicate_errors() {
 }
 
 #[test]
+fn peer_validation_and_key_reads_share_one_short_lived_snapshot() {
+    let (_root, storage, collection) = setup(2);
+    build(&storage, collection, index()).unwrap();
+    let id = BsonValue::Int32(0);
+    let shard = storage.prepare_document_id(&id).unwrap().1;
+    let count = |connection: &Connection| {
+        connection
+            .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    with_peer(&storage, shard, None, CancellationToken::new(), |peer| {
+        assert!(
+            !peer.is_autocommit(),
+            "validation must establish the read snapshot"
+        );
+        assert_eq!(count(peer), 0);
+        // A committed write on another connection cannot split validation and
+        // probing across two snapshots. WAL permits this writer while the
+        // private read remains active; the next check must see the commit.
+        storage
+            .insert_document(collection, &row(0, Some(BsonValue::Int32(7))))
+            .unwrap();
+        assert_eq!(count(peer), 0);
+        Ok(())
+    })
+    .unwrap();
+    with_peer(&storage, shard, None, CancellationToken::new(), |next| {
+        assert!(!next.is_autocommit());
+        assert_eq!(count(next), 1);
+        Ok(())
+    })
+    .unwrap();
+    // No cached read transaction pins WAL frames between calls.
+    let checkpoint: (i64, i64, i64) = storage
+        .open_unconfigured_shard(shard)
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint, (0, 0, 0));
+
+    let (first, second) = ids_on_different_shards(&storage);
+    assert_eq!(first, 0);
+    assert_eq!(
+        storage
+            .insert_document(collection, &row(second, Some(BsonValue::Int32(7))))
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::UniqueViolation
+    );
+}
+
+#[test]
+fn sequential_unique_inserts_open_at_most_one_peer_per_shard() {
+    use std::sync::atomic::Ordering;
+    let (_root, storage, collection) = setup(4);
+    build(&storage, collection, index()).unwrap();
+    for id in 0..32 {
+        storage
+            .insert_document(collection, &row(id, Some(BsonValue::Int32(id))))
+            .unwrap();
+    }
+    // Previously every input opened all three foreign shards: 96 opens. A
+    // sequential successful workload now needs at most four, regardless of
+    // input count. These are SQLite opens, not measurements of NFS RPCs.
+    let opened = storage.document_peer_readers.opened.load(Ordering::Relaxed);
+    assert!((3..=4).contains(&opened), "opened {opened} peer handles");
+    assert_eq!(storage.document_peer_readers.lock().unwrap().len(), opened);
+    for id in 0..32 {
+        assert!(
+            storage
+                .get_document(collection, &BsonValue::Int32(id))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn peer_readers_reuse_handles_without_retaining_request_hooks() {
+    use crate::core::CancellationReason;
+    use std::sync::atomic::Ordering;
+    let (_root, storage, _collection) = setup(2);
+    let readers = &storage.document_peer_readers;
+    let control = OperationControl::new(None);
+    let cancellation = CancellationToken::new();
+    with_peer(
+        &storage,
+        0,
+        Some(Arc::clone(&control)),
+        cancellation.clone(),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let opened = readers.opened.load(Ordering::Relaxed);
+    control.request_cancel(CancellationReason::DeadlineExceeded);
+    cancellation.cancel();
+    for _ in 0..10 {
+        with_peer(&storage, 0, None, CancellationToken::new(), |peer| {
+            // Enough VM work to invoke an accidentally retained progress hook.
+            let count: i64 = peer
+                .query_row(
+                    "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+                 SELECT count(*) FROM n",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            assert_eq!(count, 2001);
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(readers.opened.load(Ordering::Relaxed), opened);
+    assert_eq!(readers.lock().unwrap().len(), 1);
+    assert!(readers.lock().unwrap()[0].1.is_autocommit());
+
+    let pools = pool::ConnectionPools::new(storage.clone(), 1, 0).unwrap();
+    assert_eq!(pools.close_idle().unwrap(), 1);
+    assert!(readers.lock().unwrap().is_empty());
+    with_peer(&storage, 0, None, CancellationToken::new(), |_| Ok(())).unwrap();
+    assert_eq!(readers.opened.load(Ordering::Relaxed), opened + 1);
+    assert_eq!(pools.retire_idle_for_schema_migration().unwrap(), 1);
+}
+
+#[test]
+fn peer_readers_discard_errors_cancellation_and_panics() {
+    use crate::core::CancellationReason;
+    let (_root, storage, _collection) = setup(2);
+    for mode in ["error", "cancel", "panic"] {
+        with_peer(&storage, 0, None, CancellationToken::new(), |_| Ok(())).unwrap();
+        let control = OperationControl::new(None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_peer(
+                &storage,
+                0,
+                Some(Arc::clone(&control)),
+                CancellationToken::new(),
+                |_| match mode {
+                    "error" => Err(corrupt("injected peer failure")),
+                    "cancel" => {
+                        control.request_cancel(CancellationReason::DeadlineExceeded);
+                        Ok(())
+                    }
+                    "panic" => panic!("injected peer panic"),
+                    _ => unreachable!(),
+                },
+            )
+        }));
+        match mode {
+            "error" => assert_eq!(
+                result.unwrap().unwrap_err().kind(),
+                EngineErrorKind::DataCorruption
+            ),
+            "cancel" => assert_eq!(
+                result.unwrap().unwrap_err().kind(),
+                EngineErrorKind::DeadlineExceeded
+            ),
+            "panic" => assert!(result.is_err()),
+            _ => unreachable!(),
+        }
+        assert!(storage.document_peer_readers.lock().unwrap().is_empty());
+    }
+    with_peer(&storage, 0, None, CancellationToken::new(), |_| Ok(())).unwrap();
+}
+
+#[test]
+fn peer_readers_revalidate_durable_state_on_every_checkout() {
+    for sql in [
+        "PRAGMA application_id = 0",
+        "DROP TABLE briskdb_document_index_entries_v1",
+        "CREATE TABLE unexpected (id INTEGER)",
+    ] {
+        let (_root, storage, _collection) = setup(2);
+        with_peer(&storage, 0, None, CancellationToken::new(), |_| Ok(())).unwrap();
+        storage
+            .open_unconfigured_shard(0)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        let error = with_peer::<()>(&storage, 0, None, CancellationToken::new(), |_| {
+            panic!("unvalidated peer reached the key lookup")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{sql}");
+        assert!(storage.document_peer_readers.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn peer_readers_reject_missing_replaced_and_symlinked_files() {
+    for mode in ["missing", "replaced", "symlink"] {
+        let (root, storage, _collection) = setup(2);
+        with_peer(&storage, 0, None, CancellationToken::new(), |_| Ok(())).unwrap();
+        let path = storage.shard_path(0);
+        let checkpoint: (i64, i64, i64) = storage
+            .open_unconfigured_shard(0)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
+        let moved = root.path().join("original.sqlite");
+        std::fs::rename(&path, &moved).unwrap();
+        match mode {
+            "replaced" => {
+                std::fs::copy(&moved, &path).unwrap();
+            }
+            "symlink" => std::os::unix::fs::symlink(&moved, &path).unwrap(),
+            _ => {}
+        }
+        let error = with_peer::<()>(&storage, 0, None, CancellationToken::new(), |_| {
+            panic!("stale peer reached the key lookup")
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if mode == "symlink" {
+                EngineErrorKind::FailedPrecondition
+            } else {
+                EngineErrorKind::DataCorruption
+            }
+        );
+        assert!(storage.document_peer_readers.lock().unwrap().is_empty());
+        if mode == "missing" {
+            assert!(!path.exists(), "a required peer must never be recreated");
+        }
+    }
+}
+
+#[test]
+fn idle_peer_readers_are_bounded_per_root_and_shard() {
+    let readers = PeerReaders::default();
+    for shard in 0..(MAX_IDLE_PEER_READERS as u16 + 5) {
+        for _ in 0..2 {
+            readers.put(shard, Connection::open_in_memory().unwrap());
+        }
+    }
+    assert_eq!(readers.lock().unwrap().len(), MAX_IDLE_PEER_READERS);
+    let first = readers.take(0).unwrap().unwrap();
+    assert!(readers.take(0).unwrap().is_none());
+    assert!(first.is_autocommit());
+    assert_eq!(readers.close_idle().unwrap(), MAX_IDLE_PEER_READERS - 1);
+    assert!(readers.lock().unwrap().is_empty());
+}
+
+#[test]
 fn child_read_cancellation_preserves_precise_corruption_and_root_health() {
     use crate::core::CancellationReason;
     let (_root, storage, _collection) = setup(2);
@@ -439,11 +691,12 @@ fn child_read_cancellation_preserves_precise_corruption_and_root_health() {
     control.request_cancel(CancellationReason::DeadlineExceeded);
     let cancellation = CancellationToken::new();
     assert_eq!(
-        open_peer(
+        with_peer(
             &storage,
             1,
             Some(Arc::clone(&control)),
-            cancellation.clone()
+            cancellation.clone(),
+            |_| Ok(())
         )
         .unwrap_err()
         .kind(),

@@ -314,6 +314,12 @@ config = briskdb.Config(shards=4, max_result_rows=5_000)
 db = briskdb.open("./data", config=config)
 ```
 
+On unreleased main, `Config(storage_profile="local")` makes the default storage
+contract explicit. The reserved `storage_profile="nfs"` currently raises
+`UnsupportedError` during configuration, before opening or creating files.
+It is not EFS support and never converts an existing database. See the
+[storage-profile contract](../docs/STORAGE_FORMAT.md#explicit-profile-selection-and-reserved-nfs-format).
+
 To serve that same open database to browser/HTTP and PostgreSQL clients:
 
 ```python

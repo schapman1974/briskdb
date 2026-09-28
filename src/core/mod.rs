@@ -25,6 +25,7 @@ mod scatter;
 #[cfg(feature = "auth-scram")]
 pub mod security_catalog;
 mod session;
+mod storage_profile;
 mod stream;
 mod types;
 #[cfg(feature = "auth-scram")]
@@ -127,6 +128,7 @@ pub(crate) use routing::{
 };
 pub(crate) use scatter::merge_scatter_results;
 pub use session::{Session, SessionId, SessionState};
+pub use storage_profile::StorageProfile;
 pub(crate) use stream::RowProducer;
 pub use stream::{DEFAULT_STREAM_BUFFER_ROWS, RowStream};
 pub use types::{
@@ -314,6 +316,17 @@ impl<T> Executed<T> {
 
 impl Database {
     pub fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
+        Self::open_with_profile(root, requested_shards, StorageProfile::Local)
+    }
+
+    /// Open using an explicit storage contract; ordinary open always means local.
+    /// NFS selection currently fails before any root creation or storage access.
+    pub fn open_with_profile(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        profile: StorageProfile,
+    ) -> EngineResult<Self> {
+        profile.require_available()?;
         Ok(Self {
             storage: Storage::open(root, requested_shards)?,
             global_index_worker_id: random_global_index_worker_id()?,
@@ -471,6 +484,13 @@ impl Database {
     /// without creating or upgrading storage.
     pub fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
         crate::storage::detect_shard_count(root)
+    }
+
+    /// Inspect the validated storage profile through a read-only connection,
+    /// without creating/upgrading the manifest or selecting a journal mode.
+    /// A hot rollback journal may require a compatible recovery opener first.
+    pub fn detect_storage_profile(root: impl AsRef<Path>) -> EngineResult<StorageProfile> {
+        crate::storage::detect_storage_profile(root)
     }
 
     /// Validate and inspect global-index definitions without creating or

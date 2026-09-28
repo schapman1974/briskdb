@@ -60,6 +60,13 @@ the upgraded root, including an interrupted physical upgrade.
 
 ## Required upgrade procedure
 
+The unreleased explicit storage-profile API leaves local roots at manifest v22.
+The reserved NFS v23 format is inspectable but not publicly openable; it has its
+own checksummed profile and downgrade fence. No normal startup converts local
+storage to NFS or vice versa. NFS selection fails before storage access until
+cross-host safety is implemented and qualified. See the
+[profile contract](STORAGE_FORMAT.md#explicit-profile-selection-and-reserved-nfs-format).
+
 Before starting a newer BriskDB release against an existing data directory:
 
 1. Stop every BriskDB process using the directory.

@@ -563,6 +563,9 @@ pub(crate) struct Storage {
     root: PathBuf,
     catalog: Arc<CatalogSnapshot>,
     shard_layout: shard::ShardLayout,
+    // Drop private idle readers before releasing this root's process lease.
+    #[cfg(feature = "documents")]
+    document_peer_readers: Arc<document::PeerReaders>,
     schema_coordination: Arc<RootSchemaCoordination>,
 }
 
@@ -810,6 +813,8 @@ impl Storage {
             root,
             catalog,
             shard_layout: ready_layout,
+            #[cfg(feature = "documents")]
+            document_peer_readers: Arc::new(document::PeerReaders::default()),
             schema_coordination,
         };
         if let Some(mut ddl) = generated_table_ddl {
@@ -3487,6 +3492,12 @@ fn checkpoint_database(
 /// any database files.
 pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
     inspect_manifest_snapshot(root.as_ref(), manifest::detect_shard_count)
+}
+
+pub(crate) fn detect_storage_profile(
+    root: impl AsRef<Path>,
+) -> EngineResult<crate::core::StorageProfile> {
+    inspect_manifest_snapshot(root.as_ref(), manifest::detect_storage_profile)
 }
 
 /// Validate and inspect durable global-index definitions without creating or

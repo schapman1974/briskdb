@@ -589,6 +589,7 @@ impl Engine {
         requested_shards: u16,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        options.storage_profile().require_available()?;
         crate::storage::validate_shard_count(requested_shards)?;
         let root = PathBuf::from(root.as_ref());
         let worker_limit = options.worker_limit(requested_shards)?;
@@ -608,6 +609,7 @@ impl Engine {
         root: impl AsRef<Path>,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        options.storage_profile().require_available()?;
         let root = PathBuf::from(root.as_ref());
         let detect_root = root.clone();
         let requested_shards =
@@ -634,6 +636,7 @@ impl Engine {
         database: Arc<Database>,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        options.storage_profile().require_available()?;
         let workers = BlockingPool::new(options.worker_limit(database.shard_count())?);
         Self::from_parts(database, options, workers)
     }

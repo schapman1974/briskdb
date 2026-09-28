@@ -250,6 +250,7 @@ class DataCorruptionError(OperationalError): ...
 class InternalError(OperationalError): ...
 
 class Config:
+    storage_profile: Literal["local", "nfs"]
     shards: Optional[int]
     documents: bool
     uuid_representation: UuidRepresentation
@@ -265,6 +266,7 @@ class Config:
     def __init__(
         self,
         *,
+        storage_profile: Literal["local", "nfs"] = ...,
         shards: Optional[int] = ...,
         documents: bool = ...,
         uuid_representation: UuidRepresentation = ...,

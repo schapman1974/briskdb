@@ -15,6 +15,17 @@ LONG_QUERY = (
 
 
 class SyncApiTests(unittest.TestCase):
+    def test_storage_profile_is_explicit_and_nfs_is_not_yet_enabled(self) -> None:
+        self.assertEqual(briskdb.Config().storage_profile, "local")
+        self.assertEqual(briskdb.Config(storage_profile="local").storage_profile, "local")
+        self.assertIn('storage_profile="local"', repr(briskdb.Config()))
+        for shards in (None, 2):
+            with self.subTest(shards=shards):
+                with self.assertRaises(briskdb.UnsupportedError):
+                    briskdb.Config(storage_profile="nfs", shards=shards)
+        with self.assertRaises(briskdb.InvalidArgumentError):
+            briskdb.Config(storage_profile="efs")
+
     def test_context_managers_and_bounded_cursor_batches(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
             with briskdb.connect(data_dir, shards=2) as database:
