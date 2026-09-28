@@ -27,6 +27,8 @@ mod shard_summary;
 #[cfg(feature = "experimental-vtab")]
 #[allow(dead_code)]
 mod sharded_vtab;
+#[cfg(test)]
+mod startup_contention_tests;
 #[cfg(feature = "experimental-vtab")]
 pub(crate) use sharded_vtab::{RegistrySchemaCache, WriteCoordinator};
 
@@ -404,19 +406,35 @@ fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordinat
 
 fn begin_startup_coordination(
     coordination: &RootSchemaCoordination,
+    control: Option<&OperationControl>,
 ) -> EngineResult<LocalSchemaMigrationGuard> {
     let started = Instant::now();
     loop {
+        check_startup_control(control)?;
         match coordination.gate.begin_migration() {
             Ok(guard) => return Ok(guard),
-            Err(error)
-                if error.kind() == EngineErrorKind::Busy
-                    && started.elapsed() < CONNECTION_BUSY_TIMEOUT =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            Err(error) if error.kind() == EngineErrorKind::Busy => {
+                match control.and_then(|control| control.wait_for_contention(None)) {
+                    Some(true) => {}
+                    Some(false) => {
+                        check_startup_control(control)?;
+                        return Err(error);
+                    }
+                    None if started.elapsed() < CONNECTION_BUSY_TIMEOUT => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    None => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn check_startup_control(control: Option<&OperationControl>) -> EngineResult<()> {
+    match control.and_then(OperationControl::reason) {
+        Some(reason) => Err(reason.error()),
+        None => Ok(()),
     }
 }
 
@@ -618,7 +636,17 @@ impl Storage {
         requested_shards: u16,
         security_store_id: Option<[u8; 16]>,
     ) -> EngineResult<Self> {
+        Self::open_with_startup_control(root, requested_shards, security_store_id, None)
+    }
+
+    pub(crate) fn open_with_startup_control(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        security_store_id: Option<[u8; 16]>,
+        control: Option<&OperationControl>,
+    ) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
+        check_startup_control(control)?;
 
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|error| {
@@ -631,11 +659,18 @@ impl Storage {
         // then (only for initialization/upgrade/recovery) sole-process root
         // ownership. A queued opener cannot add a shared lease while recovery
         // is deciding whether its exclusive upgrade is safe.
-        let _process_startup =
-            process_lock::RootStartupGuard::acquire(&root, CONNECTION_BUSY_TIMEOUT)?;
+        let _process_startup = process_lock::RootStartupGuard::acquire_controlled(
+            &root,
+            CONNECTION_BUSY_TIMEOUT,
+            control,
+        )?;
         let schema_coordination = root_schema_coordination(&root)?;
-        let mut startup = begin_startup_coordination(&schema_coordination)?;
-        startup.wait_for_quiescence_blocking();
+        let mut startup = begin_startup_coordination(&schema_coordination, control)?;
+        match control {
+            Some(control) => startup.wait_for_quiescence_controlled(control)?,
+            None => startup.wait_for_quiescence_blocking(),
+        }
+        check_startup_control(control)?;
         let manifest_path = root.join("manifest.sqlite");
         let shards_dir = root.join("shards");
         let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;

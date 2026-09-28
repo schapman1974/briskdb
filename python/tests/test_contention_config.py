@@ -1,4 +1,8 @@
+import asyncio
+import os
+from pathlib import Path
 import tempfile
+import time
 import unittest
 
 import briskdb
@@ -12,6 +16,23 @@ def policy(**changes):
 
 
 class ContentionConfigTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "startup lock test uses Unix flock")
+    def test_fail_fast_open_stops_before_initialization_and_can_be_retried(self):
+        import fcntl
+
+        config = briskdb.Config(shards=2, contention_policy=briskdb.ContentionPolicy.fail_fast())
+        with tempfile.TemporaryDirectory() as root:
+            with (Path(root) / ".briskdb-startup.lock").open("a+b") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                started = time.monotonic()
+                with self.assertRaises(briskdb.BusyError):
+                    briskdb.open(root, config=config)
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertFalse((Path(root) / "manifest.sqlite").exists())
+            with briskdb.open(root, config=config) as database:
+                with database.session(routing_key="startup") as session:
+                    self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
+
     def test_policy_is_opt_in_validated_immutable_and_preserved_by_config(self):
         self.assertIsNone(briskdb.Config().contention_policy)
         configured = policy(jitter="full")
@@ -89,6 +110,21 @@ class ContentionConfigTests(unittest.TestCase):
 
 
 class AsyncContentionConfigTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == "posix", "startup lock test uses Unix flock")
+    async def test_fail_fast_async_open_shares_the_native_startup_policy(self):
+        import fcntl
+
+        config = briskdb.Config(shards=2, contention_policy=briskdb.ContentionPolicy.fail_fast())
+        with tempfile.TemporaryDirectory() as root:
+            with (Path(root) / ".briskdb-startup.lock").open("a+b") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(briskdb.BusyError):
+                    await asyncio.wait_for(briskdb.open_async(root, config=config), 2)
+                self.assertFalse((Path(root) / "manifest.sqlite").exists())
+            async with await briskdb.open_async(root, config=config) as database:
+                async with await database.session(routing_key="startup") as session:
+                    self.assertEqual((await session.query("SELECT 1"))["rows"], [(1,)])
+
     async def test_async_config_uses_the_same_native_wait_policy(self):
         selected = briskdb.ContentionPolicy.fail_fast()
         with tempfile.TemporaryDirectory() as root:

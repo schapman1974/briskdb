@@ -1,5 +1,8 @@
 //! Asynchronous protocol-neutral engine boundary.
 
+mod startup;
+use startup::StartupOperation;
+
 #[cfg(feature = "documents")]
 mod document_cursor;
 #[cfg(feature = "documents")]
@@ -602,10 +605,22 @@ impl Engine {
         let root = PathBuf::from(root.as_ref());
         let worker_limit = options.worker_limit(requested_shards)?;
         let workers = BlockingPool::new(worker_limit);
+        let startup = StartupOperation::new(options.contention_policy());
+        let control = startup.control.clone();
         let database = workers
-            .run(move || Database::open(root, requested_shards))
+            .run(move || {
+                Ok(Database {
+                    storage: crate::storage::Storage::open_with_startup_control(
+                        root,
+                        requested_shards,
+                        None,
+                        control.as_deref(),
+                    )?,
+                    global_index_worker_id: super::random_global_index_worker_id()?,
+                })
+            })
             .await?;
-        Self::from_parts(Arc::new(database), options, workers)
+        Self::from_parts(Arc::new(database), options, workers, startup.complete())
     }
 
     /// Detect an initialized database's immutable shard count and open it.
@@ -646,13 +661,19 @@ impl Engine {
     ) -> EngineResult<Self> {
         options.storage_profile().require_available()?;
         let workers = BlockingPool::new(options.worker_limit(database.shard_count())?);
-        Self::from_parts(database, options, workers)
+        Self::from_parts(
+            database,
+            options,
+            workers,
+            Arc::new(ContentionMetrics::default()),
+        )
     }
 
     fn from_parts(
         database: Arc<Database>,
         options: EngineOptions,
         workers: BlockingPool,
+        contention_metrics: Arc<ContentionMetrics>,
     ) -> EngineResult<Self> {
         let connections = ConnectionPools::new(
             database.storage.clone(),
@@ -664,7 +685,7 @@ impl Engine {
                 id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
                 database,
                 options,
-                contention_metrics: Arc::new(ContentionMetrics::default()),
+                contention_metrics,
                 workers,
                 connections,
                 lifecycle: Lifecycle::new(),

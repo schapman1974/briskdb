@@ -18,6 +18,7 @@ use std::{
 use crate::{
     core::{
         EngineError, EngineErrorKind, EngineResult, GlobalOperationId, IDEMPOTENCY_LOCK_STRIPES,
+        OperationControl,
     },
     sqlite_error,
 };
@@ -324,20 +325,44 @@ pub(super) fn remove_global_write_marker(root: &Path, operation_id: GlobalOperat
 impl RootStartupGuard {
     #[allow(dead_code)]
     pub(super) fn acquire(root: &Path, timeout: Duration) -> EngineResult<Self> {
+        Self::acquire_controlled(root, timeout, None)
+    }
+
+    pub(super) fn acquire_controlled(
+        root: &Path,
+        timeout: Duration,
+        control: Option<&OperationControl>,
+    ) -> EngineResult<Self> {
+        if let Some(reason) = control.and_then(OperationControl::reason) {
+            return Err(reason.error());
+        }
         let path = root.join(STARTUP_LOCK_FILE_NAME);
         let file = open_regular_lock_file(&path)?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
         loop {
+            if let Some(reason) = control.and_then(OperationControl::reason) {
+                return Err(reason.error());
+            }
             match lock_nonblocking(&file, LockRequest::Exclusive) {
                 Ok(()) => return Ok(Self { _file: file }),
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
                 Err(error) => {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        match control.and_then(|control| control.wait_for_contention(None)) {
+                            Some(true) => continue,
+                            Some(false) => {
+                                if let Some(reason) = control.and_then(OperationControl::reason) {
+                                    return Err(reason.error());
+                                }
+                            }
+                            None if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
                     return Err(map_lock_error(
                         error,
                         &path,

@@ -65,21 +65,25 @@ impl Engine {
         crate::storage::validate_shard_count(requested_shards)?;
         let root = root.as_ref().to_path_buf();
         let workers = BlockingPool::new(options.worker_limit(requested_shards)?);
+        let startup = StartupOperation::new(options.contention_policy());
+        let control = startup.control.clone();
         let (database, authority) = workers
             .run(move || {
                 let authority = security_root::open(&root, requested_shards)?;
                 let database = Database {
-                    storage: crate::storage::Storage::open_with_security_binding(
+                    storage: crate::storage::Storage::open_with_startup_control(
                         &root,
                         requested_shards,
                         Some(*authority.store_id().as_bytes()),
+                        control.as_deref(),
                     )?,
                     global_index_worker_id: crate::core::random_global_index_worker_id()?,
                 };
                 Ok((database, authority))
             })
             .await?;
-        let mut engine = Self::from_parts(Arc::new(database), options, workers)?;
+        let mut engine =
+            Self::from_parts(Arc::new(database), options, workers, startup.complete())?;
         Arc::get_mut(&mut engine.inner)
             .expect("unpublished engine")
             .security = Some(Arc::new(std::sync::Mutex::new(authority)));
