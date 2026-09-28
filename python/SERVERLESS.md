@@ -114,7 +114,7 @@ export BRISKDB_EFS_TEST_FILESYSTEM=fs-YOUR-APPROVED-FILESYSTEM
 export BRISKDB_EFS_TEST_ROOT="/mnt/efs/briskdb-efs-test-$BRISKDB_EFS_TEST_RUN"
 export BRISKDB_EFS_TEST_CLIENT=A
 export BRISKDB_EFS_TEST_ROWS=20
-export BRISKDB_EFS_TEST_WAIT_MS=5000
+export BRISKDB_EFS_TEST_WAIT_MS=60000
 export BRISKDB_EFS_TEST_HOLD_MS=30000
 
 set -o pipefail
@@ -133,7 +133,9 @@ efs_run() {
    A probing. Compare the logged **boot IDs**: they must differ. A probe after
    the holder finishes must fail, not produce false exclusion evidence.
 3. Start `efs_run write` once on A and once on B, overlapping them. The root
-   lock serializes their scopes. Both must complete successfully; save any
+   lock serializes their scopes; the 60-second contention allowance includes
+   waiting for a peer's entire scope, not just one statement. Both must
+   complete successfully; save any
    failure rather than rerunning the write. Then run `efs_run verify` on each.
    This checks every expected SQL value, deleted transient rows, document
    content, exact SQL row counts, both shards' integrity, and absence of WAL/SHM.
