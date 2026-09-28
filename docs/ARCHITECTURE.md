@@ -1551,7 +1551,7 @@ Unreleased main also exposes the shared engine contention policy through
 Python `Config(contention_policy=...)` and daemon `--contention-mode` plus the
 six `--contention-*` backoff settings. Defaults preserve legacy waiting;
 this controls lock/admission waits, never application-write replay. See
-[the complete contract and configuration](REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
+[the complete contract and configuration](REQUEST_CONTROLS.md#opt-in-storage-contention-backoff).
 
 When a shard has no active slot and its admission queue is full, a new operation
 fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
