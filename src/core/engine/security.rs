@@ -69,14 +69,19 @@ impl Engine {
         let control = startup.control.clone();
         let (database, authority) = workers
             .run(move || {
-                let authority =
-                    security_root::open_controlled(&root, requested_shards, control.clone())?;
+                let authority = security_root::open_controlled(
+                    &root,
+                    requested_shards,
+                    control.clone(),
+                    options.storage_profile(),
+                )?;
                 let database = Database {
-                    storage: crate::storage::Storage::open_with_startup_control(
+                    storage: crate::storage::Storage::open_with_profile_control(
                         &root,
                         requested_shards,
                         Some(*authority.store_id().as_bytes()),
                         control.as_ref(),
+                        options.storage_profile(),
                     )?,
                     global_index_worker_id: crate::core::random_global_index_worker_id()?,
                 };

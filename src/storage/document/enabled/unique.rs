@@ -216,6 +216,10 @@ pub(super) fn with_peer<T>(
     // queries. Do not install the public SQL authorizer: standalone imports do
     // not carry the engine pool's thread-local document callback registration.
     let result = (|| {
+        storage
+            .shard_layout
+            .journal()
+            .configure_durability(&connection)?;
         let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
             .map_err(sqlite_error::storage)?;
         let generation = storage.catalog.logical().schema_generation();

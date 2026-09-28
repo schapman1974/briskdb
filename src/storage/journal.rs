@@ -15,8 +15,6 @@ use crate::{
 enum JournalMode {
     Wal,
     Delete,
-    // Retained as a qualification candidate until #511 adds persisted profiles.
-    #[allow(dead_code)]
     Persist,
 }
 
@@ -37,6 +35,10 @@ pub(super) struct JournalPolicy {
 }
 
 impl JournalPolicy {
+    pub(super) const fn is_wal(self) -> bool {
+        matches!(self.mode, JournalMode::Wal)
+    }
+
     pub(super) const LOCAL: Self = Self {
         mode: JournalMode::Wal,
         synchronous: 2, // FULL: preserve the existing local data-file contract.
@@ -48,16 +50,12 @@ impl JournalPolicy {
         synchronous: 2, // Existing security stores additionally use fullfsync.
     };
 
-    // Internal candidates, deliberately not exposed through EngineOptions or
-    // any frontend before persisted profile/older-writer fencing is implemented.
-    // Neither constant is evidence that an NFS client/server is qualified.
-    #[allow(dead_code)]
+    // Validated persisted rollback policies. Not evidence that a mount is qualified.
     pub(super) const NFS_DELETE: Self = Self {
         mode: JournalMode::Delete,
         synchronous: 3,
     };
 
-    #[allow(dead_code)]
     pub(super) const NFS_PERSIST: Self = Self {
         mode: JournalMode::Persist,
         synchronous: 3,
@@ -67,9 +65,14 @@ impl JournalPolicy {
     /// native locking, busy handler, transaction state, or application data.
     /// Read back the effective value because SQLite can ignore some pragmas.
     pub(super) fn configure_durability(self, connection: &Connection) -> EngineResult<()> {
-        connection
-            .pragma_update(Some("main"), "synchronous", self.synchronous)
-            .map_err(sqlite_error::storage)?;
+        // Revalidation may share an existing read snapshot. SQLite forbids
+        // changing synchronous inside a transaction: only verify the policy
+        // that its opener established before beginning that snapshot.
+        if connection.is_autocommit() {
+            connection
+                .pragma_update(Some("main"), "synchronous", self.synchronous)
+                .map_err(sqlite_error::storage)?;
+        }
         let effective: i64 = connection
             .pragma_query_value(Some("main"), "synchronous", |row| row.get(0))
             .map_err(sqlite_error::storage)?;
@@ -102,6 +105,7 @@ impl JournalPolicy {
     }
 
     /// Validation is observational; a wrong mode is never repaired here.
+    #[cfg(test)]
     pub(super) fn require_mode(
         self,
         connection: &Connection,
@@ -112,6 +116,71 @@ impl JournalPolicy {
             .pragma_query_value(Some("main"), "journal_mode", |row| row.get(0))
             .map_err(sqlite_error::storage)?;
         self.check_mode(&effective, mismatch_kind, description)
+    }
+
+    /// Reapply a validated rollback policy on this connection, without ever
+    /// converting WAL storage. PERSIST is connection-local: a fresh handle
+    /// normally reports DELETE even when the persisted BriskDB policy is
+    /// PERSIST. Read-only handles only validate the rollback family and never
+    /// change it. Native SQLite locks and hot-journal recovery remain enabled.
+    pub(super) fn configure_existing(
+        self,
+        connection: &Connection,
+        mismatch_kind: EngineErrorKind,
+        description: &str,
+    ) -> EngineResult<()> {
+        // A metadata read can trigger hot-journal recovery. Set durability
+        // before that read, not after recovery has already written pages.
+        self.configure_durability(connection)?;
+        self.configure_existing_mode(connection, mismatch_kind, description)
+    }
+
+    /// Call after configuring durability, outside a transaction. Kept separate
+    /// so identity validation can precede connection-local journal selection.
+    pub(super) fn configure_existing_mode(
+        self,
+        connection: &Connection,
+        mismatch_kind: EngineErrorKind,
+        description: &str,
+    ) -> EngineResult<()> {
+        let effective: String = connection
+            .pragma_query_value(Some("main"), "journal_mode", |row| row.get(0))
+            .map_err(sqlite_error::storage)?;
+        self.check_reopened_mode(&effective, mismatch_kind, description)?;
+        if !self.is_wal()
+            && !connection
+                .is_readonly(rusqlite::MAIN_DB)
+                .map_err(sqlite_error::storage)?
+            && !effective.eq_ignore_ascii_case(self.mode.name())
+        {
+            self.initialize_mode(connection, mismatch_kind, description)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_reopened_mode(
+        self,
+        effective: &str,
+        mismatch_kind: EngineErrorKind,
+        description: &str,
+    ) -> EngineResult<()> {
+        if matches!(self.mode, JournalMode::Persist) && effective.eq_ignore_ascii_case("delete") {
+            Ok(())
+        } else {
+            self.check_mode(effective, mismatch_kind, description)
+        }
+    }
+
+    pub(super) fn require_reopened_mode(
+        self,
+        connection: &Connection,
+        mismatch_kind: EngineErrorKind,
+        description: &str,
+    ) -> EngineResult<()> {
+        let effective: String = connection
+            .pragma_query_value(Some("main"), "journal_mode", |row| row.get(0))
+            .map_err(sqlite_error::storage)?;
+        self.check_reopened_mode(&effective, mismatch_kind, description)
     }
 
     pub(super) fn check_mode(
@@ -158,6 +227,92 @@ mod tests {
         connection
             .pragma_query_value(Some("main"), name, |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn persisted_rollback_policy_is_reapplied_without_converting_wal() {
+        for policy in [JournalPolicy::NFS_DELETE, JournalPolicy::NFS_PERSIST] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let original = Connection::open(file.path()).unwrap();
+            initialize(&original, policy);
+            original
+                .execute_batch("CREATE TABLE item(value); INSERT INTO item VALUES (7)")
+                .unwrap();
+            drop(original);
+            let reopened = Connection::open(file.path()).unwrap();
+            assert_eq!(text_pragma(&reopened, "journal_mode"), "delete");
+            policy
+                .configure_existing(&reopened, EngineErrorKind::FailedPrecondition, "test")
+                .unwrap();
+            assert!(
+                text_pragma(&reopened, "journal_mode").eq_ignore_ascii_case(policy.mode.name())
+            );
+            assert_eq!(
+                reopened
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                3
+            );
+            assert_eq!(text_pragma(&reopened, "locking_mode"), "normal");
+            reopened
+                .execute_batch("INSERT INTO item VALUES (8)")
+                .unwrap();
+            drop(reopened);
+            let read_only = Connection::open_with_flags(
+                file.path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            policy
+                .configure_existing(&read_only, EngineErrorKind::FailedPrecondition, "test")
+                .unwrap();
+            assert_eq!(text_pragma(&read_only, "journal_mode"), "delete");
+            assert_eq!(
+                read_only
+                    .query_row("SELECT COUNT(*) FROM item", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            drop(read_only);
+
+            let wal = Connection::open(file.path()).unwrap();
+            initialize(&wal, JournalPolicy::LOCAL);
+            let before = fs::read(file.path()).unwrap();
+            assert_eq!(
+                policy
+                    .configure_existing(&wal, EngineErrorKind::FailedPrecondition, "test")
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            assert_eq!(text_pragma(&wal, "journal_mode"), "wal");
+            assert_eq!(fs::read(file.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn snapshot_revalidation_checks_preconfigured_durability_without_changing_it() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        JournalPolicy::NFS_PERSIST
+            .configure_durability(&connection)
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        JournalPolicy::NFS_PERSIST
+            .configure_durability(&transaction)
+            .unwrap();
+        assert_eq!(
+            JournalPolicy::LOCAL
+                .configure_durability(&transaction)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert_eq!(
+            transaction
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
     }
 
     #[test]

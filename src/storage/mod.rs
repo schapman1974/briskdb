@@ -2,6 +2,7 @@
 
 pub(crate) mod contention;
 mod document;
+mod profile;
 #[cfg(feature = "documents")]
 pub(crate) use document::{
     DocumentStorageRecord, DocumentWriteTransaction, MAX_DOCUMENT_SHARD_SCAN_RECORDS,
@@ -574,7 +575,7 @@ fn validate_schema_migration_checksum_prefix(
 
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
-    root: PathBuf,
+    root: profile::StorageRoot,
     catalog: Arc<CatalogSnapshot>,
     shard_layout: shard::ShardLayout,
     // Drop private idle readers before releasing this root's process lease.
@@ -610,6 +611,30 @@ fn schema_migration_status(migration: &manifest::SchemaMigration) -> SchemaMigra
 }
 
 impl Storage {
+    fn configure_manifest_connection(&self, connection: &Connection) -> EngineResult<()> {
+        configure_manifest_connection_with_policy(connection, self.root.journal())?;
+        self.root.journal().configure_existing_mode(
+            connection,
+            EngineErrorKind::FailedPrecondition,
+            "manifest",
+        )
+    }
+
+    fn configure_manifest_connection_after_busy_setup(
+        &self,
+        connection: &Connection,
+    ) -> EngineResult<()> {
+        configure_manifest_connection_after_busy_setup_with_policy(
+            connection,
+            self.root.journal(),
+        )?;
+        self.root.journal().configure_existing_mode(
+            connection,
+            EngineErrorKind::FailedPrecondition,
+            "manifest",
+        )
+    }
+
     pub(crate) fn try_acquire_idempotency_stripe(
         &self,
         key_digest: [u8; 32],
@@ -621,23 +646,39 @@ impl Storage {
         )
     }
 
+    #[cfg(any(feature = "sqlite-import", test))]
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
-        Self::open_with_security_binding(root, requested_shards, None)
+        Self::open_with_profile_control(
+            root,
+            requested_shards,
+            None,
+            None,
+            crate::core::StorageProfile::Local,
+        )
     }
 
-    pub(crate) fn open_with_security_binding(
-        root: impl AsRef<Path>,
-        requested_shards: u16,
-        security_store_id: Option<[u8; 16]>,
-    ) -> EngineResult<Self> {
-        Self::open_with_startup_control(root, requested_shards, security_store_id, None)
-    }
-
+    #[cfg(test)]
     pub(crate) fn open_with_startup_control(
         root: impl AsRef<Path>,
         requested_shards: u16,
         security_store_id: Option<[u8; 16]>,
         control: Option<&Arc<OperationControl>>,
+    ) -> EngineResult<Self> {
+        Self::open_with_profile_control(
+            root,
+            requested_shards,
+            security_store_id,
+            control,
+            crate::core::StorageProfile::Local,
+        )
+    }
+
+    pub(crate) fn open_with_profile_control(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        security_store_id: Option<[u8; 16]>,
+        control: Option<&Arc<OperationControl>>,
+        profile: crate::core::StorageProfile,
     ) -> EngineResult<Self> {
         contention::with_control(control.cloned(), || {
             Self::open_with_startup_control_inner(
@@ -645,6 +686,7 @@ impl Storage {
                 requested_shards,
                 security_store_id,
                 control.map(Arc::as_ref),
+                profile,
             )
         })
     }
@@ -654,6 +696,7 @@ impl Storage {
         requested_shards: u16,
         security_store_id: Option<[u8; 16]>,
         control: Option<&OperationControl>,
+        profile: crate::core::StorageProfile,
     ) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
         check_startup_control(control)?;
@@ -665,6 +708,11 @@ impl Storage {
         let root = fs::canonicalize(&root).map_err(|error| {
             sqlite_error::storage_io(error, format!("failed to resolve {}", root.display()))
         })?;
+        let initial_journal = match profile {
+            crate::core::StorageProfile::Local => journal::JournalPolicy::LOCAL,
+            crate::core::StorageProfile::Nfs => journal::JournalPolicy::NFS_PERSIST,
+        };
+        let mut root = profile::StorageRoot::new(root, initial_journal);
         // Lock order is startup serialization, process-local schema admission,
         // then (only for initialization/upgrade/recovery) sole-process root
         // ownership. A queued opener cannot add a shared lease while recovery
@@ -693,13 +741,15 @@ impl Storage {
         };
         let requires_exclusive = required_manifest
             .and_then(|()| {
-                startup_requires_exclusive_ownership_with_security(
+                startup_storage_profile(
                     &manifest_path,
                     requested_shards,
                     security_store_id,
+                    profile,
                 )
             })
-            .and_then(|manifest_requires_exclusive| {
+            .and_then(|(manifest_requires_exclusive, journal)| {
+                root.set_validated_journal(journal);
                 global_index::startup_requires_upgrade(&root).map(
                     |global_index_requires_exclusive| {
                         manifest_requires_exclusive || global_index_requires_exclusive
@@ -727,11 +777,18 @@ impl Storage {
             return Err(error);
         }
         let mut manifest = open_manifest_for_startup(&manifest_path, fresh_layout_allowed)?;
-        if let Err(error) = configure_manifest_connection(&manifest) {
+        if let Err(error) = configure_manifest_connection_with_policy(&manifest, root.journal()) {
             if error.kind() == EngineErrorKind::DataCorruption {
                 schema_coordination.mark_degraded();
             }
             return Err(error);
+        }
+        if !root.journal().is_wal() {
+            root.journal().configure_existing_mode(
+                &manifest,
+                EngineErrorKind::FailedPrecondition,
+                "manifest",
+            )?;
         }
         let v6_active = match manifest::load_v6_active_migration(&manifest, requested_shards) {
             Ok(active) => active,
@@ -763,11 +820,12 @@ impl Storage {
             }
         }
 
-        let loaded = match manifest::load_or_create_manifest_with_security(
+        let loaded = match manifest::load_or_create_manifest_with_profile(
             &mut manifest,
             requested_shards,
             fresh_layout_allowed,
             security_store_id,
+            profile,
         ) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -787,6 +845,12 @@ impl Storage {
             mut active_table_provisioning,
             generated_table_ddl,
         ) = loaded.into_parts_with_recovery();
+        if shard_layout.journal() != root.journal() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "manifest storage policy changed during startup",
+            ));
+        }
         let catalog = catalog.with_active_native_id_table_ids(active_native_id_table_ids);
         let catalog = catalog.with_active_hilo_id_table_ids(active_hilo_id_table_ids);
         let catalog = schema_coordination.register_catalog(catalog)?;
@@ -802,7 +866,9 @@ impl Storage {
                 "database is persistently degraded and requires a complete known-good restore",
             ));
         }
-        configure_journal_mode(&manifest)?;
+        if root.journal().is_wal() {
+            configure_journal_mode(&manifest)?;
+        }
 
         if let Some(active_migration) = active_migration {
             startup.mark_pending_on_drop();
@@ -865,7 +931,9 @@ impl Storage {
             #[cfg(feature = "documents")]
             document_peer_readers: Arc::new(document::PeerReaders::default()),
             #[cfg(feature = "documents")]
-            manifest_readers: Arc::new(manifest_readers::ManifestReaders::default()),
+            manifest_readers: Arc::new(manifest_readers::ManifestReaders::new(
+                ready_layout.journal(),
+            )),
             schema_coordination,
         };
         if let Some(mut ddl) = generated_table_ddl {
@@ -1075,12 +1143,24 @@ impl Storage {
         self.catalog.routing().shard_count()
     }
 
+    pub(crate) fn require_wal_checkpoint(&self) -> EngineResult<()> {
+        if self.root.journal().is_wal() {
+            Ok(())
+        } else {
+            Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "WAL checkpoint operations do not apply to rollback-journal storage",
+            ))
+        }
+    }
+
     pub(crate) fn checkpoint_auxiliary_databases(
         &self,
     ) -> EngineResult<Vec<CheckpointDatabaseReport>> {
+        self.require_wal_checkpoint()?;
         let result = (|| {
             let manifest = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-            configure_manifest_connection(&manifest)?;
+            self.configure_manifest_connection(&manifest)?;
             let mut reports = vec![checkpoint_database(
                 &manifest,
                 CheckpointDatabase::Manifest,
@@ -1144,7 +1224,7 @@ impl Storage {
             .allocate(table_id, |owner_id| {
                 let mut manifest_connection =
                     open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-                configure_manifest_connection(&manifest_connection)?;
+                self.configure_manifest_connection(&manifest_connection)?;
                 manifest::reserve_hilo_v1_block(
                     &mut manifest_connection,
                     self.shard_count(),
@@ -1193,8 +1273,7 @@ impl Storage {
                 .ensure_exclusive_catalog(&self.catalog)?;
             let manifest_path = self.root.join("manifest.sqlite");
             let mut manifest_connection = open_existing_manifest(&manifest_path)?;
-            configure_manifest_connection(&manifest_connection)?;
-            configure_journal_mode(&manifest_connection)?;
+            self.configure_manifest_connection(&manifest_connection)?;
 
             let classification = manifest::classify_generated_table_ddl(
                 &mut manifest_connection,
@@ -1414,7 +1493,7 @@ impl Storage {
 
             let manifest_path = self.root.join("manifest.sqlite");
             let mut manifest_connection = open_existing_manifest(&manifest_path)?;
-            configure_manifest_connection(&manifest_connection)?;
+            self.configure_manifest_connection(&manifest_connection)?;
             let replacement = if has_generated_policy {
                 let committed_schema_digest = self.schema_coordination.committed_schema_digest()?;
                 let classification = manifest::begin_native_table_provisioning(
@@ -1505,7 +1584,7 @@ impl Storage {
             .schema_coordination
             .reserve_catalog_replacement(&self.catalog)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest_connection)?;
+        self.configure_manifest_connection(&manifest_connection)?;
         let (replacement, index_id) = manifest::create_global_index(
             &mut manifest_connection,
             self.shard_count(),
@@ -1579,7 +1658,7 @@ impl Storage {
             ));
         }
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest_connection)?;
+        self.configure_manifest_connection(&manifest_connection)?;
         let replacement = manifest::transition_global_index(
             &mut manifest_connection,
             self.shard_count(),
@@ -2471,7 +2550,7 @@ impl Storage {
             .schema_coordination
             .reserve_catalog_replacement(&self.catalog)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest_connection)?;
+        self.configure_manifest_connection(&manifest_connection)?;
         let replacement = manifest::transition_global_index(
             &mut manifest_connection,
             self.shard_count(),
@@ -2496,7 +2575,7 @@ impl Storage {
             .schema_coordination
             .reserve_catalog_replacement(&self.catalog)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest_connection)?;
+        self.configure_manifest_connection(&manifest_connection)?;
         let replacement = manifest::transition_global_index(
             &mut manifest_connection,
             self.shard_count(),
@@ -2543,7 +2622,7 @@ impl Storage {
         shard_summary::remove_index(self, index_id)?;
         global_index::remove_artifacts(&self.root, index_id)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest_connection)?;
+        self.configure_manifest_connection(&manifest_connection)?;
         let replacement = manifest::remove_global_index(
             &mut manifest_connection,
             self.shard_count(),
@@ -2931,7 +3010,9 @@ impl Storage {
             let configured = manifest_connection
                 .busy_timeout(std::time::Duration::ZERO)
                 .map_err(sqlite_error::storage)
-                .and_then(|_| configure_manifest_connection_after_busy_setup(&manifest_connection));
+                .and_then(|_| {
+                    self.configure_manifest_connection_after_busy_setup(&manifest_connection)
+                });
             if configured.is_ok() {
                 let _ = manifest::mark_degraded(
                     &mut manifest_connection,
@@ -2992,7 +3073,7 @@ impl Storage {
                     &mut connection,
                     Arc::clone(&control),
                     |connection| {
-                        configure_manifest_connection_after_busy_setup(connection)?;
+                        self.configure_manifest_connection_after_busy_setup(connection)?;
                         let transaction = connection
                             .transaction_with_behavior(TransactionBehavior::Deferred)
                             .map_err(sqlite_error::storage)?;
@@ -3068,7 +3149,7 @@ impl Storage {
                     &mut connection,
                     Arc::clone(&control),
                     |connection| {
-                        configure_manifest_connection_after_busy_setup(connection)?;
+                        self.configure_manifest_connection_after_busy_setup(connection)?;
                         let transaction = connection
                             .transaction_with_behavior(TransactionBehavior::Deferred)
                             .map_err(sqlite_error::storage)?;
@@ -3546,6 +3627,15 @@ fn checkpoint_database(
 /// any database files.
 pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
     inspect_manifest_snapshot(root.as_ref(), manifest::detect_shard_count)
+}
+
+pub(crate) fn detect_shard_count_with_profile(
+    root: impl AsRef<Path>,
+    profile: crate::core::StorageProfile,
+) -> EngineResult<u16> {
+    inspect_manifest_snapshot(root.as_ref(), |connection| {
+        manifest::detect_shard_count_with_profile(connection, profile)
+    })
 }
 
 pub(crate) fn detect_storage_profile(
@@ -4057,11 +4147,22 @@ fn action_writes_connection(action: AuthAction<'_>) -> bool {
 }
 
 fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
-    contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
-    configure_manifest_connection_after_busy_setup(connection)
+    configure_manifest_connection_with_policy(connection, journal::JournalPolicy::LOCAL)
 }
 
-fn configure_manifest_connection_after_busy_setup(connection: &Connection) -> EngineResult<()> {
+fn configure_manifest_connection_with_policy(
+    connection: &Connection,
+    policy: journal::JournalPolicy,
+) -> EngineResult<()> {
+    contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
+    configure_manifest_connection_after_busy_setup_with_policy(connection, policy)
+}
+
+fn configure_manifest_connection_after_busy_setup_with_policy(
+    connection: &Connection,
+    policy: journal::JournalPolicy,
+) -> EngineResult<()> {
+    policy.configure_durability(connection)?;
     connection
         .pragma_update(None, "cell_size_check", "ON")
         .map_err(sqlite_error::storage)?;
@@ -4075,7 +4176,6 @@ fn configure_manifest_connection_after_busy_setup(connection: &Connection) -> En
         ));
     }
     validate_manifest_integrity_check(connection)?;
-    journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
@@ -4120,11 +4220,16 @@ fn open_manifest_for_startup(path: &Path, fresh_layout_allowed: bool) -> EngineR
     Ok(connection)
 }
 
-fn startup_requires_exclusive_ownership_with_security(
+fn startup_storage_profile(
     path: &Path,
     requested_shards: u16,
     security_store_id: Option<[u8; 16]>,
-) -> EngineResult<bool> {
+    profile: crate::core::StorageProfile,
+) -> EngineResult<(bool, journal::JournalPolicy)> {
+    let policy = match profile {
+        crate::core::StorageProfile::Local => journal::JournalPolicy::LOCAL,
+        crate::core::StorageProfile::Nfs => journal::JournalPolicy::NFS_PERSIST,
+    };
     validate_optional_manifest_file(path)?;
     if !path.exists() {
         if security_store_id.is_some() {
@@ -4133,15 +4238,20 @@ fn startup_requires_exclusive_ownership_with_security(
                 "authenticated startup requires an existing security-bound manifest",
             ));
         }
-        return Ok(true);
+        return Ok((true, policy));
     }
     let connection = open_existing_manifest(path)?;
-    configure_manifest_connection(&connection)?;
-    manifest::startup_requires_exclusive_ownership_with_security(
-        &connection,
-        requested_shards,
-        security_store_id,
-    )
+    configure_manifest_connection_with_policy(&connection, policy)?;
+    let inspected =
+        manifest::startup_profile(&connection, requested_shards, security_store_id, profile)?;
+    if profile == crate::core::StorageProfile::Nfs {
+        inspected.1.require_reopened_mode(
+            &connection,
+            EngineErrorKind::FailedPrecondition,
+            "manifest",
+        )?;
+    }
+    Ok(inspected)
 }
 
 pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {
@@ -5351,11 +5461,23 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
         assert!(!manifest.exists());
         assert_eq!(fs::read(&authority).unwrap(), authority_before);
-        assert!(global_index::startup_requires_upgrade(&canonical_root).unwrap());
+        assert!(
+            global_index::startup_requires_upgrade(&profile::StorageRoot::new(
+                canonical_root.clone(),
+                journal::JournalPolicy::LOCAL
+            ))
+            .unwrap()
+        );
 
         fs::write(&manifest, manifest_before).unwrap();
         drop(Storage::open(temp.path(), 2).unwrap());
-        assert!(!global_index::startup_requires_upgrade(&canonical_root).unwrap());
+        assert!(
+            !global_index::startup_requires_upgrade(&profile::StorageRoot::new(
+                canonical_root,
+                journal::JournalPolicy::LOCAL
+            ))
+            .unwrap()
+        );
     }
 
     #[test]
@@ -8116,7 +8238,13 @@ mod tests {
             );
             drop(Database::open(temp.path(), 2).unwrap());
             let canonical = fs::canonicalize(temp.path()).unwrap();
-            assert!(!global_index::startup_requires_upgrade(&canonical).unwrap());
+            assert!(
+                !global_index::startup_requires_upgrade(&profile::StorageRoot::new(
+                    canonical,
+                    journal::JournalPolicy::LOCAL
+                ))
+                .unwrap()
+            );
         }
     }
 
@@ -8383,10 +8511,22 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::Busy);
         assert!(error.is_retryable());
         let canonical = fs::canonicalize(temp.path()).unwrap();
-        assert!(global_index::startup_requires_upgrade(&canonical).unwrap());
+        assert!(
+            global_index::startup_requires_upgrade(&profile::StorageRoot::new(
+                canonical.clone(),
+                journal::JournalPolicy::LOCAL
+            ))
+            .unwrap()
+        );
         release_shared_root_peer(peer, &release);
         drop(Database::open(temp.path(), 2).unwrap());
-        assert!(!global_index::startup_requires_upgrade(&canonical).unwrap());
+        assert!(
+            !global_index::startup_requires_upgrade(&profile::StorageRoot::new(
+                canonical,
+                journal::JournalPolicy::LOCAL
+            ))
+            .unwrap()
+        );
     }
 
     #[test]

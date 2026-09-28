@@ -8,14 +8,24 @@ use super::*;
 
 const MAX_IDLE_READERS: usize = 2;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct ManifestReaders {
     idle: Mutex<Vec<Connection>>,
+    journal: journal::JournalPolicy,
     #[cfg(test)]
     opened: std::sync::atomic::AtomicUsize,
 }
 
 impl ManifestReaders {
+    pub(super) fn new(journal: journal::JournalPolicy) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            journal,
+            #[cfg(test)]
+            opened: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     /// Call only for storage-owned reads while schema admission is held.
     /// Handles remain read/write-capable for SQLite hot-journal recovery, as
     /// before, but never escape to public SQL or execute user statements.
@@ -48,7 +58,15 @@ impl ManifestReaders {
             &mut connection,
             Arc::clone(&control),
             |connection| {
-                configure_manifest_connection_after_busy_setup(connection)?;
+                configure_manifest_connection_after_busy_setup_with_policy(
+                    connection,
+                    self.journal,
+                )?;
+                self.journal.configure_existing_mode(
+                    connection,
+                    EngineErrorKind::FailedPrecondition,
+                    "manifest",
+                )?;
                 read(connection)
             },
         )?;

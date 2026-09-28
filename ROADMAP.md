@@ -629,10 +629,13 @@ requires an earlier dependency:
    must measure cold/warm metadata round trips, including manifest validation,
    handle reuse and DELETE/PERSIST journal churn; do not copy databases into
    Lambda or omit coherence checks to improve those measurements.
-   The unreleased profile prerequisite exposes explicit Rust/Python/CLI
-   selection and read-only validation of a fenced NFS-only manifest v23.
+   The unreleased profile implementation exposes explicit Rust/Python/CLI
+   selection, a fenced NFS-only manifest v23, and internal rollback-journal
+   integration for manifest, shards, document/global indexes and security stores.
    Local roots remain v22; public NFS opens still fail closed pending runtime
-   journal integration, locking/recovery and independent-host qualification.
+   locking/recovery and independent-host qualification. First cloud testing
+   targets isolated fixed-routing CRUD; optional placement is not a prerequisite
+   for that bounded test and must not be inferred from its results.
 10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential
