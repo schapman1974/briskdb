@@ -13,6 +13,8 @@ mod idempotency;
 mod index_outbox;
 mod journal;
 mod manifest;
+#[cfg(feature = "documents")]
+mod manifest_readers;
 mod migration;
 mod process_lock;
 mod schema_gate;
@@ -566,6 +568,8 @@ pub(crate) struct Storage {
     // Drop private idle readers before releasing this root's process lease.
     #[cfg(feature = "documents")]
     document_peer_readers: Arc<document::PeerReaders>,
+    #[cfg(feature = "documents")]
+    manifest_readers: Arc<manifest_readers::ManifestReaders>,
     schema_coordination: Arc<RootSchemaCoordination>,
 }
 
@@ -815,6 +819,8 @@ impl Storage {
             shard_layout: ready_layout,
             #[cfg(feature = "documents")]
             document_peer_readers: Arc::new(document::PeerReaders::default()),
+            #[cfg(feature = "documents")]
+            manifest_readers: Arc::new(manifest_readers::ManifestReaders::default()),
             schema_coordination,
         };
         if let Some(mut ddl) = generated_table_ddl {
