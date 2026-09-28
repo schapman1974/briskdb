@@ -42,12 +42,21 @@ pub(super) const PROFILE_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery
 // refuse mutation, even if a future caller accidentally uses it as an open plan.
 const INSPECTION_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: NFS_SCHEMA_VERSION,
-    migrations: MIGRATIONS,
+    // Keep this separate from the contiguous local upgrade registry, whose
+    // last entry must remain v22. This plan only inspects NFS roots, never
+    // upgrades a historical local root into the reserved profile.
+    migrations: &[Migration {
+        from: V22_SCHEMA_VERSION,
+        to: NFS_SCHEMA_VERSION,
+        name: "explicit_nfs_profile_no_automatic_conversion",
+        apply: reject_conversion,
+        validate: validate_nfs,
+    }],
     initialize_current: reject_conversion,
     initialize_interrupted_legacy: reject_conversion,
 };
 
-pub(super) fn reject_conversion(_: &Transaction<'_>, _: u16) -> EngineResult<()> {
+fn reject_conversion(_: &Transaction<'_>, _: u16) -> EngineResult<()> {
     Err(EngineError::new(
         EngineErrorKind::FailedPrecondition,
         "local/NFS storage profile conversion is not supported; retain a complete stopped-owner backup and export/import into a compatible new root once that profile is enabled",
@@ -108,7 +117,7 @@ fn profile_row(connection: &Connection) -> EngineResult<(i64, i64, i64, i64)> {
     }
 }
 
-pub(super) fn validate_nfs(
+fn validate_nfs(
     connection: &Connection,
     requested_shards: u16,
     schema: &[SchemaObject],
@@ -231,10 +240,12 @@ mod tests {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error::storage)?;
-        if !matches!(
-            inspect_with_plan(&transaction, 4, INSPECTION_PLAN)?,
-            ManifestState::Empty
-        ) {
+        if read_identity(&transaction)? != (0, 0)
+            || !matches!(
+                inspect_with_plan(&transaction, 4, INSPECTION_PLAN)?,
+                ManifestState::Empty
+            )
+        {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 "NFS initialization requires a new empty manifest; conversion is not supported",

@@ -1541,15 +1541,6 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v21_to_v22,
         validate: validate_v22,
     },
-    // Validation understands the reserved NFS format, but normal local startup
-    // stays on v22. There is deliberately no v22 -> NFS conversion migration.
-    Migration {
-        from: V22_SCHEMA_VERSION,
-        to: storage_profile::NFS_SCHEMA_VERSION,
-        name: "explicit_nfs_profile_no_automatic_conversion",
-        apply: storage_profile::reject_conversion,
-        validate: storage_profile::validate_nfs,
-    },
 ];
 
 #[derive(Clone, Copy)]
