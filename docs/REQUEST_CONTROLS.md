@@ -221,8 +221,7 @@ values. Clear backoff variables when selecting `legacy` or `fail-fast`.
 
 Root/startup locks, independent authorization work, uncontrolled maintenance
 handles, and experimental virtual-table child writes still use their
-established controls. Remaining internal wait paths and public retry diagnostics
-remain tracked by
+established controls. Remaining internal wait paths remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
 
 Blocking lock sleeps occur only on blocking workers; admission uses async
@@ -236,6 +235,36 @@ An uncontended acquisition can still succeed after retry exhaustion.
 This is also a foundation for future NFS mode, **not NFS/EFS support**. Backoff
 cannot bound an operating-system call stalled in filesystem I/O, and cancelling
 a request does not establish the outcome of an unacknowledged remote write.
+
+### Contention diagnostics
+
+On unreleased main, `Engine::contention_statistics()` reads three engine-lifetime
+counters without storage I/O. The same snapshot is included in Rust
+`EngineStatus::contention_statistics()` and Python `session.status()["contention"]`
+(also through async status):
+
+- `retries_scheduled`: reserved backoff windows, excluding the initial attempt.
+  Admission can complete, or cancellation can occur, before a window finishes.
+- `wait_nanos`: summed time in completed application contention-wait windows,
+  including early completion, cancellation, dropped futures and scheduler delay.
+  Concurrent child waits add independently; active waits contribute on exit.
+  This is **not** query latency, SQLite execution time or NFS kernel I/O time.
+- `exhausted_budgets`: shared budgets observed refusing further waiting, counted
+  at most once per budget across children, including fail-fast. This is not a
+  count of final request errors: uncontended work can still complete.
+
+The existing HTTP `/metrics` endpoint adds label-free counters
+`briskdb_contention_retries_scheduled_total`,
+`briskdb_contention_exhausted_budgets_total`, and
+`briskdb_contention_wait_seconds_total`. Reading these counters adds no storage
+I/O to the endpoint's existing global-index report. No query text, request IDs,
+paths, table names or user labels are recorded.
+
+Only explicitly configured policies and already-integrated wait paths contribute.
+Legacy and uncovered internal waits are excluded. Counters saturate at `u64::MAX`
+(wait time saturates in nanoseconds), reset with a new engine, and are shared by
+engine clones/listeners. Concurrent updates can occur between field reads;
+snapshots are observational, not transactional or an NFS qualification result.
 
 ## HTTP request identity and idempotent writes
 

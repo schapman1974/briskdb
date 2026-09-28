@@ -3108,6 +3108,12 @@ fn transaction_execution_name(execution: TransactionExecution) -> &'static str {
 
 fn status_to_python(py: Python<'_>, status: EngineStatus) -> PyResult<Py<PyAny>> {
     let output = PyDict::new(py);
+    let statistics = status.contention_statistics();
+    let contention = PyDict::new(py);
+    contention.set_item("retries_scheduled", statistics.retries_scheduled())?;
+    contention.set_item("wait_nanos", statistics.wait_nanos())?;
+    contention.set_item("exhausted_budgets", statistics.exhausted_budgets())?;
+    output.set_item("contention", contention)?;
     output.set_item("shards", status.shard_count())?;
     output.set_item("max_blocking_workers", status.max_blocking_workers())?;
     output.set_item("connections_per_shard", status.connections_per_shard())?;

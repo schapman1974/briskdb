@@ -205,7 +205,13 @@ class CheckpointReport(TypedDict):
     complete: bool
     shards: List[CheckpointShard]
 
+class ContentionStatistics(TypedDict):
+    retries_scheduled: int
+    wait_nanos: int
+    exhausted_budgets: int
+
 class Status(TypedDict):
+    contention: ContentionStatistics
     shards: int
     max_blocking_workers: int
     connections_per_shard: int

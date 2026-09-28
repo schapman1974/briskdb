@@ -12,7 +12,10 @@ use std::{
 
 use tokio::sync::Notify;
 
-use super::{ContentionJitter, ContentionPolicy, contention::ContentionBudget};
+use super::{
+    ContentionJitter, ContentionPolicy,
+    contention::{ContentionBudget, ContentionMetrics, ContentionWait},
+};
 use super::{EngineError, EngineErrorKind, EngineResult, ResultLimits};
 
 /// A cloneable, sticky request-cancellation signal.
@@ -243,13 +246,24 @@ impl OperationControl {
         Self::with_contention_policy(deadline, None)
     }
 
+    #[cfg(any(feature = "tinymongo-import", test))]
     pub(crate) fn with_contention_policy(
         deadline: Option<Instant>,
         policy: Option<ContentionPolicy>,
     ) -> Arc<Self> {
+        Self::with_contention_metrics(deadline, policy, Arc::new(ContentionMetrics::default()))
+    }
+
+    pub(crate) fn with_contention_metrics(
+        deadline: Option<Instant>,
+        policy: Option<ContentionPolicy>,
+        metrics: Arc<ContentionMetrics>,
+    ) -> Arc<Self> {
         Self::with_contention_budget(
             deadline,
-            policy.map(|policy| Arc::new(Mutex::new(ContentionBudget::new(policy)))),
+            policy.map(|policy| {
+                Arc::new(Mutex::new(ContentionBudget::with_metrics(policy, metrics)))
+            }),
         )
     }
 
@@ -284,6 +298,7 @@ impl OperationControl {
         let Some(delay) = delay else {
             return Some(false);
         };
+        let _wait = self.start_contention_wait();
         let until = Instant::now() + delay;
         loop {
             if self.should_stop() || cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -332,6 +347,15 @@ impl OperationControl {
             return None;
         }
         budget.next_delay(Instant::now(), u64::from_le_bytes(random))
+    }
+
+    fn start_contention_wait(&self) -> Option<ContentionWait> {
+        self.contention.as_ref().map(|budget| {
+            budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .start_wait()
+        })
     }
 
     fn contention_expired(&self) -> bool {
@@ -528,6 +552,7 @@ where
                     "the request contention budget was exhausted while waiting for admission",
                 ));
             };
+            let _wait = control.start_contention_wait();
             tokio::select! {
                 biased;
                 reason = wait_for_cancellation(request, shutdown, deadline) => {
@@ -593,8 +618,12 @@ mod tests {
 
     #[test]
     fn contention_scope_shares_one_atomic_retry_count_across_parallel_children() {
-        let parent =
-            OperationControl::with_contention_policy(None, Some(short_contention_policy(7)));
+        let metrics = Arc::new(ContentionMetrics::default());
+        let parent = OperationControl::with_contention_metrics(
+            None,
+            Some(short_contention_policy(7)),
+            Arc::clone(&metrics),
+        );
         let scope = RequestScope::new(CancellationToken::new(), &parent);
         let admitted = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::new();
@@ -612,6 +641,71 @@ mod tests {
         }
         assert_eq!(admitted.load(Ordering::SeqCst), 7);
         assert_eq!(parent.next_contention_delay(), None);
+        assert_eq!(metrics.snapshot().retries_scheduled(), 7);
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 1);
+        assert_eq!(metrics.snapshot().wait_nanos(), 0);
+    }
+
+    #[test]
+    fn contention_diagnostics_measure_blocking_waits_but_not_pre_cancelled_or_legacy_calls() {
+        let metrics = Arc::new(ContentionMetrics::default());
+        let legacy = OperationControl::with_contention_metrics(None, None, Arc::clone(&metrics));
+        assert_eq!(legacy.wait_for_contention(None), None);
+        let cancelled = OperationControl::with_contention_metrics(
+            None,
+            Some(short_contention_policy(1)),
+            Arc::clone(&metrics),
+        );
+        cancelled.request_cancel(CancellationReason::Cancelled);
+        assert_eq!(cancelled.wait_for_contention(None), Some(false));
+        assert_eq!(
+            metrics.snapshot(),
+            super::super::ContentionStatistics::default()
+        );
+        let active = OperationControl::with_contention_metrics(
+            None,
+            Some(short_contention_policy(1)),
+            Arc::clone(&metrics),
+        );
+        assert_eq!(active.wait_for_contention(None), Some(true));
+        assert_eq!(active.wait_for_contention(None), Some(false));
+        assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+        assert!(metrics.snapshot().wait_nanos() >= 1_000_000);
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 1);
+    }
+
+    #[tokio::test]
+    async fn contention_diagnostics_record_dropped_admission_wait_without_false_exhaustion() {
+        let metrics = Arc::new(ContentionMetrics::default());
+        let control = OperationControl::with_contention_metrics(
+            None,
+            Some(slow_contention_policy()),
+            Arc::clone(&metrics),
+        );
+        let request = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let mut waiting = Box::pin(wait_admission(
+            std::future::pending::<EngineResult<()>>(),
+            &request,
+            &shutdown,
+            None,
+            &control,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+        assert_eq!(metrics.snapshot().wait_nanos(), 0);
+        drop(waiting);
+        assert!(metrics.snapshot().wait_nanos() > 0);
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 0);
+        let before = metrics.snapshot();
+        wait_admission(async { Ok(()) }, &request, &shutdown, None, &control)
+            .await
+            .unwrap();
+        assert_eq!(metrics.snapshot(), before); // Ready admission is not a wait.
     }
 
     #[test]
@@ -853,8 +947,12 @@ mod tests {
     #[test]
     fn cancellation_wakes_a_long_backoff_and_standalone_tokens_are_polled() {
         for standalone in [false, true] {
-            let control =
-                OperationControl::with_contention_policy(None, Some(slow_contention_policy()));
+            let metrics = Arc::new(ContentionMetrics::default());
+            let control = OperationControl::with_contention_metrics(
+                None,
+                Some(slow_contention_policy()),
+                Arc::clone(&metrics),
+            );
             let token = CancellationToken::new();
             let waiter_control = Arc::clone(&control);
             let waiter_token = token.clone();
@@ -889,6 +987,9 @@ mod tests {
                 Some(false)
             );
             waiter.join().unwrap();
+            assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+            assert!(metrics.snapshot().wait_nanos() > 0);
+            assert_eq!(metrics.snapshot().exhausted_budgets(), 0);
         }
     }
 

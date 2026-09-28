@@ -61,6 +61,8 @@ class ContentionConfigTests(unittest.TestCase):
                 with briskdb.open(root, config=config) as database:
                     self.assertEqual(repr(database.config.contention_policy), repr(selected))
                     with database.session(routing_key="same") as session:
+                        self.assertEqual(session.status()["contention"], {
+                            "retries_scheduled": 0, "wait_nanos": 0, "exhausted_budgets": 0})
                         session.migrate("CREATE TABLE contention_items (id INTEGER PRIMARY KEY)")
                     with database.transaction(routing_key="same") as owner:
                         owner.execute("INSERT INTO contention_items VALUES (1)")
@@ -68,9 +70,22 @@ class ContentionConfigTests(unittest.TestCase):
                             with self.assertRaises(briskdb.BusyError):
                                 contender.execute("INSERT INTO contention_items VALUES (2)")
                     with database.session(routing_key="same") as session:
+                        counters = session.status()["contention"]
+                        self.assertEqual(counters["exhausted_budgets"], 1)
+                        if selected.is_fail_fast:
+                            self.assertEqual(counters["retries_scheduled"], 0)
+                            self.assertEqual(counters["wait_nanos"], 0)
+                        else:
+                            self.assertGreater(counters["retries_scheduled"], 0)
+                            self.assertLessEqual(counters["retries_scheduled"], selected.max_retries)
+                            self.assertGreater(counters["wait_nanos"], 0)
                         self.assertEqual(session.query("SELECT id FROM contention_items")["rows"], [(1,)])
                         session.execute("INSERT INTO contention_items VALUES (2)")
                         self.assertEqual(session.query("SELECT id FROM contention_items ORDER BY id")["rows"], [(1,), (2,)])
+                with briskdb.open(root, config=config) as reopened:
+                    with reopened.session() as session:
+                        self.assertEqual(session.status()["contention"], {
+                            "retries_scheduled": 0, "wait_nanos": 0, "exhausted_budgets": 0})
 
 
 class AsyncContentionConfigTests(unittest.IsolatedAsyncioTestCase):
@@ -89,6 +104,8 @@ class AsyncContentionConfigTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(briskdb.BusyError):
                             await contender.execute("INSERT INTO contention_items VALUES (2)")
                 async with await database.session(routing_key="same") as session:
+                    self.assertEqual((await session.status())["contention"], {
+                        "retries_scheduled": 0, "wait_nanos": 0, "exhausted_budgets": 1})
                     self.assertEqual((await session.query("SELECT id FROM contention_items"))["rows"], [(1,)])
                     await session.execute("INSERT INTO contention_items VALUES (2)")
 

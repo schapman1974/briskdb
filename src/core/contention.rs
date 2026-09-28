@@ -1,6 +1,14 @@
 //! Bounded lock-acquisition backoff. This never replays application work.
 
-use std::time::{Duration, Instant};
+mod statistics;
+
+pub use statistics::ContentionStatistics;
+pub(crate) use statistics::{ContentionMetrics, ContentionWait};
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::{EngineError, EngineErrorKind, EngineResult};
 
@@ -122,21 +130,31 @@ pub(crate) struct ContentionBudget {
     started: Option<Instant>,
     next_delay: Duration,
     retries: u32,
+    metrics: Arc<ContentionMetrics>,
+    exhaustion_recorded: bool,
 }
 
 impl ContentionBudget {
+    #[cfg(test)]
     pub(crate) fn new(policy: ContentionPolicy) -> Self {
+        Self::with_metrics(policy, Arc::new(ContentionMetrics::default()))
+    }
+
+    pub(crate) fn with_metrics(policy: ContentionPolicy, metrics: Arc<ContentionMetrics>) -> Self {
         Self {
             policy,
             started: None,
             next_delay: policy.initial_delay,
             retries: 0,
+            metrics,
+            exhaustion_recorded: false,
         }
     }
 
     pub(crate) fn next_delay(&mut self, now: Instant, random: u64) -> Option<Duration> {
         let started = *self.started.get_or_insert(now);
         if self.retries >= self.policy.max_retries {
+            self.record_exhaustion();
             return None;
         }
         let remaining = self
@@ -152,9 +170,11 @@ impl ContentionBudget {
         };
         // No shortened final sleep followed by an attempt at/after expiry.
         if delay >= remaining {
+            self.record_exhaustion();
             return None;
         }
         self.retries += 1;
+        self.metrics.scheduled();
         self.next_delay = self
             .next_delay
             .saturating_mul(self.policy.multiplier)
@@ -162,9 +182,25 @@ impl ContentionBudget {
         Some(delay)
     }
 
-    pub(crate) fn expired(&self, now: Instant) -> bool {
-        self.started
-            .is_some_and(|started| now.duration_since(started) >= self.policy.max_elapsed)
+    pub(crate) fn expired(&mut self, now: Instant) -> bool {
+        let expired = self
+            .started
+            .is_some_and(|started| now.duration_since(started) >= self.policy.max_elapsed);
+        if expired {
+            self.record_exhaustion();
+        }
+        expired
+    }
+
+    fn record_exhaustion(&mut self) {
+        if !self.exhaustion_recorded {
+            self.exhaustion_recorded = true;
+            self.metrics.exhausted();
+        }
+    }
+
+    pub(crate) fn start_wait(&self) -> ContentionWait {
+        self.metrics.start_wait()
     }
 
     pub(crate) fn jitter(&self) -> ContentionJitter {
@@ -191,6 +227,30 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn diagnostics_count_scheduled_windows_and_each_exhausted_budget_only_once() {
+        let metrics = Arc::new(ContentionMetrics::default());
+        let start = Instant::now();
+        let mut budget = ContentionBudget::with_metrics(policy(), Arc::clone(&metrics));
+        assert!(budget.next_delay(start, 0).is_some());
+        assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+        assert_eq!(metrics.snapshot().wait_nanos(), 0); // Scheduling is not sleeping.
+        assert!(!budget.expired(start));
+        for _ in 0..3 {
+            assert!(budget.expired(start + Duration::from_secs(1)));
+            assert_eq!(budget.next_delay(start + Duration::from_secs(1), 0), None);
+        }
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 1);
+        let mut fail_fast =
+            ContentionBudget::with_metrics(ContentionPolicy::fail_fast(), Arc::clone(&metrics));
+        for _ in 0..3 {
+            assert_eq!(fail_fast.next_delay(start, 0), None);
+        }
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 2);
+        assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+        assert_eq!(metrics.snapshot().wait_nanos(), 0);
     }
 
     #[test]

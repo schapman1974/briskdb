@@ -40,7 +40,7 @@ pub(crate) use catalog::{
     CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME,
     IDENTIFIER_ENCODING_VERSION, MAX_LOGICAL_DATABASES, MAX_TABLES, validate_catalog_identifier,
 };
-pub use contention::{ContentionJitter, ContentionPolicy};
+pub use contention::{ContentionJitter, ContentionPolicy, ContentionStatistics};
 pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_admission, wait_for_cancellation,
 };

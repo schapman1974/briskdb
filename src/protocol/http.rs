@@ -464,7 +464,9 @@ async fn ready(State(state): State<HttpState>) -> Response {
 
 async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
     let report = state.engine.global_index_operational_report().await?;
-    let mut response = prometheus_metrics(&report).into_response();
+    let mut body = prometheus_metrics(&report);
+    write_contention_metrics(&mut body, state.engine.contention_statistics());
+    let mut response = body.into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
@@ -1458,6 +1460,40 @@ fn lifecycle_status(lifecycle: GlobalIndexLifecycle) -> (&'static str, bool, &'s
     }
 }
 
+fn write_contention_metrics(output: &mut String, statistics: crate::ContentionStatistics) {
+    for (name, help, value) in [
+        (
+            "retries_scheduled",
+            "Reserved backoff windows for configured contention policies.",
+            statistics.retries_scheduled(),
+        ),
+        (
+            "exhausted_budgets",
+            "Shared configured budgets observed refusing further contention waiting.",
+            statistics.exhausted_budgets(),
+        ),
+    ] {
+        let _ = writeln!(output, "# HELP briskdb_contention_{name}_total {help}");
+        let _ = writeln!(output, "# TYPE briskdb_contention_{name}_total counter");
+        let _ = writeln!(output, "briskdb_contention_{name}_total {value}");
+    }
+    let nanos = statistics.wait_nanos();
+    let _ = writeln!(
+        output,
+        "# HELP briskdb_contention_wait_seconds_total Summed completed application contention waits, not query or NFS I/O time."
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE briskdb_contention_wait_seconds_total counter"
+    );
+    let _ = writeln!(
+        output,
+        "briskdb_contention_wait_seconds_total {}.{:09}",
+        nanos / 1_000_000_000,
+        nanos % 1_000_000_000
+    );
+}
+
 fn prometheus_metrics(report: &GlobalIndexOperationalReport) -> String {
     let mut output = String::from(
         "# HELP briskdb_global_indexes Global indexes by operational state.\n\
@@ -2214,6 +2250,11 @@ mod tests {
         )
         .unwrap();
         assert!(body.contains("briskdb_global_indexes{state=\"healthy\"} 1"));
+        for name in ["retries_scheduled", "exhausted_budgets"] {
+            assert!(body.contains(&format!("# TYPE briskdb_contention_{name}_total counter\n")));
+            assert!(body.contains(&format!("briskdb_contention_{name}_total 0\n")));
+        }
+        assert!(body.contains("briskdb_contention_wait_seconds_total 0.000000000\n"));
         assert!(body.contains(&format!(
             "briskdb_global_index_summary_ready_shards{{index_id=\"{index_id}\"}} 4"
         )));
