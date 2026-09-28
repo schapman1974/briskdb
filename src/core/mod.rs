@@ -176,6 +176,17 @@ pub struct Database {
     global_index_worker_id: [u8; 16],
 }
 
+#[cfg(all(test, unix, feature = "documents"))]
+impl Database {
+    /// Test-only assembly for storage qualification; no public profile bypass.
+    pub(crate) fn from_test_storage(storage: Storage) -> EngineResult<Self> {
+        Ok(Self {
+            storage,
+            global_index_worker_id: random_global_index_worker_id()?,
+        })
+    }
+}
+
 /// Caller-owned background maintenance loop for non-unique global indexes.
 ///
 /// Dropping the handle requests shutdown and joins the worker. Multiple

@@ -46,3 +46,6 @@ impl AsRef<Path> for StorageRoot {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix, feature = "documents"))]
+mod efs_qualification;
