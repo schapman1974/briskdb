@@ -174,9 +174,45 @@ resource acquisition or block the async runtime. Exhaustion drops the pending
 future and releases its queue reservation. The engine/request deadline still
 bounds the complete request.
 
+On unreleased main, Python sync/async opens accept the same validated policy:
+
+```python
+import briskdb
+
+policy = briskdb.ContentionPolicy(
+    initial_delay_ms=2, max_delay_ms=50, multiplier=2,
+    jitter="full", max_retries=8, max_elapsed_ms=250,
+)
+config = briskdb.Config(shards=4, contention_policy=policy)
+# briskdb.open(path, config=config), or await briskdb.open_async(path, config=config)
+```
+
+All six constructor arguments are required. The returned properties are
+read-only. `briskdb.ContentionPolicy.fail_fast()` selects no waiting;
+`Config(contention_policy=None)` preserves legacy behavior. Attached listeners
+inherit this engine policy and keep their existing protocol-specific deadlines.
+
+The daemon supports the same policy through flags or environment variables:
+
+```sh
+briskdb --contention-mode backoff \
+  --contention-initial-delay-ms 2 --contention-max-delay-ms 50 \
+  --contention-multiplier 2 --contention-jitter full \
+  --contention-max-retries 8 --contention-max-elapsed-ms 250
+```
+
+The default mode is `legacy`. `--contention-mode fail-fast` accepts no backoff
+parameters; `backoff` requires all six. Partial or unused settings are errors,
+not silently ignored. Each option has a matching uppercase environment name:
+`BRISKDB_CONTENTION_MODE`, `BRISKDB_CONTENTION_INITIAL_DELAY_MS`,
+`BRISKDB_CONTENTION_MAX_DELAY_MS`, `BRISKDB_CONTENTION_MULTIPLIER`,
+`BRISKDB_CONTENTION_JITTER`, `BRISKDB_CONTENTION_MAX_RETRIES`, and
+`BRISKDB_CONTENTION_MAX_ELAPSED_MS`. Explicit flags override their environment
+values. Clear backoff variables when selecting `legacy` or `fail-fast`.
+
 Root/startup locks, independent authorization work, uncontrolled maintenance
 handles, and experimental virtual-table child writes still use their
-established controls. Python/managed-Mongo and daemon configuration, remaining
+established controls. Managed-Mongo/patch configuration, remaining
 internal wait paths, and public retry diagnostics remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
 

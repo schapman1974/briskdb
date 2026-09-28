@@ -1,4 +1,5 @@
 mod bson;
+mod contention;
 mod document_api;
 mod error;
 mod mongo_client;
@@ -49,6 +50,7 @@ use crate::{
         PythonUuidRepresentation, ensure_bson_available, extract_bson_document, extract_request_id,
         parse_uuid_representation,
     },
+    contention::ContentionPolicy,
     document_api::execution_to_python as document_execution_to_python,
     error::{NativeError, NativeResult, listener_error, run_native},
     value::{
@@ -147,6 +149,7 @@ impl Drop for DatabaseShared {
 #[pyclass(module = "briskdb._briskdb", frozen, get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct Config {
+    contention_policy: Option<ContentionPolicy>,
     storage_profile: String,
     shards: Option<u16>,
     documents: bool,
@@ -165,6 +168,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            contention_policy: None,
             storage_profile: "local".to_owned(),
             shards: None,
             documents: false,
@@ -196,6 +200,11 @@ impl Config {
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
                 .with_storage_profile(self.storage_profile.parse()?)
+                .with_contention_policy(
+                    self.contention_policy
+                        .as_ref()
+                        .map(ContentionPolicy::native),
+                )
                 .with_result_limits(result_limits)
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?
@@ -210,6 +219,7 @@ impl Config {
     #[new]
     #[pyo3(signature = (
         *,
+        contention_policy = None,
         storage_profile = "local",
         shards = None,
         documents = false,
@@ -226,6 +236,7 @@ impl Config {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        contention_policy: Option<PyRef<'_, ContentionPolicy>>,
         storage_profile: &str,
         shards: Option<u16>,
         documents: bool,
@@ -241,6 +252,7 @@ impl Config {
         shutdown_grace_ms: u64,
     ) -> PyResult<Self> {
         let config = Self {
+            contention_policy: contention_policy.map(|policy| policy.clone()),
             storage_profile: storage_profile.to_owned(),
             shards,
             documents,
@@ -264,8 +276,12 @@ impl Config {
         let shards = self
             .shards
             .map_or_else(|| "None".to_owned(), |shards| shards.to_string());
+        let contention = self
+            .contention_policy
+            .as_ref()
+            .map_or_else(|| "None".to_owned(), ContentionPolicy::representation);
         format!(
-            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={}, storage_profile={:?})",
+            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={}, storage_profile={:?}, contention_policy={contention})",
             self.documents,
             self.uuid_representation,
             self.connections_per_shard,
@@ -3150,6 +3166,7 @@ fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(module)?;
     module.add_class::<CancellationToken>()?;
     module.add_class::<Config>()?;
+    module.add_class::<ContentionPolicy>()?;
     module.add_class::<Cursor>()?;
     module.add_class::<Database>()?;
     module.add_class::<Server>()?;

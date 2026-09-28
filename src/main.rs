@@ -1,3 +1,5 @@
+mod cli_contention;
+
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use briskdb::{
@@ -55,6 +57,8 @@ impl FromStr for ListenerSetting {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    #[command(flatten)]
+    contention: cli_contention::ContentionArgs,
     /// Loopback data-plane HTTP listener address.
     #[arg(long, env = "BRISKDB_LISTEN", default_value = "127.0.0.1:7654")]
     listen: SocketAddr,
@@ -283,6 +287,7 @@ impl Args {
     /// Keeping this conversion ahead of `server::run_with_engine_options`
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
+        let contention_policy = self.contention.policy()?;
         EngineOptions::default()
             .with_storage_profile(self.storage_profile)
             .validate_for_shards(self.shards)?;
@@ -351,6 +356,7 @@ impl Args {
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
                 .with_storage_profile(self.storage_profile)
+                .with_contention_policy(contention_policy)
                 .with_result_limits(result_limits)
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?

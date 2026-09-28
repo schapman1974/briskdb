@@ -5,6 +5,7 @@ from ._briskdb import (
     CancelledError as CancelledError,
     CheckViolationError as CheckViolationError,
     Config as Config,
+    ContentionPolicy as ContentionPolicy,
     ConstraintViolationError as ConstraintViolationError,
     Cursor as Cursor,
     DataCorruptionError as DataCorruptionError,

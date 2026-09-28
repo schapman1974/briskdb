@@ -314,6 +314,23 @@ config = briskdb.Config(shards=4, max_result_rows=5_000)
 db = briskdb.open("./data", config=config)
 ```
 
+Unreleased main can also configure lock/admission waiting (sync or async):
+
+```python
+policy = briskdb.ContentionPolicy(
+    initial_delay_ms=2, max_delay_ms=50, multiplier=2,
+    jitter="full", max_retries=8, max_elapsed_ms=250,
+)
+config = briskdb.Config(shards=4, contention_policy=policy)
+with briskdb.open("./data", config=config) as db:
+    pass
+```
+
+Use `ContentionPolicy.fail_fast()` for no retries, or omit the policy to keep
+existing behavior. This never replays commands or uncertain writes. Managed
+`MongoClient`/`patch` configuration is not exposed yet. See the
+[complete waiting contract](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
+
 On unreleased main, `Config(storage_profile="local")` makes the default storage
 contract explicit. The reserved `storage_profile="nfs"` currently raises
 `UnsupportedError` during configuration, before opening or creating files.
