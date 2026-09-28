@@ -563,6 +563,9 @@ pub(crate) struct Storage {
     root: PathBuf,
     catalog: Arc<CatalogSnapshot>,
     shard_layout: shard::ShardLayout,
+    // Drop private idle readers before releasing this root's process lease.
+    #[cfg(feature = "documents")]
+    document_peer_readers: Arc<document::PeerReaders>,
     schema_coordination: Arc<RootSchemaCoordination>,
 }
 
@@ -810,6 +813,8 @@ impl Storage {
             root,
             catalog,
             shard_layout: ready_layout,
+            #[cfg(feature = "documents")]
+            document_peer_readers: Arc::new(document::PeerReaders::default()),
             schema_coordination,
         };
         if let Some(mut ddl) = generated_table_ddl {

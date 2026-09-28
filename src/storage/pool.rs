@@ -309,7 +309,13 @@ impl ConnectionPools {
             let mut idle = shard.inner.lock_idle()?;
             closing.append(&mut idle);
         }
-        let closed = closing.len();
+        #[cfg(feature = "documents")]
+        let peer_readers = self.shards.first().map_or(Ok(0), |shard| {
+            shard.inner.storage.document_peer_readers.close_idle()
+        })?;
+        #[cfg(not(feature = "documents"))]
+        let peer_readers = 0;
+        let closed = closing.len() + peer_readers;
         drop(closing);
         Ok(closed)
     }
