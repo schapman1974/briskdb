@@ -44,6 +44,15 @@ state/config properties, and a synchronous context manager. `Session` exposes
 routing-key state, SQL and document commands, `status()`, `close()`, and a
 context manager.
 
+On unreleased main, `Session.status()["contention"]` (or awaited async status)
+contains engine-lifetime `retries_scheduled`, `wait_nanos` and
+`exhausted_budgets` integers for explicitly configured contention policies.
+Concurrent waits are summed, active waits contribute on completion, and a
+shared request budget contributes at most one exhaustion. These are not query
+latencies, NFS I/O counts or final request-error counts. Legacy and uncovered
+internal waits are excluded; all counters saturate at `2**64 - 1`. See the
+[diagnostic contract](../docs/REQUEST_CONTROLS.md#contention-diagnostics).
+
 `Transaction` provides routed `execute()`/`query()`, explicit
 `commit()`/`rollback()`, and commit-on-success/rollback-on-exception context
 management. The `AsyncDatabase`, `AsyncSession`, `AsyncTransaction`, and

@@ -23,6 +23,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+use super::contention::{ContentionMetrics, ContentionStatistics};
 use super::control::RequestScope;
 use super::session::TransactionState;
 use super::{
@@ -125,6 +126,7 @@ pub struct EngineStatus {
     prepared_statement_limits: PreparedStatementLimits,
     request_timeout: Option<Duration>,
     shutdown_grace: Duration,
+    contention: ContentionStatistics,
 }
 
 /// Result of one passive WAL checkpoint on a physical shard.
@@ -333,6 +335,11 @@ impl CheckpointReport {
 }
 
 impl EngineStatus {
+    /// Engine-lifetime counters for explicitly configured contention policies.
+    pub const fn contention_statistics(&self) -> ContentionStatistics {
+        self.contention
+    }
+
     /// Return the number of physical shards opened by the engine.
     pub const fn shard_count(&self) -> u16 {
         self.shard_count
@@ -385,6 +392,7 @@ struct EngineInner {
     id: u64,
     database: Arc<Database>,
     options: EngineOptions,
+    contention_metrics: Arc<ContentionMetrics>,
     workers: BlockingPool,
     connections: ConnectionPools,
     lifecycle: Arc<Lifecycle>,
@@ -656,6 +664,7 @@ impl Engine {
                 id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
                 database,
                 options,
+                contention_metrics: Arc::new(ContentionMetrics::default()),
                 workers,
                 connections,
                 lifecycle: Lifecycle::new(),
@@ -1121,9 +1130,10 @@ impl Engine {
             configured.max_bytes().min(requested.max_bytes()),
         )
         .expect("the minimum of validated result limits is valid");
-        let control = OperationControl::with_contention_policy(
+        let control = OperationControl::with_contention_metrics(
             deadline,
             self.inner.options.contention_policy(),
+            Arc::clone(&self.inner.contention_metrics),
         );
         let cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let operation = Operation {
@@ -1137,6 +1147,12 @@ impl Engine {
         };
         operation.check_before_start()?;
         Ok(operation)
+    }
+
+    /// Read fixed-size, label-free contention counters without storage I/O.
+    /// Legacy and not-yet-integrated internal waits are excluded.
+    pub fn contention_statistics(&self) -> ContentionStatistics {
+        self.inner.contention_metrics.snapshot()
     }
 
     /// Return engine status after validating the calling session.
@@ -1171,6 +1187,7 @@ impl Engine {
                 prepared_statement_limits: self.inner.options.prepared_statement_limits(),
                 request_timeout: self.inner.options.request_timeout(),
                 shutdown_grace: self.inner.options.shutdown_grace(),
+                contention: self.contention_statistics(),
             })
         }
         .await;
@@ -6297,6 +6314,14 @@ mod tests {
         assert_eq!(status.connections_per_shard(), 4);
         assert_eq!(status.queue_capacity_per_shard(), 32);
         assert_eq!(
+            status.contention_statistics(),
+            ContentionStatistics::default()
+        );
+        assert_eq!(
+            engine.contention_statistics(),
+            ContentionStatistics::default()
+        );
+        assert_eq!(
             status.prepared_statement_limits(),
             PreparedStatementLimits::default()
         );
@@ -10294,6 +10319,18 @@ mod tests {
         refused(&engine, &session).await;
         wait_for_pool_occupancy(&engine, shard, 0, 0).await;
         drop(workers);
+        let statistics = engine.clone().contention_statistics();
+        assert_eq!(statistics.retries_scheduled(), 0);
+        assert_eq!(statistics.wait_nanos(), 0);
+        assert_eq!(statistics.exhausted_budgets(), 3);
+        assert_eq!(
+            engine
+                .status(&session)
+                .await
+                .unwrap()
+                .contention_statistics(),
+            statistics
+        );
 
         let connection =
             rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))

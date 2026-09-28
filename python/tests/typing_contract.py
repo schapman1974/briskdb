@@ -17,6 +17,13 @@ def contention_policy_contract() -> briskdb.Config:
     print(jitter, retries, fast.is_fail_fast, selected)
     return configured
 
+def contention_statistics_contract(session: briskdb.Session) -> int:
+    statistics = session.status()["contention"]
+    retries: int = statistics["retries_scheduled"]
+    waited: int = statistics["wait_nanos"]
+    exhausted: int = statistics["exhausted_budgets"]
+    return retries + waited + exhausted
+
 
 def storage_profile_contract() -> Literal["local", "nfs"]:
     config = briskdb.Config(storage_profile="local")
