@@ -283,6 +283,11 @@ impl OperationControl {
         })
     }
 
+    #[cfg(feature = "auth-scram")]
+    pub(crate) fn has_contention_policy(&self) -> bool {
+        self.contention.is_some()
+    }
+
     /// A blocking-worker-only lock wait, never a retry of application work.
     /// `None` keeps the caller's legacy policy. Reusing this control across
     /// connection setup, collection fences and SQL shares one finite budget.

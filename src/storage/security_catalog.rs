@@ -9,6 +9,9 @@
 //! Unix ownership/mode checks are supported; other platforms fail closed until
 //! equivalent ACL validation is implemented. No existing permissions are changed.
 
+mod controls;
+pub(crate) use controls::with_operation_control;
+
 use std::{
     fmt,
     fs::File,
@@ -28,6 +31,7 @@ use crate::core::{
 
 const APPLICATION_ID: i64 = 0x4253_4341; // BSCA
 const FORMAT_VERSION: i64 = 1;
+const SECURITY_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const TABLE_SQL: &str = "CREATE TABLE briskdb_security_state (
     singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
     store_id BLOB NOT NULL CHECK (length(store_id) = 16),
@@ -199,16 +203,25 @@ impl SecurityCatalogStore {
     }
 
     pub fn load(&mut self) -> EngineResult<StoredSecurityCatalog> {
-        self.check()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(storage_error)?;
-        let snapshot = read_snapshot(&transaction, self.id, self.observed_revision)?;
-        check_file_identity(&transaction, &self.path, &self.identity_file)?;
-        transaction.commit().map_err(storage_error)?;
-        self.observed_revision = snapshot.revision;
-        Ok(snapshot)
+        let Self {
+            connection,
+            path,
+            identity_file,
+            id,
+            observed_revision,
+            fenced,
+        } = self;
+        controls::with_connection(connection, |connection| {
+            check(connection, path, identity_file, *fenced)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(storage_error)?;
+            let snapshot = read_snapshot(&transaction, *id, *observed_revision)?;
+            check_file_identity(&transaction, path, identity_file)?;
+            transaction.commit().map_err(storage_error)?;
+            *observed_revision = snapshot.revision;
+            Ok(snapshot)
+        })
     }
 
     /// Compare-and-swap a whole validated catalog. A stale revision never writes.
@@ -232,44 +245,53 @@ impl SecurityCatalogStore {
         catalog: &SecurityCatalog,
         hook: impl FnOnce(&Transaction<'_>) -> EngineResult<()>,
     ) -> EngineResult<u64> {
-        self.check()?;
-        if expected_revision == 0 || expected_revision >= i64::MAX as u64 {
-            return Err(failure(
-                EngineErrorKind::LimitExceeded,
-                "security store revision is invalid or exhausted",
-            ));
-        }
-        let record = catalog.to_record()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage_error)?;
-        let current = read_snapshot(&transaction, self.id, self.observed_revision)?;
-        self.observed_revision = current.revision;
-        if current.revision != expected_revision {
-            return Err(failure(
-                EngineErrorKind::FailedPrecondition,
-                "security store revision conflict",
-            ));
-        }
-        current.catalog.validate_successor(catalog)?;
-        let next = expected_revision + 1;
-        // From this point an I/O error may have an uncertain durable outcome.
-        // Fence first; only a confirmed complete commit clears the fence.
-        self.fenced = true;
-        transaction
+        let Self {
+            connection,
+            path,
+            identity_file,
+            id,
+            observed_revision,
+            fenced,
+        } = self;
+        controls::with_connection(connection, |connection| {
+            check(connection, path, identity_file, *fenced)?;
+            if expected_revision == 0 || expected_revision >= i64::MAX as u64 {
+                return Err(failure(
+                    EngineErrorKind::LimitExceeded,
+                    "security store revision is invalid or exhausted",
+                ));
+            }
+            let record = catalog.to_record()?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+            let current = read_snapshot(&transaction, *id, *observed_revision)?;
+            *observed_revision = current.revision;
+            if current.revision != expected_revision {
+                return Err(failure(
+                    EngineErrorKind::FailedPrecondition,
+                    "security store revision conflict",
+                ));
+            }
+            current.catalog.validate_successor(catalog)?;
+            let next = expected_revision + 1;
+            // From this point an I/O error may have an uncertain durable outcome.
+            // Fence first; only a confirmed complete commit clears the fence.
+            *fenced = true;
+            transaction
             .execute(
                 "UPDATE briskdb_security_state SET revision = ?1, record = ?2 WHERE singleton = 1",
                 rusqlite::params![next as i64, record.as_bytes()],
             )
             .map_err(storage_error)?;
-        hook(&transaction)?;
-        check_file_identity(&transaction, &self.path, &self.identity_file)?;
-        transaction.commit().map_err(storage_error)?;
-        check_file_identity(&self.connection, &self.path, &self.identity_file)?;
-        self.observed_revision = next;
-        self.fenced = false;
-        Ok(next)
+            hook(&transaction)?;
+            check_file_identity(&transaction, path, identity_file)?;
+            transaction.commit().map_err(storage_error)?;
+            check_file_identity(connection, path, identity_file)?;
+            *observed_revision = next;
+            *fenced = false;
+            Ok(next)
+        })
     }
 
     pub(crate) const fn is_fenced(&self) -> bool {
@@ -279,16 +301,21 @@ impl SecurityCatalogStore {
     pub(crate) const fn observed_revision(&self) -> u64 {
         self.observed_revision
     }
+}
 
-    fn check(&self) -> EngineResult<()> {
-        if self.fenced {
-            return Err(failure(
-                EngineErrorKind::FailedPrecondition,
-                "security store requires explicit reopen",
-            ));
-        }
-        check_file_identity(&self.connection, &self.path, &self.identity_file)
+fn check(
+    connection: &Connection,
+    path: &Path,
+    identity_file: &File,
+    fenced: bool,
+) -> EngineResult<()> {
+    if fenced {
+        return Err(failure(
+            EngineErrorKind::FailedPrecondition,
+            "security store requires explicit reopen",
+        ));
     }
+    check_file_identity(connection, path, identity_file)
 }
 
 fn open_connection(path: &Path) -> EngineResult<Connection> {
@@ -309,7 +336,7 @@ fn configure(connection: &Connection) -> EngineResult<()> {
         )
         .map_err(storage_error)?;
     connection
-        .busy_timeout(Duration::from_secs(2))
+        .busy_timeout(SECURITY_BUSY_TIMEOUT)
         .map_err(storage_error)?;
     // Connection-only settings: do not change or repair an existing file's mode.
     connection

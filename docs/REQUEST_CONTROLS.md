@@ -221,11 +221,16 @@ values. Clear backoff variables when selecting `legacy` or `fail-fast`.
 
 Security user/role commands and document authorization share their parent
 command's effective deadline and contention budget across session admission,
-worker admission and in-process authority-lock acquisition. Child execution
-phases and interrupt slots stay separate. Only acquiring the authority mutex is
-retried; once a security read/edit starts, it runs once and may still commit if
-cancellation arrives during execution. A known successful commit is preserved.
-Unconfigured engines retain the legacy authority-mutex wait behavior.
+worker admission, in-process authority-lock acquisition and security-store
+SQLite busy waits. Child execution phases and interrupt slots stay separate.
+Only lock acquisition is retried; once a security read/edit starts, it runs once
+and may still commit if cancellation arrives during execution. A known
+successful commit is preserved.
+The SQLite controls apply only during the synchronous authority call and are
+removed on success, failure or panic. A failed security refresh or uncertain
+update still fences the authority until explicit reopen; backoff never permits
+fallback to cached permissions. Unconfigured engines retain the legacy
+authority-mutex wait and native two-second security-store busy timeout.
 
 Controlled schema migrations use that same request budget across their
 manifest and shard SQLite busy handlers. Only SQLite lock acquisition is
@@ -241,9 +246,9 @@ guards; it does not cancel or replay initialization/recovery already executing.
 opens retain their startup contention counters in engine diagnostics. `None`
 preserves the existing startup wait behavior.
 
-Startup SQLite and authenticated security-root preparation, security-store
-SQLite waits, uncontrolled maintenance handles, and experimental virtual-table
-child writes still use their established controls. Process-lease restoration
+Startup SQLite and authenticated security-root preparation, uncontrolled
+maintenance handles, and experimental virtual-table child writes still use
+their established controls. Process-lease restoration
 after an unsuccessful exclusive upgrade must retain ownership before returning.
 Remaining internal wait paths remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).

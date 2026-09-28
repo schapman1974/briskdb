@@ -294,7 +294,10 @@ impl Engine {
                 if let Some(reason) = control.reason() {
                     return Err(reason.error());
                 }
-                work(&mut authority)
+                crate::storage::security_catalog::with_operation_control(
+                    Arc::clone(&control),
+                    || work(&mut authority),
+                )
             })();
             control.complete(result)
         });
