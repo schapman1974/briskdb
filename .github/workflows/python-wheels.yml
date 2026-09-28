@@ -129,10 +129,11 @@ jobs:
   wheels:
     name: Python wheel (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    # The Intel Mac beta rehearsal needed ~12 minutes to build and ~7.5
-    # minutes for one installed-Python suite. Keep both runtime suites and the
-    # extension-enabled HTTPS checks; budget for all of them, not just one.
-    timeout-minutes: 45
+    # Run 36444474832 needed ~25 minutes for the Intel build and ~16 for
+    # its first Python suite, exhausting 45 minutes during the second suite.
+    # Keep both suites and native addon/TLS checks, with bounded headroom on
+    # Intel only; the other platform budgets stay unchanged.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -141,18 +142,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: manylinux_2_28_x86_64
             manylinux: "2_28"
+            timeout_minutes: 45
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: manylinux_2_28_aarch64
             manylinux: "2_28"
+            timeout_minutes: 45
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: macosx_11_0_x86_64
             manylinux: auto
+            timeout_minutes: 75
           - runner: macos-15
             target: aarch64-apple-darwin
             platform: macosx_11_0_arm64
             manylinux: auto
+            timeout_minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
