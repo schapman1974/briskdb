@@ -6,6 +6,18 @@ import sqlite3
 import briskdb
 
 
+def contention_policy_contract() -> briskdb.Config:
+    policy = briskdb.ContentionPolicy(initial_delay_ms=2, max_delay_ms=50,
+        multiplier=2, jitter="full", max_retries=8, max_elapsed_ms=250)
+    jitter: Literal["none", "full"] = policy.jitter
+    retries: int = policy.max_retries
+    fast: briskdb.ContentionPolicy = briskdb.ContentionPolicy.fail_fast()
+    configured = briskdb.Config(contention_policy=policy)
+    selected: Optional[briskdb.ContentionPolicy] = configured.contention_policy
+    print(jitter, retries, fast.is_fail_fast, selected)
+    return configured
+
+
 def storage_profile_contract() -> Literal["local", "nfs"]:
     config = briskdb.Config(storage_profile="local")
     return config.storage_profile

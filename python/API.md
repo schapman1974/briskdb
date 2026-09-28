@@ -20,6 +20,17 @@ Unreleased main also accepts `Config(storage_profile="local")` (the default).
 names raise `InvalidArgumentError`. This selection does not convert a root or
 enable EFS support. See the [profile contract](../docs/STORAGE_FORMAT.md#explicit-profile-selection-and-reserved-nfs-format).
 
+Unreleased main accepts `Config(contention_policy=None)` (unchanged legacy
+waiting), `Config(contention_policy=ContentionPolicy.fail_fast())`, or an
+immutable `ContentionPolicy(initial_delay_ms=..., max_delay_ms=...,
+multiplier=..., jitter="none"|"full", max_retries=..., max_elapsed_ms=...)`.
+All six backoff arguments are required and validated by the Rust engine before
+storage opens. Retries exclude the initial acquisition attempt. This controls
+supported lock/admission waits, not application-command or uncertain-write
+replay. Sync/async opens and attached listeners use the same configured engine.
+Managed `MongoClient`/`patch` configuration is a separate, still-pending step.
+See [bounds, coverage and examples](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
+
 `shards` is required to create storage and optional when reopening it. An
 omitted count is read from the validated manifest; an explicit mismatch raises
 `FailedPreconditionError`. `Database.shard_count` and `Database.config.shards`
