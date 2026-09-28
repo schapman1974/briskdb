@@ -31,12 +31,13 @@ use crate::{
 };
 
 use super::{
-    CONNECTION_BUSY_TIMEOUT, RootSchemaCoordination, SchemaMigrationGuard, Storage,
-    configure_journal_mode, configure_manifest_connection,
-    configure_manifest_connection_after_busy_setup, manifest,
+    CONNECTION_BUSY_TIMEOUT, RootSchemaCoordination, SchemaMigrationGuard, Storage, manifest,
     manifest::{SchemaMigration, SchemaMigrationClassification},
     open_existing_manifest, shard,
 };
+
+#[cfg(test)]
+use super::{configure_journal_mode, configure_manifest_connection};
 
 thread_local! {
     static MIGRATION_BUSY_OPERATION: RefCell<Option<MigrationBusyOperation>> = const {
@@ -338,8 +339,7 @@ where
 
     let manifest_path = storage.root.join("manifest.sqlite");
     let mut manifest_connection = open_existing_manifest(&manifest_path)?;
-    configure_manifest_connection(&manifest_connection)?;
-    configure_journal_mode(&manifest_connection)?;
+    storage.configure_manifest_connection(&manifest_connection)?;
 
     let mut transaction = ManifestTransaction::begin(&mut manifest_connection, None)?;
     let (ddl, migration) = transaction.run(|connection| {
@@ -405,14 +405,10 @@ where
         Some(control) => run_connection_controlled(
             &mut manifest_connection,
             Arc::clone(control),
-            |connection| {
-                configure_manifest_connection_after_busy_setup(connection)?;
-                configure_journal_mode(connection)
-            },
+            |connection| storage.configure_manifest_connection_after_busy_setup(connection),
         )?,
         None => {
-            configure_manifest_connection(&manifest_connection)?;
-            configure_journal_mode(&manifest_connection)?;
+            storage.configure_manifest_connection(&manifest_connection)?;
         }
     }
 

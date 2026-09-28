@@ -339,7 +339,13 @@ impl Database {
     ) -> EngineResult<Self> {
         profile.require_available()?;
         Ok(Self {
-            storage: Storage::open(root, requested_shards)?,
+            storage: Storage::open_with_profile_control(
+                root,
+                requested_shards,
+                None,
+                None,
+                profile,
+            )?,
             global_index_worker_id: random_global_index_worker_id()?,
         })
     }

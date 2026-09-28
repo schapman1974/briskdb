@@ -35,14 +35,20 @@ replace busy handlers, disable SQLite's native locks, or change transaction scop
 | --- | --- | --- | --- |
 | Local manifest, data/document shards, global-index store | WAL | FULL | Existing default, unchanged |
 | Local security store | DELETE | FULL, plus existing `fullfsync` | Existing opt-in authentication contract, unchanged |
-| NFS rollback candidates | DELETE or PERSIST | EXTRA | Internal tests only; public NFS opens reject as unsupported |
+| NFS manifest, shards, global indexes, security store | PERSIST (also reads the persisted DELETE policy) | EXTRA | Internal profile integration; public NFS opens reject as unsupported |
 
 Local roots remain on manifest version 22; ordinary opens never convert between
-local and NFS profiles. The reserved NFS format below establishes inspection and
-rejection fences only. Runtime journal integration, NFS-safe lifecycle and
-stale-client handling, checkpoint/backup integration, and independent-host
-qualification remain required by [#511](https://github.com/schapman1974/briskdb/issues/511)
-and the [NFS epic](https://github.com/schapman1974/briskdb/issues/509).
+local and NFS profiles. Internal profile-aware initialization, reopen, schema
+migration, document/index lifecycle and pooled manifest readers carry a validated
+journal policy explicitly. The security store uses format 2 for rollback/EXTRA
+and retains format 1/DELETE/FULL for local roots; older standalone store openers
+reject format 2. No public entry point bypasses the NFS availability gate.
+NFS-safe lifecycle, cross-host locking, stale-client handling and independent-host
+qualification remain required by the [NFS epic](https://github.com/schapman1974/briskdb/issues/509).
+WAL checkpoint APIs explicitly reject rollback roots rather than reporting fake
+frame counts. Global-index build completion syncs rollback files without issuing
+a WAL checkpoint. Online backup and profile conversion are not supported for NFS;
+do not copy independently live SQLite files and their journals.
 Existing local initialization/recovery paths retain their journal behavior;
 strict shard and global-index reopen validation still rejects a wrong mode.
 
@@ -94,10 +100,13 @@ unsupported. Inspection rejects WAL without attempting conversion. Since
 PERSIST is connection-local, a read-only connection may report DELETE; the
 persisted policy remains authoritative for future compatible writers.
 
-Only test fixtures initialize this format today. The local migration plan stays
-at v22 and rejects v23 before managed manifest/shard mutations. Both the
-inspection plan's initializer and the v22-to-v23 migration slot reject
-conversion. SQLite's own hot-journal recovery is a separate safety boundary,
+An internal profile-specific initialization plan creates this format only from
+empty storage. The local migration plan stays at v22 and rejects v23 before
+managed manifest/shard mutations. The read-only inspection plan's initializer
+and the v22-to-v23 migration slot reject conversion. New writable handles apply
+the checked EXTRA durability before metadata reads and reapply PERSIST only
+after identity validation; WAL files are rejected, not converted. SQLite's own
+hot-journal recovery is a separate safety boundary,
 not an old-client guarantee established by these local format tests. There is
 no supported in-place local/NFS conversion: retain a complete stopped-owner
 backup and use export/import into a new compatible root once NFS is enabled.

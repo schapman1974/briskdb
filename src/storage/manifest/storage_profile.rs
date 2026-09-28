@@ -1,7 +1,7 @@
-//! Reserved NFS manifest format and read-only profile inspection.
+//! Fenced NFS manifest format and explicit, no-conversion initialization.
 //!
-//! Local roots continue to use v22. This format can be inspected, but no public
-//! opener can initialize or use it until the cross-host safety work is enabled.
+//! Local roots continue to use v22. Internal storage can exercise this format;
+//! public NFS openers remain unavailable pending cross-host safety qualification.
 
 use super::*;
 use crate::core::StorageProfile;
@@ -55,6 +55,84 @@ const INSPECTION_PLAN: MigrationPlan<'static> = MigrationPlan {
     initialize_current: reject_conversion,
     initialize_interrupted_legacy: reject_conversion,
 };
+
+const INITIALIZATION_PLAN: MigrationPlan<'static> = MigrationPlan {
+    initialize_current: create_nfs_schema,
+    ..INSPECTION_PLAN
+};
+
+pub(super) fn requested_plan(
+    connection: &Connection,
+    profile: StorageProfile,
+) -> EngineResult<MigrationPlan<'static>> {
+    let identity = read_identity(connection)?;
+    match profile {
+        StorageProfile::Local
+            if identity != (MANIFEST_APPLICATION_ID, i64::from(NFS_SCHEMA_VERSION)) =>
+        {
+            Ok(CURRENT_PLAN)
+        }
+        StorageProfile::Nfs
+            if matches!(identity, (0, 0))
+                || identity == (MANIFEST_APPLICATION_ID, i64::from(NFS_SCHEMA_VERSION)) =>
+        {
+            Ok(INITIALIZATION_PLAN)
+        }
+        _ => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "storage profile mismatch; local/NFS conversion is not supported; export/import into a new compatible root instead",
+        )),
+    }
+}
+
+pub(super) fn existing_plan(connection: &Connection) -> EngineResult<MigrationPlan<'static>> {
+    if read_identity(connection)? == (MANIFEST_APPLICATION_ID, i64::from(NFS_SCHEMA_VERSION)) {
+        Ok(INSPECTION_PLAN)
+    } else {
+        Ok(CURRENT_PLAN)
+    }
+}
+
+pub(super) const fn is_current(version: u32) -> bool {
+    version == CURRENT_SCHEMA_VERSION || version == NFS_SCHEMA_VERSION
+}
+
+fn create_nfs_schema(transaction: &Transaction<'_>, shards: u16) -> EngineResult<()> {
+    create_v22_schema(transaction, shards)?;
+    transaction
+        .execute_batch(PROFILE_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_storage_profile VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                PROFILE_VERSION,
+                NFS_MODE,
+                PERSIST_JOURNAL,
+                EXTRA_SYNCHRONOUS
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata VALUES (?1)",
+            [NFS_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version=?1",
+            [V15_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
 
 fn reject_conversion(_: &Transaction<'_>, _: u16) -> EngineResult<()> {
     Err(EngineError::new(
@@ -162,6 +240,22 @@ fn validate_nfs(
     snapshot.logical_catalog = Some(catalog.with_global_indexes(indexes));
     validate_document_catalog(connection, snapshot.shard_count)?;
     snapshot.security_store_id = security_store_id;
+    if snapshot
+        .shard_layout
+        .is_some_and(|layout| layout.state() == ShardLayoutState::Adopting)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "NFS cannot adopt a legacy local shard layout",
+        ));
+    }
+    snapshot.shard_layout = snapshot.shard_layout.map(|layout| {
+        layout.with_journal(if row.2 == PERSIST_JOURNAL {
+            super::super::journal::JournalPolicy::NFS_PERSIST
+        } else {
+            super::super::journal::JournalPolicy::NFS_DELETE
+        })
+    });
     Ok(snapshot)
 }
 
@@ -195,43 +289,6 @@ pub(in crate::storage) fn detect_storage_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn create_nfs_schema(transaction: &Transaction<'_>, shards: u16) -> EngineResult<()> {
-        create_v22_schema(transaction, shards)?;
-        transaction
-            .execute_batch(PROFILE_TABLE_SQL)
-            .map_err(sqlite_error::storage)?;
-        transaction
-            .execute(
-                "INSERT INTO briskdb_storage_profile VALUES (1, ?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    PROFILE_VERSION,
-                    NFS_MODE,
-                    PERSIST_JOURNAL,
-                    EXTRA_SYNCHRONOUS
-                ],
-            )
-            .map_err(sqlite_error::storage)?;
-        transaction
-            .execute_batch("DROP TABLE briskdb_metadata")
-            .map_err(sqlite_error::storage)?;
-        transaction
-            .execute_batch(DOWNGRADE_FENCE_SQL)
-            .map_err(sqlite_error::storage)?;
-        transaction
-            .execute(
-                "INSERT INTO briskdb_metadata VALUES (?1)",
-                [NFS_SCHEMA_VERSION],
-            )
-            .map_err(sqlite_error::storage)?;
-        transaction
-            .execute(
-                "UPDATE briskdb_integrity SET manifest_digest_version=?1",
-                [V15_MANIFEST_DIGEST_VERSION],
-            )
-            .map_err(sqlite_error::storage)?;
-        Ok(())
-    }
 
     fn create_nfs_with_hook(
         connection: &mut Connection,

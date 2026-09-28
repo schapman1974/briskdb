@@ -28,7 +28,7 @@ use crate::{
     sqlite_error,
 };
 
-use super::{CONNECTION_BUSY_TIMEOUT, Storage};
+use super::{CONNECTION_BUSY_TIMEOUT, Storage, journal::JournalPolicy, profile::StorageRoot};
 
 const DIRECTORY_NAME: &str = "global-indexes";
 const SHARED_FILE_NAME: &str = "global.sqlite";
@@ -454,7 +454,7 @@ struct UniqueReservation {
     source_locator: Vec<u8>,
 }
 
-pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
+pub(super) fn startup_requires_upgrade(root: &StorageRoot) -> EngineResult<bool> {
     let directory = root.join(DIRECTORY_NAME);
     match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -489,6 +489,11 @@ pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
     // Startup version inspection is part of the same admission budget as
     // manifest/shard inspection, even though this handle is read-only.
     super::contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
+    root.journal().configure_existing(
+        &connection,
+        EngineErrorKind::FailedPrecondition,
+        "global-index storage",
+    )?;
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(sqlite_error::storage)?;
@@ -514,7 +519,7 @@ pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
     }
 }
 
-pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
+pub(super) fn upgrade_if_needed(root: &StorageRoot) -> EngineResult<()> {
     if !startup_requires_upgrade(root)? {
         return Ok(());
     }
@@ -526,15 +531,15 @@ pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(sqlite_error::storage)?;
-    configure(&connection)?;
+    configure(&connection, root.journal())?;
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sqlite_error::storage)?;
     match version {
-        1 => validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1)?,
-        2 => validate_storage_contents(&connection, 2, EXPECTED_OBJECTS_V2)?,
-        3 => validate_storage_contents(&connection, 3, EXPECTED_OBJECTS_V3)?,
-        _ => return validate(&connection),
+        1 => validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1, root.journal())?,
+        2 => validate_storage_contents(&connection, 2, EXPECTED_OBJECTS_V2, root.journal())?,
+        3 => validate_storage_contents(&connection, 3, EXPECTED_OBJECTS_V3, root.journal())?,
+        _ => return validate(&connection, root.journal()),
     }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -564,8 +569,8 @@ pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
     abort_at_authority_test_boundary("upgrade-before-commit");
     transaction.commit().map_err(sqlite_error::storage)?;
     abort_at_authority_test_boundary("upgrade-after-commit");
-    validate(&connection)?;
-    checkpoint_and_sync(&connection, &path)
+    validate(&connection, root.journal())?;
+    checkpoint_and_sync(&connection, &path, root.journal())
 }
 
 #[cfg(test)]
@@ -654,7 +659,7 @@ pub(super) fn downgrade_to_v3_for_test(root: &Path) {
 }
 
 pub(super) fn reserve_unique(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     mutation: &GlobalUniqueMutation,
     index: &GlobalIndexMetadata,
@@ -758,7 +763,7 @@ pub(super) fn reserve_unique(
 }
 
 pub(super) fn finalize_unique(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     cancellation: &CancellationToken,
 ) -> EngineResult<GlobalUniqueReservation> {
@@ -766,7 +771,7 @@ pub(super) fn finalize_unique(
 }
 
 pub(super) fn rollback_unique(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     cancellation: &CancellationToken,
 ) -> EngineResult<GlobalUniqueReservation> {
@@ -777,7 +782,7 @@ pub(super) fn rollback_unique(
 /// through its durable operation-lock markers before attempting recovery, so
 /// lower-level callers retain ownership of their manually managed operations.
 pub(super) fn active_unique_mutations(
-    root: &Path,
+    root: &StorageRoot,
 ) -> EngineResult<Vec<(GlobalOperationId, GlobalUniqueMutation)>> {
     let Some((connection, _)) = open_existing(root)? else {
         return Ok(Vec::new());
@@ -1657,7 +1662,7 @@ pub(super) fn decide_orphaned_unique_write(
 }
 
 fn transition_unique_operation(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     target: i64,
     cancellation: &CancellationToken,
@@ -1751,7 +1756,7 @@ fn complete_unique_transition(
 }
 
 pub(super) fn lease_values(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     index: &GlobalIndexMetadata,
     shard_count: u16,
@@ -1876,7 +1881,7 @@ pub(super) fn lease_values(
 }
 
 pub(super) fn transition_value_lease(
-    root: &Path,
+    root: &StorageRoot,
     operation_id: GlobalOperationId,
     finalize: bool,
     cancellation: &CancellationToken,
@@ -2797,7 +2802,7 @@ fn build_inner(
     // retrying this build safely restarts that shard.
     super::shard_summary::rebuild(storage, index, cancellation)?;
 
-    checkpoint_and_sync(&connection, &path)?;
+    checkpoint_and_sync(&connection, &path, storage.root.journal())?;
     Ok(GlobalIndexBuildReport::from_validated(
         index.id(),
         storage.shard_count(),
@@ -3124,7 +3129,7 @@ pub(super) fn repair_non_unique(
     abort_at_recovery_test_boundary("repair-complete-before-commit");
     transaction.commit().map_err(sqlite_error::storage)?;
     abort_at_recovery_test_boundary("repair-complete-after-commit");
-    checkpoint_and_sync(&connection, &path)?;
+    checkpoint_and_sync(&connection, &path, storage.root.journal())?;
     Ok((repaired_shards, indexed_rows))
 }
 
@@ -3760,7 +3765,7 @@ fn sample_ordinals(total: u64, maximum: u16) -> Vec<u64> {
         .collect()
 }
 
-pub(super) fn remove_artifacts(root: &Path, index_id: GlobalIndexId) -> EngineResult<()> {
+pub(super) fn remove_artifacts(root: &StorageRoot, index_id: GlobalIndexId) -> EngineResult<()> {
     let Some((mut connection, path)) = open_existing(root)? else {
         return Ok(());
     };
@@ -3775,7 +3780,7 @@ pub(super) fn remove_artifacts(root: &Path, index_id: GlobalIndexId) -> EngineRe
         )
         .map_err(sqlite_error::storage)?;
     transaction.commit().map_err(sqlite_error::storage)?;
-    checkpoint_and_sync(&connection, &path)
+    checkpoint_and_sync(&connection, &path, root.journal())
 }
 
 fn prepare_build(
@@ -5256,7 +5261,7 @@ fn update_framed(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
-fn open_or_create(root: &Path) -> EngineResult<(Connection, PathBuf)> {
+fn open_or_create(root: &StorageRoot) -> EngineResult<(Connection, PathBuf)> {
     let directory = root.join(DIRECTORY_NAME);
     ensure_real_directory(&directory)?;
     let path = directory.join(SHARED_FILE_NAME);
@@ -5270,17 +5275,17 @@ fn open_or_create(root: &Path) -> EngineResult<(Connection, PathBuf)> {
             OpenFlags::SQLITE_OPEN_CREATE
         };
     let connection = Connection::open_with_flags(&path, flags).map_err(sqlite_error::storage)?;
-    configure(&connection)?;
+    configure(&connection, root.journal())?;
     if exists {
-        validate(&connection)?;
+        validate(&connection, root.journal())?;
     } else {
-        initialize(&connection)?;
+        initialize(&connection, root.journal())?;
         sync_directory(&directory)?;
     }
     Ok((connection, path))
 }
 
-pub(super) fn open_existing(root: &Path) -> EngineResult<Option<(Connection, PathBuf)>> {
+pub(super) fn open_existing(root: &StorageRoot) -> EngineResult<Option<(Connection, PathBuf)>> {
     let directory = root.join(DIRECTORY_NAME);
     match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5312,13 +5317,13 @@ pub(super) fn open_existing(root: &Path) -> EngineResult<Option<(Connection, Pat
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(sqlite_error::storage)?;
-    configure(&connection)?;
-    validate(&connection)?;
+    configure(&connection, root.journal())?;
+    validate(&connection, root.journal())?;
     Ok(Some((connection, path)))
 }
 
 pub(super) fn operational_counts(
-    root: &Path,
+    root: &StorageRoot,
     index_id: GlobalIndexId,
 ) -> EngineResult<OperationalCounts> {
     let (connection, _) = open_existing(root)?
@@ -5378,23 +5383,23 @@ pub(super) fn operational_counts(
     })
 }
 
-fn configure(connection: &Connection) -> EngineResult<()> {
+fn configure(connection: &Connection, policy: JournalPolicy) -> EngineResult<()> {
     super::contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
+    policy.configure_durability(connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
-    super::journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     Ok(())
 }
 
-fn initialize(connection: &Connection) -> EngineResult<()> {
+fn initialize(connection: &Connection, policy: JournalPolicy) -> EngineResult<()> {
     connection
         .pragma_update(None, "application_id", APPLICATION_ID)
         .map_err(sqlite_error::storage)?;
     connection
         .pragma_update(None, "user_version", STORAGE_VERSION)
         .map_err(sqlite_error::storage)?;
-    super::journal::JournalPolicy::LOCAL.initialize_mode(
+    policy.initialize_mode(
         connection,
         EngineErrorKind::StorageUnavailable,
         "global-index storage",
@@ -5411,10 +5416,10 @@ fn initialize(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch(ASYNC_INDEX_SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
-    validate(connection)
+    validate(connection, policy)
 }
 
-fn validate(connection: &Connection) -> EngineResult<()> {
+fn validate(connection: &Connection, policy: JournalPolicy) -> EngineResult<()> {
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(sqlite_error::storage)?;
@@ -5439,15 +5444,16 @@ fn validate(connection: &Connection) -> EngineResult<()> {
             ),
         ));
     }
-    validate_storage_contents(connection, STORAGE_VERSION, EXPECTED_OBJECTS)
+    validate_storage_contents(connection, STORAGE_VERSION, EXPECTED_OBJECTS, policy)
 }
 
 fn validate_storage_contents(
     connection: &Connection,
     storage_version: u32,
     expected_objects: &[&str],
+    policy: JournalPolicy,
 ) -> EngineResult<()> {
-    super::journal::JournalPolicy::LOCAL.require_mode(
+    policy.configure_existing_mode(
         connection,
         EngineErrorKind::DataCorruption,
         "global-index storage",
@@ -5541,17 +5547,23 @@ fn ensure_regular_file_or_absent(path: &Path) -> EngineResult<bool> {
     }
 }
 
-fn checkpoint_and_sync(connection: &Connection, path: &Path) -> EngineResult<()> {
-    let (_, remaining): (i64, i64) = connection
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .map_err(sqlite_error::storage)?;
-    if remaining != 0 {
-        return Err(EngineError::new(
-            EngineErrorKind::Busy,
-            "global-index WAL could not be fully checkpointed before publication",
-        ));
+fn checkpoint_and_sync(
+    connection: &Connection,
+    path: &Path,
+    policy: JournalPolicy,
+) -> EngineResult<()> {
+    if policy.is_wal() {
+        let (_, remaining): (i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(sqlite_error::storage)?;
+        if remaining != 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::Busy,
+                "global-index WAL could not be fully checkpointed before publication",
+            ));
+        }
     }
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -5851,7 +5863,7 @@ mod tests {
     #[test]
     fn version_one_storage_upgrades_atomically_to_the_authority_schema() {
         let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
+        let root = StorageRoot::new(fs::canonicalize(temp.path()).unwrap(), JournalPolicy::LOCAL);
         let connection = open_or_create(&root).unwrap().0;
         connection
             .execute(

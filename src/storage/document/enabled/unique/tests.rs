@@ -63,6 +63,63 @@ fn row(id: i32, value: Option<BsonValue>) -> BsonDocument {
 }
 
 #[test]
+fn nfs_profile_unique_peer_snapshots_retain_extra_durability() {
+    let root = tempfile::tempdir().unwrap();
+    let open = || {
+        Storage::open_with_profile_control(
+            root.path(),
+            2,
+            None,
+            None,
+            crate::core::StorageProfile::Nfs,
+        )
+        .unwrap()
+    };
+    let storage = open();
+    let collection = storage
+        .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+        .unwrap()
+        .id();
+    build(&storage, collection, index()).unwrap();
+    let (first, second) = ids_on_different_shards(&storage);
+    storage
+        .insert_document(collection, &row(first, Some(BsonValue::Int32(7))))
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            storage
+                .insert_document(collection, &row(second, Some(BsonValue::Int32(7))))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::UniqueViolation
+        );
+    }
+    for (_, connection) in storage.document_peer_readers.lock().unwrap().iter() {
+        assert!(connection.is_autocommit());
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+    drop(storage);
+    let reopened = open();
+    assert!(
+        reopened
+            .get_document(collection, &BsonValue::Int32(first))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .get_document(collection, &BsonValue::Int32(second))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn cross_shard_unique_keys_are_typed_multikey_and_persistent() {
     for shards in [2, 4] {
         for (left, right, conflicts) in [

@@ -298,10 +298,10 @@ impl Storage {
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
             let (names, before, after) = run_manifest_controlled(
+                self,
                 &mut connection,
                 Arc::clone(&control),
                 |connection| {
-                    configure_journal_mode(connection)?;
                     require_ready_manifest(connection, self.shard_count())?;
                     let catalog = load_catalog_rows(connection)?;
                     let collection = catalog
@@ -401,12 +401,15 @@ impl Storage {
             ensure_control_active(&control, "before dropping built document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-            let catalog =
-                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
-                    configure_journal_mode(connection)?;
+            let catalog = run_manifest_controlled(
+                self,
+                &mut connection,
+                Arc::clone(&control),
+                |connection| {
                     require_ready_manifest(connection, self.shard_count())?;
                     load_catalog_rows(connection)
-                })?;
+                },
+            )?;
             let collection = catalog
                 .collection(database, collection_name)
                 .ok_or_else(|| {
@@ -447,7 +450,7 @@ impl Storage {
                     format!("unable to allocate document index operation identity: {error}"),
                 )
             })?;
-            run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+            run_manifest_controlled(self, &mut connection, Arc::clone(&control), |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sqlite_error::storage)?;
@@ -567,9 +570,11 @@ impl Storage {
             ensure_control_active(&control, "before creating document indexes")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-            let before =
-                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
-                    configure_journal_mode(connection)?;
+            let before = run_manifest_controlled(
+                self,
+                &mut connection,
+                Arc::clone(&control),
+                |connection| {
                     require_ready_manifest(connection, self.shard_count())?;
                     let catalog = load_catalog_rows(connection)?;
                     let collection = catalog
@@ -585,7 +590,8 @@ impl Storage {
                         .iter()
                         .filter(|index| index.lifecycle() == DocumentIndexLifecycle::Ready)
                         .count() as u64)
-                })?;
+                },
+            )?;
             let mut after = before;
             let mut names = Vec::with_capacity(indexes.len());
             for index in indexes {
@@ -602,6 +608,7 @@ impl Storage {
                         // and process admission. Reload after each earlier batch
                         // entry; a client-side list-then-create cannot do this.
                         let reused = run_manifest_controlled(
+                            self,
                             &mut connection,
                             Arc::clone(&control),
                             |connection| {
@@ -673,12 +680,15 @@ impl Storage {
             ensure_control_active(&control, "before building document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-            let catalog =
-                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
-                    configure_journal_mode(connection)?;
+            let catalog = run_manifest_controlled(
+                self,
+                &mut connection,
+                Arc::clone(&control),
+                |connection| {
                     require_ready_manifest(connection, self.shard_count())?;
                     load_catalog_rows(connection)
-                })?;
+                },
+            )?;
             let collection = catalog
                 .collection(database, collection_name)
                 .ok_or_else(|| {
@@ -736,6 +746,7 @@ impl Storage {
                 let bytes = encode_document(specification)
                     .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
                 let id = run_manifest_controlled(
+                    self,
                     &mut connection,
                     Arc::clone(&control),
                     |connection| {
@@ -908,7 +919,7 @@ impl Storage {
                     format!("unable to allocate document index operation identity: {error}"),
                 )
             })?;
-            run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+            run_manifest_controlled(self, &mut connection, Arc::clone(&control), |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sqlite_error::storage)?;
@@ -1035,6 +1046,7 @@ impl Storage {
                 // every shard, including those whose build already committed.
             }
             let metadata = run_manifest_controlled(
+                self,
                 &mut connection,
                 Arc::clone(&control),
                 |connection| {

@@ -82,6 +82,7 @@ pub(super) struct ShardLayout {
     expected_application_id: i64,
     metadata_version: u32,
     state: ShardLayoutState,
+    journal: super::journal::JournalPolicy,
 }
 
 impl ShardLayout {
@@ -98,7 +99,17 @@ impl ShardLayout {
             expected_application_id,
             metadata_version,
             state,
+            journal: super::journal::JournalPolicy::LOCAL,
         }
+    }
+
+    pub(super) fn with_journal(mut self, journal: super::journal::JournalPolicy) -> Self {
+        self.journal = journal;
+        self
+    }
+
+    pub(super) const fn journal(self) -> super::journal::JournalPolicy {
+        self.journal
     }
 
     pub(super) const fn layout_id(self) -> [u8; 16] {
@@ -306,6 +317,7 @@ pub(super) fn validate_open_read_only_connection(
     schema_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<()> {
+    layout.journal().configure_durability(connection)?;
     configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let expected_user_version = expected_user_version(schema_generation)?;
@@ -332,12 +344,14 @@ pub(super) fn validate_open_connection(
     schema_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<()> {
+    layout.journal().configure_durability(connection)?;
     configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let expected_user_version = expected_user_version(schema_generation)?;
     require_writable(connection)?;
     validate_exact_shard(connection, path, shard_id, expected_user_version, layout)?;
-    configure_connection_pragmas(connection)
+    configure_connection_pragmas(connection)?;
+    configure_reopened_journal(connection, path, layout)
 }
 
 /// Calculate the canonical fingerprint of the persistent application schema.
@@ -479,6 +493,7 @@ pub(super) fn validate_schema_migration_connection(
     target_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<SchemaMigrationShardState> {
+    layout.journal().configure_durability(connection)?;
     configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let (source_user_version, target_user_version) =
@@ -493,6 +508,7 @@ pub(super) fn validate_schema_migration_connection(
         layout,
     )?;
     configure_connection_pragmas(connection)?;
+    configure_reopened_journal(connection, path, layout)?;
     Ok(state)
 }
 
@@ -2511,7 +2527,7 @@ fn classify_schema_migration_shard(
             ),
         ));
     };
-    require_wal(connection, path)?;
+    require_journal(connection, path, layout)?;
     validate_metadata(connection, shard_id, layout.layout_id())?;
     Ok(state)
 }
@@ -2621,6 +2637,7 @@ fn preflight_all(
             validate_existing_file(&path)?;
             let connection = open_existing_connection(&path)?;
             configure_connection_safety(&connection)?;
+            layout.journal().configure_durability(&connection)?;
             classify_shard(&connection, &path, shard_id, expected_user_version, layout)?
         };
         shards.push(PreflightShard {
@@ -3038,7 +3055,6 @@ fn require_read_only(connection: &Connection) -> EngineResult<()> {
 }
 
 fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
-    super::journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
@@ -3070,7 +3086,7 @@ fn classify_shard(
                 ),
             ));
         }
-        require_wal(connection, path)?;
+        require_journal(connection, path, layout)?;
         validate_metadata(connection, shard_id, layout.layout_id())?;
         return Ok(PreflightState::Exact);
     }
@@ -3111,7 +3127,7 @@ fn classify_shard(
             }
         }
         ShardLayoutState::Adopting => {
-            require_wal(connection, path)?;
+            require_journal(connection, path, layout)?;
             Ok(PreflightState::Legacy)
         }
         ShardLayoutState::Ready => unreachable!("ready legacy state returned above"),
@@ -3138,6 +3154,7 @@ where
         return Err(missing_shard(path, shard_id));
     };
     configure_connection_safety(&connection)?;
+    layout.journal().configure_durability(&connection)?;
 
     // Reclassify after opening so replacement between preflight and provisioning
     // cannot be overwritten as if it were the previously inspected file.
@@ -3147,8 +3164,14 @@ where
     }
     configure_connection_pragmas(&connection)?;
     if state == PreflightState::Empty {
-        enable_wal(&connection, path)?;
+        layout.journal().initialize_mode(
+            &connection,
+            EngineErrorKind::FailedPrecondition,
+            &format!("shard {}", path.display()),
+        )?;
         hook(ProvisionPoint::WalPersisted);
+    } else {
+        configure_reopened_journal(&connection, path, layout)?;
     }
 
     let transaction = connection
@@ -3227,7 +3250,7 @@ fn validate_exact_shard(
             format!("shard {shard_id} schema generation does not match its catalog"),
         ));
     }
-    require_wal(connection, path)?;
+    require_journal(connection, path, layout)?;
     validate_metadata(connection, shard_id, layout.layout_id())?;
     super::index_outbox::validate_optional_schema(connection)?;
     super::document::validate_optional_schema(connection)?;
@@ -3251,17 +3274,33 @@ fn journal_mode(connection: &Connection) -> EngineResult<String> {
         .map_err(|error| shard_read_error(error, "failed to read shard journal mode"))
 }
 
-fn require_wal(connection: &Connection, path: &Path) -> EngineResult<()> {
+fn require_journal(connection: &Connection, path: &Path, layout: &ShardLayout) -> EngineResult<()> {
     // Keep shard-specific read-error classification; only policy comparison
     // is shared with the other storage surfaces.
     let mode = journal_mode(connection)?;
-    super::journal::JournalPolicy::LOCAL.check_mode(
+    layout.journal().check_reopened_mode(
         &mode,
         EngineErrorKind::FailedPrecondition,
         &format!("shard {}", path.display()),
     )
 }
 
+fn configure_reopened_journal(
+    connection: &Connection,
+    path: &Path,
+    layout: &ShardLayout,
+) -> EngineResult<()> {
+    if layout.journal().is_wal() {
+        return Ok(()); // The identity validator already required persistent WAL.
+    }
+    layout.journal().configure_existing_mode(
+        connection,
+        EngineErrorKind::FailedPrecondition,
+        &format!("shard {}", path.display()),
+    )
+}
+
+#[cfg(test)]
 fn enable_wal(connection: &Connection, path: &Path) -> EngineResult<()> {
     super::journal::JournalPolicy::LOCAL.initialize_mode(
         connection,

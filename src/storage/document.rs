@@ -205,10 +205,9 @@ mod enabled {
     };
 
     use super::{Storage, corrupt, ensure_schema, require_schema, shard_read_error};
-    use crate::storage::{
-        SchemaMigrationGuard, configure_journal_mode, configure_manifest_connection,
-        configure_manifest_connection_after_busy_setup, manifest, open_existing_manifest, pool,
-    };
+    use crate::storage::{SchemaMigrationGuard, manifest, open_existing_manifest, pool};
+    #[cfg(test)]
+    use crate::storage::{configure_journal_mode, configure_manifest_connection};
 
     const COLLECTION_PROVISIONING: i64 = manifest::DOCUMENT_COLLECTION_PROVISIONING;
     const COLLECTION_ACTIVE: i64 = manifest::DOCUMENT_COLLECTION_ACTIVE;
@@ -704,6 +703,7 @@ mod enabled {
     }
 
     fn run_manifest_controlled<T>(
+        storage: &Storage,
         connection: &mut Connection,
         control: Arc<OperationControl>,
         work: impl FnOnce(&mut Connection) -> EngineResult<T>,
@@ -711,7 +711,7 @@ mod enabled {
         run_dedicated_controlled(connection, control, |connection| {
             // The controlled helper already owns the busy handler. Calling the
             // ordinary configurator here would replace it with a fixed timeout.
-            configure_manifest_connection_after_busy_setup(connection)?;
+            storage.configure_manifest_connection_after_busy_setup(connection)?;
             work(connection)
         })
     }
@@ -810,7 +810,7 @@ mod enabled {
             let result = (|| {
                 let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
                 let read_control = Arc::clone(&control);
-                run_manifest_controlled(&mut connection, control, |connection| {
+                run_manifest_controlled(self, &mut connection, control, |connection| {
                     read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
                         let mut statement = connection.prepare(
                             "SELECT database_name FROM briskdb_document_databases ORDER BY database_id",
@@ -844,7 +844,7 @@ mod enabled {
         ) -> EngineResult<Option<(DocumentDatabaseId, u64)>> {
             let result = (|| {
                 let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-                run_manifest_controlled(&mut connection, control, |connection| {
+                run_manifest_controlled(self, &mut connection, control, |connection| {
                     read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
                         connection.query_row(
                             "SELECT database_id, collection_high_water FROM briskdb_document_databases
@@ -872,7 +872,7 @@ mod enabled {
             let result = (|| {
                 let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
                 let read_control = Arc::clone(&control);
-                run_manifest_controlled(&mut connection, control, |connection| {
+                run_manifest_controlled(self, &mut connection, control, |connection| {
                     read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
                         let exists: bool = connection.query_row(
                             "SELECT EXISTS(SELECT 1 FROM briskdb_document_databases WHERE database_id = ?1)",
@@ -1041,10 +1041,10 @@ mod enabled {
                 let manifest_path = self.root.join("manifest.sqlite");
                 let mut connection = open_existing_manifest(&manifest_path)?;
                 let start = run_manifest_controlled(
+                    self,
                     &mut connection,
                     Arc::clone(&control),
                     |connection| {
-                        configure_journal_mode(connection)?;
                         require_ready_manifest(connection, self.shard_count())?;
 
                         if let Some(existing) =
@@ -1183,9 +1183,11 @@ mod enabled {
                 crate::document::validate_namespace(database, collection.unwrap_or("_"))?;
                 migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
                 let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-                let deletion =
-                    run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
-                        configure_journal_mode(connection)?;
+                let deletion = run_manifest_controlled(
+                    self,
+                    &mut connection,
+                    Arc::clone(&control),
+                    |connection| {
                         let transaction = connection
                             .transaction_with_behavior(TransactionBehavior::Immediate)
                             .map_err(sqlite_error::storage)?;
@@ -1266,7 +1268,8 @@ mod enabled {
                             shard_count: self.shard_count(),
                             next_shard: 0,
                         }))
-                    })?;
+                    },
+                )?;
                 let existed = deletion.is_some();
                 if let Some(deletion) = deletion {
                     recover_deletion(self, &mut connection, deletion, Some(&control))?;
@@ -1358,8 +1361,7 @@ mod enabled {
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
             let (stored_spec, index_id, stored_lifecycle) =
-                run_manifest_controlled(&mut connection, control.clone(), |connection| {
-                    configure_journal_mode(connection)?;
+                run_manifest_controlled(self, &mut connection, control.clone(), |connection| {
                     let transaction = connection
                         .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(sqlite_error::storage)?;
@@ -1485,8 +1487,7 @@ mod enabled {
                     ));
                 }
                 let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
-                    configure_journal_mode(connection)?;
+                run_manifest_controlled(self, &mut connection, Arc::clone(&control), |connection| {
                     let transaction = connection
                         .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(sqlite_error::storage)?;
@@ -1688,8 +1689,7 @@ mod enabled {
             let count = validate_natural_order_reservation_count(count)?;
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            run_manifest_controlled(&mut connection, control.clone(), |connection| {
-                configure_journal_mode(connection)?;
+            run_manifest_controlled(self, &mut connection, control.clone(), |connection| {
                 self.reserve_document_natural_orders_on_connection(
                     connection,
                     collection_id,
@@ -1718,8 +1718,7 @@ mod enabled {
             let count = validate_natural_order_reservation_count(count)?;
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            configure_manifest_connection(&connection)?;
-            configure_journal_mode(&connection)?;
+            self.configure_manifest_connection(&connection)?;
             let progress_cancellation = cancellation.clone();
             connection
                 .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
@@ -2479,7 +2478,7 @@ mod enabled {
         ) -> EngineResult<u64> {
             let path = self.root.join("manifest.sqlite");
             let connection = open_existing_manifest(&path)?;
-            configure_manifest_connection(&connection)?;
+            self.configure_manifest_connection(&connection)?;
             require_ready_manifest(&connection, self.shard_count())?;
             let next = connection
                 .query_row(
@@ -2505,7 +2504,7 @@ mod enabled {
         ) -> EngineResult<()> {
             let path = self.root.join("manifest.sqlite");
             let connection = open_existing_manifest(&path)?;
-            configure_manifest_connection(&connection)?;
+            self.configure_manifest_connection(&connection)?;
             require_ready_manifest(&connection, self.shard_count())?;
             require_active_collection(&connection, collection_id)
         }

@@ -22,6 +22,7 @@ use std::{
 #[cfg(unix)]
 use std::fs;
 
+use super::journal::JournalPolicy;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::core::{
@@ -116,6 +117,8 @@ pub struct SecurityCatalogStore {
     id: SecurityStoreId,
     observed_revision: u64,
     fenced: bool,
+    journal: JournalPolicy,
+    format_version: i64,
 }
 
 impl fmt::Debug for SecurityCatalogStore {
@@ -137,12 +140,27 @@ impl SecurityCatalogStore {
         id: SecurityStoreId,
         catalog: &SecurityCatalog,
     ) -> EngineResult<Self> {
+        Self::create_with_journal(path, id, catalog, JournalPolicy::SECURITY)
+    }
+
+    pub(super) fn create_with_journal(
+        path: impl AsRef<Path>,
+        id: SecurityStoreId,
+        catalog: &SecurityCatalog,
+        journal: JournalPolicy,
+    ) -> EngineResult<Self> {
+        let format_version = journal_format(journal)?;
         let record = catalog.to_record()?;
         let path = private_path(path.as_ref())?;
         let identity_file = private_file(&path, true)?;
         let mut connection = open_connection(&path)?;
         check_file_identity(&connection, &path, &identity_file)?;
-        configure(&connection)?;
+        configure(&connection, journal)?;
+        journal.initialize_mode(
+            &connection,
+            EngineErrorKind::DataCorruption,
+            "security catalog",
+        )?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
@@ -153,7 +171,7 @@ impl SecurityCatalogStore {
             .pragma_update(None, "application_id", APPLICATION_ID)
             .map_err(storage_error)?;
         transaction
-            .pragma_update(None, "user_version", FORMAT_VERSION)
+            .pragma_update(None, "user_version", format_version)
             .map_err(storage_error)?;
         transaction
             .execute(
@@ -174,6 +192,8 @@ impl SecurityCatalogStore {
             id,
             observed_revision: 1,
             fenced: false,
+            journal,
+            format_version,
         })
     }
 
@@ -181,6 +201,15 @@ impl SecurityCatalogStore {
     /// Wrong IDs/versions, incomplete creation and unrelated SQLite files fail
     /// closed; this does not silently initialize or upgrade anything.
     pub fn open(path: impl AsRef<Path>, expected_id: SecurityStoreId) -> EngineResult<Self> {
+        Self::open_with_journal(path, expected_id, JournalPolicy::SECURITY)
+    }
+
+    pub(super) fn open_with_journal(
+        path: impl AsRef<Path>,
+        expected_id: SecurityStoreId,
+        journal: JournalPolicy,
+    ) -> EngineResult<Self> {
+        let format_version = journal_format(journal)?;
         let path = private_path(path.as_ref())?;
         let identity_file = private_file(&path, false)?;
         let mut connection = open_connection(&path)?;
@@ -189,7 +218,7 @@ impl SecurityCatalogStore {
             .map_err(storage_error)?;
         controls::with_connection(&mut connection, |connection| {
             check_file_identity(connection, &path, &identity_file)?;
-            configure_after_busy_setup(connection)
+            configure_after_busy_setup(connection, journal)
         })?;
         let mut store = Self {
             connection,
@@ -198,8 +227,17 @@ impl SecurityCatalogStore {
             id: expected_id,
             observed_revision: 0,
             fenced: false,
+            journal,
+            format_version,
         };
         store.load()?;
+        controls::with_connection(&mut store.connection, |connection| {
+            journal.configure_existing_mode(
+                connection,
+                EngineErrorKind::DataCorruption,
+                "security catalog",
+            )
+        })?;
         Ok(store)
     }
 
@@ -215,13 +253,21 @@ impl SecurityCatalogStore {
             id,
             observed_revision,
             fenced,
+            journal,
+            format_version,
         } = self;
         controls::with_connection(connection, |connection| {
             check(connection, path, identity_file, *fenced)?;
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Deferred)
                 .map_err(storage_error)?;
-            let snapshot = read_snapshot(&transaction, *id, *observed_revision)?;
+            let snapshot = read_snapshot(
+                &transaction,
+                *id,
+                *observed_revision,
+                *journal,
+                *format_version,
+            )?;
             check_file_identity(&transaction, path, identity_file)?;
             transaction.commit().map_err(storage_error)?;
             *observed_revision = snapshot.revision;
@@ -257,6 +303,8 @@ impl SecurityCatalogStore {
             id,
             observed_revision,
             fenced,
+            journal,
+            format_version,
         } = self;
         controls::with_connection(connection, |connection| {
             check(connection, path, identity_file, *fenced)?;
@@ -270,7 +318,13 @@ impl SecurityCatalogStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(storage_error)?;
-            let current = read_snapshot(&transaction, *id, *observed_revision)?;
+            let current = read_snapshot(
+                &transaction,
+                *id,
+                *observed_revision,
+                *journal,
+                *format_version,
+            )?;
             *observed_revision = current.revision;
             if current.revision != expected_revision {
                 return Err(failure(
@@ -331,14 +385,32 @@ fn open_connection(path: &Path) -> EngineResult<Connection> {
     Connection::open_with_flags(path, flags).map_err(storage_error)
 }
 
-fn configure(connection: &Connection) -> EngineResult<()> {
+fn journal_format(journal: JournalPolicy) -> EngineResult<i64> {
+    if journal == JournalPolicy::SECURITY {
+        Ok(FORMAT_VERSION)
+    } else if journal == JournalPolicy::NFS_DELETE || journal == JournalPolicy::NFS_PERSIST {
+        // Fence standalone older openers as well as the root manifest fence.
+        Ok(2)
+    } else {
+        Err(failure(
+            EngineErrorKind::Unsupported,
+            "unsupported security store journal policy",
+        ))
+    }
+}
+
+fn configure(connection: &Connection, journal: JournalPolicy) -> EngineResult<()> {
     connection
         .busy_timeout(SECURITY_BUSY_TIMEOUT)
         .map_err(storage_error)?;
-    configure_after_busy_setup(connection)
+    configure_after_busy_setup(connection, journal)
 }
 
-fn configure_after_busy_setup(connection: &Connection) -> EngineResult<()> {
+fn configure_after_busy_setup(connection: &Connection, journal: JournalPolicy) -> EngineResult<()> {
+    // Configure before SQL metadata reads can initiate native hot-journal recovery.
+    journal
+        .configure_durability(connection)
+        .map_err(|error| failure(error.kind(), "security catalog storage operation failed"))?;
     // SQLite materializes row values before Rust can inspect length(record).
     // Cap that allocation too, allowing only small fixed row/schema overhead.
     connection
@@ -351,9 +423,6 @@ fn configure_after_busy_setup(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch("PRAGMA trusted_schema=OFF;")
         .map_err(storage_error)?;
-    super::journal::JournalPolicy::SECURITY
-        .configure_durability(connection)
-        .map_err(|error| failure(error.kind(), "security catalog storage operation failed"))?;
     connection
         .execute_batch("PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY;")
         .map_err(storage_error)
@@ -363,6 +432,8 @@ fn read_snapshot(
     connection: &Connection,
     expected_id: SecurityStoreId,
     observed: u64,
+    journal: JournalPolicy,
+    format_version: i64,
 ) -> EngineResult<StoredSecurityCatalog> {
     let application: i64 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
@@ -370,11 +441,11 @@ fn read_snapshot(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage_error)?;
-    if application != APPLICATION_ID || version != FORMAT_VERSION {
+    if application != APPLICATION_ID || version != format_version {
         return Err(corrupt());
     }
-    super::journal::JournalPolicy::SECURITY
-        .require_mode(
+    journal
+        .require_reopened_mode(
             connection,
             EngineErrorKind::DataCorruption,
             "security catalog",

@@ -624,11 +624,12 @@ impl Engine {
         let database = workers
             .run(move || {
                 Ok(Database {
-                    storage: crate::storage::Storage::open_with_startup_control(
+                    storage: crate::storage::Storage::open_with_profile_control(
                         root,
                         requested_shards,
                         None,
                         control.as_ref(),
+                        options.storage_profile(),
                     )?,
                     global_index_worker_id: super::random_global_index_worker_id()?,
                 })
@@ -653,7 +654,10 @@ impl Engine {
         let control = startup.control.clone();
         let requested_shards = tokio::task::spawn_blocking(move || {
             crate::storage::contention::with_control(control, || {
-                Database::detect_shard_count(detect_root)
+                crate::storage::detect_shard_count_with_profile(
+                    detect_root,
+                    options.storage_profile(),
+                )
             })
         })
         .await
@@ -1551,6 +1555,9 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<CheckpointReport> {
         let mut operation = self.operation(context)?;
+        if let Err(error) = self.inner.database.storage.require_wal_checkpoint() {
+            return operation.finish(Err(error));
+        }
         let schema_operation = match self.inner.database.storage.enter_schema_operation() {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),

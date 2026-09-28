@@ -1622,16 +1622,34 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
     load_or_create_manifest_with_security(connection, requested_shards, fresh_layout_allowed, None)
 }
 
+#[cfg(test)]
 pub(super) fn load_or_create_manifest_with_security(
     connection: &mut Connection,
     requested_shards: u16,
     fresh_layout_allowed: bool,
     security_store_id: Option<[u8; 16]>,
 ) -> EngineResult<LoadedManifest> {
+    load_or_create_manifest_with_profile(
+        connection,
+        requested_shards,
+        fresh_layout_allowed,
+        security_store_id,
+        crate::core::StorageProfile::Local,
+    )
+}
+
+pub(super) fn load_or_create_manifest_with_profile(
+    connection: &mut Connection,
+    requested_shards: u16,
+    fresh_layout_allowed: bool,
+    security_store_id: Option<[u8; 16]>,
+    profile: crate::core::StorageProfile,
+) -> EngineResult<LoadedManifest> {
+    let plan = storage_profile::requested_plan(connection, profile)?;
     let mut snapshot = load_or_create_snapshot_with_plan(
         connection,
         requested_shards,
-        CURRENT_PLAN,
+        plan,
         fresh_layout_allowed,
         &mut |_| Ok(()),
     )?;
@@ -1673,6 +1691,7 @@ pub(super) fn load_or_create_manifest_with_security(
 /// shared root leases. Every initialization, format upgrade, or recovery shape
 /// requires sole-process ownership before the normal startup path proceeds.
 #[cfg(any(test, feature = "auth-scram"))]
+#[cfg(test)]
 pub(super) fn startup_requires_exclusive_ownership(
     connection: &Connection,
     requested_shards: u16,
@@ -1680,12 +1699,33 @@ pub(super) fn startup_requires_exclusive_ownership(
     startup_requires_exclusive_ownership_with_security(connection, requested_shards, None)
 }
 
+#[cfg(test)]
 pub(super) fn startup_requires_exclusive_ownership_with_security(
     connection: &Connection,
     requested_shards: u16,
     security_store_id: Option<[u8; 16]>,
 ) -> EngineResult<bool> {
-    let state = inspect_with_plan(connection, requested_shards, CURRENT_PLAN)?;
+    startup_profile(
+        connection,
+        requested_shards,
+        security_store_id,
+        crate::core::StorageProfile::Local,
+    )
+    .map(|(exclusive, _)| exclusive)
+}
+
+pub(super) fn startup_profile(
+    connection: &Connection,
+    requested_shards: u16,
+    security_store_id: Option<[u8; 16]>,
+    profile: crate::core::StorageProfile,
+) -> EngineResult<(bool, super::journal::JournalPolicy)> {
+    let plan = storage_profile::requested_plan(connection, profile)?;
+    let initial_policy = match profile {
+        crate::core::StorageProfile::Local => super::journal::JournalPolicy::LOCAL,
+        crate::core::StorageProfile::Nfs => super::journal::JournalPolicy::NFS_PERSIST,
+    };
+    let state = inspect_with_plan(connection, requested_shards, plan)?;
     let ManifestState::Versioned { version, snapshot } = state else {
         if security_store_id.is_some() {
             return Err(EngineError::new(
@@ -1693,12 +1733,15 @@ pub(super) fn startup_requires_exclusive_ownership_with_security(
                 "authenticated startup requires a security-bound manifest",
             ));
         }
-        return Ok(true);
+        return Ok((true, initial_policy));
     };
     require_security_binding(&snapshot, security_store_id)?;
-    if version != CURRENT_SCHEMA_VERSION {
-        return Ok(true);
+    if version != plan.current_version {
+        return Ok((true, initial_policy));
     }
+    let policy = snapshot
+        .shard_layout
+        .map_or(initial_policy, |layout| layout.journal());
     let layout_ready = snapshot
         .shard_layout
         .as_ref()
@@ -1726,12 +1769,15 @@ pub(super) fn startup_requires_exclusive_ownership_with_security(
             manifest_read_error(error, "failed to inspect document provisioning state")
         })?
         != 0;
-    Ok(!(layout_ready
-        && integrity_steady
-        && snapshot.active_migration.is_none()
-        && snapshot.active_table_provisioning.is_none()
-        && generated_ddl_steady
-        && document_catalog_steady))
+    Ok((
+        !(layout_ready
+            && integrity_steady
+            && snapshot.active_migration.is_none()
+            && snapshot.active_table_provisioning.is_none()
+            && generated_ddl_steady
+            && document_catalog_steady),
+        policy,
+    ))
 }
 
 /// Return an active v6 journal without upgrading it. Startup completes this
@@ -2616,9 +2662,13 @@ fn current_manifest_snapshot(
     connection: &Connection,
     requested_shards: u16,
 ) -> EngineResult<ManifestSnapshot> {
-    match inspect_with_plan(connection, requested_shards, CURRENT_PLAN)? {
+    match inspect_with_plan(
+        connection,
+        requested_shards,
+        storage_profile::existing_plan(connection)?,
+    )? {
         ManifestState::Versioned { version, snapshot }
-            if version == CURRENT_SCHEMA_VERSION || version == V6_SCHEMA_VERSION =>
+            if storage_profile::is_current(version) || version == V6_SCHEMA_VERSION =>
         {
             Ok(*snapshot)
         }
@@ -5282,8 +5332,9 @@ where
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
-    let observed = match inspect_with_plan(&transaction, requested_shards, CURRENT_PLAN)? {
-        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+    let plan = storage_profile::existing_plan(&transaction)?;
+    let observed = match inspect_with_plan(&transaction, requested_shards, plan)? {
+        ManifestState::Versioned { version, snapshot } if storage_profile::is_current(version) => {
             snapshot.shard_layout.ok_or_else(|| {
                 EngineError::new(
                     EngineErrorKind::Internal,
@@ -5315,8 +5366,10 @@ where
             .map_err(sqlite_error::storage)?;
         refresh_manifest_digest_if_checksummed(&transaction)?;
 
-        let ready = match inspect_with_plan(&transaction, requested_shards, CURRENT_PLAN)? {
-            ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+        let ready = match inspect_with_plan(&transaction, requested_shards, plan)? {
+            ManifestState::Versioned { version, snapshot }
+                if storage_profile::is_current(version) =>
+            {
                 snapshot.shard_layout.ok_or_else(|| {
                     EngineError::new(
                         EngineErrorKind::Internal,
@@ -5350,6 +5403,7 @@ fn ensure_same_shard_layout(observed: &ShardLayout, expected: &ShardLayout) -> E
     if observed.layout_id() != expected.layout_id()
         || observed.expected_application_id() != expected.expected_application_id()
         || observed.metadata_version() != expected.metadata_version()
+        || observed.journal() != expected.journal()
         || (observed.state() != expected.state() && observed.state() != ShardLayoutState::Ready)
     {
         return Err(EngineError::new(
@@ -8154,8 +8208,12 @@ pub(super) fn security_binding(
     connection: &Connection,
     shards: u16,
 ) -> EngineResult<Option<[u8; 16]>> {
-    match inspect_with_plan(connection, shards, CURRENT_PLAN)? {
-        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+    match inspect_with_plan(
+        connection,
+        shards,
+        storage_profile::existing_plan(connection)?,
+    )? {
+        ManifestState::Versioned { version, snapshot } if storage_profile::is_current(version) => {
             Ok(snapshot.security_store_id)
         }
         _ => Err(EngineError::new(
@@ -8171,7 +8229,13 @@ pub(super) fn validate_security_activation(
     shards: u16,
 ) -> EngineResult<()> {
     if security_binding(connection, shards)?.is_some()
-        || startup_requires_exclusive_ownership(connection, shards)?
+        || startup_profile(
+            connection,
+            shards,
+            None,
+            detect_storage_profile(connection)?,
+        )?
+        .0
         || current_integrity(connection, shards)?.state() != DatabaseIntegrityState::Ready
     {
         return Err(EngineError::new(
@@ -12463,6 +12527,22 @@ fn read_manifest_shard_count(connection: &Connection) -> EngineResult<u16> {
 /// This is the discovery half of an embedded open with no requested count.
 /// The normal startup path validates the manifest again after discovery, so a
 /// concurrently replaced or damaged manifest still fails closed.
+pub(super) fn detect_shard_count_with_profile(
+    connection: &Connection,
+    profile: crate::core::StorageProfile,
+) -> EngineResult<u16> {
+    if profile == crate::core::StorageProfile::Local {
+        return detect_shard_count(connection);
+    }
+    if detect_storage_profile(connection)? != profile {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "stored and requested storage profiles differ; conversion is not supported",
+        ));
+    }
+    read_manifest_shard_count(connection)
+}
+
 pub(super) fn detect_shard_count(connection: &Connection) -> EngineResult<u16> {
     let (application_id, version) = read_identity(connection)?;
     let candidate = if application_id == MANIFEST_APPLICATION_ID {
@@ -12520,8 +12600,13 @@ pub(super) fn detect_shard_count(connection: &Connection) -> EngineResult<u16> {
 pub(super) fn inspect_global_indexes(
     connection: &Connection,
 ) -> EngineResult<Box<[GlobalIndexMetadata]>> {
-    let shard_count = detect_shard_count(connection)?;
-    match inspect_with_plan(connection, shard_count, CURRENT_PLAN)? {
+    let plan = storage_profile::existing_plan(connection)?;
+    let shard_count = if plan.current_version == storage_profile::NFS_SCHEMA_VERSION {
+        read_manifest_shard_count(connection)?
+    } else {
+        detect_shard_count(connection)?
+    };
+    match inspect_with_plan(connection, shard_count, plan)? {
         ManifestState::Versioned { snapshot, .. } => Ok(snapshot
             .logical_catalog
             .as_ref()

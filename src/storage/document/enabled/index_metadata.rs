@@ -10,7 +10,7 @@ impl Storage {
     ) -> EngineResult<Option<(DocumentCollectionId, u64)>> {
         let result = (|| {
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-            run_manifest_controlled(&mut connection, control, |connection| {
+            run_manifest_controlled(self, &mut connection, control, |connection| {
                 read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
                     connection
                         .query_row(
@@ -53,7 +53,7 @@ impl Storage {
         let result = (|| {
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
             let read_control = Arc::clone(&control);
-            run_manifest_controlled(&mut connection, control, |connection| {
+            run_manifest_controlled(self, &mut connection, control, |connection| {
                 read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
                     let exists: bool = connection
                         .query_row(

@@ -217,7 +217,7 @@ fn errors_panics_cancellation_and_open_transactions_retire_manifest_readers() {
 fn cancelled_reads_do_not_open_or_create_a_missing_manifest() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("missing.sqlite");
-    let readers = ManifestReaders::default();
+    let readers = ManifestReaders::new(journal::JournalPolicy::LOCAL);
     let control = OperationControl::new(None);
     control.request_cancel(CancellationReason::DeadlineExceeded);
     assert_eq!(
