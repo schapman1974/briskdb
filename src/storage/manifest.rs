@@ -33,6 +33,8 @@ use super::{
 
 /// `BRDB` encoded as SQLite's 32-bit application identifier.
 pub(super) const MANIFEST_APPLICATION_ID: i64 = 0x4252_4442;
+mod storage_profile;
+pub(super) use storage_profile::detect_storage_profile;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
@@ -105,6 +107,7 @@ const V11_MANIFEST_DIGEST_VERSION: u32 = 11;
 const V12_MANIFEST_DIGEST_VERSION: u32 = 12;
 const V13_MANIFEST_DIGEST_VERSION: u32 = 13;
 const V14_MANIFEST_DIGEST_VERSION: u32 = 14;
+const V15_MANIFEST_DIGEST_VERSION: u32 = 15;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
@@ -120,6 +123,7 @@ const V11_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v11\0
 const V12_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v12\0";
 const V13_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v13\0";
 const V14_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v14\0";
+const V15_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v15\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 const GENERATED_TABLE_DDL_DIGEST_DOMAIN: &[u8] = b"briskdb.generated-table-ddl.v1\0";
 
@@ -1536,6 +1540,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "security_catalog_root_binding",
         apply: migrate_v21_to_v22,
         validate: validate_v22,
+    },
+    // Validation understands the reserved NFS format, but normal local startup
+    // stays on v22. There is deliberately no v22 -> NFS conversion migration.
+    Migration {
+        from: V22_SCHEMA_VERSION,
+        to: storage_profile::NFS_SCHEMA_VERSION,
+        name: "explicit_nfs_profile_no_automatic_conversion",
+        apply: storage_profile::reject_conversion,
+        validate: storage_profile::validate_nfs,
     },
 ];
 
@@ -7243,6 +7256,10 @@ fn validate_table(
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_security_binding') LIMIT ?1"
         }
+        "briskdb_storage_profile" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_storage_profile') LIMIT ?1"
+        }
         _ => {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
@@ -10003,7 +10020,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V14_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V15_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -10455,7 +10472,8 @@ fn manifest_semantic_digest_for_version(
         | V11_MANIFEST_DIGEST_VERSION
         | V12_MANIFEST_DIGEST_VERSION
         | V13_MANIFEST_DIGEST_VERSION
-        | V14_MANIFEST_DIGEST_VERSION => {
+        | V14_MANIFEST_DIGEST_VERSION
+        | V15_MANIFEST_DIGEST_VERSION => {
             let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 16);
             for query in V1_MANIFEST_DIGEST_QUERIES {
                 queries.push(query);
@@ -10481,6 +10499,9 @@ fn manifest_semantic_digest_for_version(
                     if digest_version >= V14_MANIFEST_DIGEST_VERSION {
                         queries.push(&V14_SECURITY_BINDING_DIGEST_QUERY);
                     }
+                    if digest_version >= V15_MANIFEST_DIGEST_VERSION {
+                        queries.push(&storage_profile::PROFILE_DIGEST_QUERY);
+                    }
                 }
                 if query.table == "briskdb_physical_shards" {
                     queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
@@ -10496,7 +10517,9 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (
-                if digest_version == V14_MANIFEST_DIGEST_VERSION {
+                if digest_version == V15_MANIFEST_DIGEST_VERSION {
+                    V15_MANIFEST_DIGEST_DOMAIN
+                } else if digest_version == V14_MANIFEST_DIGEST_VERSION {
                     V14_MANIFEST_DIGEST_DOMAIN
                 } else if digest_version == V13_MANIFEST_DIGEST_VERSION {
                     V13_MANIFEST_DIGEST_DOMAIN
@@ -10665,7 +10688,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V19_SCHEMA_VERSION
                 | V20_SCHEMA_VERSION
                 | V21_SCHEMA_VERSION
-                | V22_SCHEMA_VERSION)
+                | V22_SCHEMA_VERSION
+                | storage_profile::NFS_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -10729,7 +10753,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V14_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V15_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -16041,7 +16065,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in [
-            ("manifest_digest_version", V14_MANIFEST_DIGEST_VERSION + 1),
+            ("manifest_digest_version", V15_MANIFEST_DIGEST_VERSION + 1),
             ("schema_digest_version", SCHEMA_DIGEST_VERSION + 1),
         ] {
             let mut unsupported = Connection::open_in_memory().unwrap();

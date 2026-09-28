@@ -15,6 +15,11 @@ For networked use of Python's real `sqlite3`, see [remote SQLite](#remote-sqlite
 - `Config(...)` validates shard, pool, queue, result, prepared-object,
   deadline, and shutdown limits before opening storage.
 
+Unreleased main also accepts `Config(storage_profile="local")` (the default).
+`"nfs"` is reserved and raises `UnsupportedError` before storage access; other
+names raise `InvalidArgumentError`. This selection does not convert a root or
+enable EFS support. See the [profile contract](../docs/STORAGE_FORMAT.md#explicit-profile-selection-and-reserved-nfs-format).
+
 `shards` is required to create storage and optional when reopening it. An
 omitted count is read from the validated manifest; an explicit mismatch raises
 `FailedPreconditionError`. `Database.shard_count` and `Database.config.shards`

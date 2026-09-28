@@ -208,6 +208,10 @@ struct Args {
     )]
     request_timeout_ms: u64,
 
+    /// Storage profile: local (default); nfs is reserved and currently fails closed.
+    #[arg(long, env = "BRISKDB_STORAGE_PROFILE", default_value = "local")]
+    storage_profile: briskdb::StorageProfile,
+
     /// Graceful-shutdown drain period in milliseconds.
     #[arg(
         long,
@@ -279,6 +283,9 @@ impl Args {
     /// Keeping this conversion ahead of `server::run_with_engine_options`
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
+        EngineOptions::default()
+            .with_storage_profile(self.storage_profile)
+            .validate_for_shards(self.shards)?;
         self.validate_mongo_tls()?;
         self.validate_http_tls()?;
         #[cfg(not(feature = "mongo"))]
@@ -343,6 +350,7 @@ impl Args {
             (self.request_timeout_ms != 0).then(|| Duration::from_millis(self.request_timeout_ms));
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
+                .with_storage_profile(self.storage_profile)
                 .with_result_limits(result_limits)
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?
@@ -408,6 +416,32 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_profile_cli_is_explicit_and_rejects_nfs_without_creating_storage() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("absent");
+        let args = super::Args::try_parse_from([
+            "briskdb",
+            "--data-dir",
+            root.to_str().unwrap(),
+            "--storage-profile",
+            "nfs",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.into_server_parts().unwrap_err().kind(),
+            briskdb::EngineErrorKind::Unsupported
+        );
+        assert!(!root.exists());
+        let (_, options) = super::Args::try_parse_from(["briskdb", "--storage-profile", "local"])
+            .unwrap()
+            .into_server_parts()
+            .unwrap();
+        assert_eq!(options.storage_profile(), briskdb::StorageProfile::Local);
+        assert!(super::Args::try_parse_from(["briskdb", "--storage-profile", "efs"]).is_err());
+    }
+
     use std::ffi::OsStr;
 
     use clap::CommandFactory;
@@ -415,9 +449,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_profile_environment_and_cli_precedence_are_isolated_in_children() {
+        const MARKER: &str = "BRISKDB_STORAGE_PROFILE_ENV_TEST_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(args.storage_profile, briskdb::StorageProfile::Nfs);
+            assert_eq!(
+                args.into_server_parts().unwrap_err().kind(),
+                EngineErrorKind::Unsupported
+            );
+            let (_, options) = Args::try_parse_from(["briskdb", "--storage-profile", "local"])
+                .unwrap()
+                .into_server_parts()
+                .unwrap();
+            assert_eq!(options.storage_profile(), briskdb::StorageProfile::Local);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::storage_profile_environment_and_cli_precedence_are_isolated_in_children",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("BRISKDB_STORAGE_PROFILE", "nfs")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn cli_defaults_are_preserved() {
         let args = Args::try_parse_from(["briskdb"]).unwrap();
 
+        assert_eq!(args.storage_profile, briskdb::StorageProfile::Local);
         assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
         assert_eq!(
             args.admin_listen,

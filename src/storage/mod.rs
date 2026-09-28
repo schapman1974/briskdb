@@ -3489,6 +3489,12 @@ pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
     inspect_manifest_snapshot(root.as_ref(), manifest::detect_shard_count)
 }
 
+pub(crate) fn detect_storage_profile(
+    root: impl AsRef<Path>,
+) -> EngineResult<crate::core::StorageProfile> {
+    inspect_manifest_snapshot(root.as_ref(), manifest::detect_storage_profile)
+}
+
 /// Validate and inspect durable global-index definitions without creating or
 /// upgrading any database files.
 pub(crate) fn inspect_global_indexes(

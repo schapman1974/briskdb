@@ -61,6 +61,7 @@ impl Engine {
         requested_shards: u16,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        options.storage_profile().require_available()?;
         crate::storage::validate_shard_count(requested_shards)?;
         let root = root.as_ref().to_path_buf();
         let workers = BlockingPool::new(options.worker_limit(requested_shards)?);

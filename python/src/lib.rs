@@ -147,6 +147,7 @@ impl Drop for DatabaseShared {
 #[pyclass(module = "briskdb._briskdb", frozen, get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct Config {
+    storage_profile: String,
     shards: Option<u16>,
     documents: bool,
     uuid_representation: String,
@@ -164,6 +165,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            storage_profile: "local".to_owned(),
             shards: None,
             documents: false,
             uuid_representation: "standard".to_owned(),
@@ -193,13 +195,12 @@ impl Config {
             (self.request_timeout_ms != 0).then(|| Duration::from_millis(self.request_timeout_ms));
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
+                .with_storage_profile(self.storage_profile.parse()?)
                 .with_result_limits(result_limits)
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?
                 .with_shutdown_grace(Duration::from_millis(self.shutdown_grace_ms))?;
-        if let Some(shards) = self.shards {
-            options.validate_for_shards(shards)?;
-        }
+        options.validate_for_shards(self.shards.unwrap_or(briskdb::DEFAULT_EMBEDDED_SHARDS))?;
         Ok(options)
     }
 }
@@ -209,6 +210,7 @@ impl Config {
     #[new]
     #[pyo3(signature = (
         *,
+        storage_profile = "local",
         shards = None,
         documents = false,
         uuid_representation = "standard",
@@ -224,6 +226,7 @@ impl Config {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        storage_profile: &str,
         shards: Option<u16>,
         documents: bool,
         uuid_representation: &str,
@@ -238,6 +241,7 @@ impl Config {
         shutdown_grace_ms: u64,
     ) -> PyResult<Self> {
         let config = Self {
+            storage_profile: storage_profile.to_owned(),
             shards,
             documents,
             uuid_representation: uuid_representation.to_owned(),
@@ -261,11 +265,12 @@ impl Config {
             .shards
             .map_or_else(|| "None".to_owned(), |shards| shards.to_string());
         format!(
-            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={})",
+            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={}, storage_profile={:?})",
             self.documents,
             self.uuid_representation,
             self.connections_per_shard,
-            self.queue_capacity_per_shard
+            self.queue_capacity_per_shard,
+            self.storage_profile
         )
     }
 }
