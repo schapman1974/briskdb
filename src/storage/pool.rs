@@ -311,7 +311,10 @@ impl ConnectionPools {
         }
         #[cfg(feature = "documents")]
         let peer_readers = self.shards.first().map_or(Ok(0), |shard| {
-            shard.inner.storage.document_peer_readers.close_idle()
+            Ok::<_, EngineError>(
+                shard.inner.storage.document_peer_readers.close_idle()?
+                    + shard.inner.storage.manifest_readers.close_idle()?,
+            )
         })?;
         #[cfg(not(feature = "documents"))]
         let peer_readers = 0;

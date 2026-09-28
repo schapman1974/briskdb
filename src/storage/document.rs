@@ -741,6 +741,20 @@ mod enabled {
     }
 
     impl Storage {
+        /// Reuse only the connection. Every call starts a new validated read
+        /// snapshot and observes newly committed manifest state. The caller
+        /// already owns schema admission; no snapshot survives this call.
+        fn read_document_manifest<T>(
+            &self,
+            control: Arc<OperationControl>,
+            read: impl FnOnce(&Connection) -> EngineResult<T>,
+        ) -> EngineResult<T> {
+            self.manifest_readers
+                .read(&self.root.join("manifest.sqlite"), control, |connection| {
+                    read_ready_manifest_snapshot(connection, self.shard_count(), read)
+                })
+        }
+
         #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn document_catalog(&self) -> EngineResult<DocumentCatalog> {
             let result = self.document_catalog_inner();
@@ -928,11 +942,7 @@ mod enabled {
             &self,
             control: Arc<OperationControl>,
         ) -> EngineResult<DocumentCatalog> {
-            let manifest_path = self.root.join("manifest.sqlite");
-            let mut connection = open_existing_manifest(&manifest_path)?;
-            run_manifest_controlled(&mut connection, control, |connection| {
-                read_ready_manifest_snapshot(connection, self.shard_count(), load_catalog_rows)
-            })
+            self.read_document_manifest(control, load_catalog_rows)
         }
 
         fn document_collection_controlled_inner(
@@ -941,13 +951,9 @@ mod enabled {
             collection: &str,
             control: Arc<OperationControl>,
         ) -> EngineResult<Option<DocumentCollectionMetadata>> {
-            let manifest_path = self.root.join("manifest.sqlite");
-            let mut connection = open_existing_manifest(&manifest_path)?;
             let read_control = Arc::clone(&control);
-            run_manifest_controlled(&mut connection, control, |connection| {
-                read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
-                    load_collection_row(connection, database, collection, read_control.as_ref())
-                })
+            self.read_document_manifest(control, |connection| {
+                load_collection_row(connection, database, collection, read_control.as_ref())
             })
         }
 
@@ -956,13 +962,9 @@ mod enabled {
             database: &str,
             control: Arc<OperationControl>,
         ) -> EngineResult<Vec<DocumentCollectionMetadata>> {
-            let manifest_path = self.root.join("manifest.sqlite");
-            let mut connection = open_existing_manifest(&manifest_path)?;
             let read_control = Arc::clone(&control);
-            run_manifest_controlled(&mut connection, control, |connection| {
-                read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
-                    load_collection_rows_for_database(connection, database, read_control.as_ref())
-                })
+            self.read_document_manifest(control, |connection| {
+                load_collection_rows_for_database(connection, database, read_control.as_ref())
             })
         }
 
