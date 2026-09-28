@@ -11,6 +11,9 @@ on:
       - "python/**"
       - "src/**"
   workflow_call:
+  # Run the complete artifact/test matrix after a local-only PR batch,
+  # without invoking the publishing Release workflow.
+  workflow_dispatch:
 
 permissions:
   contents: read
