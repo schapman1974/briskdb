@@ -129,6 +129,60 @@ request deadlines wins. Deadline failures use the distinct
 `DeadlineExceeded` kind. The server flag `--request-timeout-ms 0` disables the
 engine default.
 
+## Opt-in storage contention backoff (Rust foundation)
+
+Rust hosts can configure controlled SQLite lock waits and document collection
+writer-fence acquisition through the same engine policy:
+
+```rust
+use std::time::Duration;
+use briskdb::{ContentionJitter, ContentionPolicy, EngineOptions};
+
+# fn options() -> briskdb::EngineResult<EngineOptions> {
+let policy = ContentionPolicy::new(
+    Duration::from_millis(2),   // initial delay
+    Duration::from_millis(50),  // capped delay
+    2,                         // integer exponential multiplier
+    ContentionJitter::Full,     // random whole milliseconds, 1 through the cap
+    8,                         // retries AFTER the initial acquisition attempt
+    Duration::from_millis(250), // elapsed budget from first contention
+)?;
+let options = EngineOptions::default().with_contention_policy(Some(policy));
+// Pass options to BriskDb::builder(path).with_engine_options(options).
+# Ok(options)
+# }
+```
+
+`ContentionPolicy::fail_fast()` permits the initial acquisition attempt but no
+wait/retry. `with_contention_policy(None)` (the default) preserves existing
+behavior. Nonzero policy durations are whole milliseconds up to 24 hours;
+initial delay must not exceed maximum delay, which must not exceed the elapsed
+budget. The multiplier is 1..=1024 and retry count is 1..=1,000,000. Invalid
+settings are rejected before opening storage. A retry whose delay would reach
+or cross the elapsed limit is not scheduled.
+
+This first implementation shares a budget across repeated controlled-handle
+setup/SQL execution and collection-fence waits **within one physical storage
+task**. It is not yet a request-wide budget across document command subtasks or
+parallel scatter shards. Pool/session/worker admission, root/startup locks,
+uncontrolled maintenance handles, and experimental virtual-table child writes
+still use their established controls. The engine/request deadline continues to
+bound the complete request. Python/managed-Mongo and daemon configuration,
+cross-task/admission budgeting, and public retry diagnostics remain tracked by
+[#510](https://github.com/schapman1974/briskdb/issues/510).
+
+Backoff sleeps occur only on blocking workers, not the async runtime; accepted
+cancellation wakes them and the earlier request deadline wins. These waits
+retry only SQLite's own lock-acquisition callback or a not-yet-acquired Brisk
+collection fence. They never replay an application statement, transaction,
+partially committed bulk command, or uncertain commit. An exhausted budget
+returns `Busy`, not `DeadlineExceeded`, unless the request deadline also expires.
+An uncontended acquisition can still succeed after retry exhaustion.
+
+This is also a foundation for future NFS mode, **not NFS/EFS support**. Backoff
+cannot bound an operating-system call stalled in filesystem I/O, and cancelling
+a request does not establish the outcome of an unacknowledged remote write.
+
 ## HTTP request identity and idempotent writes
 
 The HTTP adapter generates a fresh nonzero 128-bit request ID when one is

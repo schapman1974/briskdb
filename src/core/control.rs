@@ -4,7 +4,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -12,6 +12,7 @@ use std::{
 
 use tokio::sync::Notify;
 
+use super::{ContentionJitter, ContentionPolicy, contention::ContentionBudget};
 use super::{EngineError, EngineErrorKind, EngineResult, ResultLimits};
 
 /// A cloneable, sticky request-cancellation signal.
@@ -189,10 +190,20 @@ struct OperationState {
 pub(crate) struct OperationControl {
     state: Mutex<OperationState>,
     deadline: Option<Instant>,
+    contention: Option<Mutex<ContentionBudget>>,
+    wake_contention: Condvar,
 }
 
 impl OperationControl {
+    #[cfg(any(feature = "tinymongo-import", test))]
     pub(crate) fn new(deadline: Option<Instant>) -> Arc<Self> {
+        Self::with_contention_policy(deadline, None)
+    }
+
+    pub(crate) fn with_contention_policy(
+        deadline: Option<Instant>,
+        policy: Option<ContentionPolicy>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(OperationState {
                 phase: OperationPhase::Pending,
@@ -200,7 +211,68 @@ impl OperationControl {
                 interrupt: None,
             }),
             deadline,
+            contention: policy.map(|policy| Mutex::new(ContentionBudget::new(policy))),
+            wake_contention: Condvar::new(),
         })
+    }
+
+    /// A blocking-worker-only lock wait, never a retry of application work.
+    /// `None` keeps the caller's legacy policy. Reusing this control across
+    /// connection setup, collection fences and SQL shares one finite budget.
+    pub(crate) fn wait_for_contention(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<bool> {
+        let budget = self.contention.as_ref()?;
+        if self.should_stop() || cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Some(false);
+        }
+        let delay = {
+            let mut budget = budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut random = [0; 8];
+            if budget.jitter() == ContentionJitter::Full && getrandom::fill(&mut random).is_err() {
+                // Entropy failure must not panic inside SQLite's C callback or
+                // silently disable the finite policy: stop retrying instead.
+                return Some(false);
+            }
+            budget.next_delay(Instant::now(), u64::from_le_bytes(random))
+        };
+        let Some(delay) = delay else {
+            return Some(false);
+        };
+        let until = Instant::now() + delay;
+        loop {
+            if self.should_stop() || cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Some(false);
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Some(
+                    !budget
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .expired(now),
+                );
+            }
+            let mut remaining = until.duration_since(now);
+            if let Some(deadline) = self.deadline {
+                remaining = remaining.min(deadline.saturating_duration_since(now));
+            }
+            // Poll standalone tokens too; async callers normally signal the
+            // control directly and wake the condition variable immediately.
+            remaining = remaining.min(Duration::from_millis(10));
+            let state = self.lock_state();
+            if state.reason.is_some() {
+                return Some(false);
+            }
+            drop(
+                self.wake_contention
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
     }
 
     pub(crate) fn request_cancel(&self, reason: CancellationReason) -> bool {
@@ -212,6 +284,7 @@ impl OperationControl {
             state.reason = Some(reason);
             state.interrupt.clone()
         };
+        self.wake_contention.notify_all();
         if let Some(interrupt) = interrupt {
             interrupt();
         }
@@ -375,6 +448,97 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    fn slow_contention_policy() -> ContentionPolicy {
+        ContentionPolicy::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            ContentionJitter::None,
+            10,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn contention_policy_is_opt_in_and_shared_by_repeated_handle_arms() {
+        assert_eq!(OperationControl::new(None).wait_for_contention(None), None);
+        let policy = ContentionPolicy::new(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+            ContentionJitter::None,
+            2,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let control = OperationControl::with_contention_policy(None, Some(policy));
+        for _ in 0..2 {
+            control.arm(Arc::new(|| {})).unwrap();
+            assert_eq!(control.wait_for_contention(None), Some(true));
+            assert_eq!(control.disarm(), None);
+        }
+        control.arm(Arc::new(|| {})).unwrap();
+        assert_eq!(control.wait_for_contention(None), Some(false));
+        assert_eq!(control.disarm(), None);
+    }
+
+    #[test]
+    fn contention_deadline_wins_and_successful_commit_is_not_reported_as_cancelled() {
+        let control = OperationControl::with_contention_policy(
+            Some(Instant::now() + Duration::from_millis(20)),
+            Some(slow_contention_policy()),
+        );
+        let started = Instant::now();
+        assert_eq!(control.wait_for_contention(None), Some(false));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(control.reason(), Some(CancellationReason::DeadlineExceeded));
+        // Exhaustion/deadline never reinterpret an already-known commit.
+        assert_eq!(control.complete(Ok(42)).unwrap(), 42);
+    }
+
+    #[test]
+    fn cancellation_wakes_a_long_backoff_and_standalone_tokens_are_polled() {
+        for standalone in [false, true] {
+            let control =
+                OperationControl::with_contention_policy(None, Some(slow_contention_policy()));
+            let token = CancellationToken::new();
+            let waiter_control = Arc::clone(&control);
+            let waiter_token = token.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                done_tx
+                    .send(waiter_control.wait_for_contention(Some(&waiter_token)))
+                    .unwrap();
+            });
+            let started = Instant::now();
+            while !control
+                .contention
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .started()
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "waiter must reserve a retry before cancellation"
+                );
+                std::thread::yield_now();
+            }
+            if standalone {
+                token.cancel();
+            } else {
+                control.request_cancel(CancellationReason::Cancelled);
+            }
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Some(false)
+            );
+            waiter.join().unwrap();
+        }
+    }
 
     #[test]
     fn public_control_types_are_send_sync_and_have_stable_accessors() {

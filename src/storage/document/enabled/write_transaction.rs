@@ -223,13 +223,20 @@ pub(super) fn acquire_fence(
             Arc::clone(&storage.schema_coordination.document_write_stripes),
         ) {
             Ok(fence) => return Ok(fence),
-            Err(error)
-                if error.kind() == EngineErrorKind::Busy
-                    && started.elapsed() < CONNECTION_BUSY_TIMEOUT =>
-            {
-                // Blocking worker only. No shard transaction or foreign pool
-                // lease is held while waiting for the collection.
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            Err(error) if error.kind() == EngineErrorKind::Busy => {
+                match control.and_then(|control| control.wait_for_contention(Some(cancellation))) {
+                    Some(true) => {}
+                    Some(false) => {
+                        unique::check_active(control, cancellation)?;
+                        return Err(error);
+                    }
+                    None if started.elapsed() < CONNECTION_BUSY_TIMEOUT => {
+                        // Blocking worker only. No shard transaction or foreign pool
+                        // lease is held while waiting for the collection.
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    None => return Err(error),
+                }
             }
             Err(error) => return Err(error),
         }
@@ -309,6 +316,46 @@ mod tests {
             collection,
             Arc::clone(&storage.schema_coordination.document_write_stripes),
         )
+    }
+
+    #[test]
+    fn collection_fence_uses_configured_policy_without_starting_a_transaction() {
+        use crate::core::{ContentionJitter, ContentionPolicy};
+        let (_root, storage, collection, connection) = setup();
+        let held = claim(&storage, collection).unwrap();
+        let policy = ContentionPolicy::new(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            1,
+            ContentionJitter::None,
+            1,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        for policy in [ContentionPolicy::fail_fast(), policy] {
+            let control = OperationControl::with_contention_policy(None, Some(policy));
+            let error = acquire_fence(
+                &storage,
+                collection,
+                &CancellationToken::new(),
+                Some(&control),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Busy);
+            assert_eq!(control.wait_for_contention(None), Some(false));
+            assert!(connection.is_autocommit());
+        }
+        drop(held);
+        // A zero-retry policy still permits the initial attempt.
+        let control =
+            OperationControl::with_contention_policy(None, Some(ContentionPolicy::fail_fast()));
+        acquire_fence(
+            &storage,
+            collection,
+            &CancellationToken::new(),
+            Some(&control),
+        )
+        .unwrap();
     }
 
     #[test]
