@@ -23,7 +23,8 @@ except ImportError as error:
 if pymongo.version_tuple[:3] != (4, 17, 0):
     raise ImportError("BriskDB Mongo clients currently require pymongo==4.17.0")
 
-from ._mongo_runtime import _Store, _check_process, _drained, acquire
+from ._briskdb import ContentionPolicy
+from ._mongo_runtime import _Store, _check_process, _drained, _validate_contention_policy, acquire
 from ._mongo_collections import Database, AsyncDatabase, IndexCompatibilityWarning
 
 ASCENDING = pymongo.ASCENDING
@@ -122,8 +123,12 @@ class _LocalStoreBinding:
                                srv_service_name: Any) -> None:
         pending = self._briskdb_pending
         if pending is not None:
-            folder, shards, shared, suffix = pending
-            store = shared if shared is not None else acquire(folder, shards)
+            folder, shards, contention_policy, shared, suffix = pending
+            if shared is not None:
+                shared.check_contention_policy(contention_policy)
+                store = shared
+            else:
+                store = acquire(folder, shards, contention_policy)
             self._briskdb_store = store
             self._briskdb_release = weakref.finalize(self, store.release) if shared is None else None
             self._briskdb_pending = None
@@ -147,12 +152,14 @@ class MongoClient(_LocalStoreBinding, _Client):
 
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
-                 *, folder: Any = None, shards: Optional[int] = None, **kwargs: Any) -> None:
+                 *, folder: Any = None, shards: Optional[int] = None,
+                 contention_policy: Optional[ContentionPolicy] = None, **kwargs: Any) -> None:
         _check_process()
+        _validate_contention_policy(contention_policy)
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        self._briskdb_pending = (folder, shards, shared, suffix)
+        self._briskdb_pending = (folder, shards, contention_policy, shared, suffix)
         self._briskdb_release = None
         try:
             super().__init__("mongodb://127.0.0.1:1" + suffix,
@@ -166,6 +173,11 @@ class MongoClient(_LocalStoreBinding, _Client):
     @property
     def briskdb_path(self) -> Path:
         return self._briskdb_store.path
+
+    @property
+    def briskdb_contention_policy(self) -> Optional[ContentionPolicy]:
+        self._briskdb_store.check_process()
+        return self._briskdb_store.contention_policy
 
     def __getitem__(self, name: str) -> Database:
         return Database._wrap(super().__getitem__(name))
@@ -201,12 +213,14 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
 
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
-                 *, folder: Any = None, shards: Optional[int] = None, **kwargs: Any) -> None:
+                 *, folder: Any = None, shards: Optional[int] = None,
+                 contention_policy: Optional[ContentionPolicy] = None, **kwargs: Any) -> None:
         _check_process()
+        _validate_contention_policy(contention_policy)
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        self._briskdb_pending = (folder, shards, shared, suffix)
+        self._briskdb_pending = (folder, shards, contention_policy, shared, suffix)
         self._briskdb_release = None
         try:
             super().__init__("mongodb://127.0.0.1:1" + suffix,
@@ -220,6 +234,11 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
     @property
     def briskdb_path(self) -> Path:
         return self._briskdb_store.path
+
+    @property
+    def briskdb_contention_policy(self) -> Optional[ContentionPolicy]:
+        self._briskdb_store.check_process()
+        return self._briskdb_store.contention_policy
 
     def __getitem__(self, name: str) -> AsyncDatabase:
         return AsyncDatabase._wrap(super().__getitem__(name))

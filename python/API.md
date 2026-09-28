@@ -28,7 +28,8 @@ All six backoff arguments are required and validated by the Rust engine before
 storage opens. Retries exclude the initial acquisition attempt. This controls
 supported lock/admission waits, not application-command or uncertain-write
 replay. Sync/async opens and attached listeners use the same configured engine.
-Managed `MongoClient`/`patch` configuration is a separate, still-pending step.
+Managed `MongoClient`, `AsyncMongoClient` and `patch` accept the same policy
+through a `contention_policy=` keyword (see sharing rules below).
 See [bounds, coverage and examples](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
 
 `shards` is required to create storage and optional when reopening it. An
@@ -52,9 +53,10 @@ management. The `AsyncDatabase`, `AsyncSession`, `AsyncTransaction`, and
 
 ## PyMongo-compatible local clients and patching
 
-- `patch(folder=None, backend="sqlite", *, shards=None) -> MongoPatch`
+- `patch(folder=None, backend="sqlite", *, shards=None, contention_policy=None) -> MongoPatch`
 - `MongoClient(host=None, port=None, document_class=None, tz_aware=None,
-  connect=None, type_registry=None, *, folder=None, shards=None, **driver_options)`
+  connect=None, type_registry=None, *, folder=None, shards=None,
+  contention_policy=None, **driver_options)`
 - `AsyncMongoClient(...)` has equivalent construction arguments and awaited close.
 
 These subclass the optional pinned real PyMongo clients; collection/query behavior
@@ -63,6 +65,17 @@ still uses the shared Rust engine. Direct clients default to `BRISKDB_HOME` or
 folder use isolated temporary SQLite roots. Creation defaults to four shards;
 reopen detects the existing layout. Same-process managed owners of one canonical
 persistent path share an engine until the last owner closes it.
+
+On unreleased main, `contention_policy=` accepts a native `ContentionPolicy`.
+`None` uses legacy waiting when creating an engine, or inherits the policy of
+an already-open managed engine at that path. An explicit policy must match all
+six settings of an existing engine, otherwise construction raises `ValueError`
+without changing its policy or ownership. The same rules apply to nested patch
+scopes and clients created inside a scope; explicit conflicting client policies
+are rejected, not ignored. Policy settings are runtime-only, not persisted in
+the root. `client.briskdb_contention_policy` reports the selected immutable value
+(or `None` for legacy), including after close. No per-client retry loop is added,
+and Mongo request deadlines and uncertainty handling remain unchanged.
 
 Driver options (including document classes, timezones, URI database names and
 pool limits) are validated before a direct client opens storage or a listener.
