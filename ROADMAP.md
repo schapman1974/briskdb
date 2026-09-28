@@ -636,6 +636,11 @@ requires an earlier dependency:
    locking/recovery and independent-host qualification. First cloud testing
    targets isolated fixed-routing CRUD; optional placement is not a prerequisite
    for that bounded test and must not be inferred from its results.
+   An explicitly invoked [source-test runner](python/SERVERLESS.md#isolated-efs-source-test-runner-not-public-nfs-support)
+   now prepares that first experiment: exact Linux mount gating, one retained
+   root lock, SQL/document checks and before/after-commit process-exit recovery.
+   It is test-only, serializes complete open/work/close scopes, and does not
+   establish independent-host results or stale-writer fencing by itself.
 10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential
