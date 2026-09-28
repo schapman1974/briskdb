@@ -30,7 +30,7 @@ supported lock/admission waits, not application-command or uncertain-write
 replay. Sync/async opens and attached listeners use the same configured engine.
 Managed `MongoClient`, `AsyncMongoClient` and `patch` accept the same policy
 through a `contention_policy=` keyword (see sharing rules below).
-See [bounds, coverage and examples](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
+See [bounds, coverage and examples](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff).
 
 `shards` is required to create storage and optional when reopening it. An
 omitted count is read from the validated manifest; an explicit mismatch raises

@@ -2890,10 +2890,16 @@ mod enabled {
         fenced_collections.sort_unstable_by_key(stripe);
         fenced_collections.dedup_by_key(|collection| stripe(collection));
         let cancellation = CancellationToken::new();
+        let startup_control = crate::storage::contention::current();
         let _fences = fenced_collections
             .iter()
             .map(|collection| {
-                write_transaction::acquire_fence(storage, *collection, &cancellation, None)
+                write_transaction::acquire_fence(
+                    storage,
+                    *collection,
+                    &cancellation,
+                    startup_control.as_deref(),
+                )
             })
             .collect::<EngineResult<Vec<_>>>()?;
         let unique_keys = (!fenced_collections.is_empty())

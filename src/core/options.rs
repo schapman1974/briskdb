@@ -319,11 +319,12 @@ impl EngineOptions {
     /// session/connection/worker admission. `None` preserves legacy behavior.
     ///
     /// One logical SQL/document operation shares its budget with physical
-    /// subtasks, scatter children and authorization. Engine startup admission
-    /// has its own shared budget for root locks, schema exclusion and draining
-    /// active operations. Security-store SQLite busy waits share their calling
-    /// authority operation's budget. Startup SQLite waits, uncontrolled
-    /// maintenance and experimental virtual-table child writes are not covered.
+    /// subtasks, scatter children, authorization, metadata planning, maintenance
+    /// and virtual-table children. Startup has one budget for detection, root
+    /// admission and SQLite preparation/recovery. Each managed index-worker pass
+    /// has a fresh budget. This never replays application work or bounds stalled
+    /// kernel I/O or mandatory process-lease restoration. Explicit try-only
+    /// conflict boundaries remain non-waiting.
     #[must_use]
     pub const fn with_contention_policy(mut self, policy: Option<super::ContentionPolicy>) -> Self {
         self.contention_policy = policy;

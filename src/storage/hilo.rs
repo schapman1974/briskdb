@@ -131,12 +131,7 @@ impl HiloAllocator {
                     .or_insert_with(|| Arc::new(TableAllocator::default())),
             )
         };
-        let mut range = table.range.lock().map_err(|error| {
-            EngineError::new(
-                EngineErrorKind::Internal,
-                format!("hilo_v1 table allocator is poisoned: {error}"),
-            )
-        })?;
+        let mut range = super::contention::lock(&table.range, "hilo_v1 table allocator")?;
         if range
             .as_ref()
             .is_none_or(|current| current.next_sequence > current.last_sequence)
@@ -189,6 +184,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn configured_allocator_mutex_shares_budget_without_issuing_or_replaying_ids() {
+        use crate::core::{ContentionPolicy, OperationControl};
+        let allocator = HiloAllocator::new().unwrap();
+        let table_id = TableId::new(7).unwrap();
+        let table = Arc::new(TableAllocator::default());
+        allocator
+            .tables
+            .lock()
+            .unwrap()
+            .insert(table_id, Arc::clone(&table));
+        let held = table.range.lock().unwrap();
+        let control =
+            OperationControl::with_contention_policy(None, Some(ContentionPolicy::fail_fast()));
+        let calls = AtomicUsize::new(0);
+        let reserve = |owner| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(DurableHiloLease::new(table_id, owner, 1, 1, 2))
+        };
+        let error = crate::storage::contention::with_control(Some(control), || {
+            allocator.allocate(table_id, reserve)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(held);
+        let first = allocator.allocate(table_id, reserve).unwrap();
+        let second = allocator.allocate(table_id, reserve).unwrap();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn one_durable_lease_serves_every_value_once() {

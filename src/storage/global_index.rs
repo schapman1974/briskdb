@@ -486,6 +486,9 @@ pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(sqlite_error::storage)?;
+    // Startup version inspection is part of the same admission budget as
+    // manifest/shard inspection, even though this handle is read-only.
+    super::contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(sqlite_error::storage)?;
@@ -5376,9 +5379,7 @@ pub(super) fn operational_counts(
 }
 
 fn configure(connection: &Connection) -> EngineResult<()> {
-    connection
-        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-        .map_err(sqlite_error::storage)?;
+    super::contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;

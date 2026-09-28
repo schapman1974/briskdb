@@ -1116,9 +1116,7 @@ fn validate_schema_migration_prefix_with_digests(
                     run_connection_controlled(&mut connection, Arc::clone(control), validate)
                 }
                 None => {
-                    connection
-                        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-                        .map_err(sqlite_error::storage)?;
+                    super::contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
                     validate(&mut connection)
                 }
             }
@@ -1153,9 +1151,7 @@ fn preflight_one_shard(
     match control {
         None => {
             let mut connection = shard::open_required_file(path)?;
-            connection
-                .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-                .map_err(sqlite_error::storage)?;
+            super::contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
             shard::validate_schema_migration_connection(
                 &connection,
                 path,

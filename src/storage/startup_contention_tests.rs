@@ -41,6 +41,108 @@ fn wait_until(mut ready: impl FnMut() -> bool) {
     }
 }
 
+fn exclusive_sqlite(path: &Path) -> Connection {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE")
+        .unwrap();
+    connection
+}
+
+#[tokio::test]
+async fn startup_sqlite_fail_fast_covers_manifest_shards_and_detected_open() {
+    for file in ["manifest.sqlite", "shards/0000.sqlite"] {
+        let root = tempfile::tempdir().unwrap();
+        drop(Storage::open(root.path(), 2).unwrap());
+        let held = exclusive_sqlite(&root.path().join(file));
+        let options =
+            EngineOptions::default().with_contention_policy(Some(ContentionPolicy::fail_fast()));
+        for detected in [false, true] {
+            let attempt = async {
+                if detected {
+                    Engine::open_detected_with_options(root.path(), options).await
+                } else {
+                    Engine::open_with_options(root.path(), 2, options).await
+                }
+            };
+            let error = tokio::time::timeout(Duration::from_secs(2), attempt)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::Busy,
+                "{file}, detected={detected}: {error}"
+            );
+        }
+        held.execute_batch("ROLLBACK").unwrap();
+        drop(held);
+        let engine = Engine::open_detected_with_options(root.path(), options)
+            .await
+            .unwrap();
+        assert_eq!(engine.contention_statistics().exhausted_budgets(), 0);
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn startup_admission_and_sqlite_use_one_budget() {
+    let root = tempfile::tempdir().unwrap();
+    drop(Storage::open(root.path(), 2).unwrap());
+    let held = process_lock::RootStartupGuard::acquire(root.path(), Duration::ZERO).unwrap();
+    let blocker = exclusive_sqlite(&root.path().join("manifest.sqlite"));
+    let (control, metrics) = control(policy(1), None);
+    let path = root.path().to_path_buf();
+    let opener = std::thread::spawn(move || {
+        Storage::open_with_startup_control(path, 2, None, Some(&control))
+    });
+    wait_until(|| metrics.snapshot().retries_scheduled() == 1);
+    drop(held);
+    assert_eq!(
+        opener.join().unwrap().unwrap_err().kind(),
+        EngineErrorKind::Busy
+    );
+    assert_eq!(metrics.snapshot().retries_scheduled(), 1);
+    assert_eq!(metrics.snapshot().exhausted_budgets(), 1);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    Storage::open(root.path(), 2).unwrap();
+}
+
+#[test]
+fn startup_sqlite_cancel_and_deadline_release_admission_for_explicit_reopen() {
+    for cancelled in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        drop(Storage::open(root.path(), 2).unwrap());
+        let blocker = exclusive_sqlite(&root.path().join("manifest.sqlite"));
+        let (control, metrics) = control(
+            policy(10),
+            (!cancelled).then(|| Instant::now() + Duration::from_millis(200)),
+        );
+        let child_control = Arc::clone(&control);
+        let path = root.path().to_path_buf();
+        let opener = std::thread::spawn(move || {
+            Storage::open_with_startup_control(path, 2, None, Some(&child_control))
+        });
+        wait_until(|| metrics.snapshot().retries_scheduled() == 1);
+        if cancelled {
+            control.request_cancel(CancellationReason::Cancelled);
+        }
+        assert_eq!(
+            opener.join().unwrap().unwrap_err().kind(),
+            if cancelled {
+                EngineErrorKind::Cancelled
+            } else {
+                EngineErrorKind::DeadlineExceeded
+            }
+        );
+        assert_eq!(metrics.snapshot().exhausted_budgets(), 0);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        Storage::open(root.path(), 2).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn engine_fail_fast_stops_before_manifest_work() {
     let root = tempfile::tempdir().unwrap();

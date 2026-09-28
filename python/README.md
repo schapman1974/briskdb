@@ -343,7 +343,7 @@ Owners sharing a folder share one policy: omitted/`None` inherits an open
 engine's policy; explicit conflicting settings raise `ValueError`. A new engine
 without a policy keeps legacy behavior. These settings are not saved in the
 database. See the
-[complete waiting contract](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
+[complete waiting contract](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff).
 
 On unreleased main, `Config(storage_profile="local")` makes the default storage
 contract explicit. The reserved `storage_profile="nfs"` currently raises

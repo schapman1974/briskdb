@@ -129,7 +129,7 @@ request deadlines wins. Deadline failures use the distinct
 `DeadlineExceeded` kind. The server flag `--request-timeout-ms 0` disables the
 engine default.
 
-## Opt-in storage contention backoff (Rust foundation)
+## Opt-in storage contention backoff
 
 Rust hosts can configure controlled SQLite lock waits, document collection
 writer fences, and session/connection/worker admission through one engine policy:
@@ -239,19 +239,35 @@ shard work retains its durable journal position for explicit recovery/resume.
 Unconfigured migrations keep their existing fixed busy timeout.
 
 Configured engine opens share a separate startup contention budget across the
-root startup lock, in-process schema exclusion, and draining active operations.
-Dropping the opening future cancels these admission waits and releases acquired
-guards; it does not cancel or replay initialization/recovery already executing.
+root startup lock, in-process schema exclusion, draining active operations and
+manifest/shard/security-store SQLite busy waits. Shard-count discovery and
+authenticated-root preparation use the same budget as the subsequent open.
+Dropping the opening future cancels admission/backoff waits and releases acquired
+guards; it does not undo or replay initialization/recovery already executing.
 `request_timeout` still applies to requests after open, not startup. Successful
 opens retain their startup contention counters in engine diagnostics. `None`
 preserves the existing startup wait behavior.
 
-Startup SQLite and authenticated security-root preparation, uncontrolled
-maintenance handles, and experimental virtual-table child writes still use
-their established controls. Process-lease restoration
-after an unsuccessful exclusive upgrade must retain ownership before returning.
-Remaining internal wait paths remain tracked by
-[#510](https://github.com/schapman1974/briskdb/issues/510).
+Metadata planning, auxiliary checkpoints, global-index status and experimental
+virtual-table reads/writes also use the calling operation's budget. Virtual-table
+children retain their existing cancellation/commit reconciliation; exhausting
+the SQLite busy handler does not start another fixed-duration retry loop.
+Generated-ID allocation shares the budget across its in-process range lock,
+manifest lease and physical child. Leased/consumed IDs are never returned for reuse.
+Async metadata planning runs on an admitted blocking worker and retains lifecycle
+and schema admission if its caller is dropped. The explicitly synchronous
+`plan_bound_statement` API remains synchronous and has one budget per call.
+
+An engine-started global-index background worker inherits the policy and uses a
+fresh budget for each index pass, sharing the engine's diagnostics. Stopping it
+wakes configured contention waits. Its existing polling interval and durable
+consumer checkpoints are unchanged; this is not request/transaction replay.
+Raw synchronous `Database` APIs have no `EngineOptions` and retain their legacy
+behavior. Explicit try-only boundaries (same-idempotency-key conflicts, candidate
+selection, opportunistic index reads/repairs, and fail-closed schema admission)
+remain non-waiting. Mandatory process-lease restoration after an exclusive
+upgrade must retain ownership before returning; cancellation cannot safely
+short-circuit it. The policy does not bound that restoration or kernel I/O.
 
 Blocking lock sleeps occur only on blocking workers; admission uses async
 timers. Accepted cancellation wakes waits and the earlier request deadline wins.

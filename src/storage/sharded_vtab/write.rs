@@ -908,6 +908,23 @@ enum CoordinatorAdmission {
 }
 
 impl WriteCoordinator {
+    /// Keep the request budget alive through every ephemeral child and its
+    /// cleanup, without retaining a request on standalone multi-statement
+    /// coordinators. No configured SQLite handle can escape this wrapper.
+    pub(crate) fn with_admitted_controlled<T>(
+        storage: Storage,
+        operation: SchemaOperationGuard,
+        control: Arc<OperationControl>,
+        registry_cache: Arc<RegistrySchemaCache>,
+        work: impl FnOnce(&mut Self) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        crate::storage::contention::with_control(Some(Arc::clone(&control)), || {
+            let mut coordinator =
+                Self::open_admitted_controlled(storage, operation, control, registry_cache)?;
+            work(&mut coordinator)
+        })
+    }
+
     pub(crate) fn open(storage: Storage) -> EngineResult<Self> {
         let bootstrap_operation = storage.enter_schema_operation()?;
         Self::open_with_admission(
@@ -3062,9 +3079,7 @@ impl WriteTransaction {
                 Arc::clone(&registry.cancellation_epoch),
                 self.epoch,
             )?;
-            connection
-                .busy_timeout(CANCELLABLE_BUSY_SLICE)
-                .map_err(sqlite_error::storage)?;
+            crate::storage::contention::configure(&connection, CANCELLABLE_BUSY_SLICE)?;
             let cancellation_epoch = Arc::clone(&registry.cancellation_epoch);
             let epoch = self.epoch;
             connection
@@ -3117,7 +3132,9 @@ impl WriteTransaction {
                     Ok(()) => break Ok(()),
                     Err(error) => {
                         let error = sqlite_error::statement(error);
-                        if error.kind() == EngineErrorKind::Busy && Instant::now() < begin_deadline
+                        if error.kind() == EngineErrorKind::Busy
+                            && !crate::storage::contention::is_configured()
+                            && Instant::now() < begin_deadline
                         {
                             registry.wait_after_child_busy_for_test()?;
                             continue;

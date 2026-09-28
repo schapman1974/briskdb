@@ -1,4 +1,4 @@
-//! One optional contention budget for pre-engine startup admission.
+//! One optional contention budget for pre-engine startup admission and storage.
 
 use super::*;
 

@@ -78,7 +78,7 @@ detected.
 
 Rust hosts may also opt into validated `ContentionPolicy` lock-acquisition
 backoff through `EngineOptions::with_contention_policy`. See the
-[request-control scope and example](REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation)
+[request-control scope and example](REQUEST_CONTROLS.md#opt-in-storage-contention-backoff)
 before configuring it; this foundation does not yet enable NFS storage.
 
 ## Native document commands

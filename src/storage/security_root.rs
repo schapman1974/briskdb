@@ -92,5 +92,18 @@ pub(crate) fn open(root: &Path, shards: u16) -> EngineResult<DurableSecurityCata
     Ok(authority)
 }
 
+pub(crate) fn open_controlled(
+    root: &Path,
+    shards: u16,
+    control: Option<std::sync::Arc<crate::core::OperationControl>>,
+) -> EngineResult<DurableSecurityCatalog> {
+    super::contention::with_control(control.clone(), || match control {
+        Some(control) => {
+            super::security_catalog::with_operation_control(control, || open(root, shards))
+        }
+        None => open(root, shards),
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests;

@@ -183,6 +183,7 @@ pub struct Database {
 /// every index/shard pair.
 pub struct GlobalIndexWorker {
     wake: Arc<(Mutex<bool>, Condvar)>,
+    active_control: Arc<Mutex<Option<Arc<OperationControl>>>>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -207,6 +208,14 @@ impl GlobalIndexWorker {
             let (lock, wake) = &*self.wake;
             let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *stopped = true;
+            if let Some(control) = self
+                .active_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                control.request_cancel(CancellationReason::Cancelled);
+            }
             wake.notify_all();
         }
         if let Some(join) = self.join.take() {
@@ -419,27 +428,70 @@ impl Database {
         &self,
         options: GlobalIndexAsyncOptions,
     ) -> EngineResult<GlobalIndexWorker> {
+        self.start_global_index_worker_controlled(
+            options,
+            None,
+            Arc::new(contention::ContentionMetrics::default()),
+        )
+    }
+
+    fn start_global_index_worker_controlled(
+        &self,
+        options: GlobalIndexAsyncOptions,
+        policy: Option<ContentionPolicy>,
+        metrics: Arc<contention::ContentionMetrics>,
+    ) -> EngineResult<GlobalIndexWorker> {
         let owner_id = random_global_index_worker_id()?;
         let storage = self.storage.clone();
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let worker_wake = Arc::clone(&wake);
+        let active_control = Arc::new(Mutex::new(None));
+        let worker_control = Arc::clone(&active_control);
         let join = thread::Builder::new()
             .name("briskdb-global-index".to_owned())
             .spawn(move || {
                 let cancellation = CancellationToken::new();
-                loop {
+                'passes: loop {
                     let (lock, _) = &*worker_wake;
                     if *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
                         break;
                     }
                     let mut made_progress = false;
                     for index_id in storage.ready_nonunique_global_indexes() {
-                        match storage.process_global_index_async(
-                            index_id,
-                            owner_id,
-                            options,
-                            &cancellation,
-                        ) {
+                        let control = {
+                            // The stop flag and active control are published in
+                            // one lock order, so stop cannot miss a new wait.
+                            let stopped = lock
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if *stopped {
+                                break 'passes;
+                            }
+                            let control = policy.map(|policy| {
+                                OperationControl::with_contention_metrics(
+                                    None,
+                                    Some(policy),
+                                    Arc::clone(&metrics),
+                                )
+                            });
+                            *worker_control
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = control.clone();
+                            control
+                        };
+                        let result = crate::storage::contention::with_control(control, || {
+                            storage.process_global_index_async(
+                                index_id,
+                                owner_id,
+                                options,
+                                &cancellation,
+                            )
+                        });
+                        worker_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        match result {
                             Ok(report) => made_progress |= report.applied_events() != 0,
                             Err(error)
                                 if matches!(
@@ -478,6 +530,7 @@ impl Database {
             })?;
         Ok(GlobalIndexWorker {
             wake,
+            active_control,
             join: Some(join),
         })
     }
