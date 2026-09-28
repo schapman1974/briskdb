@@ -11,6 +11,7 @@ mod global_index_async;
 mod hilo;
 mod idempotency;
 mod index_outbox;
+mod journal;
 mod manifest;
 mod migration;
 mod process_lock;
@@ -4011,9 +4012,7 @@ fn configure_manifest_connection_after_busy_setup(connection: &Connection) -> En
         ));
     }
     validate_manifest_integrity_check(connection)?;
-    connection
-        .pragma_update(None, "synchronous", "FULL")
-        .map_err(sqlite_error::storage)?;
+    journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
@@ -4181,16 +4180,11 @@ fn canonical_manifest_open_path(path: &Path) -> EngineResult<PathBuf> {
 }
 
 fn configure_journal_mode(connection: &Connection) -> EngineResult<()> {
-    let mode = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
-        .map_err(sqlite_error::storage)?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(EngineError::new(
-            EngineErrorKind::FailedPrecondition,
-            format!("SQLite retained journal mode {mode} instead of enabling WAL"),
-        ));
-    }
-    Ok(())
+    journal::JournalPolicy::LOCAL.initialize_mode(
+        connection,
+        EngineErrorKind::FailedPrecondition,
+        "manifest",
+    )
 }
 
 #[cfg(test)]

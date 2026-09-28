@@ -616,7 +616,15 @@ requires an earlier dependency:
    tracing, online backup and restore, fault testing, and compatibility gates.
 9. [ ] **Complete serverless support.** Define atomic snapshot storage,
    ephemeral-runtime lifecycle adapters, warm reuse, and fenced writer
-   guarantees.
+   guarantees. The separate EFS-only [NFS mode track (#509)](https://github.com/schapman1974/briskdb/issues/509)
+   does not require snapshot storage: persisted profiles and rollback journaling
+   (#511), cross-host locks/fencing (#512–#513), durable insert retry identity
+   (#514), and real multi-host qualification (#516) precede support claims.
+   Configurable contention budgets (#510) apply to every mode. Optional
+   insert-only placement (#515) follows safe fixed routing. NFS qualification
+   must measure cold/warm metadata round trips, including manifest validation,
+   handle reuse and DELETE/PERSIST journal churn; do not copy databases into
+   Lambda or omit coherence checks to improve those measurements.
 10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential
