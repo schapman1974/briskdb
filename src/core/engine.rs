@@ -600,12 +600,26 @@ impl Engine {
         requested_shards: u16,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        Self::open_with_startup(
+            root,
+            requested_shards,
+            options,
+            StartupOperation::new(options.contention_policy()),
+        )
+        .await
+    }
+
+    async fn open_with_startup(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        options: EngineOptions,
+        startup: StartupOperation,
+    ) -> EngineResult<Self> {
         options.storage_profile().require_available()?;
         crate::storage::validate_shard_count(requested_shards)?;
         let root = PathBuf::from(root.as_ref());
         let worker_limit = options.worker_limit(requested_shards)?;
         let workers = BlockingPool::new(worker_limit);
-        let startup = StartupOperation::new(options.contention_policy());
         let control = startup.control.clone();
         let database = workers
             .run(move || {
@@ -614,7 +628,7 @@ impl Engine {
                         root,
                         requested_shards,
                         None,
-                        control.as_deref(),
+                        control.as_ref(),
                     )?,
                     global_index_worker_id: super::random_global_index_worker_id()?,
                 })
@@ -635,17 +649,22 @@ impl Engine {
         options.storage_profile().require_available()?;
         let root = PathBuf::from(root.as_ref());
         let detect_root = root.clone();
-        let requested_shards =
-            tokio::task::spawn_blocking(move || Database::detect_shard_count(detect_root))
-                .await
-                .map_err(|error| {
-                    EngineError::from_source(
-                        EngineErrorKind::Internal,
-                        "shard-count discovery worker failed",
-                        error,
-                    )
-                })??;
-        Self::open_with_options(root, requested_shards, options).await
+        let startup = StartupOperation::new(options.contention_policy());
+        let control = startup.control.clone();
+        let requested_shards = tokio::task::spawn_blocking(move || {
+            crate::storage::contention::with_control(control, || {
+                Database::detect_shard_count(detect_root)
+            })
+        })
+        .await
+        .map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::Internal,
+                "shard-count discovery worker failed",
+                error,
+            )
+        })??;
+        Self::open_with_startup(root, requested_shards, options, startup).await
     }
 
     /// Wrap the synchronous compatibility API in the shared async boundary.
@@ -839,14 +858,114 @@ impl Engine {
         self.require_unsecured_operation()?;
         let _schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let cancellation = CancellationToken::new();
-        self.plan_bound_statement_admitted(
-            database,
-            normalized,
-            statement_index,
-            parameters,
-            explicit_routing_key,
-            (&cancellation, None),
-        )
+        let control = OperationControl::with_contention_metrics(
+            None,
+            self.inner.options.contention_policy(),
+            Arc::clone(&self.inner.contention_metrics),
+        );
+        crate::storage::contention::with_control(Some(control), || {
+            self.plan_bound_statement_admitted(
+                database,
+                normalized,
+                statement_index,
+                parameters,
+                explicit_routing_key,
+                (&cancellation, None),
+            )
+        })
+    }
+
+    /// Retain admission while metadata work and backoff run off the executor.
+    async fn run_storage_planning<T, F>(
+        &self,
+        operation: &mut Operation,
+        schema: &SchemaOperationGuard,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Engine, CancellationToken, Option<Instant>) -> EngineResult<T> + Send + 'static,
+    {
+        let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
+        operation.check_before_start()?;
+        let lease = operation.take_lease();
+        let schema = schema.clone();
+        let engine = self.clone();
+        let cancellation = operation.cancellation.clone();
+        let deadline = operation.deadline;
+        let control = Arc::clone(&operation.control);
+        let join = worker.spawn(move || {
+            let _schema = schema;
+            let result = crate::storage::contention::with_control(Some(control), || {
+                work(engine, cancellation, deadline)
+            });
+            Ok((lease, result))
+        });
+        let (lease, result) = operation.wait_started(join).await?;
+        operation.lease = Some(lease);
+        let value = result?;
+        operation.check_before_start()?;
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_bound_statement_controlled(
+        &self,
+        operation: &mut Operation,
+        schema: &SchemaOperationGuard,
+        database: LogicalDatabaseId,
+        normalized: &sql::NormalizedSql,
+        statement_index: usize,
+        parameters: &[Value],
+        explicit_routing_key: Option<&[u8]>,
+    ) -> EngineResult<BoundStatementPlan> {
+        if self.catalog().global_indexes().is_empty() {
+            return self.plan_bound_statement_admitted(
+                database,
+                normalized,
+                statement_index,
+                parameters,
+                explicit_routing_key,
+                (&operation.cancellation, operation.deadline),
+            );
+        }
+        let normalized = normalized.clone();
+        let parameters = parameters.to_vec();
+        let routing_key = explicit_routing_key.map(<[u8]>::to_vec);
+        self.run_storage_planning(operation, schema, move |engine, cancellation, deadline| {
+            engine.plan_bound_statement_admitted(
+                database,
+                &normalized,
+                statement_index,
+                &parameters,
+                routing_key.as_deref(),
+                (&cancellation, deadline),
+            )
+        })
+        .await
+    }
+
+    async fn logical_raw_query_plan_controlled(
+        &self,
+        operation: &mut Operation,
+        schema: &SchemaOperationGuard,
+        statement: &str,
+        parameters: &[Value],
+    ) -> EngineResult<(Vec<u16>, String)> {
+        if self.catalog().global_indexes().is_empty() {
+            return self.logical_raw_query_plan(
+                statement,
+                parameters,
+                &operation.cancellation,
+                operation.deadline,
+            );
+        }
+        let statement = statement.to_owned();
+        let parameters = parameters.to_vec();
+        self.run_storage_planning(operation, schema, move |engine, cancellation, deadline| {
+            engine.logical_raw_query_plan(&statement, &parameters, &cancellation, deadline)
+        })
+        .await
     }
 
     fn plan_bound_statement_admitted(
@@ -958,7 +1077,11 @@ impl Engine {
         &self,
         options: super::GlobalIndexAsyncOptions,
     ) -> EngineResult<super::GlobalIndexWorker> {
-        self.inner.database.start_global_index_worker(options)
+        self.inner.database.start_global_index_worker_controlled(
+            options,
+            self.inner.options.contention_policy(),
+            Arc::clone(&self.inner.contention_metrics),
+        )
     }
 
     /// Return the lifecycle state shared by every engine clone.
@@ -1396,7 +1519,10 @@ impl Engine {
         let join = worker.spawn(move || {
             let _lease = lease;
             let _schema_operation = schema_operation;
-            let result = storage.global_index_operational_report();
+            let result =
+                crate::storage::contention::with_control(Some(Arc::clone(&worker_control)), || {
+                    storage.global_index_operational_report()
+                });
             if result
                 .as_ref()
                 .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
@@ -1491,7 +1617,10 @@ impl Engine {
                 })
                 .collect::<EngineResult<Vec<_>>>()
                 .and_then(|shards| {
-                    let databases = storage.checkpoint_auxiliary_databases()?;
+                    let databases = crate::storage::contention::with_control(
+                        Some(Arc::clone(&worker_control)),
+                        || storage.checkpoint_auxiliary_databases(),
+                    )?;
                     Ok(CheckpointReport { shards, databases })
                 });
             if result
@@ -1658,7 +1787,7 @@ impl Engine {
                 Ok(admission) => admission,
                 Err(error) => return operation.finish(Err(error)),
             };
-        let result = (|| {
+        let result = async {
             let routing_key = guard.routing_key().map(str::as_bytes);
             let template = guard.prepared().statement(statement)?;
             let parameter_layout = &template.translated().statement_parameters()[0];
@@ -1680,20 +1809,23 @@ impl Engine {
                 parameter_layout.parameter_indices(),
                 routing_key,
             )?;
-            self.plan_bound_statement_admitted(
+            self.plan_bound_statement_controlled(
+                &mut operation,
+                &schema_operation,
                 template.database(),
                 template.translated().normalized_sql(),
                 0,
                 &parameters,
                 routing_key,
-                (&operation.cancellation, operation.deadline),
-            )?;
+            )
+            .await?;
             operation.check_before_start()?;
             let routing_key = routing_key.map(<[u8]>::to_vec);
             guard
                 .prepared_mut()
                 .insert_portal(statement, parameters, routing_key)
-        })();
+        }
+        .await;
         if result.is_err() {
             guard.fail_transaction();
         }
@@ -1826,14 +1958,18 @@ impl Engine {
         if guard.state() == super::SessionState::FailedTransaction {
             return operation.finish(Err(transaction_aborted()));
         }
-        let plan = match self.plan_bound_statement_admitted(
-            template.database(),
-            template.translated().normalized_sql(),
-            0,
-            portal_snapshot.parameters(),
-            portal_snapshot.routing_key(),
-            (&operation.cancellation, operation.deadline),
-        ) {
+        let plan = match self
+            .plan_bound_statement_controlled(
+                &mut operation,
+                &schema_operation,
+                template.database(),
+                template.translated().normalized_sql(),
+                0,
+                portal_snapshot.parameters(),
+                portal_snapshot.routing_key(),
+            )
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => {
                 guard.fail_transaction();
@@ -2044,14 +2180,18 @@ impl Engine {
         } else {
             portal_snapshot.routing_key()
         };
-        let plan = match self.plan_bound_statement_admitted(
-            template.database(),
-            template.translated().normalized_sql(),
-            0,
-            portal_snapshot.parameters(),
-            explicit_routing_key,
-            (&operation.cancellation, operation.deadline),
-        ) {
+        let plan = match self
+            .plan_bound_statement_controlled(
+                &mut operation,
+                &schema_operation,
+                template.database(),
+                template.translated().normalized_sql(),
+                0,
+                portal_snapshot.parameters(),
+                explicit_routing_key,
+            )
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => {
                 guard.fail_transaction();
@@ -2299,14 +2439,18 @@ impl Engine {
         if guard.state() == super::SessionState::FailedTransaction {
             return operation.finish(Err(transaction_aborted()));
         }
-        let plan = match self.plan_bound_statement_admitted(
-            template.database(),
-            template.translated().normalized_sql(),
-            0,
-            portal_snapshot.parameters(),
-            None,
-            (&operation.cancellation, operation.deadline),
-        ) {
+        let plan = match self
+            .plan_bound_statement_controlled(
+                &mut operation,
+                &schema_operation,
+                template.database(),
+                template.translated().normalized_sql(),
+                0,
+                portal_snapshot.parameters(),
+                None,
+            )
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => {
                 guard.fail_transaction();
@@ -3176,116 +3320,115 @@ impl Engine {
             let _target_capacity = target_capacity;
             let _auto_capacities = auto_capacities;
             let mut registry_bootstrap_gate = registry_bootstrap_gate;
-            let result = (|| {
-                let mut coordinator = WriteCoordinator::open_admitted_controlled(
-                    storage,
-                    schema_operation,
-                    Arc::clone(&worker_control),
-                    registry_schema_cache,
-                )?;
-
-                // A nonzero write no longer owns a shard-0 handle after registry
-                // construction. Keep the same permit for shard-0 target writes.
-                if auto_generated_shard || shard != 0 {
-                    drop(shard_zero_capacity.take());
-                }
-                drop(registry_bootstrap_gate.take());
-                let cancellation = coordinator.cancellation_handle();
-                worker_control
-                    .arm(Arc::new(move || cancellation.cancel_write_nonblocking()))
-                    .map_err(CancellationReason::error)?;
-                let mut native_selected_shard = None;
-                let result = match generated_target {
-                    Some(GeneratedWriteTarget::Exact(table, expected_shard)) => coordinator
-                        .execute_generated_dml_values(
-                            &sql,
-                            &params,
-                            table.get(),
-                            expected_shard,
-                        )?,
-                    Some(GeneratedWriteTarget::NativeAuto(table)) => {
-                        let selected = Arc::new(AtomicU64::new(u64::MAX));
-                        native_selected_shard = Some(Arc::clone(&selected));
-                        let retained_capacity = std::sync::Mutex::new(Vec::new());
-                        let admission_connections = connections.clone();
-                        coordinator.execute_generated_dml_values_auto_admitted(
-                            &sql,
-                            &params,
-                            table.get(),
-                            move |candidate| {
-                                {
-                                    let mut retained = retained_capacity
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    if retained
-                                        .first()
-                                        .is_some_and(|(shard, _)| *shard == candidate)
+            let result = WriteCoordinator::with_admitted_controlled(
+                storage,
+                schema_operation,
+                Arc::clone(&worker_control),
+                registry_schema_cache,
+                |coordinator| {
+                    // A nonzero write no longer owns a shard-0 handle after registry
+                    // construction. Keep the same permit for shard-0 target writes.
+                    if auto_generated_shard || shard != 0 {
+                        drop(shard_zero_capacity.take());
+                    }
+                    drop(registry_bootstrap_gate.take());
+                    let cancellation = coordinator.cancellation_handle();
+                    worker_control
+                        .arm(Arc::new(move || cancellation.cancel_write_nonblocking()))
+                        .map_err(CancellationReason::error)?;
+                    let mut native_selected_shard = None;
+                    let result = match generated_target {
+                        Some(GeneratedWriteTarget::Exact(table, expected_shard)) => coordinator
+                            .execute_generated_dml_values(
+                                &sql,
+                                &params,
+                                table.get(),
+                                expected_shard,
+                            )?,
+                        Some(GeneratedWriteTarget::NativeAuto(table)) => {
+                            let selected = Arc::new(AtomicU64::new(u64::MAX));
+                            native_selected_shard = Some(Arc::clone(&selected));
+                            let retained_capacity = std::sync::Mutex::new(Vec::new());
+                            let admission_connections = connections.clone();
+                            coordinator.execute_generated_dml_values_auto_admitted(
+                                &sql,
+                                &params,
+                                table.get(),
+                                move |candidate| {
                                     {
-                                        return Ok(());
+                                        let mut retained = retained_capacity
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        if retained
+                                            .first()
+                                            .is_some_and(|(shard, _)| *shard == candidate)
+                                        {
+                                            return Ok(());
+                                        }
+                                        retained.clear();
                                     }
-                                    retained.clear();
-                                }
-                                let capacity = admission_connections
-                                    .try_acquire_for_owner(candidate, owner)?;
-                                selected.store(u64::from(candidate), Ordering::Release);
-                                retained_capacity
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .push((candidate, capacity));
-                                Ok(())
-                            },
-                        )?
-                    }
-                    Some(GeneratedWriteTarget::HiloAuto(table)) => coordinator
-                        .execute_generated_dml_values_auto(&sql, &params, table.get())?,
-                    None => coordinator.execute_dml_values(&sql, &params)?,
-                };
-                if !auto_generated_shard
-                    && result.shard().is_some_and(|actual| actual != shard)
-                {
-                    return Err(EngineError::new(
-                        EngineErrorKind::Internal,
-                        format!(
-                            "writable coordinator mutated shard {}, but Engine admitted shard {shard}",
-                            result.shard().expect("checked as present")
-                        ),
-                    ));
-                }
-                let actual_shard = match result.shard() {
-                    Some(actual) => actual,
-                    // A successful no-op has no mutated child to report. For
-                    // ordinary and native-range writes the Engine already
-                    // admitted one exact target, so preserve that established
-                    // routed result. Only auto-routed hi/lo needs the child to
-                    // report the target selected after allocation.
-                    None if !auto_generated_shard => shard,
-                    None if native_auto => {
-                        let selected = native_selected_shard
-                            .as_ref()
-                            .expect("native auto write records its candidate")
-                            .load(Ordering::Acquire);
-                        u16::try_from(selected).map_err(|_| {
-                            EngineError::new(
-                                EngineErrorKind::Internal,
-                                "native auto-routed write completed before selecting a physical shard",
-                            )
-                        })?
-                    }
-                    None => {
+                                    let capacity = admission_connections
+                                        .try_acquire_for_owner(candidate, owner)?;
+                                    selected.store(u64::from(candidate), Ordering::Release);
+                                    retained_capacity
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push((candidate, capacity));
+                                    Ok(())
+                                },
+                            )?
+                        }
+                        Some(GeneratedWriteTarget::HiloAuto(table)) => coordinator
+                            .execute_generated_dml_values_auto(&sql, &params, table.get())?,
+                        None => coordinator.execute_dml_values(&sql, &params)?,
+                    };
+                    if !auto_generated_shard
+                        && result.shard().is_some_and(|actual| actual != shard)
+                    {
                         return Err(EngineError::new(
                             EngineErrorKind::Internal,
-                            "auto-routed generated write completed without a physical shard",
+                            format!(
+                                "writable coordinator mutated shard {}, but Engine admitted shard {shard}",
+                                result.shard().expect("checked as present")
+                            ),
                         ));
                     }
-                };
-                Ok(Routed {
-                    shard: actual_shard,
-                    value: super::WriteResult {
-                        rows_affected: result.affected_rows(),
-                        generated_key: result.generated_key().cloned(),
-                    },
-                })
-            })();
+                    let actual_shard = match result.shard() {
+                        Some(actual) => actual,
+                        // A successful no-op has no mutated child to report. For
+                        // ordinary and native-range writes the Engine already
+                        // admitted one exact target, so preserve that established
+                        // routed result. Only auto-routed hi/lo needs the child to
+                        // report the target selected after allocation.
+                        None if !auto_generated_shard => shard,
+                        None if native_auto => {
+                            let selected = native_selected_shard
+                                .as_ref()
+                                .expect("native auto write records its candidate")
+                                .load(Ordering::Acquire);
+                            u16::try_from(selected).map_err(|_| {
+                                EngineError::new(
+                                    EngineErrorKind::Internal,
+                                    "native auto-routed write completed before selecting a physical shard",
+                                )
+                            })?
+                        }
+                        None => {
+                            return Err(EngineError::new(
+                                EngineErrorKind::Internal,
+                                "auto-routed generated write completed without a physical shard",
+                            ));
+                        }
+                    };
+                    Ok(Routed {
+                        shard: actual_shard,
+                        value: super::WriteResult {
+                            rows_affected: result.affected_rows(),
+                            generated_key: result.generated_key().cloned(),
+                        },
+                    })
+                },
+            );
             drop(registry_bootstrap_gate);
             if result
                 .as_ref()
@@ -3509,12 +3652,10 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let (sql, params) = statement.into_parts();
-        let (shards, sql) = match self.logical_raw_query_plan(
-            &sql,
-            &params,
-            &operation.cancellation,
-            operation.deadline,
-        ) {
+        let (shards, sql) = match self
+            .logical_raw_query_plan_controlled(&mut operation, &schema_operation, &sql, &params)
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => return operation.finish(Err(error)),
         };
@@ -3594,12 +3735,10 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let (sql, parameters) = statement.into_parts();
-        let (shards, sql) = match self.logical_raw_query_plan(
-            &sql,
-            &parameters,
-            &operation.cancellation,
-            operation.deadline,
-        ) {
+        let (shards, sql) = match self
+            .logical_raw_query_plan_controlled(&mut operation, &schema_operation, &sql, &parameters)
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => return operation.finish(Err(error)),
         };
@@ -5281,6 +5420,7 @@ fn retire_if_broken<T>(connection: &mut PooledConnection, result: &EngineResult<
 
 #[cfg(test)]
 mod tests {
+    mod storage_contention;
     use std::{
         error::Error as _,
         process::{Child, Command, Stdio},

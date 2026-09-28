@@ -1,11 +1,45 @@
 import asyncio
+from contextlib import contextmanager
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 import briskdb
+
+
+@contextmanager
+def locked_manifest(root):
+    # Python and the wheel link different SQLite libraries. Use an independent
+    # process so the test exercises OS locks, not SQLite's per-library registry.
+    script = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.executescript("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+print("ready", flush=True)
+sys.stdin.readline()
+connection.rollback()
+connection.close()
+"""
+    child = subprocess.Popen([sys.executable, "-c", script, str(Path(root) / "manifest.sqlite")],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        if child.stdout.readline() != "ready\n":
+            raise RuntimeError("SQLite lock holder did not start")
+        yield
+    finally:
+        try:
+            _, error = child.communicate("\n", timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            raise
+        if child.returncode:
+            raise RuntimeError(error)
 
 
 def policy(**changes):
@@ -16,6 +50,20 @@ def policy(**changes):
 
 
 class ContentionConfigTests(unittest.TestCase):
+    def test_fail_fast_open_covers_sqlite_startup_not_only_the_root_lock(self):
+        config = briskdb.Config(shards=2, contention_policy=briskdb.ContentionPolicy.fail_fast())
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2):
+                pass
+            with locked_manifest(root):
+                started = time.monotonic()
+                with self.assertRaises(briskdb.BusyError):
+                    briskdb.open(root, config=config)
+                self.assertLess(time.monotonic() - started, 2)
+            with briskdb.open(root, config=config) as database:
+                with database.session(routing_key="startup") as session:
+                    self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
+
     @unittest.skipUnless(os.name == "posix", "startup lock test uses Unix flock")
     def test_fail_fast_open_stops_before_initialization_and_can_be_retried(self):
         import fcntl
@@ -110,6 +158,18 @@ class ContentionConfigTests(unittest.TestCase):
 
 
 class AsyncContentionConfigTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fail_fast_detected_open_covers_sqlite_discovery(self):
+        config = briskdb.Config(contention_policy=briskdb.ContentionPolicy.fail_fast())
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2):
+                pass
+            with locked_manifest(root):
+                with self.assertRaises(briskdb.BusyError):
+                    await asyncio.wait_for(briskdb.open_async(root, config=config), 2)
+            async with await briskdb.open_async(root, config=config) as database:
+                async with await database.session(routing_key="startup") as session:
+                    self.assertEqual((await session.query("SELECT 1"))["rows"], [(1,)])
+
     @unittest.skipUnless(os.name == "posix", "startup lock test uses Unix flock")
     async def test_fail_fast_async_open_shares_the_native_startup_policy(self):
         import fcntl

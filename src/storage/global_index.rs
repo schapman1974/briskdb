@@ -5376,9 +5376,7 @@ pub(super) fn operational_counts(
 }
 
 fn configure(connection: &Connection) -> EngineResult<()> {
-    connection
-        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-        .map_err(sqlite_error::storage)?;
+    super::contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;

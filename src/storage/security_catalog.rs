@@ -183,9 +183,14 @@ impl SecurityCatalogStore {
     pub fn open(path: impl AsRef<Path>, expected_id: SecurityStoreId) -> EngineResult<Self> {
         let path = private_path(path.as_ref())?;
         let identity_file = private_file(&path, false)?;
-        let connection = open_connection(&path)?;
-        check_file_identity(&connection, &path, &identity_file)?;
-        configure(&connection)?;
+        let mut connection = open_connection(&path)?;
+        connection
+            .busy_timeout(SECURITY_BUSY_TIMEOUT)
+            .map_err(storage_error)?;
+        controls::with_connection(&mut connection, |connection| {
+            check_file_identity(connection, &path, &identity_file)?;
+            configure_after_busy_setup(connection)
+        })?;
         let mut store = Self {
             connection,
             path,
@@ -327,6 +332,13 @@ fn open_connection(path: &Path) -> EngineResult<Connection> {
 }
 
 fn configure(connection: &Connection) -> EngineResult<()> {
+    connection
+        .busy_timeout(SECURITY_BUSY_TIMEOUT)
+        .map_err(storage_error)?;
+    configure_after_busy_setup(connection)
+}
+
+fn configure_after_busy_setup(connection: &Connection) -> EngineResult<()> {
     // SQLite materializes row values before Rust can inspect length(record).
     // Cap that allocation too, allowing only small fixed row/schema overhead.
     connection
@@ -334,9 +346,6 @@ fn configure(connection: &Connection) -> EngineResult<()> {
             rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
             (MAX_SECURITY_CATALOG_RECORD_BYTES + 4096) as i32,
         )
-        .map_err(storage_error)?;
-    connection
-        .busy_timeout(SECURITY_BUSY_TIMEOUT)
         .map_err(storage_error)?;
     // Connection-only settings: do not change or repair an existing file's mode.
     connection

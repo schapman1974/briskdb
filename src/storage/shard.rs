@@ -2989,9 +2989,7 @@ fn configure_connection_safety(connection: &Connection) -> EngineResult<()> {
 }
 
 fn configure_busy_timeout(connection: &Connection) -> EngineResult<()> {
-    connection
-        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-        .map_err(sqlite_error::storage)
+    super::contention::configure(connection, CONNECTION_BUSY_TIMEOUT)
 }
 
 fn configure_cell_size_check(connection: &Connection) -> EngineResult<()> {

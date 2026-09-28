@@ -2,6 +2,43 @@ use super::*;
 use rusqlite::Connection;
 
 #[tokio::test]
+async fn authenticated_startup_sqlite_obeys_policy_and_restores_retained_handle() {
+    let (root, engine) = configured(ContentionPolicy::fail_fast()).await;
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let blocker = Connection::open(root.path().join(security_root::FILE_NAME)).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let options =
+        EngineOptions::default().with_contention_policy(Some(ContentionPolicy::fail_fast()));
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        Engine::open_authenticated(root.path(), 2, options),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::Busy);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let reopened = Engine::open_authenticated(root.path(), 2, options)
+        .await
+        .unwrap();
+    reopened.begin_authentication(user()).await.unwrap();
+    // Reusing the retained store must select each new call's budget, not the
+    // exhausted startup scope left on the previous blocking worker.
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        reopened.begin_authentication(user()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::Busy);
+    assert_eq!(reopened.contention_statistics().exhausted_budgets(), 1);
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_fail_fast_refresh_preserves_fail_closed_authority() {
     let (root, engine) = configured(ContentionPolicy::fail_fast()).await;
     let blocker = Connection::open(root.path().join(security_root::FILE_NAME)).unwrap();

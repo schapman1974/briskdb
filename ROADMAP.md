@@ -620,7 +620,11 @@ requires an earlier dependency:
    does not require snapshot storage: persisted profiles and rollback journaling
    (#511), cross-host locks/fencing (#512–#513), durable insert retry identity
    (#514), and real multi-host qualification (#516) precede support claims.
-   Configurable contention budgets (#510) apply to every mode. Optional
+   Configurable contention budgets (#510) now cover configured Engine admission,
+   startup, SQLite/Brisk waits, maintenance and virtual-table paths, with the
+   same policy exposed through Rust/Python, managed Mongo and daemon settings.
+   Future NFS paths must reuse this budget; it cannot bound stalled kernel I/O.
+   Optional
    insert-only placement (#515) follows safe fixed routing. NFS qualification
    must measure cold/warm metadata round trips, including manifest validation,
    handle reuse and DELETE/PERSIST journal churn; do not copy databases into

@@ -1,5 +1,6 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
+pub(crate) mod contention;
 mod document;
 #[cfg(feature = "documents")]
 pub(crate) use document::{
@@ -389,12 +390,7 @@ static ROOT_SCHEMA_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<RootSchem
 
 fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordination>> {
     let registry = ROOT_SCHEMA_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry.lock().map_err(|error| {
-        EngineError::new(
-            EngineErrorKind::Internal,
-            format!("root schema coordination registry is poisoned: {error}"),
-        )
-    })?;
+    let mut registry = contention::lock(registry, "root schema coordination registry")?;
     registry.retain(|_, coordination| coordination.strong_count() != 0);
     if let Some(coordination) = registry.get(root).and_then(Weak::upgrade) {
         return Ok(coordination);
@@ -552,9 +548,7 @@ fn validate_schema_migration_checksum_prefix(
         layout,
         |path, shard_id| {
             let connection = shard::open_required_file(path)?;
-            connection
-                .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-                .map_err(sqlite_error::storage)?;
+            contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
             let state = shard::validate_schema_migration_connection(
                 &connection,
                 path,
@@ -640,6 +634,22 @@ impl Storage {
     }
 
     pub(crate) fn open_with_startup_control(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        security_store_id: Option<[u8; 16]>,
+        control: Option<&Arc<OperationControl>>,
+    ) -> EngineResult<Self> {
+        contention::with_control(control.cloned(), || {
+            Self::open_with_startup_control_inner(
+                root,
+                requested_shards,
+                security_store_id,
+                control.map(Arc::as_ref),
+            )
+        })
+    }
+
+    fn open_with_startup_control_inner(
         root: impl AsRef<Path>,
         requested_shards: u16,
         security_store_id: Option<[u8; 16]>,
@@ -3163,9 +3173,7 @@ impl Storage {
         let result = (|| {
             self.ensure_shard_in_range(shard)?;
             let connection = self.open_unconfigured_shard(shard)?;
-            connection
-                .busy_timeout(std::time::Duration::from_millis(25))
-                .map_err(sqlite_error::storage)?;
+            contention::configure(&connection, std::time::Duration::from_millis(25))?;
             let progress_epoch = Arc::clone(&cancellation_epoch);
             connection
                 .progress_handler(
@@ -3188,6 +3196,7 @@ impl Storage {
                     Ok(()) => break,
                     Err(error)
                         if error.kind() == EngineErrorKind::Busy
+                            && !contention::is_configured()
                             && std::time::Instant::now() < deadline =>
                     {
                         continue;
@@ -3320,7 +3329,11 @@ impl Storage {
 
     fn open_unconfigured_shard(&self, shard: u16) -> EngineResult<Connection> {
         self.ensure_shard_in_range(shard)?;
-        shard::open_required_file(&self.shard_path(shard))
+        let connection = shard::open_required_file(&self.shard_path(shard))?;
+        if contention::is_configured() {
+            contention::configure(&connection, CONNECTION_BUSY_TIMEOUT)?;
+        }
+        Ok(connection)
     }
 
     fn validate_unconfigured_shard(&self, connection: &Connection, shard: u16) -> EngineResult<()> {
@@ -4044,9 +4057,7 @@ fn action_writes_connection(action: AuthAction<'_>) -> bool {
 }
 
 fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
-    connection
-        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
-        .map_err(sqlite_error::storage)?;
+    contention::configure(connection, CONNECTION_BUSY_TIMEOUT)?;
     configure_manifest_connection_after_busy_setup(connection)
 }
 

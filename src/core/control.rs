@@ -283,7 +283,6 @@ impl OperationControl {
         })
     }
 
-    #[cfg(feature = "auth-scram")]
     pub(crate) fn has_contention_policy(&self) -> bool {
         self.contention.is_some()
     }

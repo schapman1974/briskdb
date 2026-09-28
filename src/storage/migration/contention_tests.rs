@@ -355,3 +355,56 @@ fn contention_after_one_shard_commit_retains_progress_and_explicit_resume_does_n
         );
     }
 }
+
+#[test]
+fn configured_startup_recovery_preserves_partial_progress_when_a_shard_is_busy() {
+    const SQL: &str =
+        "CREATE TABLE startup_once(value INTEGER); INSERT INTO startup_once VALUES (7)";
+    let root = tempfile::tempdir().unwrap();
+    let storage = Storage::open(root.path(), 2).unwrap();
+    let blocker = Connection::open(root.path().join("shards/0001.sqlite")).unwrap();
+    let (migration_control, _) = control(ContentionPolicy::fail_fast(), None);
+    let mut guard = storage.begin_schema_migration().unwrap();
+    guard.wait_for_quiescence_blocking();
+    let error = apply_schema_migration_with_hook(
+        &storage,
+        SQL,
+        &mut guard,
+        Some(migration_control),
+        |point| {
+            if matches!(point, SchemaMigrationCoordinatorPoint::ShardCommitted(0)) {
+                blocker
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .map_err(sqlite_error::storage)?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::Busy);
+    drop(guard);
+    drop(storage);
+    let (startup_control, metrics) = control(ContentionPolicy::fail_fast(), None);
+    let error = Storage::open_with_startup_control(root.path(), 2, None, Some(&startup_control))
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::Busy);
+    assert_eq!(metrics.snapshot().exhausted_budgets(), 1);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    let (startup_control, _) = control(ContentionPolicy::fail_fast(), None);
+    let recovered =
+        Storage::open_with_startup_control(root.path(), 2, None, Some(&startup_control)).unwrap();
+    assert_eq!(recovered.current_schema_generation(), 1);
+    for shard in 0..2 {
+        assert_eq!(
+            recovered
+                .open_shard(shard)
+                .unwrap()
+                .query_row("SELECT COUNT(*), MIN(value) FROM startup_once", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (1, 7)
+        );
+    }
+}
