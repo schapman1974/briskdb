@@ -207,6 +207,7 @@ impl Default for PreparedStatementLimits {
 /// for one request through `RequestContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
+    contention_policy: Option<super::ContentionPolicy>,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
     result_limits: ResultLimits,
@@ -239,6 +240,7 @@ impl EngineOptions {
         }
 
         Ok(Self {
+            contention_policy: None,
             connections_per_shard,
             queue_capacity_per_shard,
             result_limits: ResultLimits::default(),
@@ -291,6 +293,23 @@ impl EngineOptions {
     /// engine-wide deadline is disabled.
     pub const fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
+    }
+
+    /// Return the opt-in controlled-storage contention policy.
+    pub const fn contention_policy(&self) -> Option<super::ContentionPolicy> {
+        self.contention_policy
+    }
+
+    /// Configure lock acquisition in controlled SQLite tasks and document
+    /// collection fences. `None` preserves the existing five-second behavior.
+    ///
+    /// Each physical task currently has its own budget; the request deadline
+    /// bounds the complete operation. Pool admission, startup, and experimental
+    /// virtual-table child writes are not governed by this policy yet.
+    #[must_use]
+    pub const fn with_contention_policy(mut self, policy: Option<super::ContentionPolicy>) -> Self {
+        self.contention_policy = policy;
+        self
     }
 
     /// Set or disable the engine-wide request deadline.
@@ -367,6 +386,7 @@ impl EngineOptions {
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
+            contention_policy: None,
             connections_per_shard: DEFAULT_CONNECTIONS_PER_SHARD,
             queue_capacity_per_shard: DEFAULT_QUEUE_CAPACITY_PER_SHARD,
             result_limits: ResultLimits {
@@ -413,6 +433,7 @@ mod tests {
     #[test]
     fn defaults_are_explicit_and_valid_for_the_supported_shard_range() {
         let options = EngineOptions::default();
+        assert_eq!(options.contention_policy(), None);
 
         assert_eq!(options.connections_per_shard(), 4);
         assert_eq!(options.queue_capacity_per_shard(), 32);
@@ -447,6 +468,19 @@ mod tests {
         assert!(!options.experimental_vtab_writes());
         assert_eq!(options.worker_limit(2).unwrap(), 8);
         assert_eq!(options.worker_limit(64).unwrap(), 256);
+    }
+
+    #[test]
+    fn contention_policy_builder_is_explicit_and_reversible() {
+        let defaults = EngineOptions::default();
+        let configured =
+            defaults.with_contention_policy(Some(super::super::ContentionPolicy::fail_fast()));
+        assert_eq!(
+            configured.contention_policy(),
+            Some(super::super::ContentionPolicy::fail_fast())
+        );
+        assert_eq!(configured.with_contention_policy(None), defaults);
+        assert_eq!(EngineOptions::new(1, 1).unwrap().contention_policy(), None);
     }
 
     #[cfg(feature = "experimental-vtab")]

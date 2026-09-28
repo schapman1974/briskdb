@@ -1506,7 +1506,10 @@ impl Engine {
         T: Send + 'static,
         F: FnOnce(&CancellationToken, Arc<OperationControl>) -> EngineResult<T> + Send + 'static,
     {
-        let control = OperationControl::new(deadline);
+        let control = OperationControl::with_contention_policy(
+            deadline,
+            self.inner.options.contention_policy(),
+        );
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown = self.inner.shutdown_cancel.clone();
         let worker = wait_pending(
@@ -1594,7 +1597,10 @@ impl Engine {
             + Send
             + 'static,
     {
-        let control = OperationControl::new(deadline);
+        let control = OperationControl::with_contention_policy(
+            deadline,
+            self.inner.options.contention_policy(),
+        );
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown = self.inner.shutdown_cancel.clone();
         let permit = wait_pending(

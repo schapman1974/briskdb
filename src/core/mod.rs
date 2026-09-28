@@ -7,6 +7,7 @@
 pub mod authentication;
 pub mod authorization;
 mod catalog;
+mod contention;
 mod control;
 mod engine;
 mod error;
@@ -38,6 +39,7 @@ pub(crate) use catalog::{
     CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME,
     IDENTIFIER_ENCODING_VERSION, MAX_LOGICAL_DATABASES, MAX_TABLES, validate_catalog_identifier,
 };
+pub use contention::{ContentionJitter, ContentionPolicy};
 pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
 };

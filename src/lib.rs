@@ -20,9 +20,9 @@ pub use protocol::http as api;
 
 pub use core::{
     CancellationToken, CanonicalIndexKey, CheckpointDatabase, CheckpointDatabaseReport,
-    CheckpointReport, CheckpointShardReport, Column, DataType, Decimal, DecodedIndexKeyPart,
-    DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult, EngineState,
-    EngineStatus, Executed, GLOBAL_INDEX_SHARD_SUMMARY_BLOOM_BYTES,
+    CheckpointReport, CheckpointShardReport, Column, ContentionJitter, ContentionPolicy, DataType,
+    Decimal, DecodedIndexKeyPart, DescribeTarget, EngineError, EngineErrorKind, EngineOptions,
+    EngineResult, EngineState, EngineStatus, Executed, GLOBAL_INDEX_SHARD_SUMMARY_BLOOM_BYTES,
     GLOBAL_INDEX_SHARD_SUMMARY_FORMAT_VERSION, GeneratedKey, GlobalIndexAsyncOptions,
     GlobalIndexAsyncProcessReport, GlobalIndexAsyncShardOutcome, GlobalIndexAsyncShardReport,
     GlobalIndexAsyncShardStatus, GlobalIndexAsyncStatus, GlobalIndexBuildReport,

@@ -116,6 +116,9 @@ fn cancellable_busy_handler(attempt: i32) -> bool {
         let Some(operation) = operation.as_ref() else {
             return false;
         };
+        if let Some(retry) = operation.control.wait_for_contention(None) {
+            return retry;
+        }
         if operation.control.should_stop() || operation.started.elapsed() >= CONNECTION_BUSY_TIMEOUT
         {
             return false;
@@ -1379,6 +1382,127 @@ mod tests {
 
     use super::*;
     use crate::storage::{action_taints_connection, action_writes_connection};
+
+    #[test]
+    fn configured_busy_handler_shares_retry_count_across_sqlite_calls_without_replay() {
+        use crate::core::{ContentionJitter, ContentionPolicy};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("busy.sqlite");
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+            .unwrap();
+        let mut contender = Connection::open(&path).unwrap();
+        let policy = ContentionPolicy::new(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            2,
+            ContentionJitter::None,
+            2,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let control = OperationControl::with_contention_policy(None, Some(policy));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let error = run_dedicated_connection_controlled(
+                &mut contender,
+                Arc::clone(&control),
+                |connection| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    connection
+                        .execute("INSERT INTO items VALUES (1)", [])
+                        .map_err(sqlite_error::statement)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Busy);
+            assert_eq!(
+                control.wait_for_contention(None),
+                Some(false),
+                "reinstalling a handler must not reset retries"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one execution per explicit caller attempt"
+        );
+        holder.execute_batch("COMMIT").unwrap();
+        // Exhausting retries must not prevent an uncontended new operation.
+        run_dedicated_connection_controlled(&mut contender, control, |connection| {
+            connection
+                .execute("INSERT INTO items VALUES (1)", [])
+                .map_err(sqlite_error::statement)
+        })
+        .unwrap();
+        assert_eq!(
+            holder
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            contender
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5000
+        );
+    }
+
+    #[test]
+    fn fail_fast_sqlite_waits_do_not_mutate_and_a_short_deadline_overrides_long_backoff() {
+        use crate::core::{CancellationReason, ContentionJitter, ContentionPolicy};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("busy.sqlite");
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+            .unwrap();
+        let long = ContentionPolicy::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            ContentionJitter::None,
+            10,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        for (policy, deadline, expected) in [
+            (ContentionPolicy::fail_fast(), None, EngineErrorKind::Busy),
+            (
+                long,
+                Some(Instant::now() + Duration::from_millis(30)),
+                EngineErrorKind::DeadlineExceeded,
+            ),
+        ] {
+            let mut contender = Connection::open(&path).unwrap();
+            let control = OperationControl::with_contention_policy(deadline, Some(policy));
+            let started = Instant::now();
+            let error = run_dedicated_connection_controlled(
+                &mut contender,
+                Arc::clone(&control),
+                |connection| {
+                    connection
+                        .execute("INSERT INTO items VALUES (1)", [])
+                        .map_err(sqlite_error::statement)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            if deadline.is_some() {
+                assert_eq!(control.reason(), Some(CancellationReason::DeadlineExceeded));
+            }
+        }
+        holder.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            holder
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn dedicated_cancellation_resolves_ambiguous_reads_but_preserves_proven_corruption() {

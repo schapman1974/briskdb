@@ -1100,7 +1100,10 @@ impl Engine {
             configured.max_bytes().min(requested.max_bytes()),
         )
         .expect("the minimum of validated result limits is valid");
-        let control = OperationControl::new(deadline);
+        let control = OperationControl::with_contention_policy(
+            deadline,
+            self.inner.options.contention_policy(),
+        );
         let cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let operation = Operation {
             lease: Some(lease),
@@ -3879,7 +3882,10 @@ impl Engine {
         deadline: Option<Instant>,
         budget: sql::ScatterResultBudget,
     ) -> EngineResult<ResultSet> {
-        let control = OperationControl::new(deadline);
+        let control = OperationControl::with_contention_policy(
+            deadline,
+            self.inner.options.contention_policy(),
+        );
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown_cancel = self.inner.shutdown_cancel.clone();
 
@@ -10213,6 +10219,119 @@ mod tests {
         assert_eq!(snapshot.retired, 1);
         assert_eq!(snapshot.active, 0);
         assert_eq!(snapshot.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn configured_contention_fail_fast_returns_busy_without_inserting() {
+        let options = EngineOptions::default()
+            .with_contention_policy(Some(crate::ContentionPolicy::fail_fast()));
+        let (temp, engine) = engine_with_engine_options(2, options);
+        let session = engine.session();
+        engine
+            .broadcast(
+                &session,
+                "CREATE TABLE retry_items (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+        session.set_routing_key("retry").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"retry");
+        let lock =
+            rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                .unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = timeout(
+            Duration::from_secs(2),
+            engine.execute(
+                &session,
+                Statement::new("INSERT INTO retry_items VALUES (1)", vec![]),
+            ),
+        )
+        .await
+        .expect("fail-fast must not use the legacy five-second wait")
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            lock.query_row("SELECT COUNT(*) FROM retry_items", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new("INSERT INTO retry_items VALUES (1)", vec![])
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_contention_wait_keeps_runtime_responsive_and_cancels_without_replay() {
+        let policy = crate::ContentionPolicy::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            crate::ContentionJitter::None,
+            10,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let options = EngineOptions::default().with_contention_policy(Some(policy));
+        let (temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        engine
+            .broadcast(
+                &session,
+                "CREATE TABLE retry_items (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+        session.set_routing_key("retry").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"retry");
+        let lock =
+            rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                .unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let writer_engine = engine.clone();
+        let writer_session = Arc::clone(&session);
+        let writer = tokio::spawn(async move {
+            writer_engine
+                .execute_with_context(
+                    &writer_session,
+                    Statement::new("INSERT INTO retry_items VALUES (1)", vec![]),
+                    context,
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, shard, 1, 0).await;
+        // This is the single-thread Tokio runtime: a blocking backoff on the
+        // async thread would prevent both this timer and cancellation.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        token.cancel();
+        let error = timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            lock.query_row("SELECT COUNT(*) FROM retry_items", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        wait_for_pool_occupancy(&engine, shard, 0, 0).await;
     }
 
     #[tokio::test]

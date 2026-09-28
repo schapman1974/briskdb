@@ -76,6 +76,11 @@ resource defaults. Explicit shard counts are validated before storage is
 created; count-dependent limits are validated after an existing manifest is
 detected.
 
+Rust hosts may also opt into validated `ContentionPolicy` lock-acquisition
+backoff through `EngineOptions::with_contention_policy`. See the
+[request-control scope and example](REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation)
+before configuring it; this foundation does not yet enable NFS storage.
+
 ## Native document commands
 
 Document embedding uses the same owned commands and results as the
