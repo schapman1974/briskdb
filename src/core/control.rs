@@ -195,6 +195,7 @@ pub(crate) struct OperationControl {
 }
 
 impl OperationControl {
+    #[cfg(any(feature = "tinymongo-import", test))]
     pub(crate) fn new(deadline: Option<Instant>) -> Arc<Self> {
         Self::with_contention_policy(deadline, None)
     }
