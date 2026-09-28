@@ -1,5 +1,8 @@
 //! Crash-resumable application-schema migration coordination.
 
+#[cfg(test)]
+mod contention_tests;
+
 use std::{
     cell::RefCell,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
@@ -84,6 +87,9 @@ fn cancellable_busy_handler(attempt: i32) -> bool {
         let Some(operation) = operation.as_ref() else {
             return false;
         };
+        if let Some(retry) = operation.control.wait_for_contention(None) {
+            return retry;
+        }
         if operation.control.should_stop() || operation.started.elapsed() >= CONNECTION_BUSY_TIMEOUT
         {
             return false;
