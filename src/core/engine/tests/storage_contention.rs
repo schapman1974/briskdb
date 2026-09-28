@@ -70,6 +70,29 @@ fn backoff(retries: u32) -> ContentionPolicy {
     .unwrap()
 }
 
+#[tokio::test]
+async fn startup_global_index_inspection_honors_fail_fast_and_reopens_after_release() {
+    let (root, original) = indexed_engine(ContentionPolicy::fail_fast());
+    drop(original);
+    let blocker = exclusive_index(root.path());
+    let options =
+        EngineOptions::default().with_contention_policy(Some(ContentionPolicy::fail_fast()));
+    let started = Instant::now();
+    assert_eq!(
+        Engine::open_with_options(root.path(), 2, options)
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Busy
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    Engine::open_with_options(root.path(), 2, options)
+        .await
+        .unwrap();
+}
+
 async fn wait_retry(engine: &Engine, retries: u64) {
     timeout(Duration::from_secs(2), async {
         while engine.contention_statistics().retries_scheduled() < retries {
