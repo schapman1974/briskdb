@@ -12,7 +12,7 @@ impl Engine {
         owner: ConnectionOwner,
         state: &CursorState,
         plan: Arc<DocumentPartialAggregation>,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
     ) -> EngineResult<Vec<BsonDocument>> {
         let budget = Arc::new(Mutex::new(DocumentPartialBudget::default()));

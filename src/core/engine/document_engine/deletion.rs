@@ -21,7 +21,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentDeleteRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -358,7 +358,7 @@ mod tests {
             .run_document_shard_controlled(
                 shard,
                 ConnectionOwner::new(session.id().get()),
-                CancellationToken::new(),
+                RequestScope::new(CancellationToken::new(), &OperationControl::new(None)),
                 None,
                 move |storage, connection, cancellation, control| {
                     let row = |group| {

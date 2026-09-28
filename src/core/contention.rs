@@ -16,7 +16,7 @@ pub enum ContentionJitter {
     Full,
 }
 
-/// Validated, opt-in retry policy for controlled storage lock acquisition.
+/// Validated, opt-in retry policy for controlled locks and resource admission.
 ///
 /// Retries exclude the initial lock attempt. This policy does not authorize
 /// replaying SQL, transactions, bulk commands, or writes with unknown outcomes.
@@ -114,7 +114,7 @@ impl ContentionPolicy {
     }
 }
 
-/// One budget survives repeated handler installation on sequential handles.
+/// One budget survives admission, sequential handles, and parallel child tasks.
 /// Keep scheduling separate from sleeping so boundary tests need no real clock.
 #[derive(Debug)]
 pub(crate) struct ContentionBudget {

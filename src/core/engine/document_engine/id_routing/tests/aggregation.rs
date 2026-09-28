@@ -269,7 +269,7 @@ async fn selected_shards_still_deliver_unmatched_input_to_the_original_runner() 
         .read_document_source_page(
             ConnectionOwner::new(session.id().get()),
             &mut cursor,
-            token,
+            RequestScope::new(token, &OperationControl::new(None)),
             None,
             &DocumentReadOptions::new().with_batch_size(100).unwrap(),
             ResultLimits::new(100, 4 * 1024 * 1024).unwrap(),

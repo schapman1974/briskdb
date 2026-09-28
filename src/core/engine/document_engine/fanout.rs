@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use super::super::MAX_SCATTER_CONCURRENCY;
 use super::*;
 
-struct CancelChildren(CancellationToken);
+struct CancelChildren(RequestScope);
 impl Drop for CancelChildren {
     fn drop(&mut self) {
         self.0.cancel();
@@ -19,20 +19,20 @@ impl Drop for CancelChildren {
 /// across commands, or use their listener shutdown token as request control.
 pub(super) async fn coordinate<T, F, Fut>(
     shards: Vec<u16>,
-    parent: CancellationToken,
+    parent: RequestScope,
     shutdown: CancellationToken,
     deadline: Option<Instant>,
     work: F,
 ) -> EngineResult<Vec<(u16, T)>>
 where
     T: Send + 'static,
-    F: Fn(u16, CancellationToken) -> Fut,
+    F: Fn(u16, RequestScope) -> Fut,
     Fut: Future<Output = EngineResult<T>> + Send + 'static,
 {
     if let Some(reason) = pending_cancellation_reason(&parent, &shutdown, deadline) {
         return Err(reason.error());
     }
-    let children = CancellationToken::new();
+    let children = parent.fork_cancellation();
     let _cancel_children = CancelChildren(children.clone());
     let mut results = Vec::with_capacity(shards.len());
     let mut remaining = shards.into_iter();
@@ -116,7 +116,7 @@ impl Engine {
         owner: ConnectionOwner,
         collection_id: DocumentCollectionId,
         route: &PreparedFilterRoute,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
     ) -> EngineResult<u64> {
         let matcher = route.matcher().cloned();
@@ -187,7 +187,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         matcher: Option<Arc<DocumentMatcher>>,
         frontier_limit: u64,

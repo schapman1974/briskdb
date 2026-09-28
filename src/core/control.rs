@@ -190,8 +190,51 @@ struct OperationState {
 pub(crate) struct OperationControl {
     state: Mutex<OperationState>,
     deadline: Option<Instant>,
-    contention: Option<Mutex<ContentionBudget>>,
+    contention: Option<Arc<Mutex<ContentionBudget>>>,
     wake_contention: Condvar,
+}
+
+/// Request-local state propagated to physical child tasks. Clones share only
+/// the retry budget and cancellation signal, never a SQLite interrupt slot or
+/// operation phase. Public cancellation tokens can be reused across requests
+/// without accidentally reusing their budgets.
+#[derive(Clone)]
+pub(crate) struct RequestScope {
+    cancellation: CancellationToken,
+    contention: Option<Arc<Mutex<ContentionBudget>>>,
+}
+
+impl RequestScope {
+    pub(crate) fn new(cancellation: CancellationToken, parent: &OperationControl) -> Self {
+        Self {
+            cancellation,
+            contention: parent.contention.clone(),
+        }
+    }
+
+    pub(crate) fn child_control(&self, deadline: Option<Instant>) -> Arc<OperationControl> {
+        OperationControl::with_contention_budget(deadline, self.contention.clone())
+    }
+
+    /// A fanout error cancels its siblings, not its caller, while all of them
+    /// still consume the original logical request's contention budget.
+    #[cfg(feature = "documents")]
+    pub(crate) fn fork_cancellation(&self) -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            contention: self.contention.clone(),
+        }
+    }
+}
+
+// CPU/storage helpers only need the token. Async coordinators carry the scope
+// itself so creating another physical task cannot silently reset its budget.
+impl std::ops::Deref for RequestScope {
+    type Target = CancellationToken;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cancellation
+    }
 }
 
 impl OperationControl {
@@ -204,6 +247,16 @@ impl OperationControl {
         deadline: Option<Instant>,
         policy: Option<ContentionPolicy>,
     ) -> Arc<Self> {
+        Self::with_contention_budget(
+            deadline,
+            policy.map(|policy| Arc::new(Mutex::new(ContentionBudget::new(policy)))),
+        )
+    }
+
+    fn with_contention_budget(
+        deadline: Option<Instant>,
+        contention: Option<Arc<Mutex<ContentionBudget>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(OperationState {
                 phase: OperationPhase::Pending,
@@ -211,7 +264,7 @@ impl OperationControl {
                 interrupt: None,
             }),
             deadline,
-            contention: policy.map(|policy| Mutex::new(ContentionBudget::new(policy))),
+            contention,
             wake_contention: Condvar::new(),
         })
     }
@@ -227,18 +280,7 @@ impl OperationControl {
         if self.should_stop() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Some(false);
         }
-        let delay = {
-            let mut budget = budget
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut random = [0; 8];
-            if budget.jitter() == ContentionJitter::Full && getrandom::fill(&mut random).is_err() {
-                // Entropy failure must not panic inside SQLite's C callback or
-                // silently disable the finite policy: stop retrying instead.
-                return Some(false);
-            }
-            budget.next_delay(Instant::now(), u64::from_le_bytes(random))
-        };
+        let delay = self.next_contention_delay();
         let Some(delay) = delay else {
             return Some(false);
         };
@@ -273,6 +315,32 @@ impl OperationControl {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
         }
+    }
+
+    /// Reserve one retry from the shared logical-request budget. Called only
+    /// after a lock or admission future has actually reported contention.
+    fn next_contention_delay(&self) -> Option<Duration> {
+        let mut budget = self
+            .contention
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut random = [0; 8];
+        if budget.jitter() == ContentionJitter::Full && getrandom::fill(&mut random).is_err() {
+            // This can run inside SQLite's C callback: never panic or silently
+            // disable the finite policy when entropy is unavailable.
+            return None;
+        }
+        budget.next_delay(Instant::now(), u64::from_le_bytes(random))
+    }
+
+    fn contention_expired(&self) -> bool {
+        self.contention.as_ref().is_some_and(|budget| {
+            budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expired(Instant::now())
+        })
     }
 
     pub(crate) fn request_cancel(&self, reason: CancellationReason) -> bool {
@@ -420,6 +488,68 @@ pub(crate) async fn wait_for_cancellation(
     }
 }
 
+/// Wait only for cancellation-safe resource admission, never a started task.
+/// The future is retained, not replayed, across contention-delay windows.
+pub(crate) async fn wait_admission<T, F>(
+    future: F,
+    request: &CancellationToken,
+    shutdown: &CancellationToken,
+    deadline: Option<Instant>,
+    control: &OperationControl,
+) -> EngineResult<T>
+where
+    F: Future<Output = EngineResult<T>>,
+{
+    tokio::pin!(future);
+    if control.contention.is_some() {
+        // Poll once even for fail-fast/exhausted budgets: uncontended admission
+        // is always allowed. Retain this exact future (including its queue
+        // position) thereafter; never recreate or replay application work.
+        if let std::task::Poll::Ready(result) =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+        {
+            return result;
+        }
+        loop {
+            let reason = if request.is_cancelled() || shutdown.is_cancelled() {
+                Some(CancellationReason::Cancelled)
+            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                Some(CancellationReason::DeadlineExceeded)
+            } else {
+                control.reason()
+            };
+            if let Some(reason) = reason {
+                control.request_cancel(reason);
+                return Err(reason.error());
+            }
+            let Some(delay) = control.next_contention_delay() else {
+                return Err(EngineError::new(
+                    EngineErrorKind::Busy,
+                    "the request contention budget was exhausted while waiting for admission",
+                ));
+            };
+            tokio::select! {
+                biased;
+                reason = wait_for_cancellation(request, shutdown, deadline) => {
+                    control.request_cancel(reason);
+                    return Err(reason.error());
+                }
+                _ = tokio::time::sleep(delay) => {}
+                result = &mut future => {
+                    if result.is_ok() && control.contention_expired() {
+                        return Err(EngineError::new(
+                            EngineErrorKind::Busy,
+                            "the request contention budget expired while waiting for admission",
+                        ));
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+    wait_pending(future, request, shutdown, deadline, control).await
+}
+
 pub(crate) async fn wait_pending<T, F>(
     future: F,
     request: &CancellationToken,
@@ -448,6 +578,228 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    fn short_contention_policy(retries: u32) -> ContentionPolicy {
+        ContentionPolicy::new(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+            ContentionJitter::None,
+            retries,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn contention_scope_shares_one_atomic_retry_count_across_parallel_children() {
+        let parent =
+            OperationControl::with_contention_policy(None, Some(short_contention_policy(7)));
+        let scope = RequestScope::new(CancellationToken::new(), &parent);
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let control = scope.clone().child_control(None);
+            let admitted = Arc::clone(&admitted);
+            workers.push(std::thread::spawn(move || {
+                while control.next_contention_delay().is_some() {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), 7);
+        assert_eq!(parent.next_contention_delay(), None);
+    }
+
+    #[test]
+    fn contention_scope_never_shares_interrupt_slots_or_public_token_budgets() {
+        let token = CancellationToken::new();
+        let parent =
+            OperationControl::with_contention_policy(None, Some(short_contention_policy(1)));
+        let scope = RequestScope::new(token.clone(), &parent);
+        let first = scope.child_control(None);
+        let second = scope.child_control(None);
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&interrupted);
+        first
+            .arm(Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }))
+            .unwrap();
+        second
+            .arm(Arc::new(|| {
+                panic!("a sibling interrupt slot must stay independent")
+            }))
+            .unwrap();
+        first.request_cancel(CancellationReason::Cancelled);
+        assert_eq!(interrupted.load(Ordering::SeqCst), 1);
+        assert_eq!(second.reason(), None);
+        assert_eq!(parent.reason(), None);
+        assert!(!token.is_cancelled());
+        assert!(second.next_contention_delay().is_some());
+        assert_eq!(scope.child_control(None).next_contention_delay(), None);
+        // The same public cancellation token is legal in a later request.
+        let fresh =
+            OperationControl::with_contention_policy(None, Some(short_contention_policy(1)));
+        assert!(
+            RequestScope::new(token, &fresh)
+                .child_control(None)
+                .next_contention_delay()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn contention_admission_fail_fast_releases_queue_and_allows_ready_resources() {
+        let control =
+            OperationControl::with_contention_policy(None, Some(ContentionPolicy::fail_fast()));
+        let request = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let semaphore = tokio::sync::Semaphore::new(0);
+        let error = wait_admission(
+            async { Ok(semaphore.acquire().await.unwrap()) },
+            &request,
+            &shutdown,
+            None,
+            &control,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        semaphore.add_permits(1);
+        let permit = wait_admission(
+            async { Ok(semaphore.acquire().await.unwrap()) },
+            &request,
+            &shutdown,
+            None,
+            &control,
+        )
+        .await
+        .unwrap();
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn contention_admission_and_storage_share_budget_without_recreating_future() {
+        let control =
+            OperationControl::with_contention_policy(None, Some(short_contention_policy(1)));
+        let request = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let mut polls = 0;
+        let future = std::future::poll_fn(|_| {
+            polls += 1;
+            if polls == 1 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(42))
+            }
+        });
+        assert_eq!(
+            wait_admission(future, &request, &shutdown, None, &control)
+                .await
+                .unwrap(),
+            42
+        );
+        assert_eq!(polls, 2);
+        let child = RequestScope::new(request.clone(), &control).child_control(None);
+        assert_eq!(child.wait_for_contention(None), Some(false));
+        assert_eq!(
+            wait_admission(
+                std::future::pending::<EngineResult<()>>(),
+                &request,
+                &shutdown,
+                None,
+                &child
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn contention_admission_is_bounded_and_cancellation_wakes_long_async_backoff() {
+        let request = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let control =
+            OperationControl::with_contention_policy(None, Some(short_contention_policy(2)));
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_admission(
+                std::future::pending::<EngineResult<()>>(),
+                &request,
+                &shutdown,
+                None,
+                &control,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert_eq!(control.next_contention_delay(), None);
+        let control =
+            OperationControl::with_contention_policy(None, Some(slow_contention_policy()));
+        let (result, ()) = tokio::join!(
+            wait_admission(
+                std::future::pending::<EngineResult<()>>(),
+                &request,
+                &shutdown,
+                None,
+                &control
+            ),
+            async {
+                tokio::task::yield_now().await;
+                request.cancel();
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn contention_admission_deadline_precedes_exhaustion_and_legacy_is_unchanged() {
+        for deadline in [
+            Instant::now() - Duration::from_millis(1),
+            Instant::now() + Duration::from_millis(20),
+        ] {
+            let control = OperationControl::with_contention_policy(
+                Some(deadline),
+                Some(slow_contention_policy()),
+            );
+            let error = wait_admission(
+                std::future::pending::<EngineResult<()>>(),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                Some(deadline),
+                &control,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        }
+        let control = OperationControl::new(None);
+        assert_eq!(
+            wait_admission(
+                async {
+                    tokio::task::yield_now().await;
+                    Ok(42)
+                },
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                None,
+                &control
+            )
+            .await
+            .unwrap(),
+            42
+        );
+        assert!(control.contention.is_none());
+    }
 
     fn slow_contention_policy() -> ContentionPolicy {
         ContentionPolicy::new(

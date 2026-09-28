@@ -26,7 +26,7 @@ impl Engine {
             )));
         }
         let result = operation
-            .wait_pending(self.authorize_document(session, command))
+            .wait_preflight(self.authorize_document(session, command))
             .await;
         operation.check_before_start()?;
         operation.finish(result)

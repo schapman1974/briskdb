@@ -10,9 +10,9 @@ use std::{
 };
 
 use super::{
-    DOCUMENT_RESULT_ROW_BYTES, DOCUMENT_RESULT_VALUE_BYTES, Engine, add_document_result_budget,
-    cursor_page_base_bytes, limit_exceeded, next_matching_document, result_size_overflow,
-    validate_point_record,
+    DOCUMENT_RESULT_ROW_BYTES, DOCUMENT_RESULT_VALUE_BYTES, Engine, RequestScope,
+    add_document_result_budget, cursor_page_base_bytes, limit_exceeded, next_matching_document,
+    result_size_overflow, validate_point_record,
 };
 use crate::{
     core::engine::document_cursor::{CursorState, ReadStats, SortPosition},
@@ -122,7 +122,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         matcher: Option<Arc<DocumentMatcher>>,
         options: &DocumentReadOptions,

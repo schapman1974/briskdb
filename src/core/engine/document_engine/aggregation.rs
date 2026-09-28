@@ -14,7 +14,7 @@ impl Engine {
         session: &mut SessionInner,
         request_id: DocumentRequestId,
         request: DocumentAggregateRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -112,7 +112,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         options: &DocumentReadOptions,
         limits: ResultLimits,

@@ -23,6 +23,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+use super::control::RequestScope;
 use super::session::TransactionState;
 use super::{
     ActiveIdempotencyKeyGuard, ActiveIdempotencyKeys, ActiveQueryRegistry, ActiveQueryStatus,
@@ -35,7 +36,7 @@ use super::{
     ResultSet, Routed, RowProducer, RowStream, SchemaMigrationStatus, SchemaMigrationSummary,
     SchemaState, Session, SessionInner, ShardState, ShardStatus, ShardStatusReport, ShutdownReport,
     TablePlacement, TrackedQuery, TransactionExecution, Value, merge_scatter_results,
-    wait_for_cancellation, wait_pending,
+    wait_admission, wait_for_cancellation,
 };
 use crate::{
     sql,
@@ -461,11 +462,28 @@ impl StreamReadiness {
 }
 
 impl Operation {
+    // Authorization may already be running on a blocking worker. It is not a
+    // resource-acquisition attempt and must not be timed out as contention.
+    #[cfg(all(feature = "auth-scram", feature = "documents"))]
+    async fn wait_preflight<T, F>(&self, future: F) -> EngineResult<T>
+    where
+        F: std::future::Future<Output = EngineResult<T>>,
+    {
+        super::control::wait_pending(
+            future,
+            &self.cancellation,
+            &self.shutdown_cancel,
+            self.deadline,
+            &self.control,
+        )
+        .await
+    }
+
     async fn wait_pending<T, F>(&self, future: F) -> EngineResult<T>
     where
         F: std::future::Future<Output = EngineResult<T>>,
     {
-        wait_pending(
+        wait_admission(
             future,
             &self.cancellation,
             &self.shutdown_cancel,
@@ -3736,7 +3754,7 @@ impl Engine {
             return operation.control.complete(Err(error));
         }
 
-        let cancellation = CancellationToken::new();
+        let cancellation = RequestScope::new(CancellationToken::new(), &operation.control);
         let cancel_scatter = cancellation.clone();
         if let Err(reason) = operation.control.arm(Arc::new(move || {
             cancel_scatter.cancel();
@@ -3781,7 +3799,7 @@ impl Engine {
         shards: Vec<u16>,
         sql: Arc<str>,
         params: Arc<[Value]>,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         result_limits: ResultLimits,
     ) -> EngineResult<ResultSet> {
@@ -3858,7 +3876,7 @@ impl Engine {
         owner: ConnectionOwner,
         sql: Arc<str>,
         params: Arc<[Value]>,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         budget: sql::ScatterResultBudget,
     ) {
@@ -3878,18 +3896,15 @@ impl Engine {
         owner: ConnectionOwner,
         sql: Arc<str>,
         params: Arc<[Value]>,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         budget: sql::ScatterResultBudget,
     ) -> EngineResult<ResultSet> {
-        let control = OperationControl::with_contention_policy(
-            deadline,
-            self.inner.options.contention_policy(),
-        );
+        let control = cancellation.child_control(deadline);
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown_cancel = self.inner.shutdown_cancel.clone();
 
-        let permit = match wait_pending(
+        let permit = match wait_admission(
             self.inner.connections.acquire_for_owner(shard, owner),
             &cancellation,
             &shutdown_cancel,
@@ -3905,7 +3920,7 @@ impl Engine {
                 return result;
             }
         };
-        let worker = match wait_pending(
+        let worker = match wait_admission(
             self.inner.workers.acquire(),
             &cancellation,
             &shutdown_cancel,
@@ -10219,6 +10234,85 @@ mod tests {
         assert_eq!(snapshot.retired, 1);
         assert_eq!(snapshot.active, 0);
         assert_eq!(snapshot.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn configured_contention_bounds_session_pool_and_worker_admission_without_writing() {
+        async fn refused(engine: &Engine, session: &Session) {
+            let error = timeout(
+                Duration::from_secs(2),
+                engine.execute(
+                    session,
+                    Statement::new("INSERT INTO retry_items VALUES (1)", vec![]),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Busy);
+        }
+
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_contention_policy(Some(crate::ContentionPolicy::fail_fast()));
+        let (temp, engine) = engine_with_engine_options(2, options);
+        let session = engine.session();
+        engine
+            .broadcast(
+                &session,
+                "CREATE TABLE retry_items (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+        session.set_routing_key("retry").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"retry");
+
+        let session_guard = Arc::clone(&session.inner).lock_owned().await;
+        refused(&engine, &session).await;
+        drop(session_guard);
+
+        let permit = engine
+            .inner
+            .connections
+            .acquire_for_owner(shard, ConnectionOwner::new(u64::MAX))
+            .await
+            .unwrap();
+        refused(&engine, &session).await;
+        assert_eq!(
+            engine.inner.connections.snapshot().unwrap().shards[usize::from(shard)].queued,
+            0
+        );
+        drop(permit);
+
+        let mut workers = Vec::new();
+        for _ in 0..engine.inner.workers.limit() {
+            workers.push(engine.inner.workers.acquire().await.unwrap());
+        }
+        refused(&engine, &session).await;
+        wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        drop(workers);
+
+        let connection =
+            rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM retry_items", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new("INSERT INTO retry_items VALUES (1)", vec![])
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
     }
 
     #[tokio::test]

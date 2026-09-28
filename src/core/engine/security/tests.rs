@@ -319,6 +319,32 @@ mod documents {
     }
 
     #[tokio::test]
+    async fn contention_fail_fast_does_not_misclassify_running_document_authorization() {
+        let (temp, engine, session) = seeded().await;
+        drop(session);
+        drop(engine);
+        let options = EngineOptions::default()
+            .with_contention_policy(Some(crate::ContentionPolicy::fail_fast()));
+        let engine = Engine::open_authenticated(temp.path(), 2, options)
+            .await
+            .unwrap();
+        let session = login(&engine).await;
+        let id = cursor(&engine, &session).await;
+        engine
+            .execute_document(&session, request(more(id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_document(&engine.session(), request(find()))
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
     async fn real_document_reads_writes_and_reopen_require_current_permissions() {
         let (temp, engine, session) = seeded().await;
         assert_eq!(

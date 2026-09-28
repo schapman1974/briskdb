@@ -41,7 +41,7 @@ pub(crate) use catalog::{
 };
 pub use contention::{ContentionJitter, ContentionPolicy};
 pub(crate) use control::{
-    CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
+    CancelOnDrop, CancellationReason, OperationControl, wait_admission, wait_for_cancellation,
 };
 pub use control::{CancellationToken, RequestContext};
 #[cfg(any(feature = "mongo", feature = "listeners"))]
