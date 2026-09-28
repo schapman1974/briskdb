@@ -98,7 +98,7 @@ impl Engine {
         }
         #[cfg(feature = "auth-scram")]
         if let Err(error) = operation
-            .wait_preflight(self.authorize_document(session, &command))
+            .wait_preflight(self.authorize_document(session, &command, &operation))
             .await
         {
             return operation.finish(Err(error));

@@ -140,7 +140,7 @@ impl Engine {
         context: RequestContext,
         command: super::super::user_management::UserManagementCommand,
     ) -> EngineResult<()> {
-        let mut operation = self.operation_lifecycle(context.clone())?;
+        let mut operation = self.operation_lifecycle(context)?;
         let _session = operation.wait_pending(self.ready_session(session)).await?;
         let principal = session.principal.clone().ok_or_else(|| {
             EngineError::new(
@@ -151,7 +151,7 @@ impl Engine {
         let requirements = command.requirements()?;
         operation.check_before_start()?;
         let result = self
-            .security_call_with_context(context, move |authority| {
+            .security_call_from_parent(&operation, move |authority| {
                 authority
                     .update_authorized(&principal, &requirements, |catalog| command.apply(catalog))
             })
@@ -177,7 +177,7 @@ impl Engine {
         context: RequestContext,
         request: super::super::security_catalog::UserInfoRequest,
     ) -> EngineResult<Vec<super::super::security_catalog::UserInfo>> {
-        let mut operation = self.operation_lifecycle(context.clone())?;
+        let mut operation = self.operation_lifecycle(context)?;
         let _session = operation.wait_pending(self.ready_session(session)).await?;
         let principal = session.principal.clone().ok_or_else(|| {
             EngineError::new(
@@ -188,7 +188,7 @@ impl Engine {
         let limits = operation.result_limits;
         operation.check_before_start()?;
         let result = self
-            .security_call_with_context(context, move |authority| {
+            .security_call_from_parent(&operation, move |authority| {
                 authority.user_info(&principal, &request, limits)
             })
             .await;
@@ -204,7 +204,7 @@ impl Engine {
         context: RequestContext,
         request: super::super::security_catalog::RoleInfoRequest,
     ) -> EngineResult<Vec<super::super::security_catalog::RoleInfo>> {
-        let mut operation = self.operation_lifecycle(context.clone())?;
+        let mut operation = self.operation_lifecycle(context)?;
         let _session = operation.wait_pending(self.ready_session(session)).await?;
         let principal = session.principal.clone().ok_or_else(|| {
             EngineError::new(
@@ -215,7 +215,7 @@ impl Engine {
         let limits = operation.result_limits;
         operation.check_before_start()?;
         let result = self
-            .security_call_with_context(context, move |authority| {
+            .security_call_from_parent(&operation, move |authority| {
                 authority.role_info(&principal, &request, limits)
             })
             .await;
@@ -231,13 +231,54 @@ impl Engine {
         T: Send + 'static,
         F: FnOnce(&mut DurableSecurityCatalog) -> EngineResult<T> + Send + 'static,
     {
-        let authority = self.inner.security.clone().ok_or_else(|| {
+        let authority = self.security_authority()?;
+        let operation = self.operation_lifecycle(context)?;
+        self.run_security_call(authority, operation, work).await
+    }
+
+    /// A child keeps the parent's effective deadline, cancellation and budget,
+    /// but has a separate execution phase/interrupt slot and worker lease.
+    async fn security_call_from_parent<T, F>(&self, parent: &Operation, work: F) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut DurableSecurityCatalog) -> EngineResult<T> + Send + 'static,
+    {
+        let authority = self.security_authority()?;
+        let lease = self.inner.lifecycle.try_acquire()?;
+        let scope = RequestScope::new(parent.cancellation.clone(), &parent.control);
+        let control = scope.child_control(parent.deadline);
+        let operation = Operation {
+            lease: Some(lease),
+            cancel_on_drop: CancelOnDrop::new(Arc::clone(&control)),
+            control,
+            cancellation: parent.cancellation.clone(),
+            shutdown_cancel: parent.shutdown_cancel.clone(),
+            deadline: parent.deadline,
+            result_limits: parent.result_limits,
+        };
+        operation.check_before_start()?;
+        self.run_security_call(authority, operation, work).await
+    }
+
+    fn security_authority(&self) -> EngineResult<Arc<std::sync::Mutex<DurableSecurityCatalog>>> {
+        self.inner.security.clone().ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 "engine security is not enabled",
             )
-        })?;
-        let mut operation = self.operation_lifecycle(context)?;
+        })
+    }
+
+    async fn run_security_call<T, F>(
+        &self,
+        authority: Arc<std::sync::Mutex<DurableSecurityCatalog>>,
+        mut operation: Operation,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut DurableSecurityCatalog) -> EngineResult<T> + Send + 'static,
+    {
         let permit = operation.wait_pending(self.inner.workers.acquire()).await?;
         operation.check_before_start()?;
         let lease = operation.take_lease();
@@ -245,7 +286,7 @@ impl Engine {
         let join = permit.spawn(move || {
             let _lease = lease;
             let result = (|| {
-                let mut authority = authority.lock().map_err(|_| poisoned())?;
+                let mut authority = lock_authority(&authority, &control)?;
                 if let Some(reason) = control.reason() {
                     return Err(reason.error());
                 }
@@ -255,6 +296,32 @@ impl Engine {
         });
         let result = operation.wait_started(join).await;
         operation.finish_started(result)
+    }
+}
+
+fn lock_authority<'a>(
+    authority: &'a std::sync::Mutex<DurableSecurityCatalog>,
+    control: &OperationControl,
+) -> EngineResult<std::sync::MutexGuard<'a, DurableSecurityCatalog>> {
+    loop {
+        if let Some(reason) = control.reason() {
+            return Err(reason.error());
+        }
+        match authority.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
+            Err(std::sync::TryLockError::WouldBlock) => match control.wait_for_contention(None) {
+                // Unconfigured engines retain the previous blocking-mutex policy.
+                None => return authority.lock().map_err(|_| poisoned()),
+                Some(true) => continue,
+                Some(false) => {
+                    return Err(control.reason().map_or_else(
+                        || EngineError::new(EngineErrorKind::Busy, "security authority is busy"),
+                        |reason| reason.error(),
+                    ));
+                }
+            },
+        }
     }
 }
 
