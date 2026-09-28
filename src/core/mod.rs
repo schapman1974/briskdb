@@ -8,6 +8,8 @@ pub mod authentication;
 pub mod authorization;
 mod catalog;
 mod contention;
+#[cfg(test)]
+pub(crate) use contention::ContentionMetrics;
 mod control;
 mod engine;
 mod error;

@@ -227,6 +227,12 @@ retried; once a security read/edit starts, it runs once and may still commit if
 cancellation arrives during execution. A known successful commit is preserved.
 Unconfigured engines retain the legacy authority-mutex wait behavior.
 
+Controlled schema migrations use that same request budget across their
+manifest and shard SQLite busy handlers. Only SQLite lock acquisition is
+retried; a failed migration is not automatically rerun. Already committed
+shard work retains its durable journal position for explicit recovery/resume.
+Unconfigured migrations keep their existing fixed busy timeout.
+
 Root/startup locks, security-store SQLite waits, uncontrolled maintenance
 handles, and experimental virtual-table child writes still use their
 established controls. Remaining internal wait paths remain tracked by
