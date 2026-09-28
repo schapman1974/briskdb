@@ -26,7 +26,7 @@ impl Engine {
             )));
         }
         let result = operation
-            .wait_preflight(self.authorize_document(session, command))
+            .wait_preflight(self.authorize_document(session, command, &operation))
             .await;
         operation.check_before_start()?;
         operation.finish(result)
@@ -36,11 +36,12 @@ impl Engine {
         &self,
         session: &Session,
         command: &DocumentCommand,
+        operation: &Operation,
     ) -> EngineResult<()> {
         if !self.security_enabled() {
             return Ok(());
         }
-        session.inner.lock().await.ensure_open()?;
+        drop(operation.wait_pending(self.ready_session(session)).await?);
         let principal = session.principal.clone().ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::PermissionDenied,
@@ -48,7 +49,7 @@ impl Engine {
             )
         })?;
         let requirements = self.document_requirements(session, command)?;
-        self.security_call(move |authority| {
+        self.security_call_from_parent(operation, move |authority| {
             authority.authorize_all(
                 &principal,
                 requirements

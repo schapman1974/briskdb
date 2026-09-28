@@ -219,7 +219,15 @@ not silently ignored. Each option has a matching uppercase environment name:
 `BRISKDB_CONTENTION_MAX_ELAPSED_MS`. Explicit flags override their environment
 values. Clear backoff variables when selecting `legacy` or `fail-fast`.
 
-Root/startup locks, independent authorization work, uncontrolled maintenance
+Security user/role commands and document authorization share their parent
+command's effective deadline and contention budget across session admission,
+worker admission and in-process authority-lock acquisition. Child execution
+phases and interrupt slots stay separate. Only acquiring the authority mutex is
+retried; once a security read/edit starts, it runs once and may still commit if
+cancellation arrives during execution. A known successful commit is preserved.
+Unconfigured engines retain the legacy authority-mutex wait behavior.
+
+Root/startup locks, security-store SQLite waits, uncontrolled maintenance
 handles, and experimental virtual-table child writes still use their
 established controls. Remaining internal wait paths remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
