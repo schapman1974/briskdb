@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
-use crate::core::{EngineError, EngineErrorKind, EngineResult};
+use crate::core::{EngineError, EngineErrorKind, EngineResult, OperationControl};
 
 /// Current application-schema admission state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +251,38 @@ impl SchemaMigrationGuard {
                 .blocking_quiesced
                 .wait(data)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Startup already owns schema exclusion. Release the count mutex before
+    /// a bounded wait so existing operations can drain; never replay any work.
+    pub(crate) fn wait_for_quiescence_controlled(
+        &self,
+        control: &OperationControl,
+    ) -> EngineResult<()> {
+        loop {
+            if let Some(reason) = control.reason() {
+                return Err(reason.error());
+            }
+            if self.inner.lock().active_operations == 0 {
+                return Ok(());
+            }
+            match control.wait_for_contention(None) {
+                Some(true) => {}
+                Some(false) => return Err(control.reason().map_or_else(
+                    || {
+                        EngineError::new(
+                            EngineErrorKind::Busy,
+                            "startup contention budget exhausted while draining active operations",
+                        )
+                    },
+                    |reason| reason.error(),
+                )),
+                None => {
+                    self.wait_for_quiescence_blocking();
+                    return Ok(());
+                }
+            }
         }
     }
 

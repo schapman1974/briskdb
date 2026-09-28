@@ -233,9 +233,19 @@ retried; a failed migration is not automatically rerun. Already committed
 shard work retains its durable journal position for explicit recovery/resume.
 Unconfigured migrations keep their existing fixed busy timeout.
 
-Root/startup locks, security-store SQLite waits, uncontrolled maintenance
-handles, and experimental virtual-table child writes still use their
-established controls. Remaining internal wait paths remain tracked by
+Configured engine opens share a separate startup contention budget across the
+root startup lock, in-process schema exclusion, and draining active operations.
+Dropping the opening future cancels these admission waits and releases acquired
+guards; it does not cancel or replay initialization/recovery already executing.
+`request_timeout` still applies to requests after open, not startup. Successful
+opens retain their startup contention counters in engine diagnostics. `None`
+preserves the existing startup wait behavior.
+
+Startup SQLite and authenticated security-root preparation, security-store
+SQLite waits, uncontrolled maintenance handles, and experimental virtual-table
+child writes still use their established controls. Process-lease restoration
+after an unsuccessful exclusive upgrade must retain ownership before returning.
+Remaining internal wait paths remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
 
 Blocking lock sleeps occur only on blocking workers; admission uses async
