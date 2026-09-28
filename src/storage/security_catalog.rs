@@ -312,7 +312,15 @@ fn configure(connection: &Connection) -> EngineResult<()> {
         .busy_timeout(Duration::from_secs(2))
         .map_err(storage_error)?;
     // Connection-only settings: do not change or repair an existing file's mode.
-    connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY;").map_err(storage_error)
+    connection
+        .execute_batch("PRAGMA trusted_schema=OFF;")
+        .map_err(storage_error)?;
+    super::journal::JournalPolicy::SECURITY
+        .configure_durability(connection)
+        .map_err(|error| failure(error.kind(), "security catalog storage operation failed"))?;
+    connection
+        .execute_batch("PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY;")
+        .map_err(storage_error)
 }
 
 fn read_snapshot(
@@ -326,12 +334,16 @@ fn read_snapshot(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage_error)?;
-    let journal: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(storage_error)?;
-    if application != APPLICATION_ID || version != FORMAT_VERSION || journal != "delete" {
+    if application != APPLICATION_ID || version != FORMAT_VERSION {
         return Err(corrupt());
     }
+    super::journal::JournalPolicy::SECURITY
+        .require_mode(
+            connection,
+            EngineErrorKind::DataCorruption,
+            "security catalog",
+        )
+        .map_err(|error| failure(error.kind(), "security catalog store validation failed"))?;
     let mut schema = connection.prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 2").map_err(storage_error)?;
     let mut rows = schema.query([]).map_err(storage_error)?;
     let row = rows.next().map_err(storage_error)?.ok_or_else(corrupt)?;

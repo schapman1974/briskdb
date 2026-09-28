@@ -5382,9 +5382,7 @@ fn configure(connection: &Connection) -> EngineResult<()> {
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
-    connection
-        .pragma_update(None, "synchronous", "FULL")
-        .map_err(sqlite_error::storage)?;
+    super::journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     Ok(())
 }
 
@@ -5395,20 +5393,11 @@ fn initialize(connection: &Connection) -> EngineResult<()> {
     connection
         .pragma_update(None, "user_version", STORAGE_VERSION)
         .map_err(sqlite_error::storage)?;
-    let mode: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(sqlite_error::storage)?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        let mode: String = connection
-            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-            .map_err(sqlite_error::storage)?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(EngineError::new(
-                EngineErrorKind::StorageUnavailable,
-                "global-index storage did not enter WAL mode",
-            ));
-        }
-    }
+    super::journal::JournalPolicy::LOCAL.initialize_mode(
+        connection,
+        EngineErrorKind::StorageUnavailable,
+        "global-index storage",
+    )?;
     connection
         .execute_batch(SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
@@ -5457,12 +5446,11 @@ fn validate_storage_contents(
     storage_version: u32,
     expected_objects: &[&str],
 ) -> EngineResult<()> {
-    let mode: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(sqlite_error::storage)?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(corrupt("global-index storage is not in WAL mode"));
-    }
+    super::journal::JournalPolicy::LOCAL.require_mode(
+        connection,
+        EngineErrorKind::DataCorruption,
+        "global-index storage",
+    )?;
     let quick_check: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .map_err(sqlite_error::storage)?;

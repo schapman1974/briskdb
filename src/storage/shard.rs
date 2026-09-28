@@ -3040,9 +3040,7 @@ fn require_read_only(connection: &Connection) -> EngineResult<()> {
 }
 
 fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
-    connection
-        .pragma_update(None, "synchronous", "FULL")
-        .map_err(sqlite_error::storage)?;
+    super::journal::JournalPolicy::LOCAL.configure_durability(connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
@@ -3256,35 +3254,22 @@ fn journal_mode(connection: &Connection) -> EngineResult<String> {
 }
 
 fn require_wal(connection: &Connection, path: &Path) -> EngineResult<()> {
+    // Keep shard-specific read-error classification; only policy comparison
+    // is shared with the other storage surfaces.
     let mode = journal_mode(connection)?;
-    if mode.eq_ignore_ascii_case("wal") {
-        Ok(())
-    } else {
-        Err(EngineError::new(
-            EngineErrorKind::FailedPrecondition,
-            format!(
-                "shard {} uses journal mode {mode}, expected WAL",
-                path.display()
-            ),
-        ))
-    }
+    super::journal::JournalPolicy::LOCAL.check_mode(
+        &mode,
+        EngineErrorKind::FailedPrecondition,
+        &format!("shard {}", path.display()),
+    )
 }
 
 fn enable_wal(connection: &Connection, path: &Path) -> EngineResult<()> {
-    let mode = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
-        .map_err(sqlite_error::storage)?;
-    if mode.eq_ignore_ascii_case("wal") {
-        Ok(())
-    } else {
-        Err(EngineError::new(
-            EngineErrorKind::FailedPrecondition,
-            format!(
-                "SQLite retained journal mode {mode} instead of enabling WAL for {}",
-                path.display()
-            ),
-        ))
-    }
+    super::journal::JournalPolicy::LOCAL.initialize_mode(
+        connection,
+        EngineErrorKind::FailedPrecondition,
+        &format!("shard {}", path.display()),
+    )
 }
 
 fn has_application_schema_objects(connection: &Connection) -> EngineResult<bool> {

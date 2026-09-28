@@ -23,6 +23,39 @@ used, while idempotency stripes are retained after first use so unlink cannot
 create competing inodes. None may be replaced while a process is live. See the
 [multi-process contract](MULTIPROCESS.md).
 
+## Journal policy and NFS preparation (unreleased)
+
+Journal selection, non-mutating mode validation, and connection-local durability
+configuration share a checked internal policy. The effective journal and
+`synchronous` values are checked rather than assuming SQLite accepted a pragma.
+These helpers target `main`, not attached or temporary databases, and do not
+replace busy handlers, disable SQLite's native locks, or change transaction scope.
+
+| Files / policy | Journal | Synchronous | Availability |
+| --- | --- | --- | --- |
+| Local manifest, data/document shards, global-index store | WAL | FULL | Existing default, unchanged |
+| Local security store | DELETE | FULL, plus existing `fullfsync` | Existing opt-in authentication contract, unchanged |
+| NFS rollback candidates | DELETE or PERSIST | EXTRA | Internal tests only; not a selectable storage profile |
+
+This refactor does not change manifest version 22 or authorize local/NFS mode
+conversion. Persisted profile selection, older-writer fencing, NFS-safe lifecycle
+and stale-client handling, checkpoint/backup integration, and independent-host
+qualification remain required by [#511](https://github.com/schapman1974/briskdb/issues/511)
+and the [NFS epic](https://github.com/schapman1974/briskdb/issues/509).
+Existing local initialization/recovery paths retain their journal behavior;
+strict shard and global-index reopen validation still rejects a wrong mode.
+
+`PERSIST` is a candidate for reducing EFS directory metadata traffic: it clears
+the rollback-journal header at commit instead of deleting the journal. Unlike
+WAL, its selection is connection-local, so every participating opener must apply
+the validated profile. Local tests cover native peer-writer exclusion, journal
+inode reuse, and hot-journal recovery after process exit before/after commit.
+They do not establish power-loss durability or NFS/EFS support. The final choice
+requires real EFS operation counts, latency and multi-host fault/recovery results;
+neither candidate permits disabling sync or native locking. See SQLite's
+[journal modes](https://www.sqlite.org/pragma.html#pragma_journal_mode) and
+[synchronous policy](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
 ## Current format: version 22 (unreleased)
 
 SQLite header fields identify the file and its format:
