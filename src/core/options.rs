@@ -300,12 +300,12 @@ impl EngineOptions {
         self.contention_policy
     }
 
-    /// Configure lock acquisition in controlled SQLite tasks and document
-    /// collection fences. `None` preserves the existing five-second behavior.
+    /// Configure controlled SQLite locks, document collection fences, and
+    /// session/connection/worker admission. `None` preserves legacy behavior.
     ///
-    /// Each physical task currently has its own budget; the request deadline
-    /// bounds the complete operation. Pool admission, startup, and experimental
-    /// virtual-table child writes are not governed by this policy yet.
+    /// One logical SQL/document operation shares its budget with physical
+    /// subtasks and scatter children. Startup, independent authorization work,
+    /// and experimental virtual-table child writes are not covered yet.
     #[must_use]
     pub const fn with_contention_policy(mut self, policy: Option<super::ContentionPolicy>) -> Self {
         self.contention_policy = policy;

@@ -80,7 +80,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentFindOneAndUpdateRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -134,7 +134,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentUpdateRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -212,7 +212,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentFindOneAndDeleteRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -238,7 +238,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentReplaceRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -281,7 +281,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentFindOneAndReplaceRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -323,7 +323,7 @@ impl Engine {
         options: DocumentReadOptions,
         mutation: Mutation,
         upsert: bool,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -367,7 +367,7 @@ impl Engine {
         filter: Arc<DocumentFilter>,
         options: Arc<DocumentReadOptions>,
         mutation: Mutation,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -1016,7 +1016,7 @@ mod tests {
             .run_document_shard_controlled(
                 0,
                 ConnectionOwner::new(session.id().get()),
-                CancellationToken::new(),
+                RequestScope::new(CancellationToken::new(), &OperationControl::new(None)),
                 None,
                 move |storage, connection, cancellation, control| {
                     let ids: Vec<_> = (0..100)

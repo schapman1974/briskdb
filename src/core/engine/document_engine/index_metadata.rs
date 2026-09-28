@@ -13,7 +13,7 @@ impl Engine {
         session: &mut SessionInner,
         request_id: crate::document::DocumentRequestId,
         request: DocumentListIndexMetadataRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -86,7 +86,7 @@ impl Engine {
     pub(super) async fn read_index_metadata_page(
         &self,
         state: &mut IndexMetadataCursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         batch_size: u64,
         limits: ResultLimits,

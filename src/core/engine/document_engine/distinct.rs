@@ -12,7 +12,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentDistinctRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {

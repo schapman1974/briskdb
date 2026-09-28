@@ -17,7 +17,7 @@ impl Engine {
         filter: Arc<DocumentFilter>,
         updater: Arc<DocumentUpdater>,
         max_document_bytes: usize,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {

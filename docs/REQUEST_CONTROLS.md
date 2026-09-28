@@ -131,8 +131,8 @@ engine default.
 
 ## Opt-in storage contention backoff (Rust foundation)
 
-Rust hosts can configure controlled SQLite lock waits and document collection
-writer-fence acquisition through the same engine policy:
+Rust hosts can configure controlled SQLite lock waits, document collection
+writer fences, and session/connection/worker admission through one engine policy:
 
 ```rust
 use std::time::Duration;
@@ -161,20 +161,29 @@ budget. The multiplier is 1..=1024 and retry count is 1..=1,000,000. Invalid
 settings are rejected before opening storage. A retry whose delay would reach
 or cross the elapsed limit is not scheduled.
 
-This first implementation shares a budget across repeated controlled-handle
-setup/SQL execution and collection-fence waits **within one physical storage
-task**. It is not yet a request-wide budget across document command subtasks or
-parallel scatter shards. Pool/session/worker admission, root/startup locks,
-uncontrolled maintenance handles, and experimental virtual-table child writes
-still use their established controls. The engine/request deadline continues to
-bound the complete request. Python/managed-Mongo and daemon configuration,
-cross-task/admission budgeting, and public retry diagnostics remain tracked by
+One logical SQL/document operation shares its budget across admission,
+controlled-handle setup/SQL execution, collection fences, sequential document
+subtasks and parallel scatter shards. Each child retains its own cancellation
+state and exact SQLite interrupt handle. Reusing a public cancellation token
+in another request does not reuse the earlier request's budget.
+
+Queued admission retains its original future and queue position, and can
+complete as soon as capacity is available. Each backoff window reserves one
+retry from the same budget used by storage locks; it does not restart the
+resource acquisition or block the async runtime. Exhaustion drops the pending
+future and releases its queue reservation. The engine/request deadline still
+bounds the complete request.
+
+Root/startup locks, independent authorization work, uncontrolled maintenance
+handles, and experimental virtual-table child writes still use their
+established controls. Python/managed-Mongo and daemon configuration, remaining
+internal wait paths, and public retry diagnostics remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
 
-Backoff sleeps occur only on blocking workers, not the async runtime; accepted
-cancellation wakes them and the earlier request deadline wins. These waits
-retry only SQLite's own lock-acquisition callback or a not-yet-acquired Brisk
-collection fence. They never replay an application statement, transaction,
+Blocking lock sleeps occur only on blocking workers; admission uses async
+timers. Accepted cancellation wakes waits and the earlier request deadline wins.
+These waits retry only lock acquisition or await available capacity. They
+never replay an application statement, transaction,
 partially committed bulk command, or uncertain commit. An exhausted budget
 returns `Busy`, not `DeadlineExceeded`, unless the request deadline also expires.
 An uncontended acquisition can still succeed after retry exhaustion.

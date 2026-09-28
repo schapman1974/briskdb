@@ -34,11 +34,12 @@ use super::document_cursor::{
     IndexMetadataCursorState, MetadataCursorState, ReadStats, RetainedCursorState,
 };
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
+use crate::core::control::RequestScope;
 use crate::{
     core::{
         CancelOnDrop, CancellationToken, EngineError, EngineErrorKind, EngineResult,
-        OperationControl, ResultLimits, Session, SessionInner, SessionState, wait_for_cancellation,
-        wait_pending,
+        OperationControl, ResultLimits, Session, SessionInner, SessionState, wait_admission,
+        wait_for_cancellation,
     },
     document::{
         BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonObjectId, BsonTimestamp,
@@ -97,7 +98,7 @@ impl Engine {
         }
         #[cfg(feature = "auth-scram")]
         if let Err(error) = operation
-            .wait_pending(self.authorize_document(session, &command))
+            .wait_preflight(self.authorize_document(session, &command))
             .await
         {
             return operation.finish(Err(error));
@@ -289,7 +290,7 @@ impl Engine {
         command: DocumentCommand,
     ) -> EngineResult<DocumentExecution> {
         operation.check_before_start()?;
-        let cancellation = CancellationToken::new();
+        let cancellation = RequestScope::new(CancellationToken::new(), &operation.control);
         let cancel_operation = cancellation.clone();
         if let Err(reason) = operation.control.arm(Arc::new(move || {
             cancel_operation.cancel();
@@ -337,7 +338,7 @@ impl Engine {
         session: &mut SessionInner,
         request_id: crate::document::DocumentRequestId,
         command: DocumentCommand,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         result_limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -1498,7 +1499,7 @@ impl Engine {
 
     async fn run_document_storage_task<T, F>(
         &self,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         work: F,
     ) -> EngineResult<T>
@@ -1506,13 +1507,10 @@ impl Engine {
         T: Send + 'static,
         F: FnOnce(&CancellationToken, Arc<OperationControl>) -> EngineResult<T> + Send + 'static,
     {
-        let control = OperationControl::with_contention_policy(
-            deadline,
-            self.inner.options.contention_policy(),
-        );
+        let control = cancellation.child_control(deadline);
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown = self.inner.shutdown_cancel.clone();
-        let worker = wait_pending(
+        let worker = wait_admission(
             self.inner.workers.acquire(),
             &cancellation,
             &shutdown,
@@ -1556,7 +1554,7 @@ impl Engine {
         &self,
         shard: u16,
         owner: ConnectionOwner,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         work: F,
     ) -> EngineResult<T>
@@ -1582,7 +1580,7 @@ impl Engine {
         &self,
         shard: u16,
         owner: ConnectionOwner,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         work: F,
     ) -> EngineResult<T>
@@ -1597,13 +1595,10 @@ impl Engine {
             + Send
             + 'static,
     {
-        let control = OperationControl::with_contention_policy(
-            deadline,
-            self.inner.options.contention_policy(),
-        );
+        let control = cancellation.child_control(deadline);
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown = self.inner.shutdown_cancel.clone();
-        let permit = wait_pending(
+        let permit = wait_admission(
             self.inner.connections.acquire_for_owner(shard, owner),
             &cancellation,
             &shutdown,
@@ -1611,7 +1606,7 @@ impl Engine {
             &control,
         )
         .await?;
-        let worker = wait_pending(
+        let worker = wait_admission(
             self.inner.workers.acquire(),
             &cancellation,
             &shutdown,
@@ -1667,7 +1662,7 @@ impl Engine {
         &self,
         state: &CursorState,
         options: &DocumentReadOptions,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
     ) -> EngineResult<DocumentPlan> {
         let plan = state.source.plan(state.collection_id, self.shard_count())?;
@@ -1714,7 +1709,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         options: &DocumentReadOptions,
         limits: ResultLimits,
@@ -1733,7 +1728,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         options: &DocumentReadOptions,
         limits: ResultLimits,
@@ -1868,7 +1863,7 @@ impl Engine {
         &self,
         record: DocumentStorageRecord,
         projection: Option<Arc<DocumentProjector>>,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
     ) -> EngineResult<(BsonDocument, usize)> {
         let Some(projection) = projection else {
@@ -1894,7 +1889,7 @@ impl Engine {
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         matcher: Option<Arc<DocumentMatcher>>,
         options: &DocumentReadOptions,

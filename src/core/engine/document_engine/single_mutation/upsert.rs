@@ -11,7 +11,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         request: DocumentReplaceRequest,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
@@ -47,7 +47,7 @@ impl Engine {
         read_options: Arc<DocumentReadOptions>,
         mutation: Mutation,
         scope: DocumentMutationScope,
-        cancellation: CancellationToken,
+        cancellation: RequestScope,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {

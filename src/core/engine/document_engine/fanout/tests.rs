@@ -34,12 +34,60 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[tokio::test]
+async fn contention_fanout_and_sequential_document_tasks_keep_the_parent_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let policy = crate::ContentionPolicy::new(
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        1,
+        crate::ContentionJitter::None,
+        1,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let parent = OperationControl::with_contention_policy(None, Some(policy));
+    let scope = RequestScope::new(CancellationToken::new(), &parent);
+    assert_eq!(
+        engine
+            .run_document_storage_task(scope.clone(), None, |_, control| {
+                Ok(control.wait_for_contention(None))
+            })
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let worker_engine = engine.clone();
+    let results = coordinate(
+        vec![0, 1],
+        scope.clone(),
+        CancellationToken::new(),
+        None,
+        move |_, child| {
+            let engine = worker_engine.clone();
+            async move {
+                engine
+                    .run_document_storage_task(child, None, |_, control| {
+                        Ok(control.wait_for_contention(None))
+                    })
+                    .await
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(results.iter().all(|(_, result)| *result == Some(false)));
+    assert_eq!(parent.wait_for_contention(None), Some(false));
+    assert!(!scope.is_cancelled());
+}
+
+#[tokio::test]
 async fn frontier_coordinator_runs_eight_children_and_preserves_physical_identities() {
     let probe = Arc::new(Probe::default());
     let gate = Arc::new(Barrier::new(9));
     let work_probe = Arc::clone(&probe);
     let work_gate = Arc::clone(&gate);
-    let parent = CancellationToken::new();
+    let parent = RequestScope::new(CancellationToken::new(), &OperationControl::new(None));
     let task = tokio::spawn(coordinate(
         (0..64).collect(),
         parent.clone(),
@@ -79,7 +127,7 @@ async fn frontier_errors_and_panics_cancel_and_drain_peers_without_poisoning_par
         let gate = Arc::new(Barrier::new(9));
         let work_probe = Arc::clone(&probe);
         let work_gate = Arc::clone(&gate);
-        let parent = CancellationToken::new();
+        let parent = RequestScope::new(CancellationToken::new(), &OperationControl::new(None));
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(coordinate(
             (0..64).collect(),
@@ -134,7 +182,7 @@ async fn parent_and_shutdown_cancellation_drain_started_frontiers_before_return(
         let gate = Arc::new(Barrier::new(9));
         let work_probe = Arc::clone(&probe);
         let work_gate = Arc::clone(&gate);
-        let parent = CancellationToken::new();
+        let parent = RequestScope::new(CancellationToken::new(), &OperationControl::new(None));
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(coordinate(
             (0..64).collect(),
@@ -170,7 +218,7 @@ async fn parent_and_shutdown_cancellation_drain_started_frontiers_before_return(
 #[tokio::test]
 async fn expired_or_canceled_frontiers_admit_no_children() {
     let started = AtomicUsize::new(0);
-    let parent = CancellationToken::new();
+    let parent = RequestScope::new(CancellationToken::new(), &OperationControl::new(None));
     let shutdown = CancellationToken::new();
     for expired in [true, false] {
         if !expired {
@@ -198,7 +246,7 @@ async fn expired_or_canceled_frontiers_admit_no_children() {
     assert!(
         coordinate(
             Vec::<u16>::new(),
-            CancellationToken::new(),
+            RequestScope::new(CancellationToken::new(), &OperationControl::new(None)),
             shutdown,
             None,
             |_, _| async { Ok(()) }
@@ -213,7 +261,7 @@ async fn expired_or_canceled_frontiers_admit_no_children() {
 async fn live_frontier_deadline_cancels_and_drains_started_children() {
     let probe = Arc::new(Probe::default());
     let work_probe = Arc::clone(&probe);
-    let parent = CancellationToken::new();
+    let parent = RequestScope::new(CancellationToken::new(), &OperationControl::new(None));
     let error = coordinate(
         (0..64).collect(),
         parent.clone(),
