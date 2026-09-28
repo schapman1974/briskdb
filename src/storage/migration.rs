@@ -2191,6 +2191,19 @@ mod tests {
         );
 
         owner.execute_batch("ROLLBACK").unwrap();
+        // The fixture deliberately changed a local file to rollback mode to
+        // block reads. Ordinary metadata access must not repair that policy.
+        assert_eq!(
+            run_with_hook(&storage, |_| Ok(())).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert_eq!(
+            owner
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        owner.pragma_update(None, "journal_mode", "WAL").unwrap();
         assert_eq!(run_with_hook(&storage, |_| Ok(())).unwrap(), [0, 1]);
         assert_complete(&storage, temp.path());
     }
