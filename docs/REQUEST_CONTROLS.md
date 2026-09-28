@@ -192,6 +192,15 @@ read-only. `briskdb.ContentionPolicy.fail_fast()` selects no waiting;
 `Config(contention_policy=None)` preserves legacy behavior. Attached listeners
 inherit this engine policy and keep their existing protocol-specific deadlines.
 
+Managed `MongoClient`, `AsyncMongoClient`, `MongoPatch` and `briskdb.patch()` also
+accept `contention_policy=policy`. They forward it to the same native engine;
+there is no Python retry loop. On a new engine, omitted/`None` retains legacy
+behavior. When sharing an already-open managed root, omitted/`None` inherits its
+policy and an explicit policy must match every setting or raise `ValueError`.
+Patch-created clients follow the same rule, including nested scopes. Settings
+are runtime-only; reopening after the last owner closes does not remember them.
+The client's `briskdb_contention_policy` property reports the effective value.
+
 The daemon supports the same policy through flags or environment variables:
 
 ```sh
@@ -212,8 +221,8 @@ values. Clear backoff variables when selecting `legacy` or `fail-fast`.
 
 Root/startup locks, independent authorization work, uncontrolled maintenance
 handles, and experimental virtual-table child writes still use their
-established controls. Managed-Mongo/patch configuration, remaining
-internal wait paths, and public retry diagnostics remain tracked by
+established controls. Remaining internal wait paths and public retry diagnostics
+remain tracked by
 [#510](https://github.com/schapman1974/briskdb/issues/510).
 
 Blocking lock sleeps occur only on blocking workers; admission uses async

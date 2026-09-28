@@ -327,8 +327,22 @@ with briskdb.open("./data", config=config) as db:
 ```
 
 Use `ContentionPolicy.fail_fast()` for no retries, or omit the policy to keep
-existing behavior. This never replays commands or uncertain writes. Managed
-`MongoClient`/`patch` configuration is not exposed yet. See the
+existing behavior. This never replays commands or uncertain writes. On
+unreleased main, managed Mongo clients and patch scopes accept the same policy:
+
+```python
+with briskdb.MongoClient(folder="./mongo-data", contention_policy=policy) as client:
+    print(client.briskdb_contention_policy)
+
+with briskdb.patch(contention_policy=policy):
+    pass  # newly constructed pymongo clients use this engine's policy
+```
+
+`AsyncMongoClient` and `async with briskdb.patch(...)` use the same keyword.
+Owners sharing a folder share one policy: omitted/`None` inherits an open
+engine's policy; explicit conflicting settings raise `ValueError`. A new engine
+without a policy keeps legacy behavior. These settings are not saved in the
+database. See the
 [complete waiting contract](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff-rust-foundation).
 
 On unreleased main, `Config(storage_profile="local")` makes the default storage
