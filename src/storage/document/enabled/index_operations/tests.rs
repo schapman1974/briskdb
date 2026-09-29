@@ -982,6 +982,156 @@ fn setup(root: &Path, count: u16) -> (Storage, DocumentCollectionId) {
 }
 
 #[test]
+fn candidate_read_snapshots_preserve_caller_transactions_and_clean_up_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(root.path(), 2);
+    build(&storage, "value").unwrap();
+    let _admission = storage.enter_schema_operation().unwrap();
+    let matcher = DocumentMatcher::compile(
+        &BsonDocument::from_entries([("value", BsonValue::Int32(0))]).unwrap(),
+    )
+    .unwrap();
+    let probe = storage
+        .document_equality_probe(collection, &matcher, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    let id = crate::document::CanonicalBsonKey::encode(&BsonValue::Int32(0)).unwrap();
+    let shard = storage.shard_for_key(id.as_bytes());
+    let connection = storage.open_unconfigured_shard(shard).unwrap();
+    let token = CancellationToken::new();
+    let read = |token: &CancellationToken| {
+        storage.scan_document_candidates_on_connection(
+            &connection,
+            collection,
+            shard,
+            None,
+            1,
+            Some(&probe),
+            token,
+        )
+    };
+    assert!(connection.is_autocommit());
+    assert_eq!(read(&token).unwrap().len(), 1);
+    assert!(connection.is_autocommit());
+    {
+        let caller = connection.unchecked_transaction().unwrap();
+        assert_eq!(read(&token).unwrap().len(), 1);
+        assert!(
+            !connection.is_autocommit(),
+            "read must not commit its caller"
+        );
+        caller.execute("UPDATE briskdb_document_index_entries_v1 SET entry_checksum=zeroblob(32) WHERE id_key=?1", [id.as_bytes()]).unwrap();
+        assert_eq!(
+            read(&token).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+        assert!(
+            !connection.is_autocommit(),
+            "read error must not roll back its caller"
+        );
+        caller.rollback().unwrap();
+    }
+    assert_eq!(read(&token).unwrap().len(), 1);
+    let cancelled = CancellationToken::new();
+    let triggered = cancelled.clone();
+    connection
+        .progress_handler(
+            1,
+            Some(move || {
+                triggered.cancel();
+                false
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        read(&cancelled).unwrap_err().kind(),
+        EngineErrorKind::Cancelled
+    );
+    connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .unwrap();
+    assert!(
+        connection.is_autocommit(),
+        "cancelled owned snapshot must be closed"
+    );
+    assert_eq!(read(&token).unwrap().len(), 1);
+    connection.execute("UPDATE briskdb_document_index_entries_v1 SET entry_checksum=zeroblob(32) WHERE id_key=?1", [id.as_bytes()]).unwrap();
+    assert_eq!(
+        read(&token).unwrap_err().kind(),
+        EngineErrorKind::DataCorruption
+    );
+    assert!(
+        connection.is_autocommit(),
+        "failed owned snapshot must be closed"
+    );
+}
+
+#[tokio::test]
+async fn candidate_read_snapshots_keep_warm_pooled_connections_reusable() {
+    let root = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(root.path(), 2);
+    build(&storage, "value").unwrap();
+    let _admission = storage.enter_schema_operation().unwrap();
+    let pools = crate::storage::ConnectionPools::new(storage.clone(), 1, 0).unwrap();
+    let mut identity = None;
+    for value in [0, 12345, 0, 12345] {
+        let matcher = DocumentMatcher::compile(
+            &BsonDocument::from_entries([("value", BsonValue::Int32(value))]).unwrap(),
+        )
+        .unwrap();
+        let probe = storage
+            .document_equality_probe(collection, &matcher, &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        let mut connection = pools
+            .acquire_for_owner(0, crate::storage::ConnectionOwner::new(1))
+            .await
+            .unwrap()
+            .checkout()
+            .unwrap();
+        if let Some(identity) = identity {
+            assert_eq!(connection.connection_id(), identity);
+        } else {
+            identity = Some(connection.connection_id());
+        }
+        connection
+            .run_document_controlled(OperationControl::new(None), |connection| {
+                storage.scan_document_candidates_on_connection(
+                    connection,
+                    collection,
+                    0,
+                    None,
+                    1,
+                    Some(&probe),
+                    &CancellationToken::new(),
+                )
+            })
+            .unwrap();
+        assert!(connection.is_autocommit());
+        assert!(
+            connection
+                .prepare(super::super::candidate_sql::SELECTIVITY_SQL)
+                .is_err(),
+            "ordinary statement preparation must not inherit internal read authority"
+        );
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .is_err(),
+            "document authority must not escape the controlled scan"
+        );
+        drop(connection);
+    }
+    let snapshot = pools.snapshot().unwrap().shards[0];
+    assert_eq!(snapshot.opened, 1);
+    assert_eq!(snapshot.reused, 3);
+    assert_eq!(snapshot.retired, 0);
+}
+
+#[test]
 fn equality_candidates_require_current_ready_authority_and_keep_natural_pagination() {
     for count in [2, 4] {
         let root = tempfile::tempdir().unwrap();
