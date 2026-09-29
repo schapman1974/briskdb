@@ -1487,7 +1487,17 @@ TinyMongo's string-selector contract. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
 preserves BSON/other Ready indexes/allocator history, and finishes on reopen after
-an interruption. Pending drops retain their lightweight concurrent path.
+an interruption. Cancelled/timed-out index builds and drops first attempt this
+journal-owned recovery in-process, under the existing exclusive guards and a
+separate five-second cleanup budget. On success the same client can immediately
+read, write, inspect indexes, and retry index creation; the failed command still
+reports its original timeout/cancellation. Cleanup may extend response time past
+the command deadline. If cleanup is blocked or fails, reopening is still required;
+corruption remains fail-closed. New unpublished definitions are removed, prior
+Pending declarations and completed batch prefixes are preserved, and user
+commands are never automatically replayed. Pending drops retain their lightweight
+concurrent path. This does not raise the command-timeout ceiling or improve index
+build complexity tracked in #553.
 
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and

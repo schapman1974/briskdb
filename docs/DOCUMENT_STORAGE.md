@@ -136,8 +136,14 @@ exclusive schema admission. It validates the complete existing and prospective
 index set before durable intent, builds each shard transactionally, and publishes
 Ready only after all shard commits. A crash before publication causes startup to
 discard only the journal-owned derived entries and retain the PendingBuild
-declaration; it never activates a partial build. An interrupted admitted build
-leaves schema operations fenced until the root is reopened for recovery.
+declaration; it never activates a partial build. A cancelled/timed-out admitted
+index operation attempts that same journal-owned cleanup in-process, retaining
+exclusive schema/process ownership and using a separate five-second cleanup
+budget. Success republishes the surviving index cache before normal operations
+resume; the original command still reports cancellation/timeout. Cleanup can
+therefore delay that error beyond its original deadline. If cleanup cannot
+finish (including a persistent writer lock), the root stays fenced until reopen.
+Actual corruption remains degraded rather than being repaired.
 
 Each entry checksum binds collection, index, shard, canonical record ID, key
 bytes and the exact current record checksum. Inserts, replacements (including
@@ -162,7 +168,8 @@ from omitting candidates or misclassifying valid nested records as corruption.
 Record/entry formats remain unchanged. Whole-bulk post-image parity and broader
 planner use remain work under #174/#183. Native/wire batch creation and removal retain one admission
 guard across entries; completed entries survive a later failure, and only an
-unfinished entry's journal fences the root until reopen. Built-index drops use journal-owned cleanup
+unfinished entry's journal fences the root until cancellation cleanup or reopen completes.
+Built-index drops use journal-owned cleanup
 without removing records; namespace deletion can remove both indexes and records.
 Bulk removal resolves all names before its first mutation. Completed removals
 stay committed; only the currently admitted index has a restart obligation,
@@ -239,7 +246,8 @@ It precompiles the survivor cache, seals Drop intent while marking the target
 PendingBuild, removes that index ID's entries shard-by-shard, and atomically
 deletes intent plus catalog/identity rows after the complete prefix commits.
 Startup finishes an interrupted Drop (rather than restoring its declaration).
-The caller must reopen after an admitted interruption. Cached names and compiled
+Cancellation/deadline cleanup uses the bounded in-process recovery described
+above; crashes and unsuccessful cleanup still require reopening. Cached names and compiled
 definitions are published together before admitting new writes, including through
 independent handles of the same root. The existing 64-MiB compiled-definition
 allowance is unchanged; dispatch names have a separate conservative 32-MiB ceiling

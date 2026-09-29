@@ -168,8 +168,9 @@ sole-process ownership and exclusive schema admission: intent atomically changes
 the target to PendingBuild and installs the existing version-19 Drop journal.
 Cleanup removes only that globally unique index ID from each shard, then deletes
 its declaration/identity mapping and publishes the surviving compiled cache.
-The permanent allocator is never reset. Cancellation after intent leaves schema
-admission fenced until reopening completes the drop; it is not a rollback promise.
+The permanent allocator is never reset. Cancellation after intent attempts the
+bounded in-process index recovery described below; unsuccessful cleanup leaves
+admission fenced until reopening completes the drop. It is not a rollback promise.
 Process-exit tests cover both sides of intent, shard, cursor and completion commits.
 Other Ready indexes and exact BSON remain unchanged. A schema-guarded, bounded
 Ready-name cache selects this path without adding I/O to pending drops, preserving
@@ -183,7 +184,8 @@ bounded to 255 UTF-8 bytes. `DocumentDropIndexesRequest::all` selects every
 secondary definition, including non-enforcing Pending declarations, never `_id_`.
 The complete selection and Ready counts are resolved under one schema/process
 guard, and fixed-size result limits precede mutation. Completed removals survive
-an error; an admitted unfinished drop completes on reopen, while later unstarted
+an error; an admitted unfinished drop completes during cancellation recovery or
+on reopen, while later unstarted
 indexes remain. This is not batch rollback or a durable all-index transaction.
 The permanent allocator and document rows are unchanged. Named `*` remains a
 literal in the native constructor; only the wire adapter translates `*` to `all`.
@@ -220,9 +222,13 @@ one declared index offline under exclusive schema admission and
 sole-process ownership. It returns `DocumentResult::IndexReady(name)` after all
 shards commit and the checksummed manifest publishes Ready. Repeated builds and
 matching declarations preserve that Ready lifecycle. Ready entries are maintained
-transactionally by every record write and verified on reopen. Interrupted builds
-require reopening; startup discards the unpublished derived entries, leaving the
-declaration pending. Shared preparation bounds apply across all Ready indexes,
+transactionally by every record write and verified on reopen. Cancelled/timed-out
+builds attempt journal-owned cleanup under the retained exclusive guards, with
+a separate five-second recovery budget. The original error is returned after
+cleanup; subsequent requests can use the same engine when recovery succeeds.
+Crashes or unsuccessful cleanup still require reopening. Recovery discards the
+unpublished derived entries, leaving a pre-existing declaration pending.
+Shared preparation bounds apply across all Ready indexes,
 not independently per index. Unique builds validate every prospective key
 across all shards before durable intent; duplicate data returns `UniqueViolation`
 (Mongo code 11000), without activating the constraint.
