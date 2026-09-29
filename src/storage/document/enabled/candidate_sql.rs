@@ -1,5 +1,70 @@
 //! Bounded, naturally ordered index candidates for the shard merge frontier.
 
+use rusqlite::{Rows, Statement, params};
+
+const MAX_SELECTIVE_ENTRIES: i64 = 32;
+const MAX_SELECTIVE_ID_BYTES: i64 = 64 * 1024;
+pub(super) const SELECTIVITY_SQL: &str = "SELECT count(*), coalesce(sum(length(id_key)), 0) FROM (
+    SELECT id_key FROM briskdb_document_index_entries_v1
+    INDEXED BY sqlite_autoindex_briskdb_document_index_entries_v1_1
+    WHERE collection_id = ?1 AND index_id = ?2 AND index_key IN (?3, ?4)
+    LIMIT ?5)";
+
+#[cfg(test)]
+mod selective_tests;
+
+/// Keep the returned cursor alive until the chosen scan finishes. Its aggregate
+/// row is deliberately not stepped to DONE: the active read statement pins the
+/// same SQLite snapshot for both queries, including in autocommit mode. This
+/// neither starts an explicit transaction (which taints pooled handles) nor
+/// commits/rolls back a caller's transaction. Only bounded identities are counted.
+pub(super) fn selective_snapshot<'s>(
+    statement: &'s mut Statement<'_>,
+    collection: i64,
+    index: i64,
+    key: &[u8],
+    fallback: &[u8],
+) -> rusqlite::Result<(Rows<'s>, bool)> {
+    let mut rows = statement.query(params![
+        collection,
+        index,
+        key,
+        fallback,
+        MAX_SELECTIVE_ENTRIES + 1
+    ])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let entries: i64 = row.get(0)?;
+    let bytes: i64 = row.get(1)?;
+    Ok((
+        rows,
+        entries <= MAX_SELECTIVE_ENTRIES && bytes <= MAX_SELECTIVE_ID_BYTES,
+    ))
+}
+
+/// Sort only the admitted tiny identity frontier, then fetch the selected BSON
+/// and checksum-bound entry. Never put entire document payloads in the sorter.
+pub(super) fn selective_single() -> &'static str {
+    "WITH frontier AS MATERIALIZED (
+        SELECT e.id_key, d.natural_order
+        FROM briskdb_document_index_entries_v1 AS e
+        INDEXED BY sqlite_autoindex_briskdb_document_index_entries_v1_1
+        CROSS JOIN briskdb_documents_v1 AS d
+          ON d.collection_id = e.collection_id AND d.id_key = e.id_key
+        WHERE e.collection_id = ?1 AND e.index_id = ?4 AND e.index_key IN (?5, ?6)
+          AND d.natural_order > ?2
+        ORDER BY d.natural_order LIMIT ?3)
+     SELECT d.natural_order, d.id_key, d.document_bson, d.document_checksum,
+            d.storage_format_version, e.entry_checksum, e.entry_format_version, e.index_key
+     FROM frontier AS f
+     CROSS JOIN briskdb_documents_v1 AS d
+       ON d.collection_id = ?1 AND d.id_key = f.id_key
+     CROSS JOIN briskdb_document_index_entries_v1 AS e
+     INDEXED BY sqlite_autoindex_briskdb_document_index_entries_v1_1
+       ON e.collection_id = ?1 AND e.id_key = f.id_key
+     WHERE e.index_id = ?4 AND e.index_key IN (?5, ?6)
+     ORDER BY f.natural_order"
+}
+
 pub(super) fn single() -> &'static str {
     // Stale statistics can underestimate a large null/missing-key group. Keep
     // the natural-order range outermost instead of sorting the complete group

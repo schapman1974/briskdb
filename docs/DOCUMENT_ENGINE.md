@@ -434,11 +434,22 @@ malformed or unreadable metadata fails closed. Explicit provisioning/upgrade
 retains its transaction and final full validation. This removes a duplicate
 secondary-schema inspection, not an integrity check or a schema-generation fence.
 
-Singleton candidates also pin the document-first join, preventing stale SQLite
-statistics from sorting an entire large equality/null-key group for each one-row
-frontier. These joins prioritize bounded pagination memory: SQLite can still walk
-nonmatching document/index entries even though BSON decoding skips noncandidates.
-They are not index-order scans or an index-only read promise.
+Singleton equality candidates first seek at most 33 secondary entries, including
+the conservative fallback key. Groups of at most 32 entries and 64 KiB of total
+identity bytes use an index-first path: sort only that bounded identity frontier
+by natural order, then fetch the selected BSON and checksum-bound entries. Both
+queries share a read snapshot held by an active selectivity cursor; concurrent
+writes cannot enlarge the admitted group between them. The cursor is released on
+success, cancellation, and error, without committing a caller's transaction or
+tainting an otherwise reusable pooled connection. This is a per-shard scan
+snapshot, not a cross-shard or cross-request snapshot.
+
+Larger singleton groups retain the document-first streaming join, preventing
+stale SQLite statistics from sorting an entire large equality/null-key group for
+each one-row frontier. Multiple-key, sparse, and range probes also retain their
+bounded streaming paths. These fallback joins can still walk nonmatching
+document/index entries even though BSON decoding skips noncandidates. This is not
+index-order output or an index-only read promise, and does not change stored formats.
 
 Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
 9,541 eligible matching candidates) without false negatives, plus native and

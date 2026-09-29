@@ -2233,6 +2233,45 @@ mod enabled {
             let sqlite_limit =
                 i64::try_from(limit).expect("bounded document scan limit fits SQLite");
             require_schema(connection)?;
+            let single_key = probe.and_then(|probe| match probe.selection() {
+                DocumentIndexSelection::Keys(keys) if keys.len() == 1 => Some((probe, &keys[0])),
+                _ => None,
+            });
+            // Keep the selectivity cursor active until the candidate scan ends;
+            // both statements must see the same entry set, even with writers.
+            let mut snapshot_statement = if single_key.is_some() {
+                Some(
+                    connection
+                        .prepare(candidate_sql::SELECTIVITY_SQL)
+                        .map_err(|error| {
+                            shard_read_error(
+                                error,
+                                "failed to prepare document candidate read snapshot",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let snapshot = if let (Some((probe, key)), Some(statement)) =
+                (single_key, snapshot_statement.as_mut())
+            {
+                Some(
+                    candidate_sql::selective_snapshot(
+                        statement,
+                        to_sqlite_id(collection_id)?,
+                        probe.index_id().get() as i64,
+                        key,
+                        crate::document::NON_UNIQUE_FALLBACK_KEY,
+                    )
+                    .map_err(|error| {
+                        shard_read_error(error, "failed to select bounded document candidates")
+                    })?,
+                )
+            } else {
+                None
+            };
+            let selective = snapshot.as_ref().is_some_and(|(_, selective)| *selective);
             let grouped_sql = match probe.map(DocumentIndexProbe::selection) {
                 Some(DocumentIndexSelection::Keys(keys)) if keys.len() > 1 => {
                     Some(candidate_sql::membership(keys.len()))
@@ -2243,7 +2282,9 @@ mod enabled {
                 }) => Some(candidate_sql::string_range(*greater, *inclusive)),
                 _ => None,
             };
-            let sql = if let Some(sql) = grouped_sql.as_deref() {
+            let sql = if selective {
+                candidate_sql::selective_single()
+            } else if let Some(sql) = grouped_sql.as_deref() {
                 sql
             } else if probe.is_some() {
                 // Preserve streaming natural-order frontiers even when stale
@@ -2376,6 +2417,10 @@ mod enabled {
                 }
                 records.push(record);
             }
+            drop(rows);
+            drop(statement);
+            drop(snapshot);
+            drop(snapshot_statement);
             ensure_document_operation_not_cancelled(cancellation, "after scanning documents")?;
             Ok(records)
         }
