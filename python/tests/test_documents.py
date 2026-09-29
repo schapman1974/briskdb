@@ -115,7 +115,8 @@ class PythonDocumentApiTests(unittest.TestCase):
                     self.assertGreaterEqual(distinct["read_stats"]["documents_examined"], 12)
                     aggregate = session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], execution_stats=True)
                     self.assertEqual(aggregate["documents"], [{"n": 12}])
-                    self.assertGreaterEqual(aggregate["read_stats"]["documents_examined"], 12)
+                    self.assertEqual(aggregate["read_stats"]["storage_reads"], 4)
+                    self.assertEqual(aggregate["read_stats"]["documents_examined"], 0)
                     self.assertEqual(aggregate["read_stats"]["matcher_evaluations"], 0)
                     self.assertEqual(aggregate["read_stats"]["source_matches"], aggregate["read_stats"]["documents_examined"])
                     skipped = session.find(DATABASE, COLLECTION, {"_id": 1}, skip=1, execution_stats=True)
@@ -2178,7 +2179,8 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreaterEqual(distinct["read_stats"]["documents_examined"], 3)
                     aggregate = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], execution_stats=True)
                     self.assertEqual(aggregate["documents"], [{"n": 3}])
-                    self.assertGreaterEqual(aggregate["read_stats"]["documents_examined"], 3)
+                    self.assertEqual(aggregate["read_stats"]["storage_reads"], 2)
+                    self.assertEqual(aggregate["read_stats"]["documents_examined"], 0)
                     for execution in (first, second, distinct, aggregate):
                         stats = execution["read_stats"]
                         self.assertIs(type(stats["storage_read_nanos"]), int)
@@ -2203,7 +2205,7 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     distinct = await session.distinct(DATABASE, COLLECTION, "v", plan_diagnostics=True)
                     self.assertEqual(distinct["plan"]["read_access"], {"kind": "scan", "reason": "unfiltered"})
                     aggregate = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], plan_diagnostics=True)
-                    self.assertEqual(aggregate["plan"]["read_access"], {"kind": "scan", "reason": "aggregation_input"})
+                    self.assertEqual(aggregate["plan"]["read_access"], {"kind": "scan", "reason": "count_rows"})
                     self.assertEqual(aggregate["documents"], [{"n": 3}])
                     self.assertNotIn("read_access", (await session.find(DATABASE, COLLECTION))["plan"])
 

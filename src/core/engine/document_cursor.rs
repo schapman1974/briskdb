@@ -15,10 +15,10 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         BsonDocument, CanonicalBsonKey, DocumentAggregationStream, DocumentCollectionId,
-        DocumentCursorError, DocumentCursorId, DocumentDatabaseId, DocumentMatcher,
-        DocumentNamespace, DocumentPartialAggregation, DocumentPlan, DocumentPointPlan,
-        DocumentProjector, DocumentReadOptions, DocumentReadStats, DocumentScatterPlan,
-        DocumentSortKey, DocumentSorter,
+        DocumentCountAggregation, DocumentCursorError, DocumentCursorId, DocumentDatabaseId,
+        DocumentMatcher, DocumentNamespace, DocumentPartialAggregation, DocumentPlan,
+        DocumentPointPlan, DocumentProjector, DocumentReadOptions, DocumentReadStats,
+        DocumentScatterPlan, DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -273,6 +273,7 @@ impl RetainedCursorState {
 pub(super) struct AggregateCursor {
     pub runner: Option<DocumentAggregationStream>,
     pub partial: Option<Arc<DocumentPartialAggregation>>,
+    pub count: Option<DocumentCountAggregation>,
     pub pending: VecDeque<AggregateRow>,
     pub bytes: usize,
     pub source_exhausted: bool,
@@ -287,6 +288,7 @@ pub(super) struct AggregateRow {
 impl AggregateCursor {
     fn retained_bytes(&self) -> usize {
         self.bytes
+            .saturating_add(self.count.as_ref().map_or(0, |plan| plan.retained_bytes()))
             .saturating_add(
                 self.partial
                     .as_ref()
@@ -871,6 +873,7 @@ mod tests {
         let owner = ConnectionOwner::new(1);
         let mut cursor = state();
         cursor.aggregation = Some(AggregateCursor {
+            count: None,
             partial: None,
             runner: Some(
                 DocumentAggregator::compile(&DocumentPipeline::new(Vec::new()).unwrap())

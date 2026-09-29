@@ -42,12 +42,13 @@ impl DocumentReadStats {
         self
     }
 
-    /// Point/candidate record-read calls, including calls that find no record.
+    /// Point/candidate record-read calls (including misses), or shard scalar
+    /// count calls. Scalar counts do not contribute decoded-row observations.
     pub const fn storage_reads(&self) -> u64 {
         self.storage_reads
     }
 
-    /// Sum of elapsed monotonic nanoseconds inside record-read storage calls,
+    /// Sum of elapsed monotonic nanoseconds inside record-read/scalar-count calls,
     /// including SQLite execution and BSON decoding, misses and repeated reads.
     /// Excludes pool/worker admission, catalog checks, source matching and later
     /// result processing. Parallel shard calls overlap: this is neither query
@@ -64,8 +65,9 @@ impl DocumentReadStats {
         self.documents_examined
     }
 
-    /// Full source-matcher evaluations. Aggregation pipeline predicates are not
-    /// source matcher evaluations and are deliberately not counted here.
+    /// Full source-matcher evaluations, including a predicate lowered into a
+    /// scalar count's source. Predicates retained in a general/limited pipeline
+    /// are deliberately not counted here.
     pub const fn matcher_evaluations(&self) -> u64 {
         self.matcher_evaluations
     }
@@ -78,7 +80,7 @@ impl DocumentReadStats {
         self.source_matches
     }
 
-    /// Distinct physical shards on which a record-read call actually ran.
+    /// Distinct physical shards on which a record-read/scalar-count call ran.
     pub fn shards_read(&self) -> impl Iterator<Item = u16> + '_ {
         (0_u16..64).filter(|shard| self.shard_mask & (1_u64 << shard) != 0)
     }

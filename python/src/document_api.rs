@@ -291,6 +291,7 @@ fn read_access_to_python(py: Python<'_>, access: DocumentReadAccess) -> PyResult
                 DocumentScanReason::NoSafeProbe => "no_safe_probe",
                 DocumentScanReason::ProbeWorkLimit => "probe_work_limit",
                 DocumentScanReason::AggregationInput => "aggregation_input",
+                DocumentScanReason::CountRows => "count_rows",
                 _ => return Err(crate::error::unsupported("unknown document scan reason")),
             };
             output.set_item("kind", "scan")?;

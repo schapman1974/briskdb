@@ -111,6 +111,7 @@ impl FrontierBudget {
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn count_document_shards(
         &self,
         owner: ConnectionOwner,
@@ -118,6 +119,7 @@ impl Engine {
         route: &PreparedFilterRoute,
         cancellation: RequestScope,
         deadline: Option<Instant>,
+        stats: Option<Arc<ReadStats>>,
     ) -> EngineResult<u64> {
         let matcher = route.matcher().cloned();
         let shards = route.shards(self.shard_count()).collect();
@@ -130,6 +132,7 @@ impl Engine {
             move |shard, cancellation| {
                 let engine = engine.clone();
                 let matcher = matcher.clone();
+                let stats = stats.clone();
                 async move {
                     engine
                         .run_document_shard(
@@ -150,7 +153,7 @@ impl Engine {
                                         Some(&matcher),
                                         cancellation,
                                         deadline,
-                                        None,
+                                        stats.as_deref(),
                                     )? {
                                         after = Some(record.natural_order());
                                         count = count.checked_add(1).ok_or_else(|| {
@@ -159,12 +162,14 @@ impl Engine {
                                     }
                                     Ok(count)
                                 } else {
-                                    storage.count_document_shard_on_connection(
-                                        connection,
-                                        collection_id,
-                                        shard,
-                                        cancellation,
-                                    )
+                                    ReadStats::observe_storage_read(stats.as_deref(), shard, || {
+                                        storage.count_document_shard_on_connection(
+                                            connection,
+                                            collection_id,
+                                            shard,
+                                            cancellation,
+                                        )
+                                    })
                                 }
                             },
                         )

@@ -112,6 +112,31 @@ impl Group {
     pub fn retained_bytes(&self) -> usize {
         self.bytes
     }
+
+    pub(super) fn is_unit_count(&self) -> bool {
+        matches!(self.key, Expression::Literal(_))
+            && matches!(
+                self.accumulators.as_slice(),
+                [(
+                    _,
+                    Operator::Sum,
+                    Expression::Literal(BsonValue::Int32(1) | BsonValue::Int64(1))
+                )]
+            )
+    }
+
+    pub(super) fn into_unit_count(self) -> (String, BsonValue) {
+        assert!(self.is_unit_count());
+        let Expression::Literal(key) = self.key else {
+            unreachable!("literal count key")
+        };
+        let (field, _, _) = self
+            .accumulators
+            .into_iter()
+            .next()
+            .expect("one accumulator");
+        (field, key)
+    }
 }
 
 enum State {

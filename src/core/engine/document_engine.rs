@@ -1007,6 +1007,7 @@ impl Engine {
                                 &route,
                                 cancellation,
                                 deadline,
+                                None,
                             )
                             .await?;
                         (route.plan(collection_id, self.shard_count())?, count)
@@ -1678,6 +1679,11 @@ impl Engine {
         let source = state.source.clone();
         let collection = state.collection_id;
         let aggregation = state.aggregation.is_some();
+        let native_count = state
+            .aggregation
+            .as_ref()
+            .and_then(|state| state.count.as_ref())
+            .is_some_and(|count| count.uses_native_count());
         self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
             use crate::document::{DocumentReadAccess, DocumentScanReason};
             let mut check = || ensure_document_cpu_active(cancellation, &control);
@@ -1685,7 +1691,11 @@ impl Engine {
             // The request still owns schema admission. This uses the same
             // Ready cache and bounded selector as its actual reads, but keeps
             // only payload-free diagnostics, never retained probe authority.
-            let access = if aggregation {
+            let access = if native_count && source.matcher().is_none() {
+                DocumentReadAccess::Scan {
+                    reason: DocumentScanReason::CountRows,
+                }
+            } else if aggregation && !native_count {
                 DocumentReadAccess::Scan {
                     reason: DocumentScanReason::AggregationInput,
                 }

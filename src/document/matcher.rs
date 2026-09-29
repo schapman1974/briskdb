@@ -106,6 +106,14 @@ impl fmt::Debug for DocumentMatcher {
     }
 }
 
+impl DocumentMatcher {
+    /// Only a compiled empty predicate (including ignored comments) is known
+    /// to match without examining a record. Logical tautologies stay matchers.
+    pub(crate) fn is_unconditional(&self) -> bool {
+        self.clauses.is_empty()
+    }
+}
+
 enum Clause {
     Field {
         path: Vec<String>,

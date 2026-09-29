@@ -21,7 +21,7 @@ pub enum DocumentCandidateKind {
     StringRange,
 }
 
-/// Why this source uses natural-order scanning instead of a secondary probe.
+/// Why this source uses scanning/counting instead of a secondary probe.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentScanReason {
@@ -31,6 +31,9 @@ pub enum DocumentScanReason {
     ProbeWorkLimit,
     /// Aggregation retains every routed source row for pipeline accounting.
     AggregationInput,
+    /// Exact unfiltered scalar count over stored row identities, without BSON
+    /// decoding. This is not a general aggregation-input scan.
+    CountRows,
 }
 
 /// Payload-free access-path diagnostics, selected under current schema admission.
