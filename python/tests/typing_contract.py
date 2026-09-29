@@ -4,6 +4,11 @@ from pathlib import Path
 import sqlite3
 
 import briskdb
+from briskdb._briskdb import DocumentScanAccess
+
+
+def scalar_count_access_contract() -> DocumentScanAccess:
+    return {"kind": "scan", "reason": "count_rows"}
 
 
 def contention_policy_contract() -> briskdb.Config:

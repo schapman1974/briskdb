@@ -34,7 +34,7 @@ class WriteResult(TypedDict):
 
 class DocumentScanAccess(TypedDict):
     kind: Literal["scan"]
-    reason: Literal["unfiltered", "no_ready_index", "no_safe_probe", "probe_work_limit", "aggregation_input"]
+    reason: Literal["unfiltered", "no_ready_index", "no_safe_probe", "probe_work_limit", "aggregation_input", "count_rows"]
 
 class DocumentIndexAccess(TypedDict):
     kind: Literal["index_candidates"]

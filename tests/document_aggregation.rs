@@ -13,6 +13,8 @@ use briskdb::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "document_aggregation/count.rs"]
+mod count;
 #[path = "document_aggregation/partial.rs"]
 mod partial;
 

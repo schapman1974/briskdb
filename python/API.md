@@ -226,14 +226,16 @@ zero for sparse-entry scanning). String ranges filter single-component index
 entries before BSON reads; they are not ordered B-tree seeks or numeric coercions.
 A scan has
 `kind="scan"` and `reason`: `unfiltered`, `no_ready_index`, `no_safe_probe`,
-`probe_work_limit` or `aggregation_input`. No filter values, encoded keys or
+`probe_work_limit`, `aggregation_input` or `count_rows`. The last means an exact
+unfiltered scalar row count without decoding BSON. No filter values, encoded keys or
 index names are returned. Exact-ID point plans keep their existing shape.
 Repeat the option on each `get_more` that should report diagnostics; it is not
 retained by the cursor, and current index authority is reselected on each call.
 Default output is unchanged. Diagnostic scatter metadata adds 32 bytes to the
 engine's logical result budget. These are **plan choices, not measured work**:
-`shards` lists planned owners, not actual visits; aggregation still scans its
-routed input for pipeline accounting. This is not MongoDB `explain` or
+`shards` lists planned owners, not actual visits. General aggregation scans its
+routed input for pipeline accounting; eligible scalar counts use the count path
+described below. This is not MongoDB `explain` or
 `executionStats`, an index-only plan, or a new optimization. Count and mutation
 methods do not expose this option; catalog reads have no data access path.
 
@@ -250,7 +252,7 @@ for shard in result["read_stats"]["shard_work"]:
 ```
 
 The counters are `storage_reads` (point/candidate record-read calls, including
-misses), `documents_examined` (stored BSON records received before filtering or
+misses, plus shard scalar-count calls), `documents_examined` (stored BSON records received before filtering or
 projection), `matcher_evaluations` (full source-matcher evaluations),
 `source_matches` (record observations accepted by the source predicate), and
 `shards_read` (distinct physical shards where those calls ran). `shard_work`
@@ -260,7 +262,7 @@ actually-read shards.
 Empty probes have zero rows; buffered output has an empty list. It exposes
 row-work distribution without namespace labels, not CPU or physical I/O skew.
 The integer `storage_read_nanos` on the overall snapshot is the saturating sum
-of per-shard elapsed monotonic nanoseconds inside record-read storage calls,
+of per-shard elapsed monotonic nanoseconds inside record-read/scalar-count storage calls,
 including SQLite execution and BSON decoding. Misses and refetches are timed;
 pool/worker admission, engine catalog preflight, probe selection, source matching,
 engine sort-key/merge work and later result processing are not. Concurrent
@@ -270,7 +272,10 @@ Lookahead and
 sorting rescans count again; these are not distinct-document counts. Source
 matches include unfiltered reads and direct-ID hits before sort-position
 rechecks, projection, skip/limit and pipeline stages, not final output rows. Buffered
-aggregation output can have zero source reads on a later page. Pipeline
+aggregation output can have zero source reads on a later page. Unfiltered scalar
+counts have storage-call/shard/timing observations but zero decoded-document,
+source-match and matcher counters. Filtered scalar counts without a limit move
+their predicate into the source and report those matcher evaluations. Other pipeline
 predicates, catalog queries, individual index entries and SQLite pages/bytes are not
 counted by the row counters. Each request starts from zero; repeat the flag on
 each continuation. Empty initial batches do zero record reads. This independent
@@ -566,6 +571,14 @@ Mongo listener, hosted through Rust or Python `db.serve(mongo=...)`, exposes
 batch inserts/deletes, retained finds
 and aggregation, `estimated_document_count()`, and aggregation-backed
 `count_documents()` through PyMongo. These share the native document engine.
+PyMongo's scalar-count pipeline (optional leading `$match`, skip/limit stages,
+then `$count` or a literal-key `$group` with one integer `$sum: 1`) avoids the
+general aggregation 65,536-input/four-million-work-step limits. Unfiltered counts
+use exact stored-row counts without decoding unrelated BSON payloads; filtered
+counts retain the shared matcher, per-record limits and cancellation/deadlines.
+Filtered limits stop evaluation in encounter order. Empty inputs still produce
+no aggregate row (PyMongo returns zero); ordinary grouping/sorting quotas remain.
+See [scalar count execution](../docs/DOCUMENT_ENGINE.md#scalar-count-execution).
 
 ## Attached listeners
 

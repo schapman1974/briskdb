@@ -299,8 +299,8 @@ marker) and deduplicate matching entries by the collection's unique natural-orde
 identity before SQL pagination. A multikey document is returned or mutated once,
 even if several array elements match the list. The document-first join preserves
 the natural-order range and streams grouping without an all-candidate temporary
-sort, including after SQLite statistics are collected. Aggregation still receives its
-original unfiltered source rows; membership probes do not bypass its accounting.
+sort, including after SQLite statistics are collected. General aggregation still receives its
+original unfiltered source rows; the scalar-count exception is described below.
 
 After equality and finite membership candidates, a necessary positive
 `$exists: true` clause can select all entries of a non-partial sparse Ready index.
@@ -380,15 +380,16 @@ read-plan diagnostics with `DocumentReadOptions::with_plan_diagnostics(true)`
 (Python: `plan_diagnostics=True`). `DocumentScatterPlan::read_access()` then
 reports `DocumentReadAccess::IndexCandidates` with a numeric index identity,
 proof kind and key count (one bound for `StringRange`), or `Scan` with an unfiltered/no-ready-index/
-no-safe-probe/probe-work-limit/aggregation-input reason. The selector is shared
+no-safe-probe/probe-work-limit/aggregation-input/count-rows reason. The selector is shared
 with actual reads and runs under that request's schema admission, cancellation
 and deadline. It retains no probe authority between cursor pages. Defaults and
 exact-ID point plans are unchanged; each continuation opts in separately.
 The fixed 32-byte diagnostic charge participates in result limits and page
 packing, including sorted/aggregate pages. No BSON keys, filters or index names
 are exposed. These are planned access paths, not measured row/shard visits,
-SQLite I/O or index-only reads. Aggregation preserves its routed source scan
-and pipeline work accounting. Counts and find-and-modify reject this native
+SQLite I/O or index-only reads. General aggregation preserves its routed source scan
+and pipeline work accounting; scalar-count lowering has its own access path below.
+Native count methods and find-and-modify reject this native
 option; catalog commands have no data access path. MongoDB `explain` and actual
 SQLite-level execution counters remain separate work from these native planner
 diagnostics; no Mongo `explain` response or physical-page accounting is implied.
@@ -396,7 +397,7 @@ diagnostics; no Mongo `explain` response or physical-page accounting is implied.
 `DocumentReadOptions::with_execution_stats(true)` independently enables native
 per-request `DocumentExecution::read_stats()` (`execution_stats=True` /
 `result["read_stats"]` in sync/async Python). The payload-free snapshot contains
-record-read call counts, BSON documents examined, source-matcher evaluations,
+record-read/scalar-count call counts, BSON documents examined, source-matcher evaluations,
 `source_matches`, and actual distinct read shards. A source match is a record
 observation accepted by the source predicate, including direct-ID hits and
 unfiltered reads, before sort-position rechecks, projection, skip/limit and
@@ -405,7 +406,7 @@ pipeline stages. It is not a unique-document or returned-row count.
 each actually-read physical shard, sorted by ordinal, including zero-row empty probes; buffered pages have
 no entries. Three fixed 64-slot arrays preserve the bounded native `Copy` snapshot
 without namespace labels or per-record state. The total `storage_read_nanos()`
-is the saturating sum of per-shard elapsed monotonic nanoseconds inside record-read
+is the saturating sum of per-shard elapsed monotonic nanoseconds inside record-read/scalar-count
 storage calls, including SQLite execution and BSON decoding. Misses, lookahead
 and refetches are timed too. Pool/worker admission, catalog checks, candidate-probe
 selection, source matching, engine sort-key/merge work and later result processing
@@ -415,7 +416,8 @@ on both the overall snapshot and each shard summary. Exact-ID, pruned-shard, nat
 sorted, distinct and aggregation source reads share the collector. Lookahead
 and repeated sorting/source reads count again, including sorted-output refetches
 and their matcher rechecks; buffered aggregation pages can
-correctly report zero source work. The row counters exclude pipeline predicates,
+correctly report zero source work. Unfiltered scalar counts report calls/timing
+but zero decoded-row observations. The row counters exclude predicates retained in pipelines,
 catalog queries, individual index entries and physical SQLite rows/pages/bytes.
 Each requested page starts fresh, detaches the collector before cursor retention, and charges a
 fixed conservative 4,096 bytes in output limits/page packing, including up to
@@ -599,8 +601,9 @@ the entire filter. Empty/oversized lists, regex members, negations, dotted IDs
 and unproven branches provide no restriction. Without another necessary bound,
 these scan every shard; empty owner intersections also use the ordinary scan
 and matcher rather than introducing an empty-source plan.
-Aggregation uses the same shard restriction for a safe first-stage match, while
-keeping its original matcher and cumulative accounting in the pipeline. The shared
+General aggregation uses the same shard restriction for a safe first-stage match, while
+keeping its original matcher and cumulative accounting in the pipeline (see the
+scalar-count exception below). The shared
 Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
 restarts. `skip` and `limit` apply once across the whole cursor, after the
@@ -1377,6 +1380,39 @@ are tested. It inherits aggregation's consumed-row/work bounds; unlike the
 legacy count command, explicit `limit=0` is an invalid `$limit` (15958).
 Native Python's count helper continues to use the separate engine count command.
 
+### Scalar count execution
+
+After eagerly validating the entire pipeline, engine-backed aggregation recognizes
+an optional leading `$match`, any skip/limit sequence, and a terminal `$count`
+or literal-key `$group` with exactly one integer-unit `$sum`. This includes the
+pipeline sent by real PyMongo `count_documents()`. Other accumulators, computed
+keys, transforms, sorts, later predicates and trailing stages are not rewritten.
+The standalone borrowed/streaming aggregation APIs retain their existing quotas.
+
+Unfiltered scalar counts reuse the native controlled `count(*)` on each routed
+shard, retaining only checked scalar totals rather than decoding BSON payloads.
+Like native count, this uses startup validation and normal point/scan reads as
+the checksum boundary; it is not a fresh payload-integrity audit. Filtered counts
+without a limit use the full shared matcher and existing safe candidate probes.
+Filtered limits retain natural-order source processing and stop predicate
+evaluation when a limit is exhausted, even if a later skip discards that row.
+Global skip/limit ordering, empty-input omission, constant key bytes, and
+Int32/Int64/Double count promotion remain intact.
+
+These paths retain bounded plan/counter/output state and do not charge the
+general aggregation consumed-row or cumulative work quota. BSON decoding,
+per-document matcher bounds, worker/pool admission, cancellation, finite command
+deadlines, cursor retention and result-byte limits still apply. No cross-shard
+snapshot is introduced. A zero initial batch defers counting to `getMore`, with
+the same drop/recreate identity fence and cursor cleanup as other aggregates.
+
+Native plan diagnostics report `scan/count_rows` for unfiltered scalar counts,
+normal candidate/scan diagnostics for lowered filtered counts, and
+`aggregation_input` for filtered-limit processing. Execution statistics count
+scalar shard calls/timing without inventing BSON document observations;
+predicates lowered into the source contribute matcher counters. General
+aggregation's diagnostics and work quotas are unchanged.
+
 ### Aggregate commands and cursors
 
 `DocumentCommand::Aggregate`, native Python `Session.aggregate`/`AsyncSession.aggregate`,
@@ -1386,13 +1422,13 @@ match/skip/limit/transform prefix. The first count retains only a counter; the f
 retains bounded input; the first group retains bounded accumulator state.
 Finalization feeds blocking-stage output through the
 remaining shared executor. A prefix limit stops further source consumption.
-Streams admit at most 65,536 consumed inputs and four million checked steps
+General streams admit at most 65,536 consumed inputs and four million checked steps
 over their entire lifetime, including finalization; bounds do not reset per
 cursor batch. A failed push poisons the stream. Simple pipelines are not fully
 buffered merely for wire delivery. The borrowed `DocumentAggregator::execute`
 API above remains an explicitly materialized alternative.
 
-Collection reads currently use controlled one-document source pages in global
+Except for the scalar count path below, collection reads use controlled one-document source pages in global
 durable natural order, with a bounded shard frontier independent of caller
 output limits. All pipeline CPU work runs in admitted workers with cancellation
 and deadlines. A first-stage `$match` with a sole exact `_id`/`$eq` uses a point

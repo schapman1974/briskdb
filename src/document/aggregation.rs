@@ -20,6 +20,8 @@ const ROW_BYTES: usize = 96;
 
 mod partial;
 pub(crate) use partial::{DocumentPartialAggregation, DocumentPartialBudget};
+mod count;
+pub(crate) use count::DocumentCountAggregation;
 
 enum Stage {
     Match(DocumentMatcher),

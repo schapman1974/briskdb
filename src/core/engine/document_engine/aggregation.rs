@@ -25,7 +25,7 @@ impl Engine {
         }
         let storage = self.inner.database.storage.clone();
         let lookup = namespace.clone();
-        let (collection_id, source, runner, partial) = self
+        let (collection_id, source, runner, partial, count) = self
             .run_document_storage_task(
                 cancellation.clone(),
                 deadline,
@@ -33,10 +33,10 @@ impl Engine {
                     let runner = DocumentAggregator::compile_with_check(&pipeline, &mut || {
                         ensure_document_cpu_active(cancellation, &control)
                     })?;
-                    // Compile every stage first. The original leading match
-                    // stays in the runner; only physical shard selection moves
-                    // into the source, never filtering ahead of its work budget.
-                    let source = id_routing::leading_match_source(
+                    // Compile every stage first. General pipelines keep the
+                    // leading match in their runner. Only proven scalar counts
+                    // below can lower a predicate into their bounded source.
+                    let mut source = id_routing::leading_match_source(
                         &storage,
                         &pipeline,
                         cancellation,
@@ -48,16 +48,31 @@ impl Engine {
                         Arc::clone(&control),
                     )?;
                     ensure_document_cpu_active(cancellation, &control)?;
-                    let (runner, partial) = if runner.can_partition() {
-                        (None, Some(Arc::new(runner.into_partial())))
-                    } else {
-                        (Some(runner.into_stream()), None)
+                    let (runner, partial, count) = match runner.into_count() {
+                        Ok(mut count) => {
+                            if count.uses_native_count() {
+                                let matcher = count.take_source_matcher();
+                                match &mut source {
+                                    PreparedFilterRoute::Point { .. } => (),
+                                    PreparedFilterRoute::Scatter(target)
+                                    | PreparedFilterRoute::ShardSubset {
+                                        matcher: target, ..
+                                    } => *target = matcher,
+                                }
+                            }
+                            (None, None, Some(count))
+                        }
+                        Err(runner) if runner.can_partition() => {
+                            (None, Some(Arc::new(runner.into_partial())), None)
+                        }
+                        Err(runner) => (Some(runner.into_stream()), None, None),
                     };
                     Ok((
                         require_collection(collection)?.id(),
                         source,
                         runner,
                         partial,
+                        count,
                     ))
                 },
             )
@@ -77,6 +92,7 @@ impl Engine {
             aggregation: Some(AggregateCursor {
                 runner,
                 partial,
+                count,
                 pending: VecDeque::new(),
                 bytes: 0,
                 source_exhausted: false,
@@ -189,6 +205,87 @@ impl Engine {
                     .await?;
                 continue;
             }
+            if let Some(mut count) = aggregate.count.take() {
+                let total = if count.uses_native_count() {
+                    let total = if matches!(state.source, PreparedFilterRoute::Point { .. }) {
+                        self.read_document_source_page(
+                            owner,
+                            state,
+                            cancellation.clone(),
+                            deadline,
+                            &source_options,
+                            source_limits,
+                        )
+                        .await?
+                        .0
+                        .len() as u64
+                    } else {
+                        self.count_document_shards(
+                            owner,
+                            state.collection_id,
+                            &state.source,
+                            cancellation.clone(),
+                            deadline,
+                            state.read_stats.clone(),
+                        )
+                        .await?
+                    };
+                    Some(total)
+                } else {
+                    // Retain the original source order and evaluate the predicate
+                    // only as far as the first exhausted limit. No cumulative
+                    // general-aggregation row/work budget is charged for counting.
+                    while !aggregate.source_exhausted && !count.is_input_exhausted() {
+                        let (source, more) = self
+                            .read_document_source_page(
+                                owner,
+                                state,
+                                cancellation.clone(),
+                                deadline,
+                                &source_options,
+                                source_limits,
+                            )
+                            .await?;
+                        aggregate.source_exhausted = !more;
+                        count = self
+                            .run_document_storage_task(
+                                cancellation.clone(),
+                                deadline,
+                                move |cancellation, control| {
+                                    for document in source {
+                                        count.push(&document, &mut || {
+                                            ensure_document_cpu_active(cancellation, &control)
+                                        })?;
+                                    }
+                                    Ok(count)
+                                },
+                            )
+                            .await?;
+                    }
+                    None
+                };
+                aggregate = self
+                    .run_document_storage_task(
+                        cancellation.clone(),
+                        deadline,
+                        move |cancellation, control| {
+                            let mut check = || ensure_document_cpu_active(cancellation, &control);
+                            check()?;
+                            let output = match total {
+                                Some(total) => count.finish_total(total)?,
+                                None => count.finish()?,
+                            };
+                            if let Some(document) = output {
+                                push_output(&mut aggregate, document, &mut check)?;
+                            }
+                            aggregate.source_exhausted = true;
+                            check()?;
+                            Ok(aggregate)
+                        },
+                    )
+                    .await?;
+                continue;
+            }
             let Some(runner) = aggregate.runner.as_ref() else {
                 break;
             };
@@ -251,6 +348,7 @@ impl Engine {
         }
         let has_more = aggregate.runner.is_some()
             || aggregate.partial.is_some()
+            || aggregate.count.is_some()
             || !aggregate.pending.is_empty();
         state.batch_byte_limit = byte_limit;
         state.aggregation = Some(aggregate);
