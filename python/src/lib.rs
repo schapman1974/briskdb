@@ -1092,8 +1092,13 @@ impl Database {
         })
     }
 
-    fn _serve_mongo(&self, py: Python<'_>) -> PyResult<mongo_client::MongoListener> {
-        mongo_client::start(&self.shared, py)
+    #[pyo3(signature = (index_build_timeout_ms=None))]
+    fn _serve_mongo(
+        &self,
+        py: Python<'_>,
+        index_build_timeout_ms: Option<u64>,
+    ) -> PyResult<mongo_client::MongoListener> {
+        mongo_client::start(&self.shared, py, index_build_timeout_ms)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {

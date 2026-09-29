@@ -15,6 +15,12 @@ from . import _briskdb
 _lock = threading.RLock()
 _stores: dict[Path, _Store] = {}
 _pid = os.getpid()
+_DEFAULT_INDEX_BUILD_TIMEOUT_MS = 300000
+
+
+def _validate_index_build_timeout(timeout: Optional[int]) -> None:
+    if timeout is not None and (type(timeout) is not int or not 1 <= timeout <= 86400000):
+        raise ValueError("index_build_timeout_ms must be an integer between 1 and 86400000 or None")
 
 
 def _validate_contention_policy(policy: Optional[_briskdb.ContentionPolicy]) -> None:
@@ -56,7 +62,8 @@ async def _drained(awaitable: Any) -> Any:
 
 class _Store:
     def __init__(self, path: Path, temporary: bool, shards: Optional[int],
-                 contention_policy: Optional[_briskdb.ContentionPolicy]) -> None:
+                 contention_policy: Optional[_briskdb.ContentionPolicy],
+                 index_build_timeout_ms: Optional[int]) -> None:
         self.path = path
         self.temporary = temporary
         self.pid = os.getpid()
@@ -65,11 +72,17 @@ class _Store:
         # Creation defaults to four shards. Reopening retains the stored layout.
         if shards is None and not (path / "manifest.sqlite").exists():
             shards = 4
+        self.index_build_timeout_ms = (_DEFAULT_INDEX_BUILD_TIMEOUT_MS
+                                      if index_build_timeout_ms is None else index_build_timeout_ms)
+        # This Mongo-only engine must not truncate the listener's build budget
+        # at the native 30s default. Ordinary wire commands still have 15s.
         self.database = _briskdb.open(path, config=_briskdb.Config(
-            shards=shards, documents=True, contention_policy=contention_policy))
+            shards=shards, documents=True, contention_policy=contention_policy,
+            request_timeout_ms=max(30000, self.index_build_timeout_ms)))
         self.contention_policy = contention_policy
         try:
-            self.listener = self.database._serve_mongo()
+            self.listener = self.database._serve_mongo(
+                index_build_timeout_ms=self.index_build_timeout_ms)
         except BaseException:
             self.database.close()
             raise
@@ -87,6 +100,12 @@ class _Store:
             current = self.contention_policy
             if current is None or _policy_key(policy) != _policy_key(current):
                 raise ValueError("contention_policy does not match the open BriskDB database")
+
+    def check_index_build_timeout(self, timeout: Optional[int]) -> None:
+        self.check_process()
+        _validate_index_build_timeout(timeout)
+        if timeout is not None and timeout != self.index_build_timeout_ms:
+            raise ValueError("index_build_timeout_ms does not match the open BriskDB database")
 
     def release(self) -> None:
         self.check_process()
@@ -111,9 +130,11 @@ class _Store:
 
 
 def acquire(folder: Any, shards: Optional[int],
-            contention_policy: Optional[_briskdb.ContentionPolicy] = None) -> _Store:
+            contention_policy: Optional[_briskdb.ContentionPolicy] = None,
+            index_build_timeout_ms: Optional[int] = None) -> _Store:
     _check_process()
     _validate_contention_policy(contention_policy)
+    _validate_index_build_timeout(index_build_timeout_ms)
     with _lock:
         if shards is not None and (type(shards) is not int or not 2 <= shards <= 64):
             raise ValueError("shards must be an integer between 2 and 64")
@@ -129,10 +150,11 @@ def acquire(folder: Any, shards: Optional[int],
             if shards is not None and shards != existing.database.shard_count:
                 raise ValueError("shards does not match the open BriskDB database")
             existing.check_contention_policy(contention_policy)
+            existing.check_index_build_timeout(index_build_timeout_ms)
             existing.references += 1
             return existing
         try:
-            store = _Store(path, temporary, shards, contention_policy)
+            store = _Store(path, temporary, shards, contention_policy, index_build_timeout_ms)
         except BaseException:
             if temporary:
                 shutil.rmtree(path)

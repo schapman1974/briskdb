@@ -55,10 +55,12 @@ async def async_server_reload_contract(server: briskdb.AsyncServer) -> None:
 
 def patched_client_contract(path: str) -> None:
     policy = briskdb.ContentionPolicy.fail_fast()
-    with briskdb.patch(folder=path, shards=4, contention_policy=policy) as Client:
-        with Client(contention_policy=policy) as client:
+    with briskdb.patch(folder=path, shards=4, contention_policy=policy,
+                      index_build_timeout_ms=120000) as Client:
+        with Client(contention_policy=policy, index_build_timeout_ms=120000) as client:
+            build_budget: int = client.briskdb_index_build_timeout_ms
             selected: Optional[briskdb.ContentionPolicy] = client.briskdb_contention_policy
-            print(selected)
+            print(selected, build_budget)
             print(client.app.items.find_one({"_id": 1}))
     with briskdb.MongoClient(folder=path, contention_policy=policy) as client:
         print(client.app.items.find().sort("score", briskdb.DESCENDING).to_list())
@@ -72,10 +74,12 @@ def patched_client_contract(path: str) -> None:
 
 async def async_patched_client_contract(path: str) -> None:
     policy = briskdb.ContentionPolicy.fail_fast()
-    async with briskdb.patch(folder=path, contention_policy=policy):
-        async with briskdb.AsyncMongoClient(folder=path, contention_policy=policy) as client:
+    async with briskdb.patch(folder=path, contention_policy=policy, index_build_timeout_ms=120000):
+        async with briskdb.AsyncMongoClient(folder=path, contention_policy=policy,
+                                          index_build_timeout_ms=120000) as client:
+            build_budget: int = client.briskdb_index_build_timeout_ms
             selected: Optional[briskdb.ContentionPolicy] = client.briskdb_contention_policy
-            print(selected)
+            print(selected, build_budget)
             print(await client.app.items.count_documents({}))
             names: List[str] = await client.get_database("app").get_collection("items").create_indexes(
                 [{"key": {"score": 1}}]

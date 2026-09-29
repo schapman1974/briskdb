@@ -1,6 +1,91 @@
 use super::*;
 
 #[test]
+fn record_validation_seeks_the_record_instead_of_scanning_its_collection() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch(super::super::ENTRIES_SQL).unwrap();
+    connection
+        .execute_batch(super::super::BY_RECORD_SQL)
+        .unwrap();
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {RECORD_ENTRIES_SQL}"))
+        .unwrap();
+    let plan = statement
+        .query_map(params![1, b"target000".as_slice()], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("(collection_id=? AND id_key=?)")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn record_validation_work_is_independent_of_other_records_in_the_same_collection() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    connection.execute_batch(super::super::ENTRIES_SQL).unwrap();
+    connection
+        .execute_batch(super::super::BY_RECORD_SQL)
+        .unwrap();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&steps);
+    connection
+        .progress_handler(
+            1,
+            Some(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+    let validate = || {
+        validate_record_entries(
+            &connection,
+            DocumentCollectionId::from_validated(1),
+            0,
+            b"target000",
+            &[0; 32],
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap()
+    };
+    validate();
+    let empty = steps.swap(0, Ordering::Relaxed);
+    for size in [64, 512] {
+        for id in 0..size {
+            let key = format!("{size:04}-{id:09}").into_bytes();
+            for index in 1..=4 {
+                connection.execute(
+                    "INSERT INTO briskdb_document_index_entries_v1 VALUES (1, ?1, ?2, zeroblob(13), zeroblob(32), 1)",
+                    params![index, key],
+                ).unwrap();
+            }
+        }
+        steps.store(0, Ordering::Relaxed);
+        validate();
+        let populated = steps.load(Ordering::Relaxed);
+        assert!(
+            populated <= empty + 20,
+            "other records expanded validation VM work: {empty} -> {populated}"
+        );
+    }
+}
+
+#[test]
 fn startup_audit_ownership_streams_keys_without_record_seeks_or_temporary_sorting() {
     let connection = Connection::open_in_memory().unwrap();
     connection

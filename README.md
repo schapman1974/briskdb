@@ -478,6 +478,13 @@ models use reduced behavior. They do **not** add TTL expiration or text search.
 Ordinary PyMongo clients retain their own API behavior. See the
 [index-model boundary](python/API.md#local-index-model-compatibility-source-builds).
 
+On unreleased main, managed clients give index builds five minutes by default,
+independent of the 15-second ordinary-command deadline. Use
+`MongoClient(..., index_build_timeout_ms=600_000)` or
+`briskdb.patch(..., index_build_timeout_ms=600_000)` to select a different bound;
+`create_indexes(..., maxTimeMS=120_000)` can narrow it to two minutes. The same
+setting works with async clients. Builds still require exclusive schema access.
+
 ### Query registered SQL tables over HTTP
 
 Registered tables can also be queried over HTTP:

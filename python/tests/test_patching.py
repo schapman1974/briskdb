@@ -256,7 +256,7 @@ assert not _mongo_runtime._stores
                 self.assertTrue(client._briskdb_store.temporary)
                 self.assertTrue((root / "manifest.sqlite").is_file())
                 client.app.items.insert_one({"_id": 1})
-            acquire.assert_called_once_with(None, 2, None)
+            acquire.assert_called_once_with(None, 2, None, None)
         self.assertFalse(root.exists())
 
     def test_unsupported_pymongo_version_rejects_before_engine_acquisition(self):

@@ -15,6 +15,14 @@ use super::{corrupt, shard_read_error};
 
 const ENTRY_DOMAIN: &[u8] = b"briskdb.document-index-entry.v1\0";
 const MAX_RECORD_ENTRIES: usize = 16_384;
+// The primary key's ordering can tempt SQLite into scanning the collection
+// for every record. The validated by-record index bounds this integrity check
+// to this record's entries even while a new index is being built (#553).
+const RECORD_ENTRIES_SQL: &str = "SELECT index_id, index_key, entry_checksum, entry_format_version
+    FROM briskdb_document_index_entries_v1
+    INDEXED BY briskdb_document_index_entries_by_record_v1
+    WHERE collection_id = ?1 AND id_key = ?2
+    ORDER BY index_id, index_key LIMIT 16385";
 
 #[cfg(test)]
 mod tests;
@@ -233,11 +241,7 @@ pub(in crate::storage::document) fn validate_record_entries(
         }
     }
     let mut statement = connection
-        .prepare_cached(
-            "SELECT index_id, index_key, entry_checksum, entry_format_version
-         FROM briskdb_document_index_entries_v1 WHERE collection_id = ?1 AND id_key = ?2
-         ORDER BY index_id, index_key LIMIT 16385",
-        )
+        .prepare_cached(RECORD_ENTRIES_SQL)
         .map_err(|error| shard_read_error(error, "failed to inspect document index entries"))?;
     let mut rows = statement
         .query(params![sqlite_id(collection.get())?, id_key])

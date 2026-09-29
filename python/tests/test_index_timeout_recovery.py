@@ -13,12 +13,13 @@ from briskdb import mongo
 
 
 @contextmanager
-def block_first_shard_past_index_deadline(folder):
+def hold_first_shard_after_index_admission(folder, seconds=3.25):
     """Hold only a test-owned SQLite writer lock, observing durable DDL intent.
 
-    The command gets 3 seconds. Release 3.25 seconds *after* observing its
-    committed journal, so cancellation necessarily happens with an admitted
-    build. No performance threshold or large/slow data set is required.
+    Release after the requested number of seconds *after* observing the
+    committed journal. By default a 3-second command times out before release
+    at 3.25 seconds, with an admitted build. Longer holds also test successful
+    builds beyond the old deadlines without depending on CPU or data volume.
     """
     # A separate process is essential: Python and the wheel use different
     # SQLite libraries, but POSIX advisory locks are owned by the process.
@@ -37,7 +38,7 @@ try:
     while True:
         if manifest.execute("SELECT EXISTS(SELECT 1 FROM briskdb_document_index_operation)").fetchone()[0]:
             print("admitted", flush=True)
-            time.sleep(3.25)
+            time.sleep(float(sys.argv[2]))
             break
         if time.monotonic() >= deadline:
             raise AssertionError("index build never committed its intent")
@@ -47,7 +48,7 @@ finally:
     shard.close()
     manifest.close()
 '''
-    worker = subprocess.Popen([sys.executable, "-c", script, str(folder)],
+    worker = subprocess.Popen([sys.executable, "-c", script, str(folder), str(seconds)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         if worker.stdout.readline().strip() != "locked":
@@ -55,7 +56,7 @@ finally:
         yield
     finally:
         try:
-            output, errors = worker.communicate(timeout=15)
+            output, errors = worker.communicate(timeout=max(15, seconds + 10))
         except subprocess.TimeoutExpired:
             worker.kill()
             worker.communicate()
@@ -74,7 +75,7 @@ class IndexTimeoutRecoveryTests(unittest.TestCase):
                 items.create_indexes([IndexModel("email", unique=True)])
                 client.other_db.items.insert_one({"_id": "other"})
                 definitions = items.index_information()
-                with block_first_shard_past_index_deadline(folder):
+                with hold_first_shard_after_index_admission(folder):
                     with self.assertRaises(ExecutionTimeout) as error:
                         items.create_indexes([IndexModel("n")], maxTimeMS=3000)
                     self.assertEqual(error.exception.code, 50)
@@ -100,7 +101,7 @@ class AsyncIndexTimeoutRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 items = client.app.items
                 documents = [{"_id": i, "n": i} for i in range(32)]
                 await items.insert_many(documents)
-                with block_first_shard_past_index_deadline(folder):
+                with hold_first_shard_after_index_admission(folder):
                     with self.assertRaises(ExecutionTimeout) as error:
                         await items.create_indexes([IndexModel("n")], maxTimeMS=3000)
                     self.assertEqual(error.exception.code, 50)
