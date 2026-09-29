@@ -2866,6 +2866,14 @@ mod enabled {
         })
     }
 
+    // Audit the physical primary tree directly, avoiding secondary-index seeks
+    // back into large records. Natural-order uniqueness and high-water checks
+    // below are order-independent; user-visible query ordering is unchanged.
+    const STARTUP_RECORDS_SQL: &str = "SELECT collection_id, natural_order, id_key, document_bson,
+                document_checksum, storage_format_version
+         FROM briskdb_documents_v1 NOT INDEXED
+         ORDER BY collection_id, id_key";
+
     fn validate_stored_records(
         storage: &Storage,
         manifest_connection: &Connection,
@@ -2916,16 +2924,9 @@ mod enabled {
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
             super::index_storage::require_no_orphans(&connection, None)?;
-            let mut statement = connection
-                .prepare(
-                    "SELECT collection_id, natural_order, id_key, document_bson,
-                            document_checksum, storage_format_version
-                     FROM briskdb_documents_v1
-                     ORDER BY collection_id, natural_order, id_key",
-                )
-                .map_err(|error| {
-                    shard_read_error(error, "failed to inspect stored BSON documents")
-                })?;
+            let mut statement = connection.prepare(STARTUP_RECORDS_SQL).map_err(|error| {
+                shard_read_error(error, "failed to inspect stored BSON documents")
+            })?;
             let mut rows = statement.query([]).map_err(|error| {
                 shard_read_error(error, "failed to inspect stored BSON documents")
             })?;
@@ -3855,6 +3856,31 @@ mod enabled {
             },
             sql::SqlDialect,
         };
+
+        #[test]
+        fn startup_audit_records_walk_the_primary_tree_without_secondary_seeks() {
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(super::super::RECORDS_SCHEMA_SQL)
+                .unwrap();
+            let plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {STARTUP_RECORDS_SQL}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("SCAN briskdb_documents_v1")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|step| !step.contains("USING INDEX") && !step.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
 
         fn shard_path(root: &std::path::Path, shard: u16) -> std::path::PathBuf {
             root.join("shards").join(format!("{shard:04}.sqlite"))

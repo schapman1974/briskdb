@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
@@ -296,27 +296,42 @@ pub(in crate::storage::document) fn validate_record_entries(
 /// Startup audits every collection; an index build audits only its own.
 /// Use separate SQL shapes so the scoped case seeks the collection key prefix
 /// instead of scanning unrelated entries through an optional-filter predicate.
+/// Ordered EXCEPT merges the two key streams instead of seeking into the large
+/// WITHOUT ROWID record for every secondary entry (and rereading overflow pages).
+/// These sources are validated by require_schema before use; select their
+/// physical key order explicitly so no temporary sort is needed.
+/// Query the first orphan directly: EXISTS can discard ORDER BY and switch the
+/// compound query back to a temporary B-tree instead of a streaming merge.
+fn orphan_check_sql(scoped: bool) -> &'static str {
+    if scoped {
+        "SELECT collection_id, id_key FROM briskdb_document_index_entries_v1
+         INDEXED BY briskdb_document_index_entries_by_record_v1 WHERE collection_id = ?1
+         EXCEPT
+         SELECT collection_id, id_key FROM briskdb_documents_v1 NOT INDEXED
+         WHERE collection_id = ?1
+         ORDER BY collection_id, id_key LIMIT 1"
+    } else {
+        "SELECT collection_id, id_key FROM briskdb_document_index_entries_v1
+         INDEXED BY briskdb_document_index_entries_by_record_v1
+         EXCEPT
+         SELECT collection_id, id_key FROM briskdb_documents_v1 NOT INDEXED
+         ORDER BY collection_id, id_key LIMIT 1"
+    }
+}
+
 pub(in crate::storage::document) fn require_no_orphans(
     connection: &Connection,
     collection: Option<DocumentCollectionId>,
 ) -> EngineResult<()> {
-    let sql = if collection.is_some() {
-        "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_entries_v1 AS e
-         LEFT JOIN briskdb_documents_v1 AS d ON d.collection_id = e.collection_id AND d.id_key = e.id_key
-         WHERE e.collection_id = ?1 AND d.collection_id IS NULL)"
-    } else {
-        "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_entries_v1 AS e
-         LEFT JOIN briskdb_documents_v1 AS d ON d.collection_id = e.collection_id AND d.id_key = e.id_key
-         WHERE d.collection_id IS NULL)"
-    };
+    let sql = orphan_check_sql(collection.is_some());
     let collection = collection.map(|id| sqlite_id(id.get())).transpose()?;
-    let orphan: bool = connection
-        .query_row(sql, rusqlite::params_from_iter(collection), |row| {
-            row.get(0)
-        })
+    let orphan = connection
+        .query_row(sql, rusqlite::params_from_iter(collection), |_| Ok(()))
+        .optional()
         .map_err(|error| {
             shard_read_error(error, "failed to validate document index record ownership")
-        })?;
+        })?
+        .is_some();
     if orphan {
         return Err(corrupt("document index entry has no owning record"));
     }

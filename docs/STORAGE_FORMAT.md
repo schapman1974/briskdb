@@ -1968,6 +1968,14 @@ ID bytes, u64 LE length plus BDIK tuple bytes, and the current record checksum's
 32 bytes. Thus unindexed-field changes also require new entry checksums. Reopen
 reproduces the bounded complete key set and rejects missing, extra, stale,
 malformed or orphan entries without repair outside explicit journal ownership.
+Startup compares ordered `(collection_id, id_key)` streams to reject orphan
+entries, then audits records in physical primary-key order rather than seeking
+through the natural-order secondary index. This avoids repeated large-record
+lookups; it is not a validation bypass or a constant-time open. BSON checksums,
+canonical IDs and shard routing, natural-order uniqueness/high-water marks,
+complete index key coverage/checksums, and cross-shard uniqueness fences remain
+enforced. Query ordering and the stored format are unchanged. Index-build
+ownership checks use the same key comparison restricted to their collection.
 Checksums detect damage, not malicious changes by a directory writer. Ready
 entries now serve conservative equality candidates with full BSON matching,
 using this existing format and checksum binding. Version 20 enables secondary
