@@ -178,6 +178,16 @@ impl CommandError {
                     "invalid document index operation",
                 );
             }
+            if cause
+                .downcast_ref::<crate::storage::SchemaOwnershipConflict>()
+                .is_some()
+            {
+                return Self::new(
+                    20,
+                    "IllegalOperation",
+                    "schema changes require sole-process ownership; initialize collections and indexes before starting other BriskDB processes",
+                );
+            }
             if let Some(query) = cause.downcast_ref::<DocumentQueryError>() {
                 let code = query.mongo_code();
                 let name = match code {

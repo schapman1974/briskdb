@@ -155,9 +155,26 @@ Equivalent-name reuse is limited to reduced models with exactly matching ordered
 keys, uniqueness, sparse membership and representation-identical partial filters.
 Planning and builds share the server's exclusive index admission, including
 earlier batch entries. Existing Pending declarations are not Ready authority.
-Concurrent schema changes may return code 112 (`WriteConflict` / busy); the helper
-does not retry arbitrary writes automatically. Normal models still report name
-or option conflicts. Returned real names can be passed to `drop_index`.
+Concurrent schema changes within one process may return code 112 (`WriteConflict`
+/ busy); the helper does not retry arbitrary writes automatically. Normal models
+still report name or option conflicts. Returned real names can be passed to `drop_index`.
+
+For a preinitialized store, matching `collection.create_index()` and
+`collection.create_indexes()` calls succeed from independent sync or async
+workers. The server validates the existing Ready definitions in a fresh manifest
+snapshot without requiring sole-process ownership. Pending indexes are not
+treated as built, and conflicting keys/uniqueness/sparse/partial options still fail.
+
+Actual schema changes (new collections/indexes and drops) still require other
+BriskDB processes to close the store. Through Mongo/PyMongo, this specific
+restriction reports code 20 (`IllegalOperation`) with sole-process-ownership
+guidance, rather than a transient `WriteConflict`. Ordinary write contention
+still reports code 112. Initialize collections and indexes once before starting
+Gunicorn/Uvicorn/Granian workers; each worker can then run the same matching
+index declarations during startup. Native APIs retain `BusyError` for the
+cross-process ownership restriction. This does not enable live multi-process DDL.
+If workers need live schema changes, connect them to one BriskDB server process
+instead of opening the same local folder independently in each worker.
 
 Database/collection factories, subcollections and `with_options()` preserve these
 helpers and driver codec/read/write settings. Sessions remain unsupported. Direct
@@ -454,8 +471,10 @@ uniqueness. Redeclaring an identical built index preserves `lifecycle="ready"`.
 
 Sync and async `build_index(database, collection, name, ...)` build a declared
 index and return its name with `lifecycle="ready"`. They accept the
-usual request ID, timeout, cancellation and result limits. Builds require no
+usual request ID, timeout, cancellation and result limits. Actual builds require no
 other process to hold the database open and exclusively pause schema admission.
+A matching already-Ready build is a validated read-only no-op and can succeed
+while other processes have the store open.
 All current records and the combined index-key budget are validated before
 durable intent. Publication happens only after all shards commit. Interruption
 after intent requires closing/reopening the root; recovery removes the unfinished
@@ -520,8 +539,7 @@ internal ID. Built indexes require sole-process ownership and exclusive schema
 admission. Their entries are removed through the recovery journal without changing
 records or other Ready indexes. Cancellation after durable intent leaves the root
 fenced until closing/reopening finishes the admitted drop; it does not restore the
-index. The same options work through asyncio. Mongo wire `dropIndexes`, wildcard
-and field-alias removal remain unfinished.
+index. The same options work through asyncio.
 
 This API deliberately mirrors the document engine's implemented boundary:
 `insert_one` generates a missing ObjectId while preserving explicit null and
