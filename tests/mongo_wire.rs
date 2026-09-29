@@ -716,6 +716,19 @@ async fn wire_index_metadata_lists_only_ready_definitions_and_validates_options(
         names,
         ["_id_", "!before_id", "partial", "z"].map(BsonValue::from)
     );
+    // A requested batch larger than the server cap is valid, including for
+    // catalog cursors. This used to return CommandNotSupported (#549).
+    let mut large_batch = listing.clone();
+    large_batch
+        .push(
+            "cursor",
+            BsonValue::Document(
+                BsonDocument::from_entries([("batchSize", BsonValue::Int64(i64::MAX))]).unwrap(),
+            ),
+        )
+        .unwrap();
+    let large_reply = send_command(&mut stream, &large_batch).await;
+    assert_eq!(first_batch(&large_reply), first_batch(&reply));
     for (field, value, code) in [
         ("cursor", BsonValue::Boolean(true), 14),
         (
@@ -724,13 +737,6 @@ async fn wire_index_metadata_lists_only_ready_definitions_and_validates_options(
                 BsonDocument::from_entries([("batchSize", BsonValue::Int32(-1))]).unwrap(),
             ),
             2,
-        ),
-        (
-            "cursor",
-            BsonValue::Document(
-                BsonDocument::from_entries([("batchSize", BsonValue::Int32(1001))]).unwrap(),
-            ),
-            115,
         ),
         (
             "cursor",
@@ -1785,7 +1791,7 @@ async fn cursor_limits_malformed_commands_and_unacknowledged_reads_do_not_leak()
     let BsonValue::Int64(id) = ids[0] else {
         unreachable!()
     };
-    for batch in [0, -1, 1001] {
+    for batch in [0, -1] {
         assert_eq!(
             send_command(&mut stream, &cursor_more("cursor_limits", id, batch))
                 .await

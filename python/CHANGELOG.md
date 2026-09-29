@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Mongo cursor `batchSize` requests above 1,000 are now capped internally,
+  rather than rejected, for find, getMore, aggregation and metadata cursors.
+  Large PyMongo limits (including `.limit(1_000_000)`) can page normally (#549).
+  Per-page byte/document limits, total query limits and single-batch behavior
+  remain enforced; this does not raise storage or command resource budgets.
+
 - Matching `create_index()` / `create_indexes()` requests now return after
   catalog/conflict validation without rescanning shard data. New index builds
   check record ownership only in the affected collection, so unrelated indexed

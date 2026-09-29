@@ -231,6 +231,15 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
     BsonDocument::from_entries(entries).expect("static Mongo result field names")
 }
 
+// A driver batchSize is a requested upper bound, not permission to exceed
+// listener resource limits. In particular PyMongo uses the remaining query
+// limit as getMore.batchSize even when the collection contains very few rows.
+const MAX_CURSOR_BATCH_SIZE: u64 = 1000;
+
+fn cursor_batch_size(value: &BsonValue) -> Result<u64> {
+    Ok(unsigned(value)?.min(MAX_CURSOR_BATCH_SIZE))
+}
+
 fn metadata_read_options(body: &BsonDocument) -> Result<DocumentReadOptions> {
     let mut options = DocumentReadOptions::new();
     if let Some(BsonValue::Document(cursor)) = body.get_first("cursor") {
@@ -238,11 +247,7 @@ fn metadata_read_options(body: &BsonDocument) -> Result<DocumentReadOptions> {
             if field != "batchSize" {
                 return Err(CommandError::options());
             }
-            let size = unsigned(value)?;
-            if size > 1000 {
-                return Err(CommandError::unsupported());
-            }
-            options = options.with_batch_size(size)?;
+            options = options.with_batch_size(cursor_batch_size(value)?)?;
         }
     }
     Ok(options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?)
@@ -941,11 +946,7 @@ pub(super) fn prepare_with_limits(
                 }
             }
             if let Some(value) = request.body.get_first("batchSize") {
-                let size = unsigned(value)?;
-                if size > 1000 {
-                    return Err(CommandError::unsupported());
-                }
-                options = options.with_batch_size(size)?;
+                options = options.with_batch_size(cursor_batch_size(value)?)?;
             }
             let single_batch = matches!(
                 request.body.get_first("singleBatch"),
@@ -990,11 +991,7 @@ pub(super) fn prepare_with_limits(
                 if field != "batchSize" {
                     return Err(CommandError::options());
                 }
-                let size = unsigned(value)?;
-                if size > 1000 {
-                    return Err(CommandError::unsupported());
-                }
-                options = options.with_batch_size(size)?;
+                options = options.with_batch_size(cursor_batch_size(value)?)?;
             }
             DocumentAggregator::compile_with_check(&pipeline, &mut || {
                 if started.elapsed() >= timeout {
@@ -1086,10 +1083,10 @@ pub(super) fn prepare_with_limits(
             let batch = request
                 .body
                 .get_first("batchSize")
-                .map(unsigned)
+                .map(cursor_batch_size)
                 .transpose()?
                 .unwrap_or(101);
-            if batch == 0 || batch > 1000 {
+            if batch == 0 {
                 return Err(CommandError::invalid());
             }
             let options = observed_read_options(read_metrics)
@@ -2246,6 +2243,115 @@ pub(super) fn validate_response(body: &BsonDocument) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod batch_size_tests {
+    use super::*;
+
+    fn request(name: &str, size: Option<BsonValue>) -> Request {
+        let mut body = BsonDocument::new();
+        body.push(
+            name,
+            match name {
+                "getMore" => BsonValue::Int64(1),
+                "listCollections" => BsonValue::Int32(1),
+                _ => BsonValue::from("items"),
+            },
+        )
+        .unwrap();
+        if name == "getMore" {
+            body.push("collection", BsonValue::from("items")).unwrap();
+        }
+        if matches!(name, "aggregate" | "listCollections" | "listIndexes") {
+            let mut cursor = BsonDocument::new();
+            if let Some(size) = size {
+                cursor.push("batchSize", size).unwrap();
+            }
+            body.push("cursor", BsonValue::Document(cursor)).unwrap();
+        } else if let Some(size) = size {
+            body.push("batchSize", size).unwrap();
+        }
+        if name == "aggregate" {
+            body.push("pipeline", BsonValue::Array(vec![])).unwrap();
+        }
+        body.push("$db", BsonValue::from("batches")).unwrap();
+        Request {
+            request_id: 1,
+            database: "batches".into(),
+            body,
+            sequences: vec![],
+            more_to_come: false,
+            legacy_handshake: false,
+        }
+    }
+
+    #[test]
+    fn every_cursor_command_caps_requested_sizes_without_changing_byte_limits() {
+        for name in [
+            "find",
+            "getMore",
+            "aggregate",
+            "listCollections",
+            "listIndexes",
+        ] {
+            for (size, expected) in [
+                (None, 101),
+                (Some(BsonValue::Int32(1)), 1),
+                (Some(BsonValue::Int32(1000)), 1000),
+                (Some(BsonValue::Int32(1001)), 1000),
+                (Some(BsonValue::Int64(1_000_000)), 1000),
+                (Some(BsonValue::Int64(i64::MAX)), 1000),
+            ] {
+                let prepared = prepare(&request(name, size), false).unwrap().unwrap();
+                let options = match &prepared.command {
+                    Command::Find(request, _, _) => request.read_options(),
+                    Command::GetMore(request) => request.read_options(),
+                    Command::Aggregate(request, _) => request.read_options(),
+                    Command::ListCollections(request, _) => request.read_options(),
+                    Command::ListIndexes(request, _) => request.read_options(),
+                    _ => panic!("unexpected command"),
+                };
+                assert_eq!(options.batch_size(), expected, "{name}");
+                assert_eq!(
+                    options.batch_byte_limit(),
+                    Some((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_types_and_negatives_stay_invalid_and_only_initial_batches_allow_zero() {
+        for name in [
+            "find",
+            "getMore",
+            "aggregate",
+            "listCollections",
+            "listIndexes",
+        ] {
+            for size in [
+                BsonValue::Int32(-1),
+                BsonValue::Int64(-1),
+                BsonValue::Double(1001.0),
+                BsonValue::Boolean(true),
+                BsonValue::from("1001"),
+                BsonValue::Null,
+            ] {
+                let error = prepare(&request(name, Some(size)), false)
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                assert_eq!(error.code, 2, "{name}");
+            }
+            assert_eq!(
+                prepare(&request(name, Some(BsonValue::Int32(0))), false)
+                    .unwrap()
+                    .is_ok(),
+                name != "getMore"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
