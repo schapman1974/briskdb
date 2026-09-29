@@ -11,7 +11,8 @@ from typing import Any, Optional
 import warnings
 
 from ._briskdb import ContentionPolicy
-from ._mongo_runtime import _check_process, _drained, _validate_contention_policy, acquire
+from ._mongo_runtime import (_check_process, _drained, _validate_contention_policy,
+                             _validate_index_build_timeout, acquire)
 
 _lock = threading.RLock()
 _owner: Any = None
@@ -108,13 +109,16 @@ class MongoPatch(ContextDecorator):
     """
 
     def __init__(self, folder: Any = None, backend: str = "sqlite", *, shards: Optional[int] = None,
-                 contention_policy: Optional[ContentionPolicy] = None) -> None:
+                 contention_policy: Optional[ContentionPolicy] = None,
+                 index_build_timeout_ms: Optional[int] = None) -> None:
         if backend not in ("sqlite", "sqlite-sharded"):
             raise ValueError("BriskDB patch uses SQLite storage; omit folder for isolated temporary data")
         _validate_contention_policy(contention_policy)
+        _validate_index_build_timeout(index_build_timeout_ms)
         self.folder = folder
         self.shards = shards
         self.contention_policy = contention_policy
+        self.index_build_timeout_ms = index_build_timeout_ms
         self._stack: list[_Entry] = []
 
     def _enter(self, owner: Any, entry: _Entry) -> Any:
@@ -132,7 +136,8 @@ class MongoPatch(ContextDecorator):
         try:
             mongo = importlib.import_module(".mongo", __package__)
             entry.pymongo = importlib.import_module("pymongo")
-            entry.store = acquire(self.folder, self.shards, self.contention_policy)
+            entry.store = acquire(self.folder, self.shards, self.contention_policy,
+                                  self.index_build_timeout_ms)
             replacement, replacement_async = entry.replacements(mongo)
             with _lock:
                 entry.original = entry.pymongo.MongoClient
@@ -214,7 +219,8 @@ class MongoPatch(ContextDecorator):
 
 
 def patch(folder: Any = None, backend: str = "sqlite", *, shards: Optional[int] = None,
-          contention_policy: Optional[ContentionPolicy] = None) -> MongoPatch:
+          contention_policy: Optional[ContentionPolicy] = None,
+          index_build_timeout_ms: Optional[int] = None) -> MongoPatch:
     """Route newly constructed PyMongo clients to a scoped local BriskDB engine.
 
     No folder means isolated temporary SQLite storage, deleted after close (not
@@ -223,5 +229,9 @@ def patch(folder: Any = None, backend: str = "sqlite", *, shards: Optional[int] 
     PyMongo is imported only on entry, not on importing BriskDB or calling patch.
     The contention policy belongs to the engine; None inherits an open engine's
     policy or uses legacy waiting for a new engine. Explicit conflicts fail.
+    Index builds default to a five-minute host deadline on a new engine;
+    index_build_timeout_ms selects 1–86400000 ms, or None inherits an open engine.
+    Client maxTimeMS can narrow this bound. Ordinary commands still have 15s.
     """
-    return MongoPatch(folder, backend, shards=shards, contention_policy=contention_policy)
+    return MongoPatch(folder, backend, shards=shards, contention_policy=contention_policy,
+                      index_build_timeout_ms=index_build_timeout_ms)

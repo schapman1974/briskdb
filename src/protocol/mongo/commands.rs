@@ -347,7 +347,12 @@ pub(super) fn prepare_with_limits(
         return None;
     }
     Some((|| {
-        if started.elapsed() >= limits.command_timeout() {
+        let host_timeout = if name == "createIndexes" {
+            limits.index_build_timeout()
+        } else {
+            limits.command_timeout()
+        };
+        if started.elapsed() >= host_timeout {
             return Err(CommandError::new(
                 50,
                 "MaxTimeMSExpired",
@@ -393,7 +398,7 @@ pub(super) fn prepare_with_limits(
             };
             DocumentNamespace::new(&request.database, collection)?
         };
-        let mut timeout = limits.command_timeout();
+        let mut timeout = host_timeout;
         let mut cursor_budget = None;
         for (field, value) in request.body.iter().skip(1) {
             if let Some(valid) = read_options::accepts(name, field, value) {
@@ -2390,6 +2395,82 @@ mod deadline_tests {
         let expired = started - Duration::from_secs(6);
         let result = prepare_with_limits(&request(0), false, expired, limits).unwrap();
         assert_eq!(result.err().unwrap().code, 50);
+    }
+
+    #[test]
+    fn index_build_deadlines_are_separate_and_client_budgets_can_only_narrow_them() {
+        let limits = MongoResourceLimits::default()
+            .with_index_build_timeout(Duration::from_secs(300))
+            .unwrap();
+        let started = Instant::now();
+        for (client_ms, expected_ms) in [
+            (0, 300_000),
+            (120_000, 120_000),
+            (600_000, 300_000),
+            (2000, 2000),
+        ] {
+            let mut build = request(client_ms);
+            build.body = fields([
+                ("createIndexes", BsonValue::from("items")),
+                (
+                    "indexes",
+                    BsonValue::Array(vec![BsonValue::Document(fields([
+                        (
+                            "key",
+                            BsonValue::Document(fields([("n", BsonValue::Int32(1))])),
+                        ),
+                        ("name", BsonValue::from("n_1")),
+                    ]))]),
+                ),
+                ("maxTimeMS", BsonValue::Int32(client_ms)),
+                ("$db", BsonValue::from("deadline")),
+            ]);
+            let prepared = prepare_with_limits(&build, false, started, limits)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                prepared.deadline,
+                started + Duration::from_millis(expected_ms)
+            );
+            let default =
+                prepare_with_limits(&build, false, started, MongoResourceLimits::default())
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                default.deadline,
+                started + Duration::from_millis(expected_ms.min(15_000))
+            );
+            // Parsing/queueing time is still charged to the longer host bound.
+            let queued = started - Duration::from_secs(16);
+            let queued_build = prepare_with_limits(&build, false, queued, limits).unwrap();
+            assert_eq!(queued_build.is_ok(), client_ms != 2000);
+            let expired = started - Duration::from_secs(301);
+            assert_eq!(
+                prepare_with_limits(&build, false, expired, limits)
+                    .unwrap()
+                    .err()
+                    .unwrap()
+                    .code,
+                50
+            );
+        }
+        let ordinary = prepare_with_limits(&request(120_000), false, started, limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary.deadline, started + Duration::from_secs(15));
+        assert_eq!(
+            prepare_with_limits(
+                &request(120_000),
+                false,
+                started - Duration::from_secs(16),
+                limits
+            )
+            .unwrap()
+            .err()
+            .unwrap()
+            .code,
+            50
+        );
     }
 
     #[tokio::test]

@@ -1496,8 +1496,10 @@ the command deadline. If cleanup is blocked or fails, reopening is still require
 corruption remains fail-closed. New unpublished definitions are removed, prior
 Pending declarations and completed batch prefixes are preserved, and user
 commands are never automatically replayed. Pending drops retain their lightweight
-concurrent path. This does not raise the command-timeout ceiling or improve index
-build complexity tracked in #553.
+concurrent path. Per-record integrity validation seeks the existing by-record
+entry index instead of repeatedly scanning the collection, including during
+builds; checksums and exact entry coverage are unchanged. Managed Python clients
+also use the separate index-build deadline described below.
 
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and
@@ -1524,7 +1526,7 @@ before storage admission. The current option contract is:
 
 | Option | Accepted behavior |
 | --- | --- |
-| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find, aggregate, and collection/index metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
+| `maxTimeMS` | Nonnegative integer; a positive value narrows the host deadline (15 seconds for ordinary commands; separately configurable for `createIndexes`, five minutes by default in managed Python clients). Find, aggregate, and collection/index metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
 | Read `hint` | Find/count/distinct/aggregate accept a string or BSON document as a **no-effect TinyMongo compatibility option**, not a forced-index directive. Successful raw replies include the fixed `briskdbReadWarnings` message described below. |
 | Read `comment` | Any wire-valid BSON value on find/count/distinct/aggregate/getMore; ignored, not logged, echoed or retained in cursors/metrics |
@@ -1620,8 +1622,8 @@ seconds. Retained cursor limits may be narrowed to 1–32 per listener and 1–8
 connection (the latter cannot exceed the total). `start` and daemon listeners
 retain the existing eight-connection default. The wheel's managed shared-root
 listener explicitly selects 32 slots for independent PyMongo monitor/pool
-connections. Both retain 15-second deadlines, 32 total cursors and 8 cursors per
-connection. The 32-connection ceiling remains finite; frame/document/decoded
+connections. Both retain 15-second ordinary-command deadlines, 32 total cursors
+and 8 cursors per connection. The 32-connection ceiling remains finite; frame/document/decoded
 budgets do not change. Tests fill the expanded limit twice, reject overflow,
 and reclaim all slots and redacted metadata without affecting another listener.
 Overflow sockets are rejected immediately, not queued. The command deadline
@@ -1634,6 +1636,22 @@ retain their independent bounds. Expiry reports code 50 through existing metrics
 the policy is listener-local, not a new authenticated per-user quota. Engine,
 BSON, cursor and result limits remain independently authoritative. Per-user
 governance awaits the shared authentication/authorization work.
+
+`MongoResourceLimits::with_index_build_timeout(Duration)` selects a separate
+positive `createIndexes` deadline of at most 24 hours. By default it equals the
+ordinary command timeout, so existing standalone/daemon policy is unchanged.
+Host code selecting a longer build budget must also allow it in the engine's
+request timeout; the shorter bound wins. The wheel's managed `MongoClient`,
+`AsyncMongoClient`, and `patch()` explicitly select five minutes, with
+`index_build_timeout_ms` accepting 1–86,400,000 ms and adjusting their private
+Mongo-only engine deadline accordingly. Omitted/`None` inherits an open shared
+engine or defaults a new one; explicit conflicting shared-root/scope settings
+are rejected. `briskdb_index_build_timeout_ms` reports the selected host value.
+No timeout is persisted. Positive `maxTimeMS` narrows this build budget, zero
+does not disable it, and parsing/queueing time is still included. Ordinary
+CRUD, drop/index metadata, and getMore deadlines are unchanged. Lock-contention
+budgets and client-side timeouts remain independent; index builds remain offline
+under exclusive schema admission, not background or concurrent builds.
 
 Cursor registration and pooled-socket handoff both enforce the configured
 quotas. A rejected new cursor releases its native session; a rejected handoff

@@ -24,7 +24,8 @@ if pymongo.version_tuple[:3] != (4, 17, 0):
     raise ImportError("BriskDB Mongo clients currently require pymongo==4.17.0")
 
 from ._briskdb import ContentionPolicy
-from ._mongo_runtime import _Store, _check_process, _drained, _validate_contention_policy, acquire
+from ._mongo_runtime import (_Store, _check_process, _drained, _validate_contention_policy,
+                             _validate_index_build_timeout, acquire)
 from ._mongo_collections import Database, AsyncDatabase, IndexCompatibilityWarning
 
 ASCENDING = pymongo.ASCENDING
@@ -123,12 +124,13 @@ class _LocalStoreBinding:
                                srv_service_name: Any) -> None:
         pending = self._briskdb_pending
         if pending is not None:
-            folder, shards, contention_policy, shared, suffix = pending
+            folder, shards, contention_policy, index_build_timeout_ms, shared, suffix = pending
             if shared is not None:
                 shared.check_contention_policy(contention_policy)
+                shared.check_index_build_timeout(index_build_timeout_ms)
                 store = shared
             else:
-                store = acquire(folder, shards, contention_policy)
+                store = acquire(folder, shards, contention_policy, index_build_timeout_ms)
             self._briskdb_store = store
             self._briskdb_release = weakref.finalize(self, store.release) if shared is None else None
             self._briskdb_pending = None
@@ -148,18 +150,22 @@ class MongoClient(_LocalStoreBinding, _Client):
 
     Use ``folder=`` (or a positional filesystem path) for persistent data.
     Hosts/credentials are never contacted. Close the client or use ``with``.
+    Index builds default to five minutes; ``index_build_timeout_ms`` selects
+    1–86400000 ms, or None inherits an open engine. Ordinary commands keep 15s.
     """
 
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
                  *, folder: Any = None, shards: Optional[int] = None,
-                 contention_policy: Optional[ContentionPolicy] = None, **kwargs: Any) -> None:
+                 contention_policy: Optional[ContentionPolicy] = None,
+                 index_build_timeout_ms: Optional[int] = None, **kwargs: Any) -> None:
         _check_process()
         _validate_contention_policy(contention_policy)
+        _validate_index_build_timeout(index_build_timeout_ms)
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        self._briskdb_pending = (folder, shards, contention_policy, shared, suffix)
+        self._briskdb_pending = (folder, shards, contention_policy, index_build_timeout_ms, shared, suffix)
         self._briskdb_release = None
         try:
             super().__init__("mongodb://127.0.0.1:1" + suffix,
@@ -178,6 +184,11 @@ class MongoClient(_LocalStoreBinding, _Client):
     def briskdb_contention_policy(self) -> Optional[ContentionPolicy]:
         self._briskdb_store.check_process()
         return self._briskdb_store.contention_policy
+
+    @property
+    def briskdb_index_build_timeout_ms(self) -> int:
+        self._briskdb_store.check_process()
+        return self._briskdb_store.index_build_timeout_ms
 
     def __getitem__(self, name: str) -> Database:
         return Database._wrap(super().__getitem__(name))
@@ -209,18 +220,21 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
 
     Construction opens local storage synchronously. ``async with
     briskdb.patch()`` instead performs engine startup/cleanup off the event loop.
+    ``index_build_timeout_ms`` has the same host-bound semantics as MongoClient.
     """
 
     def __init__(self, host: Any = None, port: Any = None, document_class: Any = None,
                  tz_aware: Any = None, connect: Any = None, type_registry: Any = None,
                  *, folder: Any = None, shards: Optional[int] = None,
-                 contention_policy: Optional[ContentionPolicy] = None, **kwargs: Any) -> None:
+                 contention_policy: Optional[ContentionPolicy] = None,
+                 index_build_timeout_ms: Optional[int] = None, **kwargs: Any) -> None:
         _check_process()
         _validate_contention_policy(contention_policy)
+        _validate_index_build_timeout(index_build_timeout_ms)
         shared = kwargs.pop("_briskdb_store", None)
         folder, shards = _configuration(host, port, folder, shards, kwargs, shared)
         suffix, options = _local_options(host, kwargs)
-        self._briskdb_pending = (folder, shards, contention_policy, shared, suffix)
+        self._briskdb_pending = (folder, shards, contention_policy, index_build_timeout_ms, shared, suffix)
         self._briskdb_release = None
         try:
             super().__init__("mongodb://127.0.0.1:1" + suffix,
@@ -239,6 +253,11 @@ class AsyncMongoClient(_LocalStoreBinding, _AsyncClient):
     def briskdb_contention_policy(self) -> Optional[ContentionPolicy]:
         self._briskdb_store.check_process()
         return self._briskdb_store.contention_policy
+
+    @property
+    def briskdb_index_build_timeout_ms(self) -> int:
+        self._briskdb_store.check_process()
+        return self._briskdb_store.index_build_timeout_ms
 
     def __getitem__(self, name: str) -> AsyncDatabase:
         return AsyncDatabase._wrap(super().__getitem__(name))

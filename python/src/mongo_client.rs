@@ -63,7 +63,18 @@ impl MongoListener {
     }
 }
 
-pub(super) fn start(shared: &Arc<DatabaseShared>, py: Python<'_>) -> PyResult<MongoListener> {
+pub(super) fn start(
+    shared: &Arc<DatabaseShared>,
+    py: Python<'_>,
+    index_build_timeout_ms: Option<u64>,
+) -> PyResult<MongoListener> {
+    let mut limits =
+        MongoResourceLimits::new(32, Duration::from_secs(15)).map_err(listener_error)?;
+    if let Some(millis) = index_build_timeout_ms {
+        limits = limits
+            .with_index_build_timeout(Duration::from_millis(millis))
+            .map_err(listener_error)?;
+    }
     let shared = Arc::clone(shared);
     run_native(py, move || {
         // Same lock order as Database.close and ordinary listener registration.
@@ -74,9 +85,8 @@ pub(super) fn start(shared: &Arc<DatabaseShared>, py: Python<'_>) -> PyResult<Mo
         // Managed clients share this listener, not their PyMongo pools. Six
         // clients already need more than the standalone eight-socket default
         // once their monitor and application connections are active together.
-        // Keep a fixed ceiling; message/deadline/cursor limits stay unchanged.
-        let limits =
-            MongoResourceLimits::new(32, Duration::from_secs(15)).map_err(listener_error)?;
+        // Keep a fixed connection ceiling and ordinary command deadline.
+        // Only createIndexes receives the separately bounded build deadline.
         let listener = shared
             .runtime
             .runtime

@@ -345,6 +345,30 @@ without a policy keeps legacy behavior. These settings are not saved in the
 database. See the
 [complete waiting contract](../docs/REQUEST_CONTROLS.md#opt-in-storage-contention-backoff).
 
+### Index-build deadlines (unreleased main)
+
+Managed `MongoClient`, `AsyncMongoClient`, and `patch()` give `createIndexes`
+a separate five-minute host deadline by default. Ordinary Mongo commands retain
+their 15-second bound. A positive command `maxTimeMS` narrows the build deadline:
+
+```python
+with briskdb.MongoClient(folder="./mongo-data", index_build_timeout_ms=600_000) as client:
+    client.app.users.create_indexes(
+        [briskdb.IndexModel("email")], maxTimeMS=120_000,
+    )
+    print(client.briskdb_index_build_timeout_ms)  # 600000
+```
+
+`index_build_timeout_ms` accepts integer milliseconds from 1 through 86,400,000
+(24 hours). Omitted/`None` inherits an already-open managed engine's setting or
+selects five minutes for a new engine. Explicit conflicts on a shared folder or
+inside a patch scope fail before changing it. The setting is not persisted.
+The managed engine's internal deadline accommodates this build budget; other
+native engines and standalone Mongo listeners keep their existing defaults.
+Client socket/overall timeouts and lock-contention policies can still end an
+operation earlier. Builds remain offline under exclusive schema admission;
+a longer deadline does not enable concurrent queries during index creation.
+
 On unreleased main, `Config(storage_profile="local")` makes the default storage
 contract explicit. The reserved `storage_profile="nfs"` currently raises
 `UnsupportedError` during configuration, before opening or creating files.

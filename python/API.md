@@ -62,10 +62,10 @@ management. The `AsyncDatabase`, `AsyncSession`, `AsyncTransaction`, and
 
 ## PyMongo-compatible local clients and patching
 
-- `patch(folder=None, backend="sqlite", *, shards=None, contention_policy=None) -> MongoPatch`
+- `patch(folder=None, backend="sqlite", *, shards=None, contention_policy=None, index_build_timeout_ms=None) -> MongoPatch`
 - `MongoClient(host=None, port=None, document_class=None, tz_aware=None,
   connect=None, type_registry=None, *, folder=None, shards=None,
-  contention_policy=None, **driver_options)`
+  contention_policy=None, index_build_timeout_ms=None, **driver_options)`
 - `AsyncMongoClient(...)` has equivalent construction arguments and awaited close.
 
 These subclass the optional pinned real PyMongo clients; collection/query behavior
@@ -85,6 +85,17 @@ are rejected, not ignored. Policy settings are runtime-only, not persisted in
 the root. `client.briskdb_contention_policy` reports the selected immutable value
 (or `None` for legacy), including after close. No per-client retry loop is added,
 and Mongo request deadlines and uncertainty handling remain unchanged.
+
+On unreleased main, `index_build_timeout_ms=` selects a separate host deadline
+for `createIndexes`: an integer from 1 through 86,400,000 ms. `None` inherits an
+open managed engine's setting or selects 300,000 ms (five minutes) for a new one.
+Explicit conflicts on the same folder or inside a patch scope raise `ValueError`;
+invalid values fail before opening storage. Read the selected value through
+`client.briskdb_index_build_timeout_ms`, also available after close. It is not
+persisted. Positive `maxTimeMS` narrows this build budget, and zero leaves the
+host cap in effect. Ordinary commands keep their 15-second bound; native engine
+and standalone listener defaults are unchanged. Index builds still hold exclusive
+schema admission. Client-side timeouts and contention budgets can end them sooner.
 
 Driver options (including document classes, timezones, URI database names and
 pool limits) are validated before a direct client opens storage or a listener.

@@ -56,14 +56,56 @@ async fn configured(policy: ContentionPolicy) -> (tempfile::TempDir, Engine) {
     let (root, engine) = secure(&[Action::ConnectDatabase, Action::ReadData]).await;
     engine.shutdown().await.unwrap();
     drop(engine);
-    let engine = Engine::open_authenticated(
-        root.path(),
-        2,
-        EngineOptions::default().with_contention_policy(Some(policy)),
-    )
-    .await
-    .unwrap();
+    // Other parallel tests can briefly own the process-wide registry even for
+    // unrelated roots. Establish this fixture before testing its deliberately
+    // contended authority/SQLite operation; do not retry that operation or
+    // change the fail-fast policy/counters of the successfully opened engine.
+    let started = std::time::Instant::now();
+    let engine = loop {
+        let result = Engine::open_authenticated(
+            root.path(),
+            2,
+            EngineOptions::default().with_contention_policy(Some(policy)),
+        )
+        .await;
+        if result.as_ref().is_err_and(|error| {
+            fixture_registry_is_busy(error) && started.elapsed() < Duration::from_secs(5)
+        }) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+        break result.unwrap();
+    };
     (root, engine)
+}
+
+fn fixture_registry_is_busy(error: &EngineError) -> bool {
+    error.kind() == EngineErrorKind::Busy
+        && error.diagnostic() == "root schema coordination registry is busy"
+}
+
+#[test]
+fn fixture_retry_does_not_hide_security_or_storage_failures() {
+    assert!(fixture_registry_is_busy(&EngineError::new(
+        EngineErrorKind::Busy,
+        "root schema coordination registry is busy",
+    )));
+    for (kind, diagnostic) in [
+        (EngineErrorKind::Busy, "security authority is busy"),
+        (EngineErrorKind::Busy, "database is locked"),
+        (
+            EngineErrorKind::DataCorruption,
+            "root schema coordination registry is busy",
+        ),
+        (
+            EngineErrorKind::DeadlineExceeded,
+            "root schema coordination registry is busy",
+        ),
+    ] {
+        assert!(!fixture_registry_is_busy(&EngineError::new(
+            kind, diagnostic
+        )));
+    }
 }
 
 async fn wait_for_retry(engine: &Engine, count: u64) {

@@ -11,6 +11,7 @@ use std::{io, time::Duration};
 pub struct MongoResourceLimits {
     max_connections: usize,
     command_timeout: Duration,
+    index_build_timeout: Duration,
     max_cursors: usize,
     max_cursors_per_connection: usize,
 }
@@ -38,8 +39,24 @@ impl MongoResourceLimits {
         Ok(Self {
             max_connections,
             command_timeout,
+            index_build_timeout: command_timeout,
             ..Self::default()
         })
+    }
+
+    /// Select a separate positive createIndexes deadline, bounded to 24 hours.
+    /// Ordinary commands keep their original deadline. Client maxTimeMS can
+    /// only narrow either deadline; engine-wide request limits still apply.
+    /// Index builds remain offline and retain exclusive schema admission.
+    pub fn with_index_build_timeout(mut self, timeout: Duration) -> io::Result<Self> {
+        if timeout.is_zero() || timeout > Duration::from_millis(crate::core::MAX_REQUEST_TIMEOUT_MS)
+        {
+            return Err(super::invalid(
+                "Mongo index build timeout must be positive and at most 24 hours",
+            ));
+        }
+        self.index_build_timeout = timeout;
+        Ok(self)
     }
 
     /// Narrow retained wire cursors to 1–32 per listener and 1–8 per
@@ -74,6 +91,10 @@ impl MongoResourceLimits {
         self.command_timeout
     }
 
+    pub const fn index_build_timeout(self) -> Duration {
+        self.index_build_timeout
+    }
+
     pub const fn max_cursors(self) -> usize {
         self.max_cursors
     }
@@ -88,6 +109,7 @@ impl Default for MongoResourceLimits {
         Self {
             max_connections: 8,
             command_timeout: Duration::from_secs(15),
+            index_build_timeout: Duration::from_secs(15),
             max_cursors: 32,
             max_cursors_per_connection: 8,
         }
@@ -125,6 +147,31 @@ mod tests {
         let limits = MongoResourceLimits::new(1, Duration::from_nanos(1)).unwrap();
         assert_eq!(limits.max_connections(), 1);
         assert_eq!(limits.command_timeout(), Duration::from_nanos(1));
+        assert_eq!(limits.index_build_timeout(), Duration::from_nanos(1));
+    }
+
+    #[test]
+    fn index_build_limits_are_separate_finite_and_host_owned() {
+        let limits = MongoResourceLimits::new(4, Duration::from_secs(3)).unwrap();
+        assert_eq!(limits.index_build_timeout(), Duration::from_secs(3));
+        let maximum = Duration::from_millis(crate::core::MAX_REQUEST_TIMEOUT_MS);
+        for timeout in [
+            Duration::ZERO,
+            maximum + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(limits.with_index_build_timeout(timeout).is_err());
+        }
+        for timeout in [Duration::from_nanos(1), Duration::from_secs(300), maximum] {
+            let selected = limits
+                .with_index_build_timeout(timeout)
+                .unwrap()
+                .with_cursor_limits(12, 3)
+                .unwrap();
+            assert_eq!(selected.index_build_timeout(), timeout);
+            assert_eq!(selected.command_timeout(), limits.command_timeout());
+            assert_eq!(selected.max_connections(), 4);
+        }
     }
 
     #[test]

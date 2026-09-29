@@ -131,6 +131,11 @@ Missing or malformed entry schema in an already-Ready root is corruption,
 not an invitation to rebuild.
 
 Version 19 adds a checksummed build/cleanup journal and a version-19 reader fence.
+Per-record entry validation explicitly seeks the existing
+`briskdb_document_index_entries_by_record_v1` index by collection and record ID.
+This avoids a collection scan for each record during builds and write
+validation; checksum, missing/extra-entry, and cardinality checks are unchanged.
+There is no schema or storage-format change for this access-path fix.
 `BuildIndex` (Python `session.build_index`) requires sole-process ownership and
 exclusive schema admission. It validates the complete existing and prospective
 index set before durable intent, builds each shard transactionally, and publishes
