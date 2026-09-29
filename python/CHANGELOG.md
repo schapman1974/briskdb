@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Document-store startup now uses ordered ownership-key comparison and a
+  physical record scan, reducing repeated reads of large BSON records (#550).
+  Full startup integrity checks, index coverage and uniqueness, natural query
+  order, and recovery remain unchanged. No storage migration is required.
+
 - Mongo cursor `batchSize` requests above 1,000 are now capped internally,
   rather than rejected, for find, getMore, aggregation and metadata cursors.
   Large PyMongo limits (including `.limit(1_000_000)`) can page normally (#549).
