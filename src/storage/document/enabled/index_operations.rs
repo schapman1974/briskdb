@@ -10,6 +10,15 @@ const BUILD: i64 = 1;
 const DROP: i64 = 2;
 const ABORT: i64 = 3;
 
+// Recovery retains exclusive admission but must not hold a cancelled request
+// indefinitely. Its budget is independent of the expired caller deadline.
+const CANCELLED_INDEX_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct OperationIdentity {
+    index: DocumentIndexId,
+    operation: Vec<u8>,
+}
+
 struct Journal {
     index: DocumentIndexId,
     kind: i64,
@@ -52,6 +61,7 @@ fn build_checkpoint(created: bool, point: &str, shard: u16, index: DocumentIndex
 
 #[cfg(test)]
 fn checkpoint(point: &str, shard: u16, index: DocumentIndexId) {
+    tests::cancel_at_checkpoint(point, shard, index);
     if let Ok(selected) = std::env::var("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_ID") {
         if selected.parse::<u64>().expect("test index identity") != index.get() {
             return;
@@ -112,31 +122,56 @@ fn advance(
 
 /// Startup has sole-process ownership whenever this checksummed journal exists.
 pub(super) fn recover(storage: &Storage, connection: &mut Connection) -> EngineResult<()> {
-    manifest::current_integrity(connection, storage.shard_count())?;
-    let Some(mut journal) = load(connection)? else {
+    recover_controlled(storage, connection, None, None)
+}
+
+fn recover_controlled(
+    storage: &Storage,
+    connection: &mut Connection,
+    control: Option<&Arc<OperationControl>>,
+    expected: Option<&OperationIdentity>,
+) -> EngineResult<()> {
+    let journal = run_provisioning_step(connection, control, |connection| {
+        manifest::current_integrity(connection, storage.shard_count())?;
+        load(connection)
+    })?;
+    let Some(mut journal) = journal else {
         return Ok(());
     };
+    if expected.is_some_and(|expected| {
+        expected.index != journal.index || expected.operation != journal.operation
+    }) {
+        return Err(corrupt(
+            "cancelled document index operation lost its exact journal",
+        ));
+    }
     if journal.kind == BUILD {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error::storage)?;
-        let changed = transaction
-            .execute(
-                "UPDATE briskdb_document_index_operation SET operation_kind = 3, next_shard = 0
+        run_provisioning_step(connection, control, |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error::storage)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE briskdb_document_index_operation SET operation_kind = 3, next_shard = 0
              WHERE singleton = 1 AND operation_kind = 1 AND operation_id = ?1",
-                [&journal.operation],
-            )
-            .map_err(sqlite_error::storage)?;
-        if changed != 1 {
-            return Err(corrupt("unpublished document index build lost its journal"));
-        }
-        manifest::refresh_manifest_digest(&transaction)?;
-        manifest::current_integrity(&transaction, storage.shard_count())?;
-        transaction.commit().map_err(sqlite_error::storage)?;
+                    [&journal.operation],
+                )
+                .map_err(sqlite_error::storage)?;
+            if changed != 1 {
+                return Err(corrupt("unpublished document index build lost its journal"));
+            }
+            manifest::refresh_manifest_digest(&transaction)?;
+            manifest::current_integrity(&transaction, storage.shard_count())?;
+            if let Some(control) = control {
+                ensure_control_active(control, "before aborting cancelled document index build")?;
+            }
+            transaction.commit().map_err(sqlite_error::storage)?;
+            Ok(())
+        })?;
         journal.kind = ABORT;
         journal.next = 0;
     }
-    cleanup(storage, connection, journal, None)
+    cleanup(storage, connection, journal, control)
 }
 
 fn cleanup(
@@ -397,6 +432,7 @@ impl Storage {
         migration: &mut SchemaMigrationGuard,
         control: Arc<OperationControl>,
     ) -> EngineResult<()> {
+        let mut admitted = None;
         let result = (|| {
             ensure_control_active(&control, "before dropping built document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -471,6 +507,10 @@ impl Storage {
                 manifest::current_integrity(&transaction, self.shard_count())?;
                 ensure_control_active(&control, "before committing document index drop intent")?;
                 migration.mark_pending_on_drop();
+                admitted = Some(OperationIdentity {
+                    index: target.id(),
+                    operation: operation.clone(),
+                });
                 #[cfg(test)]
                 checkpoint("drop-before-intent", 0, target.id());
                 transaction.commit().map_err(sqlite_error::storage)?;
@@ -493,7 +533,67 @@ impl Storage {
             migration.mark_ready_on_drop();
             Ok(())
         })();
-        self.fail_closed_on_corruption(result)
+        self.finish_index_operation(result, admitted.as_ref(), migration)
+    }
+
+    /// A cancelled DDL request still owns the exclusive local/process guards.
+    /// Resolve only its own durable obligation before admitting normal work.
+    /// This never retries user DDL or repairs records; uncertain I/O and actual
+    /// corruption remain fenced for explicit recovery.
+    fn finish_index_operation<T>(
+        &self,
+        result: EngineResult<T>,
+        admitted: Option<&OperationIdentity>,
+        migration: &mut SchemaMigrationGuard,
+    ) -> EngineResult<T> {
+        let error = match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    EngineErrorKind::Cancelled | EngineErrorKind::DeadlineExceeded
+                ) && admitted.is_some() =>
+            {
+                error
+            }
+            result => return self.fail_closed_on_corruption(result),
+        };
+        // Clear any request-scoped busy policy: it belongs to the cancelled
+        // caller, not this separately bounded cleanup. Every SQLite recovery
+        // step installs the fresh control's interrupt/progress/busy handlers.
+        let recovery = crate::storage::contention::with_control(None, || {
+            let control = OperationControl::with_contention_metrics(
+                Some(std::time::Instant::now() + CANCELLED_INDEX_RECOVERY_TIMEOUT),
+                None,
+                Arc::default(),
+            );
+            let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+            run_manifest_controlled(self, &mut connection, Arc::clone(&control), |connection| {
+                manifest::current_integrity(connection, self.shard_count()).map(|_| ())
+            })?;
+            recover_controlled(self, &mut connection, Some(&control), admitted)?;
+            let future = run_manifest_controlled(
+                self,
+                &mut connection,
+                Arc::clone(&control),
+                |connection| {
+                    require_ready_manifest(connection, self.shard_count())?;
+                    let catalog = load_catalog_rows(connection)?;
+                    compile_ready_indexes(&catalog, &mut || {
+                        ensure_control_active(&control, "while restoring document index authority")
+                    })
+                },
+            )?;
+            self.publish_document_indexes(future)?;
+            migration.mark_ready_on_drop();
+            Ok(())
+        });
+        match self.fail_closed_on_corruption(recovery) {
+            Ok(()) => Err(error),
+            Err(recovery_error) if recovery_error.kind() == EngineErrorKind::DataCorruption => Err(recovery_error),
+            Err(recovery_error) => Err(error.context(format!(
+                "document index cancellation cleanup could not finish; reopen the database to recover it: {recovery_error}"
+            ))),
+        }
     }
 
     pub(crate) fn build_document_index_controlled(
@@ -676,6 +776,7 @@ impl Storage {
         control: Arc<OperationControl>,
         strict_compatibility: bool,
     ) -> EngineResult<BuildOutcome> {
+        let mut admitted = None;
         let result = (|| {
             ensure_control_active(&control, "before building document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -964,6 +1065,10 @@ impl Storage {
                 manifest::current_integrity(&transaction, self.shard_count())?;
                 ensure_control_active(&control, "before committing document index build intent")?;
                 migration.mark_pending_on_drop();
+                admitted = Some(OperationIdentity {
+                    index: target.id(),
+                    operation: operation.clone(),
+                });
                 #[cfg(test)]
                 build_checkpoint(created, "before-intent", 0, target.id());
                 transaction.commit().map_err(sqlite_error::storage)?;
@@ -1096,6 +1201,6 @@ impl Storage {
                 after: before + 1,
             })
         })();
-        self.fail_closed_on_corruption(result)
+        self.finish_index_operation(result, admitted.as_ref(), migration)
     }
 }

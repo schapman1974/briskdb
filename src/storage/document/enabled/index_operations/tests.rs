@@ -2,12 +2,342 @@ use super::*;
 use rusqlite::types::Value;
 use std::path::Path;
 
+struct CancelAt {
+    point: &'static str,
+    shard: u16,
+    index: Option<u64>,
+    control: Arc<OperationControl>,
+}
+
 thread_local! {
     static BUILD_PREFLIGHT_SHARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANCEL_AT: std::cell::RefCell<Option<CancelAt>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn cancel_at_checkpoint(point: &str, shard: u16, index: DocumentIndexId) {
+    CANCEL_AT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|selected| {
+            selected.point == point
+                && selected.shard == shard
+                && selected
+                    .index
+                    .is_none_or(|selected| selected == index.get())
+        }) {
+            slot.take()
+                .unwrap()
+                .control
+                .request_cancel(crate::core::CancellationReason::DeadlineExceeded);
+        }
+    });
+}
+
+#[test]
+fn timed_out_index_creation_recovers_without_reopening() {
+    for (point, shard) in [
+        ("create-before-intent", 0),
+        ("create-after-intent", 0),
+        ("create-after-shard", 0),
+        ("create-after-shard", 1),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, collection) = setup(temp.path(), 2);
+        build(&storage, "value").unwrap();
+        let peer = Storage::open(temp.path(), 2).unwrap();
+        let catalog = storage.document_catalog().unwrap();
+        let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+        let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+        let control = OperationControl::new(None);
+        CANCEL_AT.with(|slot| {
+            slot.replace(Some(CancelAt {
+                point,
+                shard,
+                index: None,
+                control: Arc::clone(&control),
+            }))
+        });
+        let migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        let error = storage
+            .create_built_document_index_controlled(
+                &DocumentNamespace::new("app", "items").unwrap(),
+                "new",
+                &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                false,
+                migration,
+                control,
+            )
+            .unwrap_err();
+        assert!(CANCEL_AT.with(|slot| slot.borrow().is_none()));
+        assert_eq!(
+            error.kind(),
+            EngineErrorKind::DeadlineExceeded,
+            "{point}:{shard}"
+        );
+        drop(
+            storage
+                .enter_schema_operation()
+                .expect("timeout must not poison the client"),
+        );
+        assert_eq!(peer.document_catalog().unwrap(), catalog);
+        assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+        assert_eq!(
+            snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+            entries
+        );
+        peer.insert_document(collection, &document(99, BsonValue::Int32(99)))
+            .unwrap();
+        assert_eq!(create_built(&storage, "new", "value").unwrap(), (2, 3));
+        drop(peer);
+        drop(storage);
+        drop(Storage::open(temp.path(), 2).unwrap());
+    }
+}
+
+#[test]
+fn timed_out_declared_build_retains_pending_identity_and_records() {
+    for (point, shard) in [("after-intent", 0), ("after-shard", 0), ("after-cursor", 1)] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, _) = setup(temp.path(), 2);
+        let catalog = storage.document_catalog().unwrap();
+        let high = high_water(temp.path());
+        let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+        let control = OperationControl::new(None);
+        CANCEL_AT.with(|slot| {
+            slot.replace(Some(CancelAt {
+                point,
+                shard,
+                index: None,
+                control: Arc::clone(&control),
+            }))
+        });
+        let migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        assert_eq!(
+            storage
+                .build_document_index_controlled("app", "items", "value", migration, control)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DeadlineExceeded
+        );
+        assert!(CANCEL_AT.with(|slot| slot.borrow().is_none()));
+        drop(storage.enter_schema_operation().unwrap());
+        assert_eq!(storage.document_catalog().unwrap(), catalog);
+        assert_eq!(high_water(temp.path()), high);
+        assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+        assert!(
+            snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+                .iter()
+                .all(Vec::is_empty)
+        );
+        build(&storage, "value").unwrap();
+        drop(storage);
+        drop(Storage::open(temp.path(), 2).unwrap());
+    }
+}
+
+#[test]
+fn timed_out_drop_finishes_cleanup_and_republishes_survivors() {
+    for (point, shard) in [("drop-after-intent", 0), ("cleanup-after-shard", 0)] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, collection) = setup(temp.path(), 2);
+        build(&storage, "value").unwrap();
+        create_built(&storage, "keep", "other").unwrap();
+        let peer = Storage::open(temp.path(), 2).unwrap();
+        let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+        let high = high_water(temp.path());
+        let control = OperationControl::new(None);
+        CANCEL_AT.with(|slot| {
+            slot.replace(Some(CancelAt {
+                point,
+                shard,
+                index: None,
+                control: Arc::clone(&control),
+            }))
+        });
+        let migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        assert_eq!(
+            storage
+                .drop_built_document_index_controlled("app", "items", "value", migration, control)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DeadlineExceeded
+        );
+        assert!(CANCEL_AT.with(|slot| slot.borrow().is_none()));
+        drop(storage.enter_schema_operation().unwrap());
+        let namespace = DocumentNamespace::new("app", "items").unwrap();
+        assert!(!peer.document_index_is_ready(&namespace, "value").unwrap());
+        assert!(peer.document_index_is_ready(&namespace, "keep").unwrap());
+        assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+        assert_eq!(high_water(temp.path()), high);
+        peer.insert_document(collection, &document(99, BsonValue::Int32(99)))
+            .unwrap();
+        drop(peer);
+        drop(storage);
+        drop(Storage::open(temp.path(), 2).unwrap());
+    }
+}
+
+#[test]
+fn timed_out_create_batch_preserves_completed_prefix_and_skips_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    let high = high_water(temp.path());
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let control = OperationControl::new(None);
+    CANCEL_AT.with(|slot| {
+        slot.replace(Some(CancelAt {
+            point: "create-after-shard",
+            shard: 0,
+            index: Some((high + 2) as u64),
+            control: Arc::clone(&control),
+        }))
+    });
+    let definitions = crate::document::normalize_index_batch(
+        vec![
+            batch_index("first", "first"),
+            batch_index("second", "second"),
+            batch_index("third", "third"),
+        ]
+        .into_boxed_slice(),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    assert_eq!(
+        storage
+            .create_document_indexes_controlled(
+                &DocumentNamespace::new("app", "items").unwrap(),
+                definitions,
+                migration,
+                control
+            )
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DeadlineExceeded
+    );
+    assert!(CANCEL_AT.with(|slot| slot.borrow().is_none()));
+    drop(storage.enter_schema_operation().unwrap());
+    let catalog = storage.document_catalog().unwrap();
+    let indexes = catalog.collection("app", "items").unwrap().indexes();
+    assert!(
+        indexes
+            .iter()
+            .any(|index| index.name() == "first"
+                && index.lifecycle() == DocumentIndexLifecycle::Ready)
+    );
+    assert!(
+        !indexes
+            .iter()
+            .any(|index| matches!(index.name(), "second" | "third"))
+    );
+    assert_eq!(high_water(temp.path()), high + 2);
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    drop(storage);
+    drop(Storage::open(temp.path(), 2).unwrap());
+}
+
+#[test]
+fn cancellation_after_activation_preserves_known_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    let control = OperationControl::new(None);
+    CANCEL_AT.with(|slot| {
+        slot.replace(Some(CancelAt {
+            point: "after-activation",
+            shard: 0,
+            index: None,
+            control: Arc::clone(&control),
+        }))
+    });
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    assert_eq!(
+        storage
+            .build_document_index_controlled("app", "items", "value", migration, control)
+            .unwrap()
+            .lifecycle(),
+        DocumentIndexLifecycle::Ready
+    );
+    assert!(CANCEL_AT.with(|slot| slot.borrow().is_none()));
+    drop(storage.enter_schema_operation().unwrap());
+    drop(storage);
+    drop(Storage::open(temp.path(), 2).unwrap());
 }
 
 pub(super) fn note_build_preflight_shard() {
     BUILD_PREFLIGHT_SHARDS.with(|count| count.set(count.get() + 1));
+}
+
+#[test]
+fn cancelled_index_recovery_rejects_foreign_or_unsealed_journals() {
+    for unsealed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, _) = setup(temp.path(), 2);
+        create_built(&storage, "keep", "other").unwrap();
+        let catalog = storage.document_catalog().unwrap();
+        let index = catalog
+            .collection("app", "items")
+            .unwrap()
+            .indexes()
+            .iter()
+            .find(|index| index.name() == "value")
+            .unwrap()
+            .id();
+        let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+        let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        migration
+            .acquire_process_ownership(&storage.schema_coordination.process_lease)
+            .unwrap();
+        let mut connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO briskdb_document_index_operation VALUES (1, ?1, 1, ?2, 2, 0)",
+                params![index.get() as i64, vec![7_u8; 32]],
+            )
+            .unwrap();
+        manifest::refresh_manifest_digest(&transaction).unwrap();
+        transaction.commit().unwrap();
+        if unsealed {
+            connection
+                .execute(
+                    "UPDATE briskdb_document_index_operation SET operation_id=?1",
+                    [vec![8_u8; 32]],
+                )
+                .unwrap();
+        }
+        migration.mark_pending_on_drop();
+        let identity = OperationIdentity {
+            index,
+            operation: vec![8_u8; 32],
+        };
+        assert_eq!(
+            storage
+                .finish_index_operation::<()>(
+                    Err(EngineError::deadline_exceeded("test cancellation")),
+                    Some(&identity),
+                    &mut migration,
+                )
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        drop(migration);
+        assert!(
+            matches!(storage.enter_schema_operation(), Err(error) if error.kind() == EngineErrorKind::DataCorruption)
+        );
+        assert!(load(&connection).unwrap().is_some());
+        assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+        assert_eq!(
+            snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+            entries
+        );
+    }
 }
 
 #[test]
