@@ -2915,7 +2915,7 @@ mod enabled {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
-            super::index_storage::require_no_orphans(&connection)?;
+            super::index_storage::require_no_orphans(&connection, None)?;
             let mut statement = connection
                 .prepare(
                     "SELECT collection_id, natural_order, id_key, document_bson,

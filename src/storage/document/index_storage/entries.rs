@@ -293,14 +293,30 @@ pub(in crate::storage::document) fn validate_record_entries(
     check()
 }
 
+/// Startup audits every collection; an index build audits only its own.
+/// Use separate SQL shapes so the scoped case seeks the collection key prefix
+/// instead of scanning unrelated entries through an optional-filter predicate.
 pub(in crate::storage::document) fn require_no_orphans(
     connection: &Connection,
+    collection: Option<DocumentCollectionId>,
 ) -> EngineResult<()> {
-    let orphan: bool = connection.query_row(
+    let sql = if collection.is_some() {
         "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_entries_v1 AS e
          LEFT JOIN briskdb_documents_v1 AS d ON d.collection_id = e.collection_id AND d.id_key = e.id_key
-         WHERE d.collection_id IS NULL)", [], |row| row.get(0),
-    ).map_err(|error| shard_read_error(error, "failed to validate document index record ownership"))?;
+         WHERE e.collection_id = ?1 AND d.collection_id IS NULL)"
+    } else {
+        "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_entries_v1 AS e
+         LEFT JOIN briskdb_documents_v1 AS d ON d.collection_id = e.collection_id AND d.id_key = e.id_key
+         WHERE d.collection_id IS NULL)"
+    };
+    let collection = collection.map(|id| sqlite_id(id.get())).transpose()?;
+    let orphan: bool = connection
+        .query_row(sql, rusqlite::params_from_iter(collection), |row| {
+            row.get(0)
+        })
+        .map_err(|error| {
+            shard_read_error(error, "failed to validate document index record ownership")
+        })?;
     if orphan {
         return Err(corrupt("document index entry has no owning record"));
     }

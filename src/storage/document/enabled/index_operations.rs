@@ -799,6 +799,19 @@ impl Storage {
             if target.is_built_in() {
                 return Err(DocumentIndexError::Protected.into_engine_error());
             }
+            // A matching Ready declaration is a metadata-only no-op, not an
+            // integrity audit. Resolve conflicts above under exclusive schema
+            // and process ownership, before preparing keys or opening shards.
+            // Startup still validates complete stored index coverage.
+            if target.lifecycle() == DocumentIndexLifecycle::Ready {
+                ensure_control_active(&control, "before returning an existing document index")?;
+                migration.mark_ready_on_drop();
+                return Ok(BuildOutcome {
+                    metadata: target.clone(),
+                    before,
+                    after: before,
+                });
+            }
             let current = compile_ready_indexes(&catalog, &mut || {
                 ensure_control_active(&control, "while preparing document index authority")
             })?;
@@ -816,14 +829,16 @@ impl Storage {
                 .has_unique_secondary()
                 .then(|| unique::UniqueKeyScratch::new(Some(Arc::clone(&control))))
                 .transpose()?;
-            // Validate all current entries and the combined future write budget
-            // before accepting durable intent. Data cannot change under this guard.
+            // Validate this collection's current entries and combined future
+            // write budget before intent. Data cannot change under this guard.
             for shard in 0..self.shard_count() {
+                #[cfg(test)]
+                tests::note_build_preflight_shard();
                 let mut source = self.open_unconfigured_shard(shard)?;
                 run_provisioning_step(&mut source, Some(&control), |source| {
                     self.validate_unconfigured_shard_nonterminal(source, shard)?;
                     require_schema(source)?;
-                    super::super::index_storage::require_no_orphans(source)?;
+                    super::super::index_storage::require_no_orphans(source, Some(collection.id()))?;
                     visit_records(
                         self,
                         source,
@@ -903,14 +918,6 @@ impl Storage {
                         },
                     )
                 })?;
-            }
-            if target.lifecycle() == DocumentIndexLifecycle::Ready {
-                migration.mark_ready_on_drop();
-                return Ok(BuildOutcome {
-                    metadata: target.clone(),
-                    before,
-                    after: before,
-                });
             }
             let mut operation = vec![0_u8; 32];
             getrandom::fill(&mut operation).map_err(|error| {
