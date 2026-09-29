@@ -2,6 +2,102 @@ use super::*;
 use rusqlite::types::Value;
 use std::path::Path;
 
+thread_local! {
+    static BUILD_PREFLIGHT_SHARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn note_build_preflight_shard() {
+    BUILD_PREFLIGHT_SHARDS.with(|count| count.set(count.get() + 1));
+}
+
+#[test]
+fn building_an_index_checks_its_collection_not_unrelated_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let other = storage
+        .create_document_collection("other_db", "empty", &DocumentCollectionOptions::empty())
+        .unwrap();
+    // Simulate an out-of-band orphan in the populated collection. A build in
+    // the other database must not audit it; a build in its own collection and
+    // ordinary startup must still detect it, without repairing anything.
+    for shard in 0..2 {
+        storage
+            .open_unconfigured_shard(shard)
+            .unwrap()
+            .execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM briskdb_documents_v1")
+            .unwrap();
+    }
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    assert_eq!(
+        storage
+            .create_built_document_index_controlled(
+                &DocumentNamespace::new("other_db", "empty").unwrap(),
+                "new",
+                &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                false,
+                migration,
+                OperationControl::new(None)
+            )
+            .unwrap(),
+        (1, 2)
+    );
+    assert_ne!(other.id(), collection);
+    assert_eq!(
+        create_built(&storage, "new", "other").unwrap_err().kind(),
+        EngineErrorKind::DataCorruption
+    );
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    drop(storage);
+    assert_eq!(
+        Storage::open(temp.path(), 2).err().unwrap().kind(),
+        EngineErrorKind::DataCorruption
+    );
+}
+
+#[test]
+fn repeated_ready_index_batch_is_metadata_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    let catalog = storage.document_catalog().unwrap();
+    let high = high_water(temp.path());
+    BUILD_PREFLIGHT_SHARDS.with(|count| count.set(0));
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("value", "value")]).unwrap(),
+        (2, 2)
+    );
+    assert_eq!(
+        BUILD_PREFLIGHT_SHARDS.with(|count| count.get()),
+        0,
+        "an unchanged index must not enter shard/data validation"
+    );
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high);
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    let error = create_batch(&storage, vec![batch_index("other", "value")]).unwrap_err();
+    assert_eq!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<DocumentIndexError>(),
+        Some(&DocumentIndexError::KeySpecsConflict)
+    );
+    assert_eq!(BUILD_PREFLIGHT_SHARDS.with(|count| count.get()), 0);
+}
+
 fn document(id: i32, value: BsonValue) -> BsonDocument {
     BsonDocument::from_entries([("_id", BsonValue::Int32(id)), ("value", value)]).unwrap()
 }

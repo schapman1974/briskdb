@@ -1938,9 +1938,13 @@ Version 20 permits both, with unchanged entry schema and journal kinds. The exac
 count and progress are sealed; operations cannot overlap namespace provisioning,
 namespace deletion or an unfinished physical-layout upgrade.
 
-Sole-process/exclusive schema ownership fences every build. All current entries
-and prospective combined per-record bounds are checked before intent. Each
-shard commits the target entries before a sealed cursor transaction advances.
+Sole-process/exclusive schema ownership fences every build. The target collection's
+current entries (including orphan ownership) and prospective combined per-record
+bounds are checked before intent; a build does not audit unrelated collections.
+A matching Ready declaration returns after catalog and conflict validation,
+without opening shards or rescanning records. This no-op is not an integrity
+audit: complete cross-collection validation remains part of ordinary startup.
+Each shard commits the target entries before a sealed cursor transaction advances.
 Only the final transaction removes intent and marks the index Ready. If startup
 finds Build intent, it seals Abort with cursor zero, removes only that index ID's
 derived entries shard-by-shard, and clears intent while retaining PendingBuild.

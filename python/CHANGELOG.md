@@ -1,5 +1,15 @@
 # Python changelog
 
+## Unreleased
+
+- Matching `create_index()` / `create_indexes()` requests now return after
+  catalog/conflict validation without rescanning shard data. New index builds
+  check record ownership only in the affected collection, so unrelated indexed
+  collections no longer add data-scan cost to each requested index (#547).
+  Full startup integrity checks, uniqueness, build recovery, and index-option
+  conflict errors are unchanged. This does not change build timeouts or resource
+  limits.
+
 ## 0.1.0-beta.1 — local/developer beta
 
 Python distribution version: `0.1.0b1`. Publication follows the full CI and
