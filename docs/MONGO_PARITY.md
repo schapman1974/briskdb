@@ -1249,7 +1249,8 @@ series, and other nonempty wire creation options fail before mutation. See
 
 `listCollections` and sync/async PyMongo `list_collections()` /
 `list_collection_names()` return engine-owned metadata cursors. The optional
-`cursor` document accepts `batchSize` (0–1000); for example,
+`cursor` document accepts nonnegative integer `batchSize` (capped at 1000); for
+example,
 `db.list_collections(cursor={"batchSize": 1})`. Shared BSON filters are compiled
 even for absent databases and zero-sized initial batches. `nameOnly: true`
 returns only `name`/`type` and filters those fields; full results additionally
@@ -1275,8 +1276,9 @@ Rows contain ordered `key` and `name`, plus applicable `sparse` and
 they are not built indexes, including declarations marked unique. No internal
 identity, lifecycle, or fictitious Mongo index version is exposed. Raw missing
 collections return code 26; PyMongo returns empty discovery without creating them.
-The `cursor` option accepts `batchSize` 0–1000; `maxTimeMS`, byte caps, cursor
-ownership, pooled-socket continuation and cleanup use the shared engine path.
+The `cursor` option accepts nonnegative integer `batchSize`, capped at 1000;
+`maxTimeMS`, byte caps, cursor ownership, pooled-socket continuation and cleanup
+use the shared engine path.
 `includeBuildUUIDs` / `includeIndexBuildInfo` and other unsupported options are
 rejected rather than fabricated. The cursor namespace is `database.collection`,
 as defined by the [Mongo command](https://www.mongodb.com/docs/manual/reference/command/listIndexes/).
@@ -1527,13 +1529,13 @@ before storage admission. The current option contract is:
 | Distinct `key` / `query` | BSON string key and optional document filter; shared identity and global encounter order, absent collection returns an empty values array |
 | Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
-| Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
-| Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only `batchSize` from 0 through 1000 (default 101). Basic stages plus project/set/addFields/unset; absent collection returns empty after validation. |
+| Find `batchSize` | Nonnegative integer request, capped internally at 1000; zero opens an empty initial batch. Default 101. |
+| Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only nonnegative integer `batchSize`, capped internally at 1000 (default 101). Basic stages plus project/set/addFields/unset; absent collection returns empty after validation. |
 | Find/aggregate `allowDiskUse` | Only `false`; there is no disk spill |
 | Find/aggregate `let` | Empty document only; command-level expression variables remain unsupported |
 | Find `tailable`, `awaitData`, `noCursorTimeout`, `allowPartialResults`, `returnKey`, `showRecordId` | Only boolean `false`, preserving existing result, expiry and all-or-error behavior |
 | Find `oplogReplay` | Boolean legacy no-op; does not enable an oplog |
-| `getMore` `batchSize` | Integer from 1 through 1000; default 101. Pages also end at the wire byte budget. |
+| `getMore` `batchSize` | Positive integer request, capped internally at 1000; default 101. Pages also end at the wire byte budget. Large requests do not truncate the total query limit; remaining results stay on the cursor. |
 | Find `singleBatch` | Boolean; `true` intentionally returns only the first batch, with cursor ID zero |
 
 For example, existing PyMongo code can chain ordinary read options:
