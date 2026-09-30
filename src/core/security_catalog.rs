@@ -30,6 +30,7 @@ mod role_info;
 mod user_info;
 pub use durable::DurableSecurityCatalog;
 pub use mongo_data_roles::MongoDataRole;
+pub(crate) use mongo_data_roles::validate_document_role_policy;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
 pub use role_info::{MAX_ROLE_INFO_SELECTORS, RoleInfo, RoleInfoRequest};
 pub use user_info::{MAX_USER_INFO_SELECTORS, UserInfo, UserInfoRequest};

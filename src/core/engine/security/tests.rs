@@ -9,6 +9,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 mod contention;
 mod create_role;
 mod drop_role;
+mod grant_role_privileges;
 #[cfg(feature = "documents")]
 mod non_system;
 mod role_info;

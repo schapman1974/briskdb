@@ -477,7 +477,13 @@ database under differential/property tests.
   actions, input/expanded-policy limits, no implicit membership, and Rust-side
   confinement prevent cross-database/global/SQL/admin escalation. Real TLS
   clients cover least privilege, persistence and deletion/recreation; inheritance,
-  role updates and authenticated host integration remain open.
+  `updateRole` and authenticated host integration remain open.
+  `grantPrivilegesToRole` now adds database-local data/schema grants to existing
+  roles with current `GrantRole` authority and one revision-checked catalog
+  publication. Memberships and prior grants are preserved; resulting role and
+  affected-user unions are bounded before any edit. Native and real TLS clients
+  cover live permission refresh, restart, revocation and policy-limit rejection.
+  Privilege revocation, full role replacement and inheritance remain open.
   `rolesInfo` now inspects assigned roles or separately authorized role realms
   without policy/credential export; whole-realm listing requires `ViewRoles`.
   Live membership/credential checks, bounded output and restart behavior apply.

@@ -943,7 +943,7 @@ references. Account commands cannot target `local`. Passwords are bounded to
 `digestPassword` must be `true`; write concern must be omitted, `{}` or `{w: 1}`.
 Unknown/duplicate fields, unacknowledged writes, SHA-1, pre-digested passwords,
 custom data, authentication restrictions, comments, role-array replacement in
-`updateUser`, role updates and inherited role definitions are unsupported. The
+`updateUser`, `updateRole` and inherited role definitions are unsupported. The
 bounded `createRole` subset is documented below. Catalog
 existence/conflict errors currently use BriskDB's generic wire error mapping,
 not every MongoDB administration-specific error code.
@@ -1046,7 +1046,7 @@ authorized catalog revision and never automatically replays a conflicting or
 uncertain write. Already-admitted work is not retroactively cancelled; a timeout
 after blocking work starts can leave an uncertain outcome. Sync/async PyMongo,
 live cursor revocation, independent-engine refresh and recreation/reopen are
-covered. This does not add role updates, inheritance, automatic built-in
+covered. This does not add `updateRole`, inheritance, automatic built-in
 roles, or Python/daemon/composed authenticated-host configuration; #188 stays open.
 
 `createRole` supports flat, database-local custom data roles through the same
@@ -1100,6 +1100,39 @@ uncertain timeout. Existing catalog limits apply. Real sync/async TLS clients
 cover least privilege, exact/non-system scopes, persistence, and revocation after
 deleting/recreating a custom role. No security catalog format/version change is
 needed; full role administration and authenticated host integration remain open.
+
+`grantPrivilegesToRole` adds a bounded union of document privileges to an
+existing role without replacing its other grants or changing any user's
+membership. It uses the same resource/action subset, expansion limits and
+write-concern rules as `createRole`, but has no `roles` field. Only current
+`GrantRole` on the target database is required; `CreateRole` is not required.
+The realm check precedes existence lookup, including empty/repeated additions.
+An authorized missing role returns redacted code 31; this command never creates
+a missing role. These rules implement the supported portion of MongoDB's
+[`grantPrivilegesToRole` contract](https://www.mongodb.com/docs/manual/reference/command/grantprivilegestorole/).
+
+```python
+# Existing members gain insert permission on posts on their next admission.
+operator.app.command(
+    "grantPrivilegesToRole", "post_reader",
+    privileges=[{"resource": {"db": "app", "collection": "posts"},
+                 "actions": ["insert"]}],
+    writeConcern={"w": 1},
+)
+```
+
+The resulting role and every affected user's resolved union must fit the
+256-grant limit before publication; a failure changes neither permissions nor
+memberships. Repeated grants deduplicate without losing existing rights. New
+additions must be database-local document grants; existing host-provisioned
+grants outside that subset are preserved unchanged, not silently discarded or
+reinterpreted. The native `Engine::grant_document_role_privileges` enforces the
+same current authority, session ownership and request controls. Authorization
+and publication share a single catalog revision, with no automatic replay after
+conflict or uncertain timeout. Live clients, independent-engine refresh,
+credential/administrator revocation, policy-limit failure and restart persistence
+are tested. `revokePrivilegesFromRole`, full `updateRole`, inheritance and
+expanded privilege export remain unsupported.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -1770,7 +1803,8 @@ one-way responses. Unknown command names share `Other`; namespaces, query values
 identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
 (including their rejected outcomes), five user-management commands, `usersInfo`,
-`rolesInfo`, `dropRole` and `createRole`. Missing stored roles use the fixed code-31 counter.
+`rolesInfo`, `dropRole`, `createRole` and `grantPrivilegesToRole`. Missing stored
+roles use the fixed code-31 counter.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can
 span multiple commands.

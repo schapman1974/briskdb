@@ -70,6 +70,7 @@ pub enum MongoCommandKind {
     RolesInfo,
     DropRole,
     CreateRole,
+    GrantPrivilegesToRole,
     Other,
 }
 
@@ -109,6 +110,7 @@ impl MongoCommandKind {
         Self::RolesInfo,
         Self::DropRole,
         Self::CreateRole,
+        Self::GrantPrivilegesToRole,
         Self::Other,
     ];
 
@@ -148,6 +150,7 @@ impl MongoCommandKind {
             "rolesInfo" => Self::RolesInfo,
             "dropRole" => Self::DropRole,
             "createRole" => Self::CreateRole,
+            "grantPrivilegesToRole" => Self::GrantPrivilegesToRole,
             _ => Self::Other,
         }
     }
@@ -189,6 +192,7 @@ impl MongoCommandKind {
             Self::RolesInfo => "rolesInfo",
             Self::DropRole => "dropRole",
             Self::CreateRole => "createRole",
+            Self::GrantPrivilegesToRole => "grantPrivilegesToRole",
             Self::Other => "other",
         }
     }

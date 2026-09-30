@@ -1,7 +1,30 @@
 //! Explicit host-provisioned Mongo data-role profiles, not implicit roles.
 
 use super::*;
-use crate::core::authorization::{DataDomain, Privilege, Scope};
+use crate::core::authorization::{DataDomain, Privilege, Scope, ScopeValue};
+
+pub(crate) fn validate_document_role_policy(
+    name: &SecurityName,
+    policy: &Policy,
+) -> EngineResult<()> {
+    for grant in policy.privileges() {
+        let confined = match grant.scope().stored_value() {
+            ScopeValue::Exact(resource) => {
+                resource.domain() == Some(DataDomain::Document)
+                    && resource.database_name() == Some(name.realm())
+            }
+            ScopeValue::NonSystemDocumentCollections(database) => database == name.realm(),
+            _ => false,
+        };
+        if !confined {
+            return Err(error(
+                EngineErrorKind::InvalidArgument,
+                "document role privileges must be confined to their own database",
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The supported data/schema subset of Mongo's database-local data roles.
 /// Unsupported Mongo operations remain unsupported. These profiles grant no
@@ -59,6 +82,28 @@ impl MongoDataRole {
 }
 
 impl SecurityCatalog {
+    /// Trusted, bounded addition of exact-realm document privileges. Existing
+    /// grants and memberships are preserved, including host-provisioned grants
+    /// outside this subset. Validate the resulting role and every affected user
+    /// union before any edit. This method does not authorize the caller; use
+    /// Engine::grant_document_role_privileges for session-authorized mutation.
+    pub fn grant_document_role_privileges(
+        &mut self,
+        name: &SecurityName,
+        additions: Policy,
+    ) -> EngineResult<()> {
+        validate_document_role_policy(name, &additions)?;
+        let current = self.roles.get(name).ok_or_else(|| {
+            EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                "security role does not exist",
+                RoleNotFound,
+            )
+        })?;
+        let combined = Policy::combine([current, &additions])?;
+        self.replace_role(name, combined)
+    }
+
     /// Trusted provisioning of the supported `read` and `readWrite` profiles
     /// in one exact database. Both are installed or neither is. A collision
     /// (even an identical existing policy) or capacity limit changes nothing.
