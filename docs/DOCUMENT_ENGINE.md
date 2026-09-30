@@ -643,7 +643,10 @@ use the same bounded coordinator and one shared heap, not per-shard heaps.
 
 Native `Count` uses the same eight-child coordinator for independent shard
 counts, including owner-pruned `_id` sets. An empty filter uses each shard's
-storage count; filtered counts retain the existing full matcher/candidate path.
+storage count; filtered counts stream the existing full matcher/candidate path
+through one statement per shard, preparing its probe and validating its storage
+schema once. Each streamed record still receives checksum/identity validation,
+matcher checks and cancellation checks; no result documents are accumulated.
 Only one checked scalar per shard is retained, and global skip/limit applies
 once after summation. Exact-ID counts still read their one owner directly.
 
@@ -1455,7 +1458,10 @@ Unfiltered scalar counts reuse the native controlled `count(*)` on each routed
 shard, retaining only checked scalar totals rather than decoding BSON payloads.
 Like native count, this uses startup validation and normal point/scan reads as
 the checksum boundary; it is not a fresh payload-integrity audit. Filtered counts
-without a limit use the full shared matcher and existing safe candidate probes.
+without a limit use the full shared matcher and existing safe candidate probes
+in one short-lived SQLite read stream per shard. Only the current decoded
+record and a checked counter are retained. The stream does not start or finish
+caller-owned transactions and releases its snapshot when that worker returns.
 Filtered limits retain natural-order source processing and stop predicate
 evaluation when a limit is exhausted, even if a later skip discards that row.
 Global skip/limit ordering, empty-input omission, constant key bytes, and

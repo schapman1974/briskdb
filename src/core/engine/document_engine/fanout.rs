@@ -135,31 +135,64 @@ impl Engine {
                 let stats = stats.clone();
                 async move {
                     engine
-                        .run_document_shard(
+                        .run_document_shard_controlled(
                             shard,
                             owner,
                             cancellation,
                             deadline,
-                            move |storage, connection, cancellation| {
+                            move |storage, connection, cancellation, control| {
                                 if let Some(matcher) = matcher {
-                                    let mut after = None;
+                                    let mut check =
+                                        || ensure_document_cpu_active(cancellation, control);
+                                    let probe = storage.document_equality_probe(
+                                        collection_id,
+                                        &matcher,
+                                        &mut check,
+                                    )?;
                                     let mut count = 0_u64;
-                                    while let Some(record) = next_matching_document(
-                                        storage,
+                                    let mut observe = |elapsed| {
+                                        if let Some(stats) = &stats {
+                                            stats.streamed_storage_read(shard, elapsed);
+                                        }
+                                    };
+                                    let observer = stats.as_ref().map(|_| {
+                                        &mut observe as &mut dyn FnMut(std::time::Duration)
+                                    });
+                                    storage.visit_document_candidates_on_connection(
                                         connection,
                                         collection_id,
                                         shard,
-                                        after,
-                                        Some(&matcher),
+                                        None,
+                                        None,
+                                        probe.as_ref(),
                                         cancellation,
-                                        deadline,
-                                        stats.as_deref(),
-                                    )? {
-                                        after = Some(record.natural_order());
-                                        count = count.checked_add(1).ok_or_else(|| {
-                                            limit_exceeded("document count overflowed")
-                                        })?;
-                                    }
+                                        observer,
+                                        |record| {
+                                            check()?;
+                                            validate_point_record(
+                                                &record,
+                                                collection_id,
+                                                shard,
+                                                record.id_key(),
+                                            )?;
+                                            if let Some(stats) = &stats {
+                                                stats.examine(shard, 1);
+                                                stats.match_document();
+                                            }
+                                            if matcher
+                                                .matches_with_check(record.document(), &mut check)?
+                                            {
+                                                if let Some(stats) = &stats {
+                                                    stats.source_match(shard);
+                                                }
+                                                count = count.checked_add(1).ok_or_else(|| {
+                                                    limit_exceeded("document count overflowed")
+                                                })?;
+                                            }
+                                            Ok(true)
+                                        },
+                                    )?;
+                                    check()?;
                                     Ok(count)
                                 } else {
                                     ReadStats::observe_storage_read(stats.as_deref(), shard, || {

@@ -150,4 +150,16 @@ async fn subset_and_point_counts_never_wait_for_unrelated_shards() {
 #[tokio::test]
 async fn counts_drain_failure_cancellation_and_caller_abort_without_poisoning_shared_controls() {
     assert_failure_cleanup(all, |result| assert_count(result, 12)).await;
+    assert_failure_cleanup(
+        || {
+            count(
+                filter(BsonValue::Document(
+                    BsonDocument::from_entries([("$gte", BsonValue::Int32(0))]).unwrap(),
+                )),
+                DocumentReadOptions::new(),
+            )
+        },
+        |result| assert_count(result, 12),
+    )
+    .await;
 }
