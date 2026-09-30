@@ -56,7 +56,7 @@ pub(super) fn prepare_create(
     started: Instant,
     limits: super::super::MongoResourceLimits,
 ) -> Result<Prepared> {
-    prepare_policy(request, started, limits, false)
+    prepare_policy(request, started, limits, PolicyCommand::Create)
 }
 
 pub(super) fn prepare_grant(
@@ -64,14 +64,29 @@ pub(super) fn prepare_grant(
     started: Instant,
     limits: super::super::MongoResourceLimits,
 ) -> Result<Prepared> {
-    prepare_policy(request, started, limits, true)
+    prepare_policy(request, started, limits, PolicyCommand::Grant)
+}
+
+pub(super) fn prepare_revoke(
+    request: &Request,
+    started: Instant,
+    limits: super::super::MongoResourceLimits,
+) -> Result<Prepared> {
+    prepare_policy(request, started, limits, PolicyCommand::Revoke)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PolicyCommand {
+    Create,
+    Grant,
+    Revoke,
 }
 
 fn prepare_policy(
     request: &Request,
     started: Instant,
     limits: super::super::MongoResourceLimits,
-    grant: bool,
+    command: PolicyCommand,
 ) -> Result<Prepared> {
     if request.more_to_come || request.legacy_handshake || !request.sequences.is_empty() {
         return Err(CommandError::options());
@@ -79,15 +94,15 @@ fn prepare_policy(
     if request.database == "local" {
         return Err(CommandError::unsupported());
     }
-    let command_name = if grant {
-        "grantPrivilegesToRole"
-    } else {
-        "createRole"
+    let command_name = match command {
+        PolicyCommand::Create => "createRole",
+        PolicyCommand::Grant => "grantPrivilegesToRole",
+        PolicyCommand::Revoke => "revokePrivilegesFromRole",
     };
-    let allowed: &[&str] = if grant {
-        &["grantPrivilegesToRole", "privileges", "writeConcern", "$db"]
+    let allowed: &[&str] = if command == PolicyCommand::Create {
+        &[command_name, "privileges", "roles", "writeConcern", "$db"]
     } else {
-        &["createRole", "privileges", "roles", "writeConcern", "$db"]
+        &[command_name, "privileges", "writeConcern", "$db"]
     };
     let mut seen = 0u8;
     for (field, value) in request.body.iter() {
@@ -107,7 +122,7 @@ fn prepare_policy(
         return Err(CommandError::invalid());
     };
     let name = SecurityName::new(&request.database, name)?;
-    if !grant {
+    if command == PolicyCommand::Create {
         let Some(BsonValue::Array(roles)) = request.body.get_first("roles") else {
             return Err(CommandError::invalid());
         };
@@ -118,7 +133,11 @@ fn prepare_policy(
     let Some(BsonValue::Array(privileges)) = request.body.get_first("privileges") else {
         return Err(CommandError::invalid());
     };
-    let policy = data_policy(&request.database, privileges)?;
+    let policy = data_policy(
+        &request.database,
+        privileges,
+        command != PolicyCommand::Revoke,
+    )?;
     let deadline = started + limits.command_timeout();
     if Instant::now() >= deadline {
         return Err(CommandError::new(
@@ -128,10 +147,10 @@ fn prepare_policy(
         ));
     }
     Ok(Prepared {
-        command: if grant {
-            Command::GrantRolePrivileges(name, policy)
-        } else {
-            Command::CreateRole(name, policy)
+        command: match command {
+            PolicyCommand::Create => Command::CreateRole(name, policy),
+            PolicyCommand::Grant => Command::GrantRolePrivileges(name, policy),
+            PolicyCommand::Revoke => Command::RevokeRolePrivileges(name, policy),
         },
         deadline,
         advisory_hint: false,
@@ -141,6 +160,7 @@ fn prepare_policy(
 fn data_policy(
     database: &str,
     privileges: &[BsonValue],
+    include_admission: bool,
 ) -> Result<crate::core::authorization::Policy> {
     use crate::core::authorization::{
         Action, DataDomain, MAX_POLICY_PRIVILEGES, Policy, Privilege, Resource, Scope,
@@ -211,19 +231,19 @@ fn data_policy(
             } else {
                 scope.clone()
             };
-            if action == Action::CreateObject {
+            if action == Action::CreateObject && include_admission {
                 grants.push(Privilege::new(
                     Action::CreateDatabase,
                     Scope::exact(db.clone()),
                 )?);
             }
             grants.push(Privilege::new(action, scope)?);
-            if grants.len() >= MAX_POLICY_PRIVILEGES {
+            if grants.len() + usize::from(include_admission) > MAX_POLICY_PRIVILEGES {
                 return Err(CommandError::invalid());
             }
         }
     }
-    if !grants.is_empty() {
+    if include_admission && !grants.is_empty() {
         // BriskDB requires database admission independently of every data action.
         grants.push(Privilege::new(Action::ConnectDatabase, Scope::exact(db))?);
     }

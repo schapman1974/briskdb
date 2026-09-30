@@ -1131,8 +1131,49 @@ same current authority, session ownership and request controls. Authorization
 and publication share a single catalog revision, with no automatic replay after
 conflict or uncertain timeout. Live clients, independent-engine refresh,
 credential/administrator revocation, policy-limit failure and restart persistence
-are tested. `revokePrivilegesFromRole`, full `updateRole`, inheritance and
-expanded privilege export remain unsupported.
+are tested. Full `updateRole`, inheritance and expanded privilege export remain
+unsupported.
+
+`revokePrivilegesFromRole` removes exact action/resource pairs from an existing
+database-local role. Current `RevokeRole` on the exact command database is
+required before lookup, even for empty/repeated removals; `GrantRole` alone is
+not sufficient. An authorized missing role returns redacted code 31. The same
+bounded resources/actions, strict options and write concerns as the grant command
+apply. This follows MongoDB's
+[`exact-resource removal rule`](https://www.mongodb.com/docs/manual/reference/command/revokePrivilegesFromRole/):
+removing `find` on `posts` does not subtract from a non-system-collection `find`
+grant, and removing that broad grant does not remove a separately stored exact
+`posts` grant. Other assigned roles retain their independent permissions.
+
+```python
+operator.app.command(
+    "revokePrivilegesFromRole", "post_reader",
+    privileges=[{"resource": {"db": "app", "collection": "posts"},
+                 "actions": ["insert"]}],
+    writeConcern={"w": 1},
+)
+```
+
+Role identity, memberships and unrelated grants are retained. Existing sessions,
+independent engines and cursor continuations observe lost data permissions on
+their next admission; already-admitted work is not retroactively cancelled.
+Revocations survive restart. Empty/repeated/nonmatching removals succeed without
+changing the role policy, but still require current authority. Native
+`Engine::revoke_document_role_privileges` uses the same session, deadline,
+cancellation and revision-checked publication controls; uncertain writes are
+never automatically replayed.
+
+Unlike granting, revocation does **not** expand requested actions into BriskDB's
+internal `ConnectDatabase`/`CreateDatabase` grants. These existing admission
+grants are preserved: removing one collection permission must not remove an
+unrelated collection's shared prerequisites or reinterpret a host-provisioned
+grant. They are not data-read/write rights; corresponding collection actions
+are still required. Hosts needing to remove those internal grants explicitly
+must use trusted catalog policy replacement or delete the role. Native document
+revocation rejects these internal actions as inputs as well. Input remains
+bounded to 256 privilege entries and 256 actions before deduplication; no new
+grants or memberships are introduced. Full role replacement, inheritance,
+expanded privilege export and authenticated host integration remain open.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -1803,7 +1844,8 @@ one-way responses. Unknown command names share `Other`; namespaces, query values
 identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
 (including their rejected outcomes), five user-management commands, `usersInfo`,
-`rolesInfo`, `dropRole`, `createRole` and `grantPrivilegesToRole`. Missing stored
+`rolesInfo`, `dropRole`, `createRole`, `grantPrivilegesToRole` and
+`revokePrivilegesFromRole`. Missing stored
 roles use the fixed code-31 counter.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can

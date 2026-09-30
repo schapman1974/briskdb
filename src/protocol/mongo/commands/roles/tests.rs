@@ -1,6 +1,99 @@
 use super::*;
 use crate::protocol::mongo::MongoResourceLimits;
 
+fn revoking(privileges: Vec<BsonValue>) -> Request {
+    let mut input = creation(vec![]);
+    input.body = fields([
+        ("revokePrivilegesFromRole", BsonValue::from("private-role")),
+        ("privileges", BsonValue::Array(privileges)),
+        ("$db", BsonValue::from("app")),
+    ]);
+    input
+}
+
+#[test]
+fn revoke_role_privileges_preserves_exact_pairs_without_expanding_admission_grants() {
+    use crate::core::authorization::{Action, DataDomain, Resource};
+    let prepare =
+        |input: &Request| prepare_revoke(input, Instant::now(), MongoResourceLimits::default());
+    for privileges in [
+        vec![],
+        vec![privilege("app", "posts", &["find", "createCollection"])],
+        vec![privilege("app", "", &["find"; 256])],
+    ] {
+        let input = revoking(privileges);
+        let Command::RevokeRolePrivileges(name, policy) = prepare(&input).unwrap().command else {
+            panic!("wrong command")
+        };
+        assert_eq!(name, SecurityName::new("app", "private-role").unwrap());
+        let db = Resource::database(DataDomain::Document, "app").unwrap();
+        assert!(!policy.allows(Action::ConnectDatabase, &db));
+        assert!(!policy.allows(Action::CreateDatabase, &db));
+        assert!(super::super::prepare(&input, false).unwrap().is_ok());
+    }
+    for privileges in [
+        vec![privilege("other", "", &["find"])],
+        vec![privilege("", "", &["find"])],
+        vec![privilege("app", "", &["revokeRole"])],
+        vec![privilege("app", "posts", &["connect_database"])],
+        vec![privilege("app", "posts", &["find"; 257])],
+        vec![privilege("app", "posts", &[])],
+        vec![BsonValue::Null],
+    ] {
+        assert!(prepare(&revoking(privileges)).is_err());
+    }
+    for (field, value) in [
+        ("revokePrivilegesFromRole", BsonValue::from("duplicate")),
+        ("privileges", BsonValue::Array(vec![])),
+        ("roles", BsonValue::Array(vec![])),
+        ("createRole", BsonValue::from("private-role")),
+        ("grantPrivilegesToRole", BsonValue::from("private-role")),
+        ("$db", BsonValue::from("other")),
+        ("comment", BsonValue::from("private-comment")),
+        (
+            "writeConcern",
+            BsonValue::Document(fields([("w", BsonValue::Int32(0))])),
+        ),
+    ] {
+        let mut input = revoking(vec![]);
+        input.body.push(field, value).unwrap();
+        let error = prepare(&input).err().unwrap();
+        assert!(!format!("{:?}", error.document()).contains("private"));
+    }
+    for variant in 0..4 {
+        let mut input = revoking(vec![]);
+        match variant {
+            0 => input.more_to_come = true,
+            1 => input.legacy_handshake = true,
+            2 => input.database = "local".into(),
+            _ => input.sequences.push(wire::DocumentSequence {
+                identifier: "private".into(),
+                documents: vec![],
+            }),
+        }
+        assert!(prepare(&input).is_err());
+    }
+    assert_eq!(
+        prepare_revoke(
+            &revoking(vec![]),
+            Instant::now() - Duration::from_secs(30),
+            MongoResourceLimits::default()
+        )
+        .err()
+        .unwrap()
+        .code,
+        50
+    );
+    let mut catalog = crate::core::security_catalog::SecurityCatalog::new();
+    let missing = catalog
+        .revoke_document_role_privileges(
+            &SecurityName::new("app", "private-role").unwrap(),
+            crate::core::authorization::Policy::default(),
+        )
+        .unwrap_err();
+    assert_eq!(CommandError::from(missing).code, 31);
+}
+
 fn granting(privileges: Vec<BsonValue>) -> Request {
     let mut input = creation(vec![]);
     input.body = fields([

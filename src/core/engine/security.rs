@@ -246,6 +246,41 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Remove exact database-local document action/scope pairs. Requires current
+    /// RevokeRole on the exact realm before lookup, even for empty/no-op removal.
+    /// Existing memberships and unrelated/internal database admission grants are
+    /// retained. Authorization and publication use one catalog revision, without
+    /// automatic retries. Already-started work can have an uncertain outcome on
+    /// timeout/cancellation; queued cancelled work makes no catalog change.
+    pub async fn revoke_document_role_privileges(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        name: SecurityName,
+        removals: crate::core::authorization::Policy,
+    ) -> EngineResult<()> {
+        use crate::core::authorization::{Action, Resource};
+        let mut operation = self.operation_lifecycle(context)?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        crate::core::security_catalog::validate_document_role_revocations(&name, &removals)?;
+        let requirements = [(Action::RevokeRole, Resource::security_realm(name.realm())?)];
+        operation.check_before_start()?;
+        let result = self
+            .security_call_from_parent(&operation, move |authority| {
+                authority.update_authorized(&principal, &requirements, |catalog| {
+                    catalog.revoke_document_role_privileges(&name, removals)
+                })
+            })
+            .await;
+        operation.finish(result)
+    }
+
     /// Delete a stored flat role and all its memberships in one catalog commit.
     /// Requires current DropRole authority on the target realm, including for a
     /// missing role. Existing sessions retain their login but observe revoked

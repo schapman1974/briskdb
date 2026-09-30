@@ -30,6 +30,9 @@ mod create_role;
 #[path = "authentication/grant_role_privileges.rs"]
 mod grant_role_privileges;
 
+#[path = "authentication/revoke_role_privileges.rs"]
+mod revoke_role_privileges;
+
 fn assert_audit_fields(events: &[capture::Fields]) {
     let mut connections = std::collections::BTreeMap::new();
     let mut identities = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
