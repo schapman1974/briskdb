@@ -4,9 +4,29 @@ import tempfile
 import unittest
 
 from briskdb import mongo
+from pymongo.errors import OperationFailure
 
 
 class RetainedSortWindowTests(unittest.TestCase):
+    def test_find_disk_policy_accepts_booleans_but_not_aggregation_spill(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mongo.MongoClient(folder=folder, shards=2) as client:
+                items = client.app.items
+                items.insert_many([{"_id": i, "rank": -i} for i in range(9)])
+                for allow in (True, False):
+                    rows = list(items.find({}, {"_id": 1}, allow_disk_use=allow)
+                                .sort("rank").batch_size(2))
+                    self.assertEqual(rows, [{"_id": i} for i in reversed(range(9))])
+                    self.assertEqual(list(items.find({"_id": 0}).allow_disk_use(allow)),
+                                     [{"_id": 0, "rank": 0}])
+                for invalid in (0, None, "false"):
+                    with self.assertRaises(OperationFailure) as error:
+                        client.app.command("find", "items", allowDiskUse=invalid)
+                    self.assertEqual(error.exception.code, 72)
+                with self.assertRaises(OperationFailure) as error:
+                    list(items.aggregate([], allowDiskUse=True))
+                self.assertEqual(error.exception.code, 72)
+
     def test_continuations_recheck_rows_without_retaining_stale_documents(self):
         with tempfile.TemporaryDirectory() as folder:
             with mongo.MongoClient(folder=folder, shards=2) as client:

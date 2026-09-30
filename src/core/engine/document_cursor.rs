@@ -93,6 +93,7 @@ pub(super) struct CursorState {
     pub sort_after: Option<Arc<SortPosition>>,
     pub sort_window: Option<SortWindow>,
     pub sort_spool: Option<SortSpool>,
+    pub allow_sort_spill: bool,
     pub after: Option<u64>,
     pub skip: u64,
     pub remaining: Option<u64>,
@@ -331,6 +332,8 @@ pub(super) struct SortPosition {
 pub(super) struct SortWindow {
     pub entries: VecDeque<(Arc<SortPosition>, u16)>,
     pub truncated: bool,
+    pub fallback_scans: u8,
+    pub spill_after: bool,
     key_bytes: usize,
 }
 
@@ -343,6 +346,8 @@ impl SortWindow {
         Self {
             entries,
             truncated,
+            fallback_scans: 0,
+            spill_after: false,
             key_bytes,
         }
     }
@@ -711,6 +716,7 @@ mod tests {
             sort_after: None,
             sort_window: None,
             sort_spool: None,
+            allow_sort_spill: true,
             after: None,
             skip: 0,
             remaining: None,

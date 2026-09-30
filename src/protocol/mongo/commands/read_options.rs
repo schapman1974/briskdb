@@ -18,7 +18,8 @@ pub(super) fn accepts(command: &str, field: &str, value: &BsonValue) -> Option<b
             if doc.len() == 1 && matches!(doc.get_first("locale"), Some(BsonValue::String(locale)) if locale == "simple")),
         "readConcern" if read => matches!(value, BsonValue::Document(doc)
             if doc.is_empty() || (doc.len() == 1 && matches!(doc.get_first("level"), Some(BsonValue::String(level)) if level == "local"))),
-        "allowDiskUse" if matches!(command, "find" | "aggregate") => {
+        "allowDiskUse" if command == "find" => matches!(value, BsonValue::Boolean(_)),
+        "allowDiskUse" if command == "aggregate" => {
             matches!(value, BsonValue::Boolean(false))
         }
         "tailable"
@@ -155,9 +156,57 @@ mod tests {
     }
 
     #[test]
+    fn find_disk_policy_is_typed_and_forwarded_without_enabling_aggregation_spill() {
+        for allow in [false, true] {
+            let plan = prepare(
+                &request("find", "allowDiskUse", BsonValue::Boolean(allow)),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            let Command::Find(find, _, _) = plan.command else {
+                panic!("find command")
+            };
+            assert_eq!(find.read_options().allow_disk_use(), Some(allow));
+        }
+        for value in [
+            BsonValue::Int32(0),
+            BsonValue::Null,
+            BsonValue::String("false".into()),
+        ] {
+            assert_eq!(
+                prepare(&request("find", "allowDiskUse", value), false)
+                    .unwrap()
+                    .err()
+                    .unwrap()
+                    .code,
+                72
+            );
+        }
+        assert!(
+            prepare(
+                &request("aggregate", "allowDiskUse", BsonValue::Boolean(false)),
+                false
+            )
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(
+            prepare(
+                &request("aggregate", "allowDiskUse", BsonValue::Boolean(true)),
+                false
+            )
+            .unwrap()
+            .err()
+            .unwrap()
+            .code,
+            72
+        );
+    }
+
+    #[test]
     fn cursor_defaults_cannot_disable_limits_or_enable_unimplemented_features() {
         for option in [
-            "allowDiskUse",
             "tailable",
             "awaitData",
             "noCursorTimeout",

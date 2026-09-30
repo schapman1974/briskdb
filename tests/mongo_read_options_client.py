@@ -84,7 +84,7 @@ def sync_read_options(uri, reopened):
                         assert "briskdbReadWarnings" not in error.details
                     else:
                         raise AssertionError(("unsupported option accepted", name, options))
-        for option in ("tailable", "awaitData", "noCursorTimeout", "allowPartialResults", "returnKey", "showRecordId", "allowDiskUse"):
+        for option in ("tailable", "awaitData", "noCursorTimeout", "allowPartialResults", "returnKey", "showRecordId"):
             assert database.command("find", "items", **{option: False})["cursor"]["firstBatch"] == DOCUMENTS
             try:
                 missing.command("find", "items", **{option: True})
@@ -93,6 +93,8 @@ def sync_read_options(uri, reopened):
             else:
                 raise AssertionError(("unsupported true flag accepted", option))
         for value in (True, False):
+            assert list(collection.find({}).allow_disk_use(value)) == DOCUMENTS
+            assert list(missing.items.find({}).allow_disk_use(value)) == []
             assert database.command("find", "items", oplogReplay=value)["cursor"]["firstBatch"] == DOCUMENTS
         assert "unwritten_read_options" not in client.list_database_names()
         assert list(collection.find({})) == DOCUMENTS

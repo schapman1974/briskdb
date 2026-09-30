@@ -1,6 +1,7 @@
 //! Bounded external sorting of keys, never document payloads. Anonymous files
 //! are removed by the OS on last-close, including process termination. Binary
-//! run merges bound the number of simultaneously decoded frontiers to two.
+//! runs are merged lazily at read time when their frontiers fit memory. Only
+//! oversized frontier sets require balanced, two-way materialized merge passes.
 
 use std::{
     cmp::Reverse,
@@ -22,6 +23,11 @@ const QUERY_DISK_BYTES: u64 = 256 * 1024 * 1024;
 const ENGINE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
 const HEADER_BYTES: usize = 4 + 8 + 2 + 32;
 const IO_CHUNK: usize = 64 * 1024;
+// Large keys bypass BufWriter's small buffer in larger, bounded writes. A
+// 64-KiB read buffer still keeps a many-run cursor's retained memory modest.
+const FILE_IO_CHUNK: usize = 1024 * 1024;
+const MAX_RUNS: usize = 512;
+const FRONTIER_RUNS: usize = 64;
 
 fn limit() -> EngineError {
     EngineError::new(
@@ -150,6 +156,7 @@ impl SpoolPosition {
 struct RunWriter {
     file: BufWriter<File>,
     charge: Charge,
+    max_key_bytes: usize,
 }
 
 impl RunWriter {
@@ -161,6 +168,7 @@ impl RunWriter {
                 global: global.clone(),
                 bytes: 0,
             },
+            max_key_bytes: 0,
         })
     }
 
@@ -171,10 +179,11 @@ impl RunWriter {
     ) -> EngineResult<()> {
         check()?;
         let header = position.header(check)?;
+        self.max_key_bytes = self.max_key_bytes.max(position.key.len());
         self.charge
             .reserve((HEADER_BYTES + position.key.len()) as u64)?;
         self.file.write_all(&header).map_err(io)?;
-        for chunk in position.key.chunks(IO_CHUNK) {
+        for chunk in position.key.chunks(FILE_IO_CHUNK) {
             check()?;
             self.file.write_all(chunk).map_err(io)?;
         }
@@ -194,6 +203,7 @@ impl RunWriter {
             file: BufReader::with_capacity(IO_CHUNK, file),
             read: 0,
             charge: self.charge,
+            max_key_bytes: self.max_key_bytes,
         })
     }
 }
@@ -202,6 +212,7 @@ struct Run {
     file: BufReader<File>,
     read: u64,
     charge: Charge,
+    max_key_bytes: usize,
 }
 
 impl Run {
@@ -220,6 +231,7 @@ impl Run {
         self.file.read_exact(&mut header).map_err(io)?;
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         if !(9..=MAX_KEY_BYTES).contains(&len)
+            || len > self.max_key_bytes
             || self.charge.bytes - self.read - (HEADER_BYTES as u64) < len as u64
         {
             return Err(damaged());
@@ -227,7 +239,7 @@ impl Run {
         let mut key = Vec::new();
         key.try_reserve_exact(len).map_err(|_| limit())?;
         key.resize(len, 0);
-        for chunk in key.chunks_mut(IO_CHUNK) {
+        for chunk in key.chunks_mut(FILE_IO_CHUNK) {
             check()?;
             self.file.read_exact(chunk).map_err(io)?;
         }
@@ -272,9 +284,11 @@ pub(super) struct SpoolBuilder {
     global: Arc<Counter>,
     keys: BinaryHeap<Reverse<SpoolPosition>>,
     key_bytes: usize,
-    levels: Vec<Option<Run>>,
+    runs: Vec<Run>,
     chunk_bytes: usize,
     chunk_keys: usize,
+    frontier_bytes: usize,
+    frontier_runs: usize,
 }
 
 impl SpoolBuilder {
@@ -284,9 +298,11 @@ impl SpoolBuilder {
             global: budget.0.clone(),
             keys: BinaryHeap::new(),
             key_bytes: 0,
-            levels: Vec::new(),
+            runs: Vec::new(),
             chunk_bytes: CHUNK_BYTES,
             chunk_keys: CHUNK_KEYS,
+            frontier_bytes: CHUNK_BYTES,
+            frontier_runs: FRONTIER_RUNS,
         }
     }
 
@@ -314,28 +330,16 @@ impl SpoolBuilder {
         if self.keys.is_empty() {
             return check();
         }
+        if self.runs.len() == MAX_RUNS {
+            return Err(limit());
+        }
         let mut writer = RunWriter::new(&self.local, &self.global)?;
         while let Some(Reverse(position)) = self.keys.pop() {
             writer.push(&position, check)?;
         }
         self.keys = BinaryHeap::new();
         self.key_bytes = 0;
-        let mut run = writer.finish(check)?;
-        let mut level = 0;
-        loop {
-            check()?;
-            if level == self.levels.len() {
-                self.levels.push(Some(run));
-                break;
-            }
-            if let Some(previous) = self.levels[level].take() {
-                run = merge(previous, run, check)?;
-                level += 1;
-            } else {
-                self.levels[level] = Some(run);
-                break;
-            }
-        }
+        self.runs.push(writer.finish(check)?);
         Ok(())
     }
 
@@ -344,47 +348,92 @@ impl SpoolBuilder {
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<SortSpool> {
         self.spill(check)?;
-        let mut output = None;
-        for run in self.levels.into_iter().flatten() {
-            output = Some(match output {
-                None => run,
-                Some(previous) => merge(previous, run, check)?,
-            });
+        // Usually each run only needs one small key in the cursor's merge
+        // heap. Do not rewrite every byte of every run just to collapse files.
+        // When frontiers would exceed the memory/handle cap, merge adjacent
+        // pairs in complete balanced passes (never a growing run with each
+        // subsequent input). This bounds materialized merge work to O(n log n).
+        while self.runs.len() > 1
+            && (self.runs.len() > self.frontier_runs
+                || self
+                    .runs
+                    .iter()
+                    .map(|run| run.max_key_bytes + 128)
+                    .sum::<usize>()
+                    > self.frontier_bytes)
+        {
+            let mut next = Vec::with_capacity(self.runs.len().div_ceil(2));
+            let mut runs = self.runs.into_iter();
+            while let Some(left) = runs.next() {
+                check()?;
+                next.push(match runs.next() {
+                    Some(right) => merge(left, right, check)?,
+                    None => left,
+                });
+            }
+            self.runs = next;
         }
         check()?;
         Ok(SortSpool {
-            run: output,
+            runs: self.runs,
+            frontiers: BinaryHeap::new(),
+            initialized: false,
             pending: VecDeque::new(),
         })
     }
 }
 
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct Frontier {
+    position: SpoolPosition,
+    run: usize,
+}
+
 pub(super) struct SortSpool {
-    run: Option<Run>,
+    runs: Vec<Run>,
+    frontiers: BinaryHeap<Reverse<Frontier>>,
+    initialized: bool,
     pub pending: VecDeque<Arc<SpoolPosition>>,
 }
 
 impl SortSpool {
     pub fn advance(&mut self, check: &mut dyn FnMut() -> EngineResult<()>) -> EngineResult<()> {
+        if !self.initialized {
+            for (index, run) in self.runs.iter_mut().enumerate() {
+                if let Some(position) = run.next(check)? {
+                    self.frontiers.push(Reverse(Frontier {
+                        position,
+                        run: index,
+                    }));
+                }
+            }
+            self.initialized = true;
+        }
         if self.pending.is_empty() {
             let mut bytes = 0;
             while self.pending.len() < 256 && bytes < 1024 * 1024 {
-                let next = match self.run.as_mut() {
-                    Some(run) => run.next(check)?,
-                    None => None,
-                };
-                let Some(position) = next else {
+                let Some(Reverse(Frontier { position, run })) = self.frontiers.pop() else {
                     break;
                 };
                 bytes += position.retained_bytes();
                 self.pending.push_back(Arc::new(position));
+                if let Some(position) = self.runs[run].next(check)? {
+                    self.frontiers.push(Reverse(Frontier { position, run }));
+                }
             }
         }
         check()
     }
 
     pub fn retained_bytes(&self) -> usize {
-        IO_CHUNK
+        self.runs.len() * IO_CHUNK
+            + self.runs.capacity() * std::mem::size_of::<Run>()
+            + self.frontiers.capacity() * std::mem::size_of::<Frontier>()
+            + self
+                .frontiers
+                .iter()
+                .map(|frontier| frontier.0.position.retained_bytes())
+                .sum::<usize>()
             + 256
             + self.pending.capacity() * 128
             + self

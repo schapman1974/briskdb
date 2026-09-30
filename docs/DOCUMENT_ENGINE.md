@@ -1120,10 +1120,17 @@ limited finds retain at most skip + limit + one lookahead position. Live keys
 and the queue's unshrunk allocation count against the existing shared 64-MiB
 cursor retention quota. Sets that fit one window require one scan and an
 O(n log n) key sort, followed by point refetches. When fallback sorting exceeds
-that window and more rows are needed, one additional source scan writes sorted
-key runs into anonymous temporary files. Binary run merges provide bounded
+that window and more rows are needed, requested results observed to exceed eight windows
+plan sorted key runs in anonymous temporary files after consuming their current
+memory prefix. The first page does not wait for a second scan, and scratch
+contains only positions after that consumed frontier. Modest overflow stays
+in memory; a hard eight-fallback-window cap also triggers spooling if key widths
+or index coverage change. One additional source scan builds the runs, so a
+stable query requires at most nine source scans regardless of result size or
+batch count (normally two for large sets). Bounded run merges provide
 external O(n log n) sorting; subsequent cursor pages do not rescan the source.
-Small top-K queries and entirely index-ordered windows do not use scratch files.
+Small top-K queries, modest overflow and entirely index-ordered windows do not
+use scratch files.
 At most eight admitted shard workers scan
 and derive keys concurrently, each under the existing BSON allocation, 8-MiB
 key, and derivation-work limits. Heap comparison/updates hold a short shared
@@ -1144,10 +1151,20 @@ again in a later window. Payload updates with unchanged matching/sort values
 are visible on refetch. A spooled result fixes its candidate positions at build
 time but still refetches/rechecks current documents; it is not a BSON snapshot.
 
+`DocumentReadOptions::with_allow_disk_use(false)` disables scratch files for a
+find and remains in force across cursor continuations. If its bounded memory
+scan budget is exceeded, the request fails with `LimitExceeded` before opening
+any temporary run. Omitted or `true` permits bounded spilling. This policy is
+find-only; continuation cannot override it and aggregation does not spill.
+
 The external sorter stores only versioned order-key bytes, natural order, shard
 IDs and per-entry checksums, never whole result documents. Encoded keys are
-bounded to 16 MiB. In-memory runs use the same 16-MiB/65,536-key charge; binary
-merges decode at most two run frontiers at a time. Cursor prefetch holds at most
+bounded to 16 MiB. In-memory runs use the same 16-MiB/65,536-key charge. Cursors
+normally merge sorted files lazily without rewriting them, retaining at most
+64 run frontiers with a conservative 16-MiB key charge plus read buffers.
+Larger frontier sets first undergo balanced materialized merge passes, decoding
+at most two keys at a time. At most 512 run handles exist during construction.
+Cursor prefetch holds at most
 256 keys, stopping after reaching 1 MiB (one large key may exceed that target),
 and is charged against the existing shared cursor memory quota. Encoded scratch
 bytes are capped at 256 MiB per sort and 1 GiB per engine, including both input

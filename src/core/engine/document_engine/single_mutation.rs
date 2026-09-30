@@ -582,6 +582,7 @@ fn require_single_mutation_read_options(options: &DocumentReadOptions) -> Engine
         || options.limit().is_some()
         || options.batch_size() != DEFAULT_DOCUMENT_BATCH_SIZE
         || options.batch_byte_limit().is_some()
+        || options.allow_disk_use().is_some()
     {
         return Err(unsupported(
             "single-record mutations accept only projection and sort read options",

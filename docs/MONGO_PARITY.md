@@ -1543,7 +1543,8 @@ before storage admission. The current option contract is:
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Nonnegative integer request, capped internally at 1000; zero opens an empty initial batch. Default 101. |
 | Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only nonnegative integer `batchSize`, capped internally at 1000 (default 101). Basic stages plus project/set/addFields/unset; absent collection returns empty after validation. |
-| Find/aggregate `allowDiskUse` | Only `false`; there is no disk spill |
+| Find `allowDiskUse` | Boolean; omitted or `true` permits bounded temporary key files for large fallback sorts. `false` is retained across getMore and returns a resource-limit error rather than writing scratch files if the in-memory scan budget is exceeded. |
+| Aggregate `allowDiskUse` | Only `false`; aggregation does not spill |
 | Find/aggregate `let` | Empty document only; command-level expression variables remain unsupported |
 | Find `tailable`, `awaitData`, `noCursorTimeout`, `allowPartialResults`, `returnKey`, `showRecordId` | Only boolean `false`, preserving existing result, expiry and all-or-error behavior |
 | Find `oplogReplay` | Boolean legacy no-op; does not enable an oplog |
