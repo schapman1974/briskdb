@@ -12,6 +12,7 @@ mod drop_role;
 mod grant_role_privileges;
 #[cfg(feature = "documents")]
 mod non_system;
+mod revoke_role_privileges;
 mod role_info;
 mod user_info;
 mod user_management;

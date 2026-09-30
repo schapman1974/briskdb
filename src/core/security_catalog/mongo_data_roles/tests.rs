@@ -1,5 +1,155 @@
 use super::*;
 
+#[test]
+fn document_role_revocation_matches_pairs_not_coverage_and_preserves_other_grants() {
+    use super::super::tests::{credential, login};
+    let mut catalog = SecurityCatalog::new();
+    let role = SecurityName::new("app", "custom").unwrap();
+    let other = SecurityName::new("app", "backup").unwrap();
+    let user = SecurityName::new("accounts", "alice").unwrap();
+    let resource = Resource::object(DataDomain::Document, "app", "posts").unwrap();
+    let wildcard = Privilege::new(
+        Action::ReadData,
+        Scope::non_system_document_collections("app").unwrap(),
+    )
+    .unwrap();
+    let retained = [
+        Privilege::new(Action::InsertData, Scope::exact(resource.clone())).unwrap(),
+        Privilege::new(
+            Action::ConnectDatabase,
+            Scope::exact(Resource::database(DataDomain::Document, "app").unwrap()),
+        )
+        .unwrap(),
+        Privilege::new(
+            Action::CreateDatabase,
+            Scope::exact(Resource::database(DataDomain::Document, "app").unwrap()),
+        )
+        .unwrap(),
+        Privilege::new(
+            Action::ReadData,
+            Scope::exact(Resource::object(DataDomain::Relational, "app", "legacy").unwrap()),
+        )
+        .unwrap(),
+    ];
+    catalog
+        .create_role(
+            role.clone(),
+            Policy::new(retained.iter().cloned().chain([wildcard.clone()])).unwrap(),
+        )
+        .unwrap();
+    catalog
+        .create_role(other.clone(), Policy::new([exact_grant("posts")]).unwrap())
+        .unwrap();
+    catalog
+        .create_user(user.clone(), credential(), [role.clone(), other.clone()])
+        .unwrap();
+    let before = catalog.to_record().unwrap();
+    // A collection-specific removal cannot subtract from a wildcard grant.
+    catalog
+        .revoke_document_role_privileges(&role, Policy::new([exact_grant("posts")]).unwrap())
+        .unwrap();
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    catalog
+        .grant_document_role_privileges(&role, Policy::new([exact_grant("posts")]).unwrap())
+        .unwrap();
+    catalog
+        .revoke_document_role_privileges(&role, Policy::new([wildcard]).unwrap())
+        .unwrap();
+    assert!(catalog.roles[&role].allows(Action::ReadData, &resource));
+    catalog
+        .revoke_document_role_privileges(&role, Policy::new([exact_grant("posts")]).unwrap())
+        .unwrap();
+    assert!(!catalog.roles[&role].allows(Action::ReadData, &resource));
+    assert_eq!(catalog.roles[&role], Policy::new(retained).unwrap());
+    assert_eq!(
+        catalog.users[&user].roles,
+        BTreeSet::from([role.clone(), other])
+    );
+    // Another assigned role continues to grant its own exact read permission.
+    catalog
+        .authorize(&login(&catalog, &user), Action::ReadData, &resource)
+        .unwrap();
+    let before = catalog.to_record().unwrap();
+    for removals in [
+        Policy::new([exact_grant("posts")]).unwrap(),
+        Policy::default(),
+    ] {
+        catalog
+            .revoke_document_role_privileges(&role, removals)
+            .unwrap();
+    }
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    let restored = SecurityCatalog::from_record(before.as_bytes()).unwrap();
+    assert_eq!(catalog.roles, restored.roles);
+    assert_eq!(catalog.users[&user].roles, restored.users[&user].roles);
+}
+
+#[test]
+fn document_role_revocation_rejects_broad_or_internal_inputs_without_editing() {
+    let mut catalog = SecurityCatalog::new();
+    let role = SecurityName::new("app", "custom").unwrap();
+    catalog
+        .create_role(
+            role.clone(),
+            Policy::new((0..256).map(|n| exact_grant(&format!("c{n}")))).unwrap(),
+        )
+        .unwrap();
+    let before = catalog.to_record().unwrap();
+    for (action, scope) in [
+        (Action::ReadData, Scope::all_databases(DataDomain::Document)),
+        (
+            Action::ReadData,
+            Scope::non_system_document_collections("other").unwrap(),
+        ),
+        (
+            Action::ReadData,
+            Scope::exact(Resource::object(DataDomain::Relational, "app", "posts").unwrap()),
+        ),
+        (
+            Action::RevokeRole,
+            Scope::exact(Resource::security_realm("app").unwrap()),
+        ),
+        (
+            Action::ConnectDatabase,
+            Scope::exact(Resource::database(DataDomain::Document, "app").unwrap()),
+        ),
+        (
+            Action::CreateDatabase,
+            Scope::exact(Resource::database(DataDomain::Document, "app").unwrap()),
+        ),
+    ] {
+        assert_eq!(
+            catalog
+                .revoke_document_role_privileges(
+                    &role,
+                    Policy::new([Privilege::new(action, scope).unwrap()]).unwrap()
+                )
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    }
+    let missing = catalog
+        .revoke_document_role_privileges(
+            &SecurityName::new("app", "missing").unwrap(),
+            Policy::default(),
+        )
+        .unwrap_err();
+    assert!(
+        std::error::Error::source(&missing)
+            .unwrap()
+            .is::<RoleNotFound>()
+    );
+    catalog
+        .revoke_document_role_privileges(
+            &role,
+            Policy::new((0..256).map(|n| exact_grant(&format!("c{n}")))).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(catalog.roles[&role].privilege_count(), 0);
+}
+
 fn exact_grant(collection: &str) -> Privilege {
     Privilege::new(
         Action::ReadData,

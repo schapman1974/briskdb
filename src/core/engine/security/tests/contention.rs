@@ -183,7 +183,7 @@ async fn security_commands_share_session_and_authority_wait_budget() {
     let (root, engine) = configured(backoff(1)).await;
     let actor = Arc::new(login(&engine).await);
     let before = fs::read(root.path().join("security.sqlite")).unwrap();
-    let mut cases = vec![0, 1, 2, 4, 5, 6];
+    let mut cases = vec![0, 1, 2, 4, 5, 6, 7];
     if cfg!(feature = "documents") {
         cases.push(3);
     }
@@ -257,6 +257,16 @@ async fn security_commands_share_session_and_authority_wait_budget() {
                 6 => {
                     client
                         .grant_document_role_privileges(
+                            &session,
+                            RequestContext::new(),
+                            role(),
+                            Policy::default(),
+                        )
+                        .await
+                }
+                7 => {
+                    client
+                        .revoke_document_role_privileges(
                             &session,
                             RequestContext::new(),
                             role(),

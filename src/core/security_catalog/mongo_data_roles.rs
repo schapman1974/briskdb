@@ -26,6 +26,25 @@ pub(crate) fn validate_document_role_policy(
     Ok(())
 }
 
+pub(crate) fn validate_document_role_revocations(
+    name: &SecurityName,
+    policy: &Policy,
+) -> EngineResult<()> {
+    validate_document_role_policy(name, policy)?;
+    if policy.privileges().any(|grant| {
+        matches!(
+            grant.action(),
+            Action::ConnectDatabase | Action::CreateDatabase
+        )
+    }) {
+        return Err(error(
+            EngineErrorKind::InvalidArgument,
+            "document role revocation cannot target internal database admission grants",
+        ));
+    }
+    Ok(())
+}
+
 /// The supported data/schema subset of Mongo's database-local data roles.
 /// Unsupported Mongo operations remain unsupported. These profiles grant no
 /// user/role administration, SQL access, database deletion or global discovery.
@@ -82,6 +101,33 @@ impl MongoDataRole {
 }
 
 impl SecurityCatalog {
+    /// Trusted removal of exact action/scope pairs, not resource coverage.
+    /// Preserve all other grants and memberships, including internal admission
+    /// grants which may support other permissions or have been host-provisioned.
+    /// Use Engine::revoke_document_role_privileges for authorized mutation.
+    pub fn revoke_document_role_privileges(
+        &mut self,
+        name: &SecurityName,
+        removals: Policy,
+    ) -> EngineResult<()> {
+        validate_document_role_revocations(name, &removals)?;
+        let current = self.roles.get(name).ok_or_else(|| {
+            EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                "security role does not exist",
+                RoleNotFound,
+            )
+        })?;
+        let removals = removals.privileges().collect::<BTreeSet<_>>();
+        let retained = Policy::new(
+            current
+                .privileges()
+                .filter(|grant| !removals.contains(grant))
+                .cloned(),
+        )?;
+        self.replace_role(name, retained)
+    }
+
     /// Trusted, bounded addition of exact-realm document privileges. Existing
     /// grants and memberships are preserved, including host-provisioned grants
     /// outside this subset. Validate the resulting role and every affected user

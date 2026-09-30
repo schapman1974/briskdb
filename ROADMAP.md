@@ -483,7 +483,12 @@ database under differential/property tests.
   publication. Memberships and prior grants are preserved; resulting role and
   affected-user unions are bounded before any edit. Native and real TLS clients
   cover live permission refresh, restart, revocation and policy-limit rejection.
-  Privilege revocation, full role replacement and inheritance remain open.
+  `revokePrivilegesFromRole` removes exact data action/resource pairs with current
+  `RevokeRole` authority. Other grants, memberships and internal database-admission
+  prerequisites remain intact; live sessions/cursors refresh and revocations
+  persist across restart. Native and real TLS tests cover exact versus broad
+  scopes, other-role unions, administrator revocation and bounded request controls.
+  Full role replacement, inheritance and secure host integration remain open.
   `rolesInfo` now inspects assigned roles or separately authorized role realms
   without policy/credential export; whole-realm listing requires `ViewRoles`.
   Live membership/credential checks, bounded output and restart behavior apply.

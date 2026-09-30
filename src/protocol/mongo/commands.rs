@@ -288,6 +288,11 @@ pub(super) enum Command {
         crate::core::security_catalog::SecurityName,
         crate::core::authorization::Policy,
     ),
+    #[cfg(feature = "auth-scram")]
+    RevokeRolePrivileges(
+        crate::core::security_catalog::SecurityName,
+        crate::core::authorization::Policy,
+    ),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -350,6 +355,10 @@ pub(super) fn prepare_with_limits(
     #[cfg(feature = "auth-scram")]
     if name == "grantPrivilegesToRole" {
         return Some(roles::prepare_grant(request, started, limits));
+    }
+    #[cfg(feature = "auth-scram")]
+    if name == "revokePrivilegesFromRole" {
+        return Some(roles::prepare_revoke(request, started, limits));
     }
     #[cfg(feature = "auth-scram")]
     if name == "rolesInfo" {
@@ -1529,6 +1538,17 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::RevokeRolePrivileges(name, removals) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                self.database
+                    .engine()
+                    .revoke_document_role_privileges(session, context, name, removals)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             #[cfg(feature = "auth-scram")]
             Command::GrantRolePrivileges(name, additions) => {
                 if !self.secured() {
