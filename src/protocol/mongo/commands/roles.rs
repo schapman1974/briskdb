@@ -56,13 +56,39 @@ pub(super) fn prepare_create(
     started: Instant,
     limits: super::super::MongoResourceLimits,
 ) -> Result<Prepared> {
+    prepare_policy(request, started, limits, false)
+}
+
+pub(super) fn prepare_grant(
+    request: &Request,
+    started: Instant,
+    limits: super::super::MongoResourceLimits,
+) -> Result<Prepared> {
+    prepare_policy(request, started, limits, true)
+}
+
+fn prepare_policy(
+    request: &Request,
+    started: Instant,
+    limits: super::super::MongoResourceLimits,
+    grant: bool,
+) -> Result<Prepared> {
     if request.more_to_come || request.legacy_handshake || !request.sequences.is_empty() {
         return Err(CommandError::options());
     }
     if request.database == "local" {
         return Err(CommandError::unsupported());
     }
-    let allowed = ["createRole", "privileges", "roles", "writeConcern", "$db"];
+    let command_name = if grant {
+        "grantPrivilegesToRole"
+    } else {
+        "createRole"
+    };
+    let allowed: &[&str] = if grant {
+        &["grantPrivilegesToRole", "privileges", "writeConcern", "$db"]
+    } else {
+        &["createRole", "privileges", "roles", "writeConcern", "$db"]
+    };
     let mut seen = 0u8;
     for (field, value) in request.body.iter() {
         let index = allowed
@@ -77,15 +103,17 @@ pub(super) fn prepare_create(
             users::write_concern(value)?;
         }
     }
-    let Some(BsonValue::String(name)) = request.body.get_first("createRole") else {
+    let Some(BsonValue::String(name)) = request.body.get_first(command_name) else {
         return Err(CommandError::invalid());
     };
     let name = SecurityName::new(&request.database, name)?;
-    let Some(BsonValue::Array(roles)) = request.body.get_first("roles") else {
-        return Err(CommandError::invalid());
-    };
-    if !roles.is_empty() {
-        return Err(CommandError::options());
+    if !grant {
+        let Some(BsonValue::Array(roles)) = request.body.get_first("roles") else {
+            return Err(CommandError::invalid());
+        };
+        if !roles.is_empty() {
+            return Err(CommandError::options());
+        }
     }
     let Some(BsonValue::Array(privileges)) = request.body.get_first("privileges") else {
         return Err(CommandError::invalid());
@@ -100,7 +128,11 @@ pub(super) fn prepare_create(
         ));
     }
     Ok(Prepared {
-        command: Command::CreateRole(name, policy),
+        command: if grant {
+            Command::GrantRolePrivileges(name, policy)
+        } else {
+            Command::CreateRole(name, policy)
+        },
         deadline,
         advisory_hint: false,
     })

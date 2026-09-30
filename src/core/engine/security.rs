@@ -184,7 +184,7 @@ impl Engine {
         name: SecurityName,
         policy: crate::core::authorization::Policy,
     ) -> EngineResult<()> {
-        use crate::core::authorization::{Action, DataDomain, Resource, ScopeValue};
+        use crate::core::authorization::{Action, Resource};
 
         let mut operation = self.operation_lifecycle(context)?;
         let _session = operation.wait_pending(self.ready_session(session)).await?;
@@ -194,22 +194,7 @@ impl Engine {
                 "authentication is required",
             )
         })?;
-        for grant in policy.privileges() {
-            let confined = match grant.scope().stored_value() {
-                ScopeValue::Exact(resource) => {
-                    resource.domain() == Some(DataDomain::Document)
-                        && resource.database_name() == Some(name.realm())
-                }
-                ScopeValue::NonSystemDocumentCollections(database) => database == name.realm(),
-                _ => false,
-            };
-            if !confined {
-                return Err(EngineError::new(
-                    EngineErrorKind::InvalidArgument,
-                    "document role privileges must be confined to their own database",
-                ));
-            }
-        }
+        crate::core::security_catalog::validate_document_role_policy(&name, &policy)?;
         let realm = Resource::security_realm(name.realm())?;
         let requirements = [
             (Action::CreateRole, realm.clone()),
@@ -220,6 +205,41 @@ impl Engine {
             .security_call_from_parent(&operation, move |authority| {
                 authority.update_authorized(&principal, &requirements, |catalog| {
                     catalog.create_role(name, policy)
+                })
+            })
+            .await;
+        operation.finish(result)
+    }
+
+    /// Add database-local document privileges to an existing role without
+    /// removing other grants or changing membership. Current GrantRole on the
+    /// exact realm is required even for empty/repeated additions or missing roles.
+    /// Both role and affected-user policy limits are checked before publication.
+    /// Authorization and durable publication share one revision; no automatic
+    /// retry follows a conflict or an uncertain cancellation/timeout.
+    pub async fn grant_document_role_privileges(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        name: SecurityName,
+        additions: crate::core::authorization::Policy,
+    ) -> EngineResult<()> {
+        use crate::core::authorization::{Action, Resource};
+        let mut operation = self.operation_lifecycle(context)?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        crate::core::security_catalog::validate_document_role_policy(&name, &additions)?;
+        let requirements = [(Action::GrantRole, Resource::security_realm(name.realm())?)];
+        operation.check_before_start()?;
+        let result = self
+            .security_call_from_parent(&operation, move |authority| {
+                authority.update_authorized(&principal, &requirements, |catalog| {
+                    catalog.grant_document_role_privileges(&name, additions)
                 })
             })
             .await;

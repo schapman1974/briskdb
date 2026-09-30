@@ -283,6 +283,11 @@ pub(super) enum Command {
         crate::core::security_catalog::SecurityName,
         crate::core::authorization::Policy,
     ),
+    #[cfg(feature = "auth-scram")]
+    GrantRolePrivileges(
+        crate::core::security_catalog::SecurityName,
+        crate::core::authorization::Policy,
+    ),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -341,6 +346,10 @@ pub(super) fn prepare_with_limits(
     #[cfg(feature = "auth-scram")]
     if name == "createRole" {
         return Some(roles::prepare_create(request, started, limits));
+    }
+    #[cfg(feature = "auth-scram")]
+    if name == "grantPrivilegesToRole" {
+        return Some(roles::prepare_grant(request, started, limits));
     }
     #[cfg(feature = "auth-scram")]
     if name == "rolesInfo" {
@@ -1520,6 +1529,17 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::GrantRolePrivileges(name, additions) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                self.database
+                    .engine()
+                    .grant_document_role_privileges(session, context, name, additions)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             #[cfg(feature = "auth-scram")]
             Command::CreateRole(name, policy) => {
                 if !self.secured() {
