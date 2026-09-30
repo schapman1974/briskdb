@@ -236,6 +236,40 @@ pub(in crate::storage::document) fn validate_record_entries_with_layout(
     record_natural_order: Option<i64>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
+    validate_equality_record_entries(
+        connection,
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        expected,
+        check,
+    )?;
+    super::super::ordered_storage::validate_record(
+        connection,
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        expected,
+        ordered,
+        record_natural_order,
+        check,
+    )
+}
+
+/// Equality coverage only; startup separately consumes the ordered-entry stream
+/// in the same shard snapshot. Point/build callers use the combined wrapper.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::storage::document) fn validate_equality_record_entries(
+    connection: &Connection,
+    collection: DocumentCollectionId,
+    shard: u16,
+    id_key: &[u8],
+    record_checksum: &[u8; 32],
+    expected: Option<&PreparedDocumentIndexEntries>,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<()> {
     check()?;
     let mut missing = HashMap::<u64, HashSet<&[u8]>>::new();
     let mut missing_count = 0;
@@ -332,17 +366,7 @@ pub(in crate::storage::document) fn validate_record_entries_with_layout(
             "document index is missing authoritative record entries",
         ));
     }
-    super::super::ordered_storage::validate_record(
-        connection,
-        collection,
-        shard,
-        id_key,
-        record_checksum,
-        expected,
-        ordered,
-        record_natural_order,
-        check,
-    )
+    check()
 }
 
 /// Startup audits every collection; an index build audits only its own.
