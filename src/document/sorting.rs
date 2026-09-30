@@ -9,6 +9,8 @@ use super::{
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
+mod ordered;
+
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_FIELDS: usize = 32;
 const MAX_DEPTH: usize = 100;
