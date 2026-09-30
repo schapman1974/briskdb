@@ -216,11 +216,14 @@ pub(in crate::storage::document) fn validate_record_entries(
         record_checksum,
         expected,
         ordered,
+        None,
         check,
     )
 }
 
 /// Audits/builds inspect the schema once per admitted shard, not once per row.
+/// `record_natural_order` must come from the checksum-validated source record,
+/// never from an index entry. Reuse it to avoid seeking that record again.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::storage::document) fn validate_record_entries_with_layout(
     connection: &Connection,
@@ -230,6 +233,7 @@ pub(in crate::storage::document) fn validate_record_entries_with_layout(
     record_checksum: &[u8; 32],
     expected: Option<&PreparedDocumentIndexEntries>,
     ordered: bool,
+    record_natural_order: Option<i64>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
     check()?;
@@ -336,6 +340,7 @@ pub(in crate::storage::document) fn validate_record_entries_with_layout(
         record_checksum,
         expected,
         ordered,
+        record_natural_order,
         check,
     )
 }

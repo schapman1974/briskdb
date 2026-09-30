@@ -143,6 +143,7 @@ pub(in crate::storage::document) fn validate_record(
     record: &[u8; 32],
     expected: Option<&PreparedDocumentIndexEntries>,
     ordered: bool,
+    record_natural_order: Option<i64>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
     check()?;
@@ -167,7 +168,7 @@ pub(in crate::storage::document) fn validate_record(
         .query(params![collection.get() as i64, id])
         .map_err(sqlite_error::storage)?;
     let mut count = 0_usize;
-    let mut natural = None;
+    let mut natural = record_natural_order;
     while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
         check()?;
         count += 1;
@@ -196,6 +197,7 @@ pub(in crate::storage::document) fn validate_record(
             }
         };
         if !(0..=1).contains(&direction)
+            || natural <= 0
             || count > 128
             || version != 1
             || stored_natural != natural

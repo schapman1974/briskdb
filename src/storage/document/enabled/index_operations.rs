@@ -971,6 +971,7 @@ impl Storage {
                                 &record.checksum,
                                 expected.as_ref(),
                                 ordered_layout,
+                                Some(document_natural_order_to_sqlite(record.natural_order())?),
                                 &mut || {
                                     ensure_control_active(
                                         &control,
@@ -1143,6 +1144,7 @@ impl Storage {
                                 &record.checksum,
                                 Some(&entries),
                                 ordered_layout,
+                                Some(document_natural_order_to_sqlite(record.natural_order())?),
                                 &mut || {
                                     ensure_control_active(
                                         &control,

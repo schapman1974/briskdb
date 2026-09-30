@@ -3173,6 +3173,7 @@ mod enabled {
                     &record_checksum,
                     expected.as_ref(),
                     ordered_layout,
+                    Some(natural_order),
                     &mut || Ok(()),
                 )?;
                 if !natural_orders.insert((collection_id, natural_order)) {
