@@ -147,13 +147,9 @@ pub(in crate::storage::document) fn validate_record(
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
     check()?;
-    let expected: Vec<_> = expected
-        .into_iter()
-        .flat_map(|entries| entries.indexes())
-        .filter_map(|index| index.ordered_keys().map(|keys| (index.index_id(), keys)))
-        .collect();
+    let expected_count = expected_ordered_count(expected);
     if !ordered {
-        return if expected.is_empty() {
+        return if expected_count == 0 {
             Ok(())
         } else {
             Err(corrupt("ordered index coverage is missing"))
@@ -172,22 +168,6 @@ pub(in crate::storage::document) fn validate_record(
     while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
         check()?;
         count += 1;
-        let index: i64 = row.get(0).map_err(sqlite_error::storage)?;
-        let direction: i64 = row.get(1).map_err(sqlite_error::storage)?;
-        let key = match row.get_ref(2).map_err(sqlite_error::storage)? {
-            ValueRef::Null => None,
-            ValueRef::Blob(key) if (9..=65536).contains(&key.len()) => Some(key),
-            _ => return Err(corrupt("ordered index key has an invalid type or size")),
-        };
-        let stored_natural: i64 = row.get(3).map_err(sqlite_error::storage)?;
-        let digest = row
-            .get_ref(4)
-            .and_then(|value| value.as_blob().map_err(Into::into))
-            .map_err(sqlite_error::storage)?;
-        let version: i64 = row.get(5).map_err(sqlite_error::storage)?;
-        let Some((index, keys)) = expected.iter().find(|(id, _)| id.get() as i64 == index) else {
-            return Err(corrupt("ordered index entry has no active authority"));
-        };
         let natural = match natural {
             Some(value) => value,
             None => {
@@ -196,31 +176,78 @@ pub(in crate::storage::document) fn validate_record(
                 value
             }
         };
-        if !(0..=1).contains(&direction)
-            || natural <= 0
-            || count > 128
-            || version != 1
-            || stored_natural != natural
-            || key != keys[direction as usize].as_deref()
-            || digest
-                != checksum(
-                    collection,
-                    *index,
-                    shard,
-                    id,
-                    direction as u8,
-                    key,
-                    natural,
-                    record,
-                )
-        {
-            return Err(corrupt("ordered document index entry is stale or damaged"));
-        }
+        validate_ordered_row(row, collection, shard, id, record, expected, natural, count)?;
     }
-    if count != expected.len() * 2 {
+    if count != expected_count {
         return Err(corrupt("ordered document index coverage is incomplete"));
     }
     check()
+}
+
+pub(super) fn expected_ordered_count(expected: Option<&PreparedDocumentIndexEntries>) -> usize {
+    expected
+        .into_iter()
+        .flat_map(|entries| entries.indexes())
+        .filter(|index| index.ordered_keys().is_some())
+        .count()
+        * 2
+}
+
+/// Shared by point/build validation and the startup stream. Borrow keys and
+/// checksums directly from SQLite; validate both independently derived directions.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_ordered_row(
+    row: &rusqlite::Row<'_>,
+    collection: DocumentCollectionId,
+    shard: u16,
+    id: &[u8],
+    record: &[u8; 32],
+    expected: Option<&PreparedDocumentIndexEntries>,
+    natural: i64,
+    count: usize,
+) -> EngineResult<()> {
+    let index: i64 = row.get(0).map_err(sqlite_error::storage)?;
+    let direction: i64 = row.get(1).map_err(sqlite_error::storage)?;
+    let key = match row.get_ref(2).map_err(sqlite_error::storage)? {
+        ValueRef::Null => None,
+        ValueRef::Blob(key) if (9..=65536).contains(&key.len()) => Some(key),
+        _ => return Err(corrupt("ordered index key has an invalid type or size")),
+    };
+    let stored_natural: i64 = row.get(3).map_err(sqlite_error::storage)?;
+    let digest = row
+        .get_ref(4)
+        .and_then(|value| value.as_blob().map_err(Into::into))
+        .map_err(sqlite_error::storage)?;
+    let version: i64 = row.get(5).map_err(sqlite_error::storage)?;
+    let Some((index, keys)) = expected
+        .into_iter()
+        .flat_map(|entries| entries.indexes())
+        .find(|candidate| candidate.index_id().get() as i64 == index)
+        .and_then(|index| index.ordered_keys().map(|keys| (index.index_id(), keys)))
+    else {
+        return Err(corrupt("ordered index entry has no active authority"));
+    };
+    if !(0..=1).contains(&direction)
+        || natural <= 0
+        || count > 128
+        || version != 1
+        || stored_natural != natural
+        || key != keys[direction as usize].as_deref()
+        || digest
+            != checksum(
+                collection,
+                index,
+                shard,
+                id,
+                direction as u8,
+                key,
+                natural,
+                record,
+            )
+    {
+        return Err(corrupt("ordered document index entry is stale or damaged"));
+    }
+    Ok(())
 }
 
 pub(in crate::storage::document) fn require_no_orphans(

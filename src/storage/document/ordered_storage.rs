@@ -120,7 +120,11 @@ pub(super) fn inspect_index_schemas(connection: &Connection) -> EngineResult<(bo
 }
 
 #[cfg(feature = "documents")]
+mod audit;
+#[cfg(feature = "documents")]
 mod entries;
+#[cfg(feature = "documents")]
+pub(super) use audit::{STARTUP_ORDERED_SQL, StartupAudit};
 #[cfg(feature = "documents")]
 pub(super) use entries::*;
 

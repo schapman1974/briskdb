@@ -3081,11 +3081,23 @@ mod enabled {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
+            // Keep both primary walks on one snapshot even when either tree is
+            // empty: an exhausted implicit cursor otherwise releases its read
+            // transaction before the other walk starts. This scope is read-only.
+            let _audit_snapshot = connection
+                .unchecked_transaction()
+                .map_err(sqlite_error::storage)?;
             super::index_storage::require_no_orphans(&connection, None)?;
             let ordered_layout = super::ordered_storage::validate_optional_schema(&connection)?;
             if requires_ordered_layout && !ordered_layout {
                 return Err(corrupt("ready ordered index is missing physical coverage"));
             }
+            let mut ordered_statement = ordered_layout
+                .then(|| connection.prepare(super::ordered_storage::STARTUP_ORDERED_SQL))
+                .transpose()
+                .map_err(sqlite_error::storage)?;
+            let mut ordered_audit =
+                super::ordered_storage::StartupAudit::new(ordered_statement.as_mut())?;
             let mut statement = connection.prepare(STARTUP_RECORDS_SQL).map_err(|error| {
                 shard_read_error(error, "failed to inspect stored BSON documents")
             })?;
@@ -3165,15 +3177,22 @@ mod enabled {
                         ));
                     }
                 }
-                super::index_storage::validate_record_entries_with_layout(
+                super::index_storage::validate_equality_record_entries(
                     &connection,
                     collection_id,
                     shard,
                     &id_key,
                     &record_checksum,
                     expected.as_ref(),
-                    ordered_layout,
-                    Some(natural_order),
+                    &mut || Ok(()),
+                )?;
+                ordered_audit.validate_record(
+                    collection_id,
+                    shard,
+                    &id_key,
+                    &record_checksum,
+                    natural_order,
+                    expected.as_ref(),
                     &mut || Ok(()),
                 )?;
                 if !natural_orders.insert((collection_id, natural_order)) {
@@ -3186,6 +3205,7 @@ mod enabled {
                     .and_modify(|maximum| *maximum = (*maximum).max(natural_order))
                     .or_insert(natural_order);
             }
+            ordered_audit.finish()?;
         }
 
         let allocators = load_natural_order_allocators(manifest_connection)?;

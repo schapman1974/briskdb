@@ -1347,6 +1347,199 @@ fn ordered_audit_reuses_validated_record_order_without_a_second_record_read() {
 }
 
 #[test]
+fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
+    use super::super::super::ordered_storage::{STARTUP_ORDERED_SQL, StartupAudit};
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    create_built(&storage, "missing_order", "missing").unwrap();
+    let marker_id = (1000..1100)
+        .find(|id| {
+            storage.shard_for_key(
+                CanonicalBsonKey::encode(&BsonValue::Int32(*id))
+                    .unwrap()
+                    .as_bytes(),
+            ) == 0
+        })
+        .unwrap();
+    // A value exceeding the ordered-key budget persists a checksummed NULL
+    // fallback marker, while its independent missing-field key stays supported.
+    storage
+        .insert_document(
+            collection,
+            &document(marker_id, BsonValue::String("x".repeat(70_000))),
+        )
+        .unwrap();
+    let other = storage
+        .create_document_collection("other", "unindexed", &DocumentCollectionOptions::empty())
+        .unwrap();
+    storage
+        .insert_document(other.id(), &document(marker_id, BsonValue::Int32(1)))
+        .unwrap();
+    let connection = storage.open_unconfigured_shard(0).unwrap();
+    let identities = connection.prepare(
+        "SELECT collection_id, id_key FROM briskdb_documents_v1 NOT INDEXED ORDER BY collection_id, id_key"
+    ).unwrap().query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let records: Vec<_> = identities
+        .into_iter()
+        .map(|(collection, id)| {
+            let collection = DocumentCollectionId::from_validated(collection as u64);
+            let id = CanonicalBsonKey::from_bytes(&id).unwrap();
+            let record = storage
+                .get_document_on_connection(
+                    &connection,
+                    collection,
+                    0,
+                    &id,
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .unwrap();
+            let expected = storage
+                .active_document_indexes(collection)
+                .unwrap()
+                .map(|preparation| {
+                    preparation.prepare_for_storage_with_check(record.document(), &mut || Ok(()))
+                })
+                .transpose()
+                .unwrap();
+            super::super::super::index_storage::validate_record_entries_with_layout(
+                &connection,
+                collection,
+                0,
+                record.id_key.as_bytes(),
+                &record.checksum,
+                expected.as_ref(),
+                true,
+                Some(record.natural_order() as i64),
+                &mut || Ok(()),
+            )
+            .unwrap();
+            (record, expected)
+        })
+        .collect();
+    let run = |check: &mut dyn FnMut() -> EngineResult<()>| {
+        let mut statement = connection.prepare(STARTUP_ORDERED_SQL).unwrap();
+        let mut audit = StartupAudit::new(Some(&mut statement))?;
+        for (record, expected) in &records {
+            audit.validate_record(
+                record.collection_id(),
+                0,
+                record.id_key.as_bytes(),
+                &record.checksum,
+                record.natural_order() as i64,
+                expected.as_ref(),
+                check,
+            )?;
+        }
+        audit.finish()
+    };
+    connection
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "briskdb_documents_v1",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    run(&mut || Ok(())).unwrap();
+    assert_eq!(
+        run(&mut || Err(EngineError::new(EngineErrorKind::Cancelled, "cancel audit")))
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Cancelled
+    );
+    run(&mut || Ok(())).expect("an interrupted audit must release its statement/snapshot");
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    let (record, _) = &records[0];
+    let (index, direction): (i64, i64) = connection.query_row(
+        "SELECT index_id, direction FROM briskdb_document_ordered_entries_v1 WHERE collection_id=?1 AND id_key=?2 AND sort_key IS NOT NULL LIMIT 1",
+        params![collection.get() as i64, record.id_key.as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    let forged = super::super::super::ordered_storage::checksum(
+        collection,
+        DocumentIndexId::from_validated(index as u64),
+        0,
+        record.id_key.as_bytes(),
+        direction as u8,
+        None,
+        record.natural_order() as i64,
+        &record.checksum,
+    );
+    connection.execute_batch("BEGIN").unwrap();
+    connection.execute(
+        "UPDATE briskdb_document_ordered_entries_v1 SET sort_key=NULL, entry_checksum=?1 WHERE collection_id=?2 AND id_key=?3 AND index_id=?4 AND direction=?5",
+        params![forged.as_slice(), collection.get() as i64, record.id_key.as_bytes(), index, direction],
+    ).unwrap();
+    assert_eq!(
+        run(&mut || Ok(())).unwrap_err().kind(),
+        EngineErrorKind::DataCorruption,
+        "a matching forged digest must not bypass independently recomputed keys"
+    );
+    connection.execute_batch("ROLLBACK").unwrap();
+    for damage in [
+        "DELETE FROM briskdb_document_ordered_entries_v1 WHERE direction=1",
+        "UPDATE briskdb_document_ordered_entries_v1 SET entry_checksum=zeroblob(32)",
+        "UPDATE briskdb_document_ordered_entries_v1 SET natural_order=natural_order+1",
+        "UPDATE briskdb_document_ordered_entries_v1 SET sort_key=NULL",
+        "UPDATE briskdb_document_ordered_entries_v1 SET entry_format_version=2",
+        "UPDATE briskdb_document_ordered_entries_v1 SET direction=2 WHERE direction=1",
+        "UPDATE briskdb_document_ordered_entries_v1 SET index_id=index_id+1000",
+        "UPDATE briskdb_document_ordered_entries_v1 SET collection_id=999",
+        "UPDATE briskdb_document_ordered_entries_v1 SET id_key=zeroblob(9) WHERE id_key=(SELECT min(id_key) FROM briskdb_document_ordered_entries_v1)",
+        "UPDATE briskdb_document_ordered_entries_v1 SET id_key=x'ffffffffffffffffff' WHERE id_key=(SELECT max(id_key) FROM briskdb_document_ordered_entries_v1)",
+    ] {
+        connection.execute_batch("BEGIN").unwrap();
+        connection.execute_batch(damage).unwrap();
+        assert_eq!(
+            run(&mut || Ok(())).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption,
+            "{damage}"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+        run(&mut || Ok(())).unwrap();
+    }
+    // Even when no records are handed to the stream, it must not silently ignore
+    // entries left over at the end (the empty-record-table/orphan case).
+    let mut statement = connection.prepare(STARTUP_ORDERED_SQL).unwrap();
+    assert_eq!(
+        StartupAudit::new(Some(&mut statement))
+            .unwrap()
+            .finish()
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DataCorruption
+    );
+    let mut absent = StartupAudit::new(None).unwrap();
+    let (record, expected) = &records[0];
+    assert_eq!(
+        absent
+            .validate_record(
+                collection,
+                0,
+                record.id_key.as_bytes(),
+                &record.checksum,
+                record.natural_order() as i64,
+                expected.as_ref(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DataCorruption
+    );
+}
+
+#[test]
 fn ordered_startup_rejects_missing_empty_index_tables_and_damaged_coverage() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(temp.path(), 2).unwrap();
