@@ -1138,12 +1138,36 @@ fn setup(root: &Path, count: u16) -> (Storage, DocumentCollectionId) {
 
 #[test]
 fn candidate_read_snapshots_preserve_caller_transactions_and_clean_up_errors() {
+    for membership in [false, true] {
+        check_candidate_read_snapshot_cleanup(membership);
+    }
+}
+
+fn candidate_condition(value: i32, membership: bool) -> BsonValue {
+    if membership {
+        BsonValue::Document(
+            BsonDocument::from_entries([(
+                "$in",
+                BsonValue::Array(vec![
+                    BsonValue::Int32(value),
+                    BsonValue::Int32(-12345),
+                    BsonValue::Int32(-23456),
+                ]),
+            )])
+            .unwrap(),
+        )
+    } else {
+        BsonValue::Int32(value)
+    }
+}
+
+fn check_candidate_read_snapshot_cleanup(membership: bool) {
     let root = tempfile::tempdir().unwrap();
     let (storage, collection) = setup(root.path(), 2);
     build(&storage, "value").unwrap();
     let _admission = storage.enter_schema_operation().unwrap();
     let matcher = DocumentMatcher::compile(
-        &BsonDocument::from_entries([("value", BsonValue::Int32(0))]).unwrap(),
+        &BsonDocument::from_entries([("value", candidate_condition(0, membership))]).unwrap(),
     )
     .unwrap();
     let probe = storage
@@ -1223,6 +1247,12 @@ fn candidate_read_snapshots_preserve_caller_transactions_and_clean_up_errors() {
 
 #[tokio::test]
 async fn candidate_read_snapshots_keep_warm_pooled_connections_reusable() {
+    for membership in [false, true] {
+        check_candidate_warm_pool(membership).await;
+    }
+}
+
+async fn check_candidate_warm_pool(membership: bool) {
     let root = tempfile::tempdir().unwrap();
     let (storage, collection) = setup(root.path(), 2);
     build(&storage, "value").unwrap();
@@ -1231,7 +1261,8 @@ async fn candidate_read_snapshots_keep_warm_pooled_connections_reusable() {
     let mut identity = None;
     for value in [0, 12345, 0, 12345] {
         let matcher = DocumentMatcher::compile(
-            &BsonDocument::from_entries([("value", BsonValue::Int32(value))]).unwrap(),
+            &BsonDocument::from_entries([("value", candidate_condition(value, membership))])
+                .unwrap(),
         )
         .unwrap();
         let probe = storage

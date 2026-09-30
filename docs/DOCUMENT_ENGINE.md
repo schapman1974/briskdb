@@ -297,9 +297,17 @@ remain work under #178. No format migration is needed.
 Multi-key probes bind every encoded value (including the non-unique fallback
 marker) and deduplicate matching entries by the collection's unique natural-order
 identity before SQL pagination. A multikey document is returned or mutated once,
-even if several array elements match the list. The document-first join preserves
-the natural-order range and streams grouping without an all-candidate temporary
-sort, including after SQLite statistics are collected. General aggregation still receives its
+even if several array elements match the list. Selective lists seek the entry
+index first: a bounded preflight admits at most 32 entries per distinct literal
+and 64 KiB of combined identity/key bytes, including fallback and duplicate
+multikey entries. An active read statement pins the same snapshot through
+deduplication and the candidate fetch. Only bounded identities, natural positions,
+and one representative key per identity enter the sorter; BSON and that exact
+entry's checksum are fetched afterward. Broad groups keep the document-first
+join, preserving the natural-order range and streaming grouping without an
+all-candidate temporary sort, including after SQLite statistics are collected.
+This is a selective optimization, not an index-only or index-sort implementation.
+General aggregation still receives its
 original unfiltered source rows; the scalar-count exception is described below.
 
 After equality and finite membership candidates, a necessary positive
@@ -446,8 +454,9 @@ snapshot, not a cross-shard or cross-request snapshot.
 
 Larger singleton groups retain the document-first streaming join, preventing
 stale SQLite statistics from sorting an entire large equality/null-key group for
-each one-row frontier. Multiple-key, sparse, and range probes also retain their
-bounded streaming paths. These fallback joins can still walk nonmatching
+each one-row frontier. Multi-key probes use the similarly bounded selective
+union described above, falling back when its entry/byte budget is exceeded.
+Sparse and range probes retain their bounded streaming paths. These fallback joins can still walk nonmatching
 document/index entries even though BSON decoding skips noncandidates. This is not
 index-order output or an index-only read promise, and does not change stored formats.
 
