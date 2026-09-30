@@ -38,6 +38,8 @@ pub(crate) mod pool;
 pub(crate) use idempotency::{IdempotencyReceipt, IdempotentExecuteOutcome, NewIdempotencyReceipt};
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
 pub(crate) use process_lock::IdempotencyStripeGuard;
+#[cfg(feature = "mongo")]
+pub(crate) use process_lock::SchemaOwnershipConflict;
 
 use std::{
     collections::{BTreeSet, HashMap},

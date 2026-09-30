@@ -621,6 +621,161 @@ fn batch_index(field: &str, name: &str) -> crate::document::DocumentIndexRequest
     .unwrap()
 }
 
+#[test]
+fn ready_index_noops_succeed_with_a_peer_but_never_admit_real_mutations() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    storage
+        .declare_document_index(
+            collection,
+            "pending",
+            &BsonDocument::from_entries([("pending", BsonValue::Int32(1))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    let catalog = storage.document_catalog().unwrap();
+    let high = high_water(temp.path());
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    // A distinct file description supplies the same OS shared lease as a peer.
+    // Real spawned sync/async processes are also covered by Python tests.
+    let peer = crate::storage::process_lock::RootProcessLease::acquire(temp.path()).unwrap();
+    BUILD_PREFLIGHT_SHARDS.with(|count| count.set(0));
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("value", "value")]).unwrap(),
+        (2, 2)
+    );
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("_id", "ignored")]).unwrap(),
+        (2, 2)
+    );
+    assert_eq!(
+        create_batch(
+            &storage,
+            vec![batch_index("value", "value"), batch_index("_id", "ignored")]
+        )
+        .unwrap(),
+        (2, 2)
+    );
+    build(&storage, "value").unwrap();
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    assert_eq!(
+        storage
+            .create_built_document_index_controlled(
+                &DocumentNamespace::new("app", "items").unwrap(),
+                "value",
+                &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                false,
+                migration,
+                OperationControl::new(None),
+            )
+            .unwrap(),
+        (2, 2)
+    );
+    for (request, expected) in [
+        (
+            batch_index("different", "value"),
+            DocumentIndexError::KeySpecsConflict,
+        ),
+        (
+            batch_index("value", "alias"),
+            DocumentIndexError::OptionsConflict,
+        ),
+    ] {
+        let error = create_batch(&storage, vec![request]).unwrap_err();
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<DocumentIndexError>(),
+            Some(&expected)
+        );
+    }
+    for batch in [
+        vec![batch_index("new", "new")],
+        vec![batch_index("pending", "pending")],
+        vec![
+            batch_index("value", "value"),
+            batch_index("new", "new"),
+            batch_index("different", "value"),
+        ],
+    ] {
+        let error = create_batch(&storage, batch).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<crate::storage::process_lock::SchemaOwnershipConflict>()
+        );
+    }
+    assert_eq!(BUILD_PREFLIGHT_SHARDS.with(|count| count.get()), 0);
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high);
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    drop(peer);
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("new", "new")]).unwrap(),
+        (2, 3)
+    );
+}
+
+#[cfg(feature = "mongo")]
+#[test]
+fn ready_index_noop_equivalent_reuse_and_cancellation_preserve_shared_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let peer = crate::storage::process_lock::RootProcessLease::acquire(temp.path()).unwrap();
+    let definitions = crate::document::normalize_index_batch(
+        vec![batch_index("value", "alias").with_equivalent_reuse(true)].into_boxed_slice(),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let (before, after, names) = storage
+        .create_document_indexes_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            definitions,
+            migration,
+            OperationControl::new(None),
+        )
+        .unwrap();
+    assert_eq!((before, after), (2, 2));
+    assert_eq!(&*names, &["value"]);
+    let definitions = crate::document::normalize_index_batch(
+        vec![batch_index("value", "value")].into_boxed_slice(),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let control = OperationControl::new(None);
+    control.request_cancel(crate::core::CancellationReason::DeadlineExceeded);
+    assert_eq!(
+        storage
+            .create_document_indexes_controlled(
+                &DocumentNamespace::new("app", "items").unwrap(),
+                definitions,
+                migration,
+                control,
+            )
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DeadlineExceeded
+    );
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("value", "value")]).unwrap(),
+        (2, 2)
+    );
+    drop(peer);
+}
+
 #[cfg(feature = "mongo")]
 #[test]
 fn model_reuse_requires_ready_authority_and_preserves_ids_records_and_entries() {

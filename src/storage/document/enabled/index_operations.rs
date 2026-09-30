@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod noop;
+
 #[cfg(test)]
 mod tests;
 
@@ -646,6 +648,16 @@ impl Storage {
         mut migration: SchemaMigrationGuard,
         control: Arc<OperationControl>,
     ) -> EngineResult<BuildOutcome> {
+        if let Some(outcome) = self.existing_index_noop(
+            database,
+            collection_name,
+            name,
+            declaration,
+            Arc::clone(&control),
+        )? {
+            migration.publish_ready()?;
+            return Ok(outcome);
+        }
         let outcome = self.build_or_create_document_index_under_guard(
             database,
             collection_name,
@@ -668,6 +680,12 @@ impl Storage {
     ) -> EngineResult<(u64, u64, Box<[String]>)> {
         let result = (|| {
             ensure_control_active(&control, "before creating document indexes")?;
+            if let Some((count, names)) =
+                self.existing_index_batch_noop(namespace, &indexes, Arc::clone(&control))?
+            {
+                migration.publish_ready()?;
+                return Ok((count, count, names));
+            }
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
             let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
             let before = run_manifest_controlled(
@@ -798,51 +816,13 @@ impl Storage {
                         "document collection does not exist",
                     )
                 })?;
-            let existing = collection
-                .indexes()
-                .iter()
-                .find(|index| index.name() == name);
-            if let Some((specification, unique)) = declaration {
-                if strict_compatibility {
-                    let proposed = DocumentIndexMetadata::from_validated_parts(
-                        DocumentIndexId::from_validated(1),
-                        name.to_owned(),
-                        specification.clone(),
-                        unique,
-                        false,
-                        DocumentIndexLifecycle::PendingBuild,
-                    );
-                    if let Some(existing) = existing {
-                        if !equivalent_definition(existing, &proposed) {
-                            return Err(DocumentIndexError::KeySpecsConflict.into_engine_error());
-                        }
-                    } else {
-                        for index in collection.indexes() {
-                            ensure_control_active(
-                                &control,
-                                "while checking document index conflicts",
-                            )?;
-                            if equivalent_definition(index, &proposed) {
-                                return Err(DocumentIndexError::OptionsConflict.into_engine_error());
-                            }
-                        }
-                    }
-                }
-                if let Some(existing) = existing.filter(|_| !strict_compatibility) {
-                    let canonical_keys = !specification.is_empty()
-                        && specification
-                            .iter()
-                            .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
-                    let same_spec = existing.specification().representation_eq(specification)
-                        || (canonical_keys && existing.specification() == specification);
-                    if !same_spec || existing.is_unique() != unique {
-                        return Err(EngineError::new(
-                            EngineErrorKind::FailedPrecondition,
-                            "document index name already has a different declaration",
-                        ));
-                    }
-                }
-            }
+            let existing = noop::matching_declaration(
+                collection,
+                name,
+                declaration,
+                strict_compatibility,
+                &control,
+            )?;
             let addition = if let (None, Some((specification, unique))) = (existing, declaration) {
                 let bytes = encode_document(specification)
                     .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;

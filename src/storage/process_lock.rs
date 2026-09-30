@@ -28,6 +28,23 @@ pub(super) const STARTUP_LOCK_FILE_NAME: &str = ".briskdb-startup.lock";
 const GLOBAL_WRITE_LOCK_PREFIX: &str = ".briskdb-global-write-";
 const IDEMPOTENCY_LOCK_PREFIX: &str = ".briskdb-idempotency-";
 
+/// Distinguish a lifetime schema lease from transient record/SQLite contention.
+/// Native callers retain Busy; protocols may give fixed, actionable guidance.
+#[derive(Debug)]
+pub(crate) struct SchemaOwnershipConflict(io::Error);
+
+impl std::fmt::Display for SchemaOwnershipConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("schema changes require sole-process ownership")
+    }
+}
+
+impl std::error::Error for SchemaOwnershipConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseMode {
     Shared,
@@ -102,11 +119,19 @@ impl RootProcessLease {
                         ),
                     )
                 })?;
-                Err(map_lock_error(
-                    error,
-                    &lease.path,
-                    "another BriskDB process has this data directory open",
-                ))
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Err(EngineError::from_source(
+                        EngineErrorKind::Busy,
+                        "another BriskDB process has this data directory open",
+                        SchemaOwnershipConflict(error),
+                    ))
+                } else {
+                    Err(map_lock_error(
+                        error,
+                        &lease.path,
+                        "another BriskDB process has this data directory open",
+                    ))
+                }
             }
         }
     }
@@ -591,9 +616,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let first = RootProcessLease::acquire(temp.path()).unwrap();
         let second = RootProcessLease::acquire(temp.path()).unwrap();
-        assert_eq!(
-            first.try_acquire_exclusive().unwrap_err().kind(),
-            EngineErrorKind::Busy
+        let error = first.try_acquire_exclusive().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<SchemaOwnershipConflict>()
         );
         drop(second);
         first.try_acquire_exclusive().unwrap().downgrade().unwrap();
