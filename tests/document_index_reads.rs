@@ -293,15 +293,24 @@ async fn seed(engine: &Engine, session: &Session, namespace: &DocumentNamespace,
             doc(entries)
         })
         .collect();
-    call(
-        engine,
-        session,
-        DocumentCommand::Insert(
-            DocumentInsertRequest::new(namespace.clone(), documents, DocumentWriteOptions::new())
+    // These fixtures measure reads, not one oversized insert request. Keep
+    // setup requests bounded on slower debug-build runners without changing
+    // the default deadline, dataset size/order, or any measured read bounds.
+    for batch in documents.chunks(256) {
+        call(
+            engine,
+            session,
+            DocumentCommand::Insert(
+                DocumentInsertRequest::new(
+                    namespace.clone(),
+                    batch.to_vec(),
+                    DocumentWriteOptions::new(),
+                )
                 .unwrap(),
-        ),
-    )
-    .await;
+            ),
+        )
+        .await;
+    }
 }
 async fn build(
     engine: &Engine,
