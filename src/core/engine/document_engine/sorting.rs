@@ -1,6 +1,6 @@
-//! Bounded global top-key windows. Until sorted indexes exist, each window
-//! scans matching documents again, but its remaining positions survive cursor
-//! continuations. No result documents or SQLite leases are retained.
+//! Bounded global top-key windows from eligible ordered indexes or scan/sort
+//! fallback. Remaining positions survive cursor continuations; no result
+//! documents or SQLite leases are retained between requests.
 
 use std::{
     cmp::Ordering,
