@@ -32,15 +32,15 @@ class RetainedSortWindowTests(unittest.TestCase):
                 items = client.app.items
                 # Owned keys exceed the 16-MiB window budget. Projection makes
                 # each returned page tiny; the key budget must still apply.
-                for i in range(7):
-                    items.insert_one({"_id": i, "rank": str(i) + "x" * (3 * 1024 * 1024)})
+                for i in range(45):
+                    items.insert_one({"_id": i, "rank": f"{i:02}" + "x" * 400_000})
                 for direction in (1, -1):
-                    expected = list(range(7))[::direction]
+                    expected = list(range(45))[::direction]
                     rows = list(items.find({}, {"_id": 1}).sort("rank", direction).batch_size(2))
                     self.assertEqual([row["_id"] for row in rows], expected)
                     rows = list(items.find({}, {"_id": 1}).sort("rank", direction)
-                                .skip(4).limit(2).batch_size(1))
-                    self.assertEqual([row["_id"] for row in rows], expected[4:6])
+                                .skip(40).limit(2).batch_size(1))
+                    self.assertEqual([row["_id"] for row in rows], expected[40:42])
 
 
 class AsyncRetainedSortWindowTests(unittest.IsolatedAsyncioTestCase):
