@@ -1142,7 +1142,7 @@ fn ordered_marker_probe_pins_the_snapshot_before_the_first_record_step() {
     let (storage, collection) = setup(temp.path(), 2);
     build(&storage, "value").unwrap();
     let connection = storage.open_unconfigured_shard(0).unwrap();
-    let expected: usize = connection
+    let expected: i64 = connection
         .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| {
             row.get(0)
         })

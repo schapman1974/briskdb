@@ -64,9 +64,8 @@ class PythonDocumentApiTests(unittest.TestCase):
                     with database.session() as session:
                         if not reopened:
                             session.create_collection(DATABASE, COLLECTION)
-                            session.insert_many(DATABASE, COLLECTION, [
-                                {"_id": identity, "v": identity} for identity in range(240)
-                            ])
+                            for identity in range(240):
+                                session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": identity})
                             session.create_built_index(DATABASE, COLLECTION, {"v": 1})
                         result = session.find(DATABASE, COLLECTION, {}, sort={"v": -1}, limit=3,
                                               plan_diagnostics=True, execution_stats=True)
