@@ -308,6 +308,7 @@ fn read_access_to_python(py: Python<'_>, access: DocumentReadAccess) -> PyResult
                 DocumentCandidateKind::LogicalFinite => "logical_finite",
                 DocumentCandidateKind::SparsePresence => "sparse_presence",
                 DocumentCandidateKind::StringRange => "string_range",
+                DocumentCandidateKind::OrderedSort => "ordered_sort",
                 _ => return Err(crate::error::unsupported("unknown document candidate kind")),
             };
             output.set_item("kind", "index_candidates")?;

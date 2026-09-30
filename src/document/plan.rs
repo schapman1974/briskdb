@@ -19,6 +19,9 @@ pub enum DocumentCandidateKind {
     SparsePresence,
     /// One necessary string bound on a single-component Ready index.
     StringRange,
+    /// Exact declared/inverse sort order. Per-shard unsupported-key markers
+    /// can still require the ordinary sort fallback; this is planned authority.
+    OrderedSort,
 }
 
 /// Why this source uses scanning/counting instead of a secondary probe.
@@ -47,7 +50,7 @@ pub enum DocumentReadAccess {
     IndexCandidates {
         index_id: DocumentIndexId,
         kind: DocumentCandidateKind,
-        /// Zero for a sparse-entry scan, one for a string-range bound, otherwise
+        /// Zero for a sparse-entry or ordered-sort scan, one for a string-range bound, otherwise
         /// the finite equality probe-key count. Not a measured row count.
         key_count: usize,
     },

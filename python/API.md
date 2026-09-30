@@ -238,7 +238,8 @@ print(result["plan"])  # routing shards plus the selected access path
 
 An index candidate path contains `kind="index_candidates"`, a numeric `index_id`,
 `candidate_kind` (`equality`, `necessary_finite`, `logical_finite`,
-`string_range` or `sparse_presence`) and `key_count` (one bound for string ranges,
+`string_range`, `sparse_presence`, or `ordered_sort`) and `key_count` (zero for
+ordered sorts, one bound for string ranges,
 zero for sparse-entry scanning). String ranges filter single-component index
 entries before BSON reads; they are not ordered B-tree seeks or numeric coercions.
 A scan has

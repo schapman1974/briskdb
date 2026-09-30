@@ -12,6 +12,7 @@ use crate::{
 use super::Storage;
 
 mod index_storage;
+mod ordered_storage;
 #[cfg(all(test, feature = "documents"))]
 mod schema_tests;
 
@@ -46,11 +47,13 @@ pub(super) fn is_exact_schema_object(
             normalize_schema_sql(sql) == normalize_schema_sql(RECORDS_SCHEMA_SQL)
         }))
         || index_storage::is_exact_schema_object(object_type, name, table_name, sql)
+        || ordered_storage::is_exact_schema_object(object_type, name, table_name, sql)
 }
 
 pub(super) fn is_storage_table(name: &str) -> bool {
     name.eq_ignore_ascii_case(RECORDS_TABLE)
         || name.eq_ignore_ascii_case(index_storage::ENTRIES_TABLE)
+        || name.eq_ignore_ascii_case(ordered_storage::TABLE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,7 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
 /// Records-only remains valid for the explicitly fenced legacy layout upgrade;
 /// ordinary reads/writes require Complete. Orphan/malformed indexes always fail.
 fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresence> {
+    let (equality, ordered) = ordered_storage::inspect_index_schemas(connection)?;
     let objects = connection
         .prepare(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema
@@ -88,7 +92,7 @@ fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresenc
         })
         .map_err(|error| shard_read_error(error, "failed to inspect document storage schema"))?;
     if objects.is_empty() {
-        if index_storage::validate_optional_schema(connection)? {
+        if equality || ordered {
             return Err(corrupt(
                 "document index storage exists without document records",
             ));
@@ -107,9 +111,14 @@ fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresenc
             "shard document storage table has an incompatible schema",
         ));
     }
-    Ok(if index_storage::validate_optional_schema(connection)? {
+    Ok(if equality {
         DocumentSchemaPresence::Complete
     } else {
+        if ordered {
+            return Err(corrupt(
+                "ordered index storage exists without equality index storage",
+            ));
+        }
         DocumentSchemaPresence::RecordsOnly
     })
 }
@@ -180,6 +189,7 @@ mod enabled {
     mod fault_tests;
     mod index_metadata;
     mod index_operations;
+    mod ordered_reads;
     mod unique;
     mod write_transaction;
     use std::{
@@ -292,11 +302,19 @@ mod enabled {
             // A prospective declaration participates in the same combined
             // bounds without cloning the catalog or publishing draft metadata.
             let metadata = || {
-                collection.indexes().iter().chain(
-                    addition
-                        .filter(|(id, _)| *id == collection.id())
-                        .map(|(_, index)| index),
-                )
+                collection
+                    .indexes()
+                    .iter()
+                    .filter(|index| {
+                        !addition.is_some_and(|(id, added)| {
+                            id == collection.id() && added.id() == index.id()
+                        })
+                    })
+                    .chain(
+                        addition
+                            .filter(|(id, _)| *id == collection.id())
+                            .map(|(_, index)| index),
+                    )
             };
             let preparation = DocumentIndexPreparation::compile_selected_with_check(
                 collection.id(),
@@ -1360,8 +1378,11 @@ mod enabled {
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            let (stored_spec, index_id, stored_lifecycle) =
-                run_manifest_controlled(self, &mut connection, control.clone(), |connection| {
+            let (stored_spec, index_id, stored_lifecycle, ordered) = run_manifest_controlled(
+                self,
+                &mut connection,
+                control.clone(),
+                |connection| {
                     let transaction = connection
                         .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(sqlite_error::storage)?;
@@ -1446,13 +1467,19 @@ mod enabled {
                         index_id,
                         "document index identity",
                     )?);
+                    let ordered = manifest::supports_ordered_document_indexes(&transaction)?
+                        && transaction.query_row(
+                            "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_ordering WHERE index_id = ?1)",
+                            [index_id.get() as i64], |row| row.get::<_, bool>(0),
+                        ).map_err(sqlite_error::storage)?;
                     ensure_control_active(
                         &control,
                         "before committing document index declaration",
                     )?;
                     transaction.commit().map_err(sqlite_error::storage)?;
-                    Ok((stored_spec, index_id, stored_lifecycle))
-                })?;
+                    Ok((stored_spec, index_id, stored_lifecycle, ordered))
+                },
+            )?;
             let decoded = decode_metadata_document(&stored_spec, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
                 index_id,
@@ -1461,7 +1488,8 @@ mod enabled {
                 unique,
                 false,
                 stored_lifecycle,
-            ))
+            )
+            .with_ordered_keys(ordered))
         }
 
         /// Remove one pending declaration by exact name under Engine-held schema
@@ -2662,6 +2690,7 @@ mod enabled {
                     // This shard may have committed before its journal cursor.
                     // The absence of the exact optional table is then success.
                     if present {
+                        super::ordered_storage::drop_schema(&transaction)?;
                         super::index_storage::drop_schema(&transaction)?;
                         transaction
                             .execute_batch("DROP TABLE briskdb_documents_v1")
@@ -2983,11 +3012,19 @@ mod enabled {
             .collect::<HashSet<_>>();
         let mut natural_orders = HashSet::new();
         let mut maximum_orders = HashMap::<DocumentCollectionId, i64>::new();
+        let requires_ordered_layout = indexes
+            .collections
+            .values()
+            .any(|indexes| indexes.has_ordered_secondary());
         for shard in 0..storage.shard_count() {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
             super::index_storage::require_no_orphans(&connection, None)?;
+            let ordered_layout = super::ordered_storage::validate_optional_schema(&connection)?;
+            if requires_ordered_layout && !ordered_layout {
+                return Err(corrupt("ready ordered index is missing physical coverage"));
+            }
             let mut statement = connection.prepare(STARTUP_RECORDS_SQL).map_err(|error| {
                 shard_read_error(error, "failed to inspect stored BSON documents")
             })?;
@@ -3067,13 +3104,14 @@ mod enabled {
                         ));
                     }
                 }
-                super::index_storage::validate_record_entries(
+                super::index_storage::validate_record_entries_with_layout(
                     &connection,
                     collection_id,
                     shard,
                     &id_key,
                     &record_checksum,
                     expected.as_ref(),
+                    ordered_layout,
                     &mut || Ok(()),
                 )?;
                 if !natural_orders.insert((collection_id, natural_order)) {
@@ -3441,15 +3479,27 @@ mod enabled {
         if let Some(control) = control {
             ensure_control_active(control, "before reading document index metadata")?;
         }
+        let ordered = manifest::supports_ordered_document_indexes(connection)?;
+        let capability_column = if ordered {
+            "o.key_format_version IS NOT NULL"
+        } else {
+            "0"
+        };
+        let capability_join = if ordered {
+            "LEFT JOIN briskdb_document_index_ordering AS o ON o.index_id = d.index_id"
+        } else {
+            ""
+        };
         let mut statement = connection
-            .prepare(
-                "SELECT i.index_name, i.spec_bson, i.is_unique, i.is_builtin, i.lifecycle_state, d.index_id
+            .prepare(&format!(
+                "SELECT i.index_name, i.spec_bson, i.is_unique, i.is_builtin, i.lifecycle_state, d.index_id, {capability_column}
                  FROM briskdb_document_indexes AS i
                  LEFT JOIN briskdb_document_index_identities AS d
                    ON d.collection_id = i.collection_id AND d.index_name = i.index_name
+                 {capability_join}
                  WHERE i.collection_id = ?1
-                 ORDER BY i.index_name COLLATE BINARY",
-            )
+                 ORDER BY i.index_name COLLATE BINARY"
+            ))
             .map_err(sqlite_error::storage)?;
         let rows = statement
             .query_map([to_sqlite_id(collection_id)?], |row| {
@@ -3460,6 +3510,7 @@ mod enabled {
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, bool>(6)?,
                 ))
             })
             .map_err(sqlite_error::storage)?
@@ -3467,7 +3518,7 @@ mod enabled {
             .map_err(sqlite_error::storage)?;
         let expected_id = builtin_id_specification()?;
         let mut indexes = Vec::with_capacity(rows.len());
-        for (name, spec_bson, unique, built_in, lifecycle, index_id) in rows {
+        for (name, spec_bson, unique, built_in, lifecycle, index_id, ordered) in rows {
             if let Some(control) = control {
                 ensure_control_active(control, "while decoding document index metadata")?;
             }
@@ -3487,17 +3538,20 @@ mod enabled {
             {
                 return Err(corrupt("built-in document _id index metadata is invalid"));
             }
-            indexes.push(DocumentIndexMetadata::from_validated_parts(
-                DocumentIndexId::from_validated(positive_u64(
-                    index_id.ok_or_else(|| corrupt("document index identity is missing"))?,
-                    "document index identity",
-                )?),
-                name,
-                specification,
-                unique,
-                built_in,
-                lifecycle,
-            ));
+            indexes.push(
+                DocumentIndexMetadata::from_validated_parts(
+                    DocumentIndexId::from_validated(positive_u64(
+                        index_id.ok_or_else(|| corrupt("document index identity is missing"))?,
+                        "document index identity",
+                    )?),
+                    name,
+                    specification,
+                    unique,
+                    built_in,
+                    lifecycle,
+                )
+                .with_ordered_keys(ordered),
+            );
         }
         if let Some(control) = control {
             ensure_control_active(control, "after reading document index metadata")?;

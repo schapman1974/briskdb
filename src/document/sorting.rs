@@ -126,6 +126,13 @@ impl DocumentSortKey {
 }
 
 impl DocumentSorter {
+    pub(crate) fn same_specification(&self, other: &Self) -> bool {
+        self.fields.len() == other.fields.len()
+            && self.fields.iter().zip(&other.fields).all(|(left, right)| {
+                left.parts == right.parts && left.descending == right.descending
+            })
+    }
+
     pub fn compile(spec: &BsonDocument) -> EngineResult<Self> {
         Self::compile_with_check(spec, &mut || Ok(()))
     }

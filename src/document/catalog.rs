@@ -158,6 +158,7 @@ pub struct DocumentIndexMetadata {
     unique: bool,
     built_in: bool,
     lifecycle: DocumentIndexLifecycle,
+    ordered: bool,
 }
 
 impl DocumentIndexMetadata {
@@ -176,6 +177,7 @@ impl DocumentIndexMetadata {
             unique,
             built_in,
             lifecycle,
+            ordered: false,
         }
     }
 
@@ -214,6 +216,17 @@ impl DocumentIndexMetadata {
     /// Return the physical-build lifecycle.
     pub const fn lifecycle(&self) -> DocumentIndexLifecycle {
         self.lifecycle
+    }
+
+    /// Set only from the fenced manifest capability or a prospective build
+    /// holding exclusive schema ownership. A declaration alone is not coverage.
+    pub(crate) fn with_ordered_keys(mut self, ordered: bool) -> Self {
+        self.ordered = ordered;
+        self
+    }
+
+    pub(crate) const fn has_ordered_keys(&self) -> bool {
+        self.ordered
     }
 }
 

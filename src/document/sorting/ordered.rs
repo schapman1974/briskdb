@@ -29,9 +29,18 @@ impl DocumentSortKey {
         &self,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<Vec<u8>> {
+        self.ordered_bytes_bounded(MAX_BYTES, check)
+    }
+
+    pub(crate) fn ordered_bytes_bounded(
+        &self,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Vec<u8>> {
         let mut encoder = Encoder {
             bytes: Vec::new(),
             steps: 0,
+            max_bytes: max_bytes.min(MAX_BYTES),
             check,
         };
         encoder.extend(b"BBSO")?;
@@ -62,6 +71,7 @@ impl DocumentSortKey {
 struct Encoder<'a> {
     bytes: Vec<u8>,
     steps: usize,
+    max_bytes: usize,
     check: &'a mut dyn FnMut() -> EngineResult<()>,
 }
 
@@ -77,7 +87,7 @@ impl Encoder<'_> {
 
     fn extend(&mut self, bytes: &[u8]) -> EngineResult<()> {
         let needed = self.bytes.len().saturating_add(bytes.len());
-        if needed > MAX_BYTES {
+        if needed > self.max_bytes {
             return Err(limit());
         }
         if needed > self.bytes.capacity() {
@@ -85,7 +95,7 @@ impl Encoder<'_> {
             // than the output budget just because Vec would double its capacity.
             let capacity = needed
                 .max(self.bytes.capacity().saturating_mul(2))
-                .min(MAX_BYTES);
+                .min(self.max_bytes);
             self.bytes
                 .try_reserve_exact(capacity - self.bytes.len())
                 .map_err(|_| limit())?;

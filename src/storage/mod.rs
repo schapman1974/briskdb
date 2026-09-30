@@ -4879,6 +4879,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_document_index_ordering;
                      DROP TABLE briskdb_security_binding;
                      DROP TABLE briskdb_document_index_operation;
                      DROP TABLE briskdb_document_index_storage;
@@ -4996,6 +4997,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_ordering;
                  DROP TABLE briskdb_security_binding;
                  DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;
@@ -5107,6 +5109,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_ordering;
                  DROP TABLE briskdb_security_binding;
                  DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;

@@ -170,7 +170,16 @@ pub(in crate::storage::document) fn insert_selected_entries(
                 })?;
         }
     }
-    check()
+    super::super::ordered_storage::insert_selected(
+        transaction,
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        prepared,
+        only,
+        check,
+    )
 }
 
 pub(in crate::storage::document) fn remove_record_entries(
@@ -183,7 +192,7 @@ pub(in crate::storage::document) fn remove_record_entries(
         "DELETE FROM briskdb_document_index_entries_v1 WHERE collection_id = ?1 AND id_key = ?2",
         params![sqlite_id(collection.get())?, id_key],
     ).map_err(sqlite_error::storage)?;
-    Ok(())
+    super::super::ordered_storage::remove_record(transaction, collection, id_key)
 }
 
 /// Check both directions: every expected key is present, and every stored key
@@ -196,6 +205,31 @@ pub(in crate::storage::document) fn validate_record_entries(
     id_key: &[u8],
     record_checksum: &[u8; 32],
     expected: Option<&PreparedDocumentIndexEntries>,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<()> {
+    let ordered = super::super::ordered_storage::validate_optional_schema(connection)?;
+    validate_record_entries_with_layout(
+        connection,
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        expected,
+        ordered,
+        check,
+    )
+}
+
+/// Audits/builds inspect the schema once per admitted shard, not once per row.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::storage::document) fn validate_record_entries_with_layout(
+    connection: &Connection,
+    collection: DocumentCollectionId,
+    shard: u16,
+    id_key: &[u8],
+    record_checksum: &[u8; 32],
+    expected: Option<&PreparedDocumentIndexEntries>,
+    ordered: bool,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
     check()?;
@@ -294,7 +328,16 @@ pub(in crate::storage::document) fn validate_record_entries(
             "document index is missing authoritative record entries",
         ));
     }
-    check()
+    super::super::ordered_storage::validate_record(
+        connection,
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        expected,
+        ordered,
+        check,
+    )
 }
 
 /// Startup audits every collection; an index build audits only its own.
@@ -328,9 +371,11 @@ pub(in crate::storage::document) fn require_no_orphans(
     collection: Option<DocumentCollectionId>,
 ) -> EngineResult<()> {
     let sql = orphan_check_sql(collection.is_some());
-    let collection = collection.map(|id| sqlite_id(id.get())).transpose()?;
+    let sqlite_collection = collection.map(|id| sqlite_id(id.get())).transpose()?;
     let orphan = connection
-        .query_row(sql, rusqlite::params_from_iter(collection), |_| Ok(()))
+        .query_row(sql, rusqlite::params_from_iter(sqlite_collection), |_| {
+            Ok(())
+        })
         .optional()
         .map_err(|error| {
             shard_read_error(error, "failed to validate document index record ownership")
@@ -339,5 +384,5 @@ pub(in crate::storage::document) fn require_no_orphans(
     if orphan {
         return Err(corrupt("document index entry has no owning record"));
     }
-    Ok(())
+    super::super::ordered_storage::require_no_orphans(connection, collection)
 }
