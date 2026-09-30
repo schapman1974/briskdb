@@ -3087,7 +3087,9 @@ mod enabled {
             let _audit_snapshot = connection
                 .unchecked_transaction()
                 .map_err(sqlite_error::storage)?;
-            super::index_storage::require_no_orphans(&connection, None)?;
+            // Ordered ownership is checked by the complete merge below,
+            // including entries before/between records and after the last one.
+            super::index_storage::require_no_equality_orphans(&connection, None)?;
             let ordered_layout = super::ordered_storage::validate_optional_schema(&connection)?;
             if requires_ordered_layout && !ordered_layout {
                 return Err(corrupt("ready ordered index is missing physical coverage"));

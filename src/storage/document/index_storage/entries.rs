@@ -399,6 +399,16 @@ pub(in crate::storage::document) fn require_no_orphans(
     connection: &Connection,
     collection: Option<DocumentCollectionId>,
 ) -> EngineResult<()> {
+    require_no_equality_orphans(connection, collection)?;
+    super::super::ordered_storage::require_no_orphans(connection, collection)
+}
+
+/// Startup checks ordered ownership while merging its complete ordered/source
+/// walks. Other callers still need both standalone ownership checks above.
+pub(in crate::storage::document) fn require_no_equality_orphans(
+    connection: &Connection,
+    collection: Option<DocumentCollectionId>,
+) -> EngineResult<()> {
     let sql = orphan_check_sql(collection.is_some());
     let sqlite_collection = collection.map(|id| sqlite_id(id.get())).transpose()?;
     let orphan = connection
@@ -413,5 +423,5 @@ pub(in crate::storage::document) fn require_no_orphans(
     if orphan {
         return Err(corrupt("document index entry has no owning record"));
     }
-    super::super::ordered_storage::require_no_orphans(connection, collection)
+    Ok(())
 }

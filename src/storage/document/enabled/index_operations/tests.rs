@@ -1540,6 +1540,46 @@ fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
 }
 
 #[test]
+fn startup_ordered_merge_rejects_orphans_without_a_separate_ordered_pass() {
+    for damage in [
+        "UPDATE briskdb_document_ordered_entries_v1 SET id_key = CAST(x'00' || id_key AS BLOB)",
+        "UPDATE briskdb_document_ordered_entries_v1 SET id_key = CAST(x'ff' || id_key AS BLOB)",
+        "DELETE FROM briskdb_document_index_entries_v1; DELETE FROM briskdb_documents_v1",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, _) = setup(temp.path(), 2);
+        build(&storage, "value").unwrap();
+        let connection = storage.open_unconfigured_shard(0).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        connection.execute_batch(damage).unwrap();
+        // The equality-only precheck cannot detect these ordered orphans.
+        super::super::super::index_storage::require_no_equality_orphans(&connection, None).unwrap();
+        assert_eq!(
+            super::super::super::index_storage::require_no_orphans(&connection, None)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption,
+            "standalone callers must retain ordered ownership validation"
+        );
+        drop(connection);
+        drop(storage);
+        let before = snapshot(temp.path(), 2, "briskdb_document_ordered_entries_v1");
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{damage}");
+        let message = error.to_string();
+        assert!(
+            message.contains("ordered audit entry has no source record")
+                || message.contains("ordered document index coverage is incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot(temp.path(), 2, "briskdb_document_ordered_entries_v1"),
+            before
+        );
+    }
+}
+
+#[test]
 fn ordered_startup_rejects_missing_empty_index_tables_and_damaged_coverage() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(temp.path(), 2).unwrap();
