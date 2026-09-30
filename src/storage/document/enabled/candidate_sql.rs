@@ -4,6 +4,10 @@ use rusqlite::{Rows, Statement, params};
 
 const MAX_SELECTIVE_ENTRIES: i64 = 32;
 const MAX_SELECTIVE_ID_BYTES: i64 = 64 * 1024;
+mod membership;
+pub(super) use membership::{
+    membership_selectivity_sql, selective_membership, selective_membership_snapshot,
+};
 pub(super) const SELECTIVITY_SQL: &str = "SELECT count(*), coalesce(sum(length(id_key)), 0) FROM (
     SELECT id_key FROM briskdb_document_index_entries_v1
     INDEXED BY sqlite_autoindex_briskdb_document_index_entries_v1_1
