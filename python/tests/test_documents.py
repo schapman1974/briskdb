@@ -57,6 +57,24 @@ def shard_rows_without_timing(stats: dict) -> list:
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_ordered_index_top_k_diagnostics_and_bounded_reads_survive_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            for reopened in (False, True):
+                with briskdb.open(root, shards=4, documents=True) as database:
+                    with database.session() as session:
+                        if not reopened:
+                            session.create_collection(DATABASE, COLLECTION)
+                            for identity in range(240):
+                                session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": identity})
+                            session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                        result = session.find(DATABASE, COLLECTION, {}, sort={"v": -1}, limit=3,
+                                              plan_diagnostics=True, execution_stats=True)
+                        self.assertEqual([row["_id"] for row in result["documents"]], [239, 238, 237])
+                        access = result["plan"]["read_access"]
+                        self.assertEqual((access["kind"], access["candidate_kind"], access["key_count"]),
+                                         ("index_candidates", "ordered_sort", 0))
+                        self.assertLessEqual(result["read_stats"]["documents_examined"], 23)
+
     def test_string_range_plan_and_reduced_bson_reads_survive_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             for reopened in (False, True):

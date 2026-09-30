@@ -1,3 +1,21 @@
+# Unreleased source changes
+
+Ordered document indexes now enable bounded indexed `find().sort().limit(k)`
+reads and frontier-based full sorts (#563). Exact/inverse ordinary secondary
+sort specifications are eligible; sparse/partial, prefix-only compound and
+built-in `_id_` sorts retain the fallback path. Maintaining directional keys
+adds write/index-build work. This source change is not a package publication.
+
+Local roots use manifest version 24 and semantic digest 16. Accepted source
+versions are exact historical local formats 1 through 22; reserved NFS v23 is
+not a local upgrade source. Startup adds empty ordered-key capability metadata
+without scanning BSON or rebuilding existing indexes. Existing indexes and
+matching create-index no-ops remain unchanged. Stop all owners and retain a
+complete pre-upgrade backup before opening a root. In-place downgrade is
+unsupported; older binaries reject the migrated root. To enable ordered reads
+on an old ordinary secondary index, close other processes and explicitly
+drop/recreate it; stop writes before dropping a unique index.
+
 # BriskDB 0.1.0-beta.1 — local/developer beta
 
 Rust crate version: `0.1.0-beta.1`; Python distribution version: `0.1.0b1`.

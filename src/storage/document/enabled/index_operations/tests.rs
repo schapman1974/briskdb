@@ -1137,6 +1137,199 @@ fn setup(root: &Path, count: u16) -> (Storage, DocumentCollectionId) {
 }
 
 #[test]
+fn ordered_marker_probe_pins_the_snapshot_before_the_first_record_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let connection = storage.open_unconfigured_shard(0).unwrap();
+    let expected: i64 = connection
+        .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(expected > 0);
+    let new_id = (200..500)
+        .find(|id| {
+            storage
+                .prepare_document_id(&BsonValue::Int32(*id))
+                .unwrap()
+                .1
+                == 0
+        })
+        .unwrap();
+    let sorter = crate::document::DocumentSorter::compile(
+        &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap();
+    let mut checks = 0;
+    let mut seen = 0;
+    assert!(
+        storage
+            .visit_ordered_documents_on_connection(
+                &connection,
+                collection,
+                0,
+                &sorter,
+                None,
+                None,
+                &mut || {
+                    checks += 1;
+                    if checks == 2 {
+                        storage.insert_document(
+                            collection,
+                            &document(new_id, BsonValue::String("x".repeat(70_000))),
+                        )?;
+                    }
+                    Ok(())
+                },
+                None,
+                |_, _| {
+                    seen += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        seen, expected,
+        "the newly committed fallback marker is outside the pinned snapshot"
+    );
+    assert!(connection.is_autocommit());
+    assert!(
+        !storage
+            .visit_ordered_documents_on_connection(
+                &connection,
+                collection,
+                0,
+                &sorter,
+                None,
+                None,
+                &mut || Ok(()),
+                None,
+                |_, _| panic!("fallback must not visit a partial ordered stream"),
+            )
+            .unwrap()
+    );
+    assert!(connection.is_autocommit());
+}
+
+#[test]
+fn ordered_stream_preserves_caller_transactions_and_releases_early_stop_and_error_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let connection = storage.open_unconfigured_shard(0).unwrap();
+    let sorter = crate::document::DocumentSorter::compile(
+        &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap();
+    for caller_transaction in [false, true] {
+        if caller_transaction {
+            connection.execute_batch("BEGIN").unwrap();
+        }
+        assert!(
+            storage
+                .visit_ordered_documents_on_connection(
+                    &connection,
+                    collection,
+                    0,
+                    &sorter,
+                    None,
+                    None,
+                    &mut || Ok(()),
+                    None,
+                    |_, _| Ok(false),
+                )
+                .unwrap()
+        );
+        assert_eq!(connection.is_autocommit(), !caller_transaction);
+        let error = storage
+            .visit_ordered_documents_on_connection(
+                &connection,
+                collection,
+                0,
+                &sorter,
+                None,
+                None,
+                &mut || Ok(()),
+                None,
+                |_, _| {
+                    Err(EngineError::new(
+                        EngineErrorKind::Cancelled,
+                        "visitor cancelled",
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(connection.is_autocommit(), !caller_transaction);
+        if caller_transaction {
+            connection.execute_batch("ROLLBACK").unwrap();
+        }
+        // No leaked snapshot/transaction prevents the next admitted write.
+        storage
+            .insert_document(
+                collection,
+                &document(
+                    if caller_transaction { 202 } else { 201 },
+                    BsonValue::Int32(5),
+                ),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn ordered_startup_rejects_missing_empty_index_tables_and_damaged_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    storage
+        .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+        .unwrap();
+    create_built(&storage, "empty", "value").unwrap();
+    let connection = storage.open_unconfigured_shard(0).unwrap();
+    connection
+        .execute_batch("DROP TABLE briskdb_document_ordered_entries_v1")
+        .unwrap();
+    drop(connection);
+    drop(storage);
+    assert_eq!(
+        Storage::open(temp.path(), 2).unwrap_err().kind(),
+        EngineErrorKind::DataCorruption
+    );
+
+    for damage in [
+        "DELETE FROM briskdb_document_ordered_entries_v1",
+        "UPDATE briskdb_document_ordered_entries_v1 SET sort_key = NULL",
+        "UPDATE briskdb_document_ordered_entries_v1 SET entry_checksum = zeroblob(32)",
+        "UPDATE briskdb_document_ordered_entries_v1 SET natural_order = natural_order + 1",
+        "UPDATE briskdb_document_ordered_entries_v1 SET entry_format_version = 2",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, _) = setup(temp.path(), 2);
+        build(&storage, "value").unwrap();
+        let connection = storage.open_unconfigured_shard(0).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        connection.execute_batch(damage).unwrap();
+        drop(connection);
+        drop(storage);
+        let before = snapshot(temp.path(), 2, "briskdb_document_ordered_entries_v1");
+        assert_eq!(
+            Storage::open(temp.path(), 2).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption,
+            "{damage}"
+        );
+        assert_eq!(
+            snapshot(temp.path(), 2, "briskdb_document_ordered_entries_v1"),
+            before,
+            "corrupt keys must not be repaired silently"
+        );
+    }
+}
+
+#[test]
 fn candidate_read_snapshots_preserve_caller_transactions_and_clean_up_errors() {
     for membership in [false, true] {
         check_candidate_read_snapshot_cleanup(membership);
@@ -1605,10 +1798,13 @@ fn builds_nonunique_multikey_indexes_idempotently_without_record_rewrites() {
             .unwrap()
             .clone();
         let ready = build(&storage, "value").unwrap();
+        assert!(ready.has_ordered_keys());
         assert_eq!(ready.id(), declared.id());
         assert_eq!(ready.lifecycle(), DocumentIndexLifecycle::Ready);
         let entries = snapshot(temp.path(), count, "briskdb_document_index_entries_v1");
         assert_eq!(entries.iter().map(Vec::len).sum::<usize>(), 24);
+        let ordered_entries = snapshot(temp.path(), count, "briskdb_document_ordered_entries_v1");
+        assert_eq!(ordered_entries.iter().map(Vec::len).sum::<usize>(), 24);
         assert_eq!(build(&storage, "value").unwrap(), ready);
         assert_eq!(
             storage
@@ -1624,6 +1820,10 @@ fn builds_nonunique_multikey_indexes_idempotently_without_record_rewrites() {
             snapshot(temp.path(), count, "briskdb_documents_v1"),
             records
         );
+        assert_eq!(
+            snapshot(temp.path(), count, "briskdb_document_ordered_entries_v1"),
+            ordered_entries
+        );
         // The same-root handle sees newly published authority immediately.
         peer.insert_document(collection, &document(30, BsonValue::Int32(99)))
             .unwrap();
@@ -1633,6 +1833,13 @@ fn builds_nonunique_multikey_indexes_idempotently_without_record_rewrites() {
                 .map(Vec::len)
                 .sum::<usize>(),
             25
+        );
+        assert_eq!(
+            snapshot(temp.path(), count, "briskdb_document_ordered_entries_v1")
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            26
         );
         drop(peer);
         drop(storage);

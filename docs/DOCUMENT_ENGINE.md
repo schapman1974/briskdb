@@ -643,7 +643,10 @@ use the same bounded coordinator and one shared heap, not per-shard heaps.
 
 Native `Count` uses the same eight-child coordinator for independent shard
 counts, including owner-pruned `_id` sets. An empty filter uses each shard's
-storage count; filtered counts retain the existing full matcher/candidate path.
+storage count; filtered counts stream the existing full matcher/candidate path
+through one statement per shard, preparing its probe and validating its storage
+schema once. Each streamed record still receives checksum/identity validation,
+matcher checks and cancellation checks; no result documents are accumulated.
 Only one checked scalar per shard is retained, and global skip/limit applies
 once after summation. Exact-ID counts still read their one owner directly.
 
@@ -1076,7 +1079,40 @@ reject attempts to change the sort on continuation. Growing keys are charged
 again against the shared cursor retention quota; an over-quota continuation
 fails and releases its cursor.
 
-Until sorted indexes are available, each bounded window scans matching
+Newly built ordinary secondary indexes maintain separate BSON-order keys for
+their exact declared field order/directions and the exact inverse directions.
+Eligible `find` sorts stream these entries and seek past the previous window's
+key/natural-order frontier. Each shard stops once its remaining keys cannot beat
+the bounded global heap; an unfiltered indexed `sort().limit(k)` therefore reads
+a bounded prefix per routed shard, not the collection. Residual filters still
+run against full documents, and can require more reads. Prefix-only or partially
+reversed compound specifications, sparse/partial indexes, and the built-in `_id_`
+index currently use the fallback sorter. Aggregation `$sort` is unchanged.
+Proven finite equality/membership candidates retain priority over an ordered
+scan, preventing selective lookups from turning into collection-sized walks.
+
+Ordered keys use their own versioned, order-preserving encoding, not equality
+index bytes. Each direction is derived separately so arrays retain their correct
+minimum/maximum selection. Unsupported/oversized sort keys contribute a
+record-checksummed NULL marker; any marker in that index/direction on a shard
+requires that shard's fallback sorter. Keys are bounded to 64 KiB per direction
+per record/index. Entry checksums bind the collection, index, shard, ID, natural
+order, direction, key/marker and exact record checksum. The marker probe and
+ordered fetch share one SQLite read snapshot; selected BSON is still validated.
+`ordered_sort` plan diagnostics describe this candidate authority, not a promise
+that no shard needs fallback or a measurement of physical I/O.
+
+The local manifest upgrades from v22 to v24 (v23 remains reserved for the
+unavailable NFS profile). Older binaries reject the new root before writes.
+The upgrade adds empty capability metadata; it does not scan/rebuild existing
+indexes. Existing Ready indexes and matching `create_index` no-ops remain
+unchanged. To enable ordered reads on an old index, close other processes and
+explicitly drop/recreate that index. Do not drop a unique index while application
+writes are active. New capabilities and physical keys participate in the existing
+build/abort/drop journal and in the record's write transaction. Startup validates
+their complete coverage; cancellation/recovery cannot publish a partial build.
+
+Without an eligible ordered path, each bounded window scans matching
 documents on the routed shards. Its remaining keys survive continuation, so
 small result batches do not repeatedly rescan the collection. A window retains
 at most 65,536 keys and a conservative 16-MiB heap charge across all shards;
@@ -1101,8 +1137,7 @@ key cannot return an unrelated/nonmatching row at the old position. Concurrent
 writes do not have cross-batch snapshot semantics. New or moved keys are not
 added to an already retained window; moved sort keys can be missed or encountered
 again in a later window. Payload updates with unchanged matching/sort values
-are visible on refetch. This is bounded in-memory sorting,
-not indexed sorting or external spill-to-disk execution.
+are visible on refetch. Neither path provides external spill-to-disk execution.
 
 The shared implementation handles missing/null ties, the empty-array position
 between MinKey and null, direction-sensitive array member selection, dotted
@@ -1423,7 +1458,10 @@ Unfiltered scalar counts reuse the native controlled `count(*)` on each routed
 shard, retaining only checked scalar totals rather than decoding BSON payloads.
 Like native count, this uses startup validation and normal point/scan reads as
 the checksum boundary; it is not a fresh payload-integrity audit. Filtered counts
-without a limit use the full shared matcher and existing safe candidate probes.
+without a limit use the full shared matcher and existing safe candidate probes
+in one short-lived SQLite read stream per shard. Only the current decoded
+record and a checked counter are retained. The stream does not start or finish
+caller-owned transactions and releases its snapshot when that worker returns.
 Filtered limits retain natural-order source processing and stop predicate
 evaluation when a limit is exhausted, even if a later skip discards that row.
 Global skip/limit ordering, empty-input omission, constant key bytes, and

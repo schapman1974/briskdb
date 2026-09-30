@@ -1,6 +1,6 @@
-//! Bounded global top-key windows. Until sorted indexes exist, each window
-//! scans matching documents again, but its remaining positions survive cursor
-//! continuations. No result documents or SQLite leases are retained.
+//! Bounded global top-key windows from eligible ordered indexes or scan/sort
+//! fallback. Remaining positions survive cursor continuations; no result
+//! documents or SQLite leases are retained between requests.
 
 use std::{
     cmp::Ordering,
@@ -18,9 +18,10 @@ use crate::{
     core::engine::document_cursor::{CursorState, ReadStats, SortPosition, SortWindow},
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, ResultLimits},
     document::{
-        BsonDocument, DocumentMatcher, DocumentReadOptions, DocumentSortKey, DocumentSorter,
+        BsonDocument, DocumentCollectionId, DocumentMatcher, DocumentReadOptions, DocumentSortKey,
+        DocumentSorter,
     },
-    storage::ConnectionOwner,
+    storage::{ConnectionOwner, Storage},
 };
 
 const MAX_WINDOW_KEYS: u64 = 65_536;
@@ -116,6 +117,78 @@ fn check(cancellation: &CancellationToken, deadline: Option<Instant>) -> EngineR
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_ordered_window(
+    storage: &Storage,
+    connection: &rusqlite::Connection,
+    collection: DocumentCollectionId,
+    shard: u16,
+    sorter: &DocumentSorter,
+    matcher: Option<&DocumentMatcher>,
+    after: Option<&SortPosition>,
+    window: &Mutex<Window>,
+    stats: Option<&ReadStats>,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> EngineResult<bool> {
+    let mut observe = |elapsed| {
+        if let Some(stats) = stats {
+            stats.streamed_storage_read(shard, elapsed);
+        }
+    };
+    let observer = stats.map(|_| &mut observe as &mut dyn FnMut(std::time::Duration));
+    storage.visit_ordered_documents_on_connection(
+        connection,
+        collection,
+        shard,
+        sorter,
+        matcher,
+        after.map(|position| (&position.key, position.natural_order)),
+        &mut || check(cancellation, deadline),
+        observer,
+        |record, key| {
+            if let Some(stats) = stats {
+                stats.examine(shard, 1);
+            }
+            if let Some(matcher) = matcher {
+                if let Some(stats) = stats {
+                    stats.match_document();
+                }
+                if !matcher
+                    .matches_with_check(record.document(), &mut || check(cancellation, deadline))?
+                {
+                    return Ok(true);
+                }
+            }
+            if let Some(stats) = stats {
+                stats.source_match(shard);
+            }
+            let position = SortPosition {
+                key,
+                natural_order: record.natural_order(),
+            };
+            let mut window = window.lock().map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "document sort window lock poisoned",
+                )
+            })?;
+            check(cancellation, deadline)?;
+            let entry = Entry { position, shard };
+            // This shard's next keys cannot beat the full global heap. Other
+            // shards can only lower that frontier, so stopping here is safe.
+            if window.keys.len() == window.capacity
+                && window.keys.peek().is_some_and(|largest| entry >= *largest)
+            {
+                window.truncated = true;
+                return Ok(false);
+            }
+            window.consider(entry)?;
+            Ok(true)
+        },
+    )
+}
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn scan_sorted_document_page(
@@ -186,6 +259,21 @@ impl Engine {
                                     cancellation,
                                     deadline,
                                     move |storage, connection, cancellation| {
+                                        if try_ordered_window(
+                                            storage,
+                                            connection,
+                                            collection_id,
+                                            shard,
+                                            &sorter,
+                                            matcher.as_deref(),
+                                            after.as_deref(),
+                                            &window,
+                                            stats.as_deref(),
+                                            cancellation,
+                                            deadline,
+                                        )? {
+                                            return Ok(());
+                                        }
                                         let mut natural_after = None;
                                         while let Some(record) = next_matching_document(
                                             storage,

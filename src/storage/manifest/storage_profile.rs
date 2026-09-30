@@ -1,6 +1,6 @@
 //! Fenced NFS manifest format and explicit, no-conversion initialization.
 //!
-//! Local roots continue to use v22. Internal storage can exercise this format;
+//! Local roots use their separate version registry. Internal storage can exercise this format;
 //! public NFS openers remain unavailable pending cross-host safety qualification.
 
 use super::*;
@@ -42,8 +42,8 @@ pub(super) const PROFILE_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery
 // refuse mutation, even if a future caller accidentally uses it as an open plan.
 const INSPECTION_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: NFS_SCHEMA_VERSION,
-    // Keep this separate from the contiguous local upgrade registry, whose
-    // last entry must remain v22. This plan only inspects NFS roots, never
+    // Keep this on its frozen v22 base, separate from local upgrades (which
+    // skip reserved NFS version 23). This plan only inspects NFS roots, never
     // upgrades a historical local root into the reserved profile.
     migrations: &[Migration {
         from: V22_SCHEMA_VERSION,
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn local_format_stays_v22_and_local_openers_reject_nfs_before_mutation() {
+    fn local_format_is_independent_and_local_openers_reject_nfs_before_mutation() {
         let (file, mut nfs) = fixture();
         let bytes = std::fs::read(file.path()).unwrap();
         assert_eq!(
@@ -371,7 +371,10 @@ mod tests {
         assert_eq!(std::fs::read(file.path()).unwrap(), bytes);
         let mut local = Connection::open_in_memory().unwrap();
         load_or_create_manifest(&mut local, 4).unwrap();
-        assert_eq!(read_identity(&local).unwrap().1, 22);
+        assert_eq!(
+            read_identity(&local).unwrap().1,
+            i64::from(CURRENT_SCHEMA_VERSION)
+        );
         assert_eq!(
             detect_storage_profile(&local).unwrap(),
             StorageProfile::Local
@@ -382,7 +385,10 @@ mod tests {
                 .kind(),
             EngineErrorKind::FailedPrecondition
         );
-        assert_eq!(read_identity(&local).unwrap().1, 22);
+        assert_eq!(
+            read_identity(&local).unwrap().1,
+            i64::from(CURRENT_SCHEMA_VERSION)
+        );
     }
 
     #[test]

@@ -14,6 +14,8 @@ use crate::{
 };
 use std::error::Error;
 
+mod ordering;
+
 /// Maximum secondary declarations in one preparation; the built-in `_id_`
 /// index is handled by record storage and does not count toward this limit.
 pub const MAX_DOCUMENT_PREPARED_INDEXES: usize = 64;
@@ -45,6 +47,7 @@ struct CompiledIndex {
     id: DocumentIndexId,
     unique: bool,
     generator: DocumentIndexKeyGenerator,
+    ordering: Option<ordering::Ordering>,
 }
 
 /// Request-local derived selection. Only storage's schema-admitted Ready cache
@@ -105,9 +108,23 @@ pub struct PreparedDocumentIndexKeys {
     index_id: DocumentIndexId,
     unique: bool,
     keys: Vec<Vec<u8>>,
+    ordered: Option<[Option<Vec<u8>>; 2]>,
 }
 
 impl DocumentIndexPreparation {
+    pub(crate) fn ordered_probe(
+        &self,
+        sorter: &crate::document::DocumentSorter,
+    ) -> Option<(DocumentIndexId, u8)> {
+        self.indexes.iter().find_map(|index| {
+            index
+                .ordering
+                .as_ref()
+                .and_then(|ordering| ordering.direction(sorter))
+                .map(|direction| (index.id, direction))
+        })
+    }
+
     pub fn compile(collection: &DocumentCollectionMetadata) -> EngineResult<Self> {
         Self::compile_with_check(collection, &mut || Ok(()))
     }
@@ -166,8 +183,15 @@ impl DocumentIndexPreparation {
                 definition.partial_filter(),
                 &mut || budget.step(),
             )?;
+            let ordering = ordering::Ordering::compile(metadata, &mut || budget.step())?;
             let retained = generator
                 .retained_bytes()
+                .checked_add(
+                    ordering
+                        .as_ref()
+                        .map_or(0, ordering::Ordering::retained_bytes),
+                )
+                .ok_or_else(limit)?
                 .checked_add(128)
                 .ok_or_else(limit)?;
             budget.charge(retained)?;
@@ -177,6 +201,7 @@ impl DocumentIndexPreparation {
                 id: metadata.id(),
                 unique: metadata.is_unique(),
                 generator,
+                ordering,
             });
         }
         budget.step()?;
@@ -197,6 +222,10 @@ impl DocumentIndexPreparation {
 
     pub(crate) fn has_unique_secondary(&self) -> bool {
         self.indexes.iter().any(|index| index.unique)
+    }
+
+    pub(crate) fn has_ordered_secondary(&self) -> bool {
+        self.indexes.iter().any(|index| index.ordering.is_some())
     }
 
     pub(crate) fn equality_probe_with_check(
@@ -354,6 +383,16 @@ impl DocumentIndexPreparation {
             .map_err(allocation)?;
         for index in &self.indexes {
             budget.step()?;
+            let ordered = index
+                .ordering
+                .as_ref()
+                .map(|ordering| ordering.prepare(document, &mut || budget.step()))
+                .transpose()?;
+            if let Some(keys) = &ordered {
+                for key in keys.iter().flatten() {
+                    budget.charge(key.capacity())?;
+                }
+            }
             let tuples = match index
                 .generator
                 .keys_validated_with_budget(document, &mut budget)
@@ -383,6 +422,7 @@ impl DocumentIndexPreparation {
                         index_id: index.id,
                         unique: false,
                         keys,
+                        ordered,
                     });
                     continue;
                 }
@@ -400,6 +440,7 @@ impl DocumentIndexPreparation {
                 index_id: index.id,
                 unique: index.unique,
                 keys,
+                ordered,
             });
         }
         budget.step()?;
@@ -432,6 +473,12 @@ impl PreparedDocumentIndexKeys {
 
     pub fn keys(&self) -> &[Vec<u8>] {
         &self.keys
+    }
+
+    /// Ordered bytes for the declared and inverse specifications. None at the
+    /// outer level means no coverage; an inner None is an unsupported marker.
+    pub(crate) fn ordered_keys(&self) -> Option<&[Option<Vec<u8>>; 2]> {
+        self.ordered.as_ref()
     }
 }
 

@@ -26,6 +26,14 @@ fn pre_one_policy_matches_the_manifest_created_by_this_package() {
 
     let storage_contract = include_str!("../docs/STORAGE_FORMAT.md");
     assert!(storage_contract.contains(&format!("## Current format: version {manifest_version}")));
+    let digest_version = manifest
+        .query_row(
+            "SELECT manifest_digest_version FROM briskdb_integrity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .unwrap();
+    assert!(storage_contract.contains(&format!("Manifest digest version {digest_version} is")));
 
     let release_policy = include_str!("../docs/PRE_1_COMPATIBILITY.md");
     for required_boundary in [

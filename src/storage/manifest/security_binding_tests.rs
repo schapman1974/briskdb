@@ -7,6 +7,17 @@ const V21_PLAN: MigrationPlan<'static> = MigrationPlan {
     initialize_interrupted_legacy: migrate_interrupted_legacy_to_v21,
 };
 
+const V22_PLAN: MigrationPlan<'static> = MigrationPlan {
+    current_version: V22_SCHEMA_VERSION,
+    migrations: MIGRATIONS,
+    initialize_current: create_v22_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v22,
+};
+
+fn upgrade_to_v22(connection: &mut Connection) {
+    load_or_create_snapshot_with_plan(connection, 2, V22_PLAN, true, &mut |_| Ok(())).unwrap();
+}
+
 fn at_v21() -> Connection {
     let mut connection = Connection::open_in_memory().unwrap();
     load_or_create_snapshot_with_plan(&mut connection, 2, V21_PLAN, true, &mut |_| Ok(())).unwrap();
@@ -29,7 +40,7 @@ fn bind_fixture(connection: &mut Connection) {
 fn v22_upgrade_preserves_catalog_and_starts_without_a_security_binding() {
     let mut connection = at_v21();
     let before = validate_v21(&connection, 2, &schema_objects(&connection).unwrap()).unwrap();
-    load_or_create_manifest(&mut connection, 2).unwrap();
+    upgrade_to_v22(&mut connection);
     let after = validate_v22(&connection, 2, &schema_objects(&connection).unwrap()).unwrap();
     assert_eq!(before.logical_catalog, after.logical_catalog);
     assert_eq!(before.routing_catalog, after.routing_catalog);
@@ -72,7 +83,7 @@ fn v22_migration_rolls_back_at_each_injected_boundary_and_retries_cleanly() {
         let mut connection = at_v21();
         let before = manifest_semantic_digest(&connection).unwrap();
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            load_or_create_with_hook(&mut connection, 2, |point| {
+            load_or_create_snapshot_with_plan(&mut connection, 2, V22_PLAN, true, &mut |point| {
                 if point.from == V21_SCHEMA_VERSION && point.phase == phase {
                     if inject_panic {
                         panic!("injected v22 rollback panic");
@@ -99,7 +110,7 @@ fn v22_migration_rolls_back_at_each_injected_boundary_and_retries_cleanly() {
         );
         assert_eq!(schema_objects(&connection).unwrap(), v19_objects());
         assert_eq!(manifest_semantic_digest(&connection).unwrap(), before);
-        load_or_create_manifest(&mut connection, 2).unwrap();
+        upgrade_to_v22(&mut connection);
         assert_eq!(
             read_identity(&connection).unwrap().1,
             i64::from(V22_SCHEMA_VERSION)
@@ -110,7 +121,7 @@ fn v22_migration_rolls_back_at_each_injected_boundary_and_retries_cleanly() {
 #[test]
 fn v21_reader_and_tampered_version_cannot_ignore_the_v22_binding_table() {
     let mut connection = at_v21();
-    load_or_create_manifest(&mut connection, 2).unwrap();
+    upgrade_to_v22(&mut connection);
     assert_eq!(
         inspect_with_plan(&connection, 2, V21_PLAN)
             .unwrap_err()
@@ -145,7 +156,9 @@ fn bound_manifest_rejects_every_ordinary_startup_path_even_with_auth_feature() {
     let mut connection = at_v21();
     load_or_create_manifest(&mut connection, 2).unwrap();
     bind_fixture(&mut connection);
-    let snapshot = validate_v22(&connection, 2, &schema_objects(&connection).unwrap()).unwrap();
+    let snapshot =
+        ordered_indexes::validate_v24(&connection, 2, &schema_objects(&connection).unwrap())
+            .unwrap();
     assert_eq!(snapshot.security_store_id, Some([7; 16]));
     assert_eq!(
         startup_requires_exclusive_ownership(&connection, 2)
@@ -174,7 +187,7 @@ fn security_binding_is_checksum_covered_and_malformed_rows_fail_closed() {
         )
         .unwrap();
     assert_eq!(
-        validate_v22(&connection, 2, &schema_objects(&connection).unwrap())
+        ordered_indexes::validate_v24(&connection, 2, &schema_objects(&connection).unwrap())
             .unwrap_err()
             .kind(),
         EngineErrorKind::DataCorruption
@@ -219,4 +232,26 @@ fn real_root_bound_startup_does_not_change_manifest_or_open_anonymous_storage() 
     assert!(error.to_string().contains("authenticated engine startup"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(!temp.path().join("security").exists());
+}
+
+#[test]
+fn bound_v22_root_rejects_anonymous_startup_before_ordered_index_upgrade() {
+    let temp = tempfile::tempdir().unwrap();
+    drop(crate::core::Database::open(temp.path(), 2).unwrap());
+    let path = temp.path().join("manifest.sqlite");
+    let mut connection = Connection::open(&path).unwrap();
+    ordered_indexes::downgrade_to_v22_for_test(&connection, 2).unwrap();
+    bind_fixture(&mut connection);
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    let error = crate::core::Database::open(temp.path(), 2).unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+    assert!(error.to_string().contains("authenticated engine startup"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        read_identity(&connection).unwrap().1,
+        i64::from(V22_SCHEMA_VERSION)
+    );
+    assert_eq!(schema_objects(&connection).unwrap(), v22_objects());
 }

@@ -202,6 +202,7 @@ fn cleanup(
                     [journal.index.get() as i64],
                 )
                 .map_err(sqlite_error::storage)?;
+            super::super::ordered_storage::remove_index(&transaction, journal.index)?;
             if let Some(control) = control {
                 ensure_control_active(control, "before committing document index cleanup")?;
             }
@@ -243,6 +244,14 @@ fn cleanup(
             if removed != 1 {
                 return Err(corrupt("document index drop lost its declaration"));
             }
+        }
+        if manifest::supports_ordered_document_indexes(&transaction)? {
+            transaction
+                .execute(
+                    "DELETE FROM briskdb_document_index_ordering WHERE index_id = ?1",
+                    [journal.index.get() as i64],
+                )
+                .map_err(sqlite_error::storage)?;
         }
         manifest::refresh_manifest_digest(&transaction)?;
         manifest::current_integrity(&transaction, storage.shard_count())?;
@@ -893,6 +902,11 @@ impl Storage {
                     after: before,
                 });
             }
+            let ordered = manifest::supports_ordered_document_indexes(&connection)?
+                && target.definition().is_some_and(|definition| {
+                    !definition.sparse() && definition.partial_filter().is_none()
+                });
+            let target = target.clone().with_ordered_keys(ordered);
             let current = compile_ready_indexes(&catalog, &mut || {
                 ensure_control_active(&control, "while preparing document index authority")
             })?;
@@ -900,7 +914,7 @@ impl Storage {
                 &catalog,
                 Some(target.id()),
                 None,
-                addition.as_ref().map(|index| (collection.id(), index)),
+                Some((collection.id(), &target)),
                 &mut || ensure_control_active(&control, "while preparing document index build"),
             )?;
             let prepared = future
@@ -920,6 +934,8 @@ impl Storage {
                     self.validate_unconfigured_shard_nonterminal(source, shard)?;
                     require_schema(source)?;
                     super::super::index_storage::require_no_orphans(source, Some(collection.id()))?;
+                    let ordered_layout =
+                        super::super::ordered_storage::validate_optional_schema(source)?;
                     visit_records(
                         self,
                         source,
@@ -947,13 +963,14 @@ impl Storage {
                                 })
                                 .transpose()
                                 .map_err(stored_index_error)?;
-                            super::super::index_storage::validate_record_entries(
+                            super::super::index_storage::validate_record_entries_with_layout(
                                 source,
                                 collection.id(),
                                 shard,
                                 record.id_key.as_bytes(),
                                 &record.checksum,
                                 expected.as_ref(),
+                                ordered_layout,
                                 &mut || {
                                     ensure_control_active(
                                         &control,
@@ -1032,6 +1049,13 @@ impl Storage {
                         ));
                     }
                 }
+                if ordered {
+                    transaction.execute(
+                        "INSERT INTO briskdb_document_index_ordering (index_id, key_format_version) VALUES (?1, 1)
+                         ON CONFLICT(index_id) DO NOTHING",
+                        [target.id().get() as i64],
+                    ).map_err(sqlite_error::storage)?;
+                }
                 // A new declaration is published together with an existing v19
                 // DROP cleanup obligation. Until activation cancels it, restart
                 // must remove the provisional definition as well as its entries.
@@ -1070,6 +1094,11 @@ impl Storage {
                     let transaction = source
                         .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(sqlite_error::storage)?;
+                    if ordered {
+                        super::super::ordered_storage::ensure_schema(&transaction)?;
+                    }
+                    let ordered_layout =
+                        super::super::ordered_storage::validate_optional_schema(&transaction)?;
                     visit_records(
                         self,
                         &transaction,
@@ -1106,13 +1135,14 @@ impl Storage {
                                     )
                                 },
                             )?;
-                            super::super::index_storage::validate_record_entries(
+                            super::super::index_storage::validate_record_entries_with_layout(
                                 &transaction,
                                 collection.id(),
                                 shard,
                                 record.id_key.as_bytes(),
                                 &record.checksum,
                                 Some(&entries),
+                                ordered_layout,
                                 &mut || {
                                     ensure_control_active(
                                         &control,

@@ -96,6 +96,88 @@ fn storage_preparation(unique: bool, fields: BsonDocument) -> DocumentIndexPrepa
 }
 
 #[test]
+fn ordered_keys_derive_both_array_directions_and_do_not_change_legacy_preparation() {
+    use crate::document::DocumentSorter;
+    let index = secondary(2, keys());
+    let input = doc([(
+        "v",
+        BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(1)]),
+    )]);
+    let legacy = DocumentIndexPreparation::compile(&collection([index.clone()])).unwrap();
+    assert!(
+        legacy.prepare(&input).unwrap().indexes()[0]
+            .ordered_keys()
+            .is_none()
+    );
+    let ordered =
+        DocumentIndexPreparation::compile(&collection([index.with_ordered_keys(true)])).unwrap();
+    let entries = ordered.prepare(&input).unwrap();
+    let actual = entries.indexes()[0].ordered_keys().unwrap();
+    for (offset, direction, selected) in [(0, 1, 1), (1, -1, 3)] {
+        let sorter = DocumentSorter::compile(&doc([("v", BsonValue::Int32(direction))])).unwrap();
+        let expected = sorter
+            .key(&doc([("v", BsonValue::Int32(selected))]))
+            .unwrap()
+            .ordered_bytes()
+            .unwrap();
+        assert_eq!(actual[offset].as_ref().unwrap(), &expected);
+    }
+}
+
+#[test]
+fn oversized_order_keys_are_deterministic_markers_without_rejecting_equality_keys() {
+    let metadata = secondary(2, keys()).with_ordered_keys(true);
+    let preparation = DocumentIndexPreparation::compile(&collection([metadata])).unwrap();
+    let input = doc([(
+        "v",
+        BsonValue::String("x".repeat(ordering::MAX_ORDER_KEY_BYTES)),
+    )]);
+    for _ in 0..2 {
+        let entries = preparation.prepare(&input).unwrap();
+        assert_eq!(entries.indexes()[0].ordered_keys(), Some(&[None, None]));
+        assert_eq!(entries.indexes()[0].keys().len(), 1);
+    }
+}
+
+#[test]
+fn ordered_parallel_arrays_fall_back_but_caller_errors_are_not_swallowed() {
+    let metadata = secondary(
+        2,
+        doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(1))]),
+    )
+    .with_ordered_keys(true);
+    let compiled = ordering::Ordering::compile(&metadata, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    let input = doc([
+        ("a", BsonValue::Array(vec![BsonValue::Int32(1)])),
+        ("b", BsonValue::Array(vec![BsonValue::Int32(2)])),
+    ]);
+    assert_eq!(
+        compiled.prepare(&input, &mut || Ok(())).unwrap(),
+        [None, None]
+    );
+    for kind in [
+        EngineErrorKind::Cancelled,
+        EngineErrorKind::DeadlineExceeded,
+        EngineErrorKind::LimitExceeded,
+    ] {
+        assert_eq!(
+            compiled
+                .prepare(&input, &mut || Err(EngineError::new(
+                    kind,
+                    "caller interrupted"
+                )))
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+    }
+    let sparse = membership(3, true, None).with_ordered_keys(true);
+    assert!(ordering::Ordering::compile(&sparse, &mut || Ok(())).is_err());
+}
+
+#[test]
 fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_preference() {
     let metadata = collection([
         secondary(2, keys()),

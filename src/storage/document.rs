@@ -12,6 +12,7 @@ use crate::{
 use super::Storage;
 
 mod index_storage;
+mod ordered_storage;
 #[cfg(all(test, feature = "documents"))]
 mod schema_tests;
 
@@ -46,11 +47,13 @@ pub(super) fn is_exact_schema_object(
             normalize_schema_sql(sql) == normalize_schema_sql(RECORDS_SCHEMA_SQL)
         }))
         || index_storage::is_exact_schema_object(object_type, name, table_name, sql)
+        || ordered_storage::is_exact_schema_object(object_type, name, table_name, sql)
 }
 
 pub(super) fn is_storage_table(name: &str) -> bool {
     name.eq_ignore_ascii_case(RECORDS_TABLE)
         || name.eq_ignore_ascii_case(index_storage::ENTRIES_TABLE)
+        || name.eq_ignore_ascii_case(ordered_storage::TABLE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,7 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
 /// Records-only remains valid for the explicitly fenced legacy layout upgrade;
 /// ordinary reads/writes require Complete. Orphan/malformed indexes always fail.
 fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresence> {
+    let (equality, ordered) = ordered_storage::inspect_index_schemas(connection)?;
     let objects = connection
         .prepare(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema
@@ -88,7 +92,7 @@ fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresenc
         })
         .map_err(|error| shard_read_error(error, "failed to inspect document storage schema"))?;
     if objects.is_empty() {
-        if index_storage::validate_optional_schema(connection)? {
+        if equality || ordered {
             return Err(corrupt(
                 "document index storage exists without document records",
             ));
@@ -107,9 +111,14 @@ fn inspect_schema(connection: &Connection) -> EngineResult<DocumentSchemaPresenc
             "shard document storage table has an incompatible schema",
         ));
     }
-    Ok(if index_storage::validate_optional_schema(connection)? {
+    Ok(if equality {
         DocumentSchemaPresence::Complete
     } else {
+        if ordered {
+            return Err(corrupt(
+                "ordered index storage exists without equality index storage",
+            ));
+        }
         DocumentSchemaPresence::RecordsOnly
     })
 }
@@ -180,6 +189,7 @@ mod enabled {
     mod fault_tests;
     mod index_metadata;
     mod index_operations;
+    mod ordered_reads;
     mod unique;
     mod write_transaction;
     use std::{
@@ -292,11 +302,19 @@ mod enabled {
             // A prospective declaration participates in the same combined
             // bounds without cloning the catalog or publishing draft metadata.
             let metadata = || {
-                collection.indexes().iter().chain(
-                    addition
-                        .filter(|(id, _)| *id == collection.id())
-                        .map(|(_, index)| index),
-                )
+                collection
+                    .indexes()
+                    .iter()
+                    .filter(|index| {
+                        !addition.is_some_and(|(id, added)| {
+                            id == collection.id() && added.id() == index.id()
+                        })
+                    })
+                    .chain(
+                        addition
+                            .filter(|(id, _)| *id == collection.id())
+                            .map(|(_, index)| index),
+                    )
             };
             let preparation = DocumentIndexPreparation::compile_selected_with_check(
                 collection.id(),
@@ -1360,8 +1378,11 @@ mod enabled {
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            let (stored_spec, index_id, stored_lifecycle) =
-                run_manifest_controlled(self, &mut connection, control.clone(), |connection| {
+            let (stored_spec, index_id, stored_lifecycle, ordered) = run_manifest_controlled(
+                self,
+                &mut connection,
+                control.clone(),
+                |connection| {
                     let transaction = connection
                         .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(sqlite_error::storage)?;
@@ -1446,13 +1467,19 @@ mod enabled {
                         index_id,
                         "document index identity",
                     )?);
+                    let ordered = manifest::supports_ordered_document_indexes(&transaction)?
+                        && transaction.query_row(
+                            "SELECT EXISTS (SELECT 1 FROM briskdb_document_index_ordering WHERE index_id = ?1)",
+                            [index_id.get() as i64], |row| row.get::<_, bool>(0),
+                        ).map_err(sqlite_error::storage)?;
                     ensure_control_active(
                         &control,
                         "before committing document index declaration",
                     )?;
                     transaction.commit().map_err(sqlite_error::storage)?;
-                    Ok((stored_spec, index_id, stored_lifecycle))
-                })?;
+                    Ok((stored_spec, index_id, stored_lifecycle, ordered))
+                },
+            )?;
             let decoded = decode_metadata_document(&stored_spec, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
                 index_id,
@@ -1461,7 +1488,8 @@ mod enabled {
                 unique,
                 false,
                 stored_lifecycle,
-            ))
+            )
+            .with_ordered_keys(ordered))
         }
 
         /// Remove one pending declaration by exact name under Engine-held schema
@@ -2210,6 +2238,47 @@ mod enabled {
             probe: Option<&DocumentIndexProbe>,
             cancellation: &CancellationToken,
         ) -> EngineResult<Vec<DocumentStorageRecord>> {
+            // Preserve exact bounded-page allocation; invalid limits are
+            // rejected by the shared visitor before allocating record slots.
+            let capacity = if (1..=MAX_DOCUMENT_SHARD_SCAN_RECORDS).contains(&limit) {
+                limit
+            } else {
+                0
+            };
+            let mut records = Vec::with_capacity(capacity);
+            self.visit_document_candidates_on_connection(
+                connection,
+                collection_id,
+                shard,
+                after_natural_order,
+                Some(limit),
+                probe,
+                cancellation,
+                None,
+                |record| {
+                    records.push(record);
+                    Ok(true)
+                },
+            )?;
+            Ok(records)
+        }
+
+        /// Stream validated candidates through one statement and read snapshot.
+        /// Only the current record is decoded; the visitor controls retention.
+        /// `None` is an unbounded row count, not an unbounded materialized page.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn visit_document_candidates_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            after_natural_order: Option<u64>,
+            limit: Option<usize>,
+            probe: Option<&DocumentIndexProbe>,
+            cancellation: &CancellationToken,
+            mut observe: Option<&mut dyn FnMut(std::time::Duration)>,
+            mut visit: impl FnMut(DocumentStorageRecord) -> EngineResult<bool>,
+        ) -> EngineResult<()> {
             ensure_document_operation_not_cancelled(cancellation, "before scanning documents")?;
             self.ensure_shard_in_range(shard)?;
             if probe.is_some_and(|probe| probe.collection_id() != collection_id) {
@@ -2218,7 +2287,7 @@ mod enabled {
                     "document index probe belongs to another collection",
                 ));
             }
-            if !(1..=MAX_DOCUMENT_SHARD_SCAN_RECORDS).contains(&limit) {
+            if limit.is_some_and(|limit| !(1..=MAX_DOCUMENT_SHARD_SCAN_RECORDS).contains(&limit)) {
                 return Err(EngineError::new(
                     EngineErrorKind::InvalidArgument,
                     format!(
@@ -2230,8 +2299,9 @@ mod enabled {
                 .map(document_natural_order_to_sqlite)
                 .transpose()?
                 .unwrap_or(0);
-            let sqlite_limit =
-                i64::try_from(limit).expect("bounded document scan limit fits SQLite");
+            let sqlite_limit = limit.map_or(i64::MAX, |limit| {
+                i64::try_from(limit).expect("bounded document scan limit fits SQLite")
+            });
             require_schema(connection)?;
             let finite_keys = probe.and_then(|probe| match probe.selection() {
                 DocumentIndexSelection::Keys(keys) => Some((probe, keys)),
@@ -2371,77 +2441,96 @@ mod enabled {
             .map_err(|error| {
                 shard_read_error(error, "failed to start stored BSON document scan")
             })?;
-            let mut records = Vec::with_capacity(limit);
-            while let Some(row) = rows.next().map_err(|error| {
-                shard_read_error(error, "failed while scanning stored BSON documents")
-            })? {
+            loop {
                 ensure_document_operation_not_cancelled(cancellation, "while scanning documents")?;
-                let natural_order = row.get::<_, i64>(0).map_err(|error| {
-                    shard_read_error(error, "failed to decode stored BSON natural order")
-                })?;
-                let id_key = row.get::<_, Vec<u8>>(1).map_err(|error| {
-                    shard_read_error(error, "failed to decode stored BSON canonical key")
-                })?;
-                let document_bson = row.get::<_, Vec<u8>>(2).map_err(|error| {
-                    shard_read_error(error, "failed to decode stored BSON payload")
-                })?;
-                let checksum = row.get::<_, Vec<u8>>(3).map_err(|error| {
-                    shard_read_error(error, "failed to decode stored BSON checksum")
-                })?;
-                let version = row.get::<_, i64>(4).map_err(|error| {
-                    shard_read_error(error, "failed to decode stored BSON format version")
-                })?;
-                let canonical = CanonicalBsonKey::from_bytes(&id_key)
-                    .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
-                if self.shard_for_key(canonical.as_bytes()) != shard {
-                    return Err(corrupt(
-                        "stored BSON document is on a shard that disagrees with its canonical _id route",
-                    ));
-                }
-                let record = decode_storage_record(
-                    collection_id,
-                    shard,
-                    natural_order,
-                    id_key,
-                    document_bson,
-                    checksum,
-                    version,
-                )?;
-                if let Some(probe) = probe {
-                    let stored = row
-                        .get_ref(5)
-                        .and_then(|value| value.as_blob().map_err(Into::into))
-                        .map_err(|error| {
-                            shard_read_error(error, "invalid document index checksum")
-                        })?;
-                    let version = row.get::<_, i64>(6).map_err(|error| {
-                        shard_read_error(error, "invalid document index entry version")
+                let started = observe.as_ref().map(|_| std::time::Instant::now());
+                let fetched: EngineResult<_> = (|| {
+                    let Some(row) = rows.next().map_err(|error| {
+                        shard_read_error(error, "failed while scanning stored BSON documents")
+                    })?
+                    else {
+                        return Ok(None);
+                    };
+                    ensure_document_operation_not_cancelled(
+                        cancellation,
+                        "while scanning documents",
+                    )?;
+                    let natural_order = row.get::<_, i64>(0).map_err(|error| {
+                        shard_read_error(error, "failed to decode stored BSON natural order")
                     })?;
-                    let index_key = row
-                        .get_ref(7)
-                        .and_then(|value| value.as_blob().map_err(Into::into))
-                        .map_err(|error| {
-                            shard_read_error(error, "invalid document index candidate key")
-                        })?;
-                    super::index_storage::validate_probe_entry(
+                    let id_key = row.get::<_, Vec<u8>>(1).map_err(|error| {
+                        shard_read_error(error, "failed to decode stored BSON canonical key")
+                    })?;
+                    let document_bson = row.get::<_, Vec<u8>>(2).map_err(|error| {
+                        shard_read_error(error, "failed to decode stored BSON payload")
+                    })?;
+                    let checksum = row.get::<_, Vec<u8>>(3).map_err(|error| {
+                        shard_read_error(error, "failed to decode stored BSON checksum")
+                    })?;
+                    let version = row.get::<_, i64>(4).map_err(|error| {
+                        shard_read_error(error, "failed to decode stored BSON format version")
+                    })?;
+                    let canonical = CanonicalBsonKey::from_bytes(&id_key)
+                        .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+                    if self.shard_for_key(canonical.as_bytes()) != shard {
+                        return Err(corrupt(
+                            "stored BSON document is on a shard that disagrees with its canonical _id route",
+                        ));
+                    }
+                    let record = decode_storage_record(
                         collection_id,
-                        probe.index_id(),
                         shard,
-                        record.id_key.as_bytes(),
-                        index_key,
-                        &record.checksum,
-                        stored,
+                        natural_order,
+                        id_key,
+                        document_bson,
+                        checksum,
                         version,
                     )?;
+                    if let Some(probe) = probe {
+                        let stored = row
+                            .get_ref(5)
+                            .and_then(|value| value.as_blob().map_err(Into::into))
+                            .map_err(|error| {
+                                shard_read_error(error, "invalid document index checksum")
+                            })?;
+                        let version = row.get::<_, i64>(6).map_err(|error| {
+                            shard_read_error(error, "invalid document index entry version")
+                        })?;
+                        let index_key = row
+                            .get_ref(7)
+                            .and_then(|value| value.as_blob().map_err(Into::into))
+                            .map_err(|error| {
+                                shard_read_error(error, "invalid document index candidate key")
+                            })?;
+                        super::index_storage::validate_probe_entry(
+                            collection_id,
+                            probe.index_id(),
+                            shard,
+                            record.id_key.as_bytes(),
+                            index_key,
+                            &record.checksum,
+                            stored,
+                            version,
+                        )?;
+                    }
+                    Ok(Some(record))
+                })();
+                if let (Some(observe), Some(started)) = (observe.as_mut(), started) {
+                    observe(started.elapsed());
                 }
-                records.push(record);
+                let Some(record) = fetched? else {
+                    break;
+                };
+                if !visit(record)? {
+                    break;
+                }
             }
             drop(rows);
             drop(statement);
             drop(snapshot);
             drop(snapshot_statement);
             ensure_document_operation_not_cancelled(cancellation, "after scanning documents")?;
-            Ok(records)
+            Ok(())
         }
 
         #[cfg(any(feature = "tinymongo-import", test))]
@@ -2662,6 +2751,7 @@ mod enabled {
                     // This shard may have committed before its journal cursor.
                     // The absence of the exact optional table is then success.
                     if present {
+                        super::ordered_storage::drop_schema(&transaction)?;
                         super::index_storage::drop_schema(&transaction)?;
                         transaction
                             .execute_batch("DROP TABLE briskdb_documents_v1")
@@ -2983,11 +3073,19 @@ mod enabled {
             .collect::<HashSet<_>>();
         let mut natural_orders = HashSet::new();
         let mut maximum_orders = HashMap::<DocumentCollectionId, i64>::new();
+        let requires_ordered_layout = indexes
+            .collections
+            .values()
+            .any(|indexes| indexes.has_ordered_secondary());
         for shard in 0..storage.shard_count() {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
             super::index_storage::require_no_orphans(&connection, None)?;
+            let ordered_layout = super::ordered_storage::validate_optional_schema(&connection)?;
+            if requires_ordered_layout && !ordered_layout {
+                return Err(corrupt("ready ordered index is missing physical coverage"));
+            }
             let mut statement = connection.prepare(STARTUP_RECORDS_SQL).map_err(|error| {
                 shard_read_error(error, "failed to inspect stored BSON documents")
             })?;
@@ -3067,13 +3165,14 @@ mod enabled {
                         ));
                     }
                 }
-                super::index_storage::validate_record_entries(
+                super::index_storage::validate_record_entries_with_layout(
                     &connection,
                     collection_id,
                     shard,
                     &id_key,
                     &record_checksum,
                     expected.as_ref(),
+                    ordered_layout,
                     &mut || Ok(()),
                 )?;
                 if !natural_orders.insert((collection_id, natural_order)) {
@@ -3441,15 +3540,27 @@ mod enabled {
         if let Some(control) = control {
             ensure_control_active(control, "before reading document index metadata")?;
         }
+        let ordered = manifest::supports_ordered_document_indexes(connection)?;
+        let capability_column = if ordered {
+            "o.key_format_version IS NOT NULL"
+        } else {
+            "0"
+        };
+        let capability_join = if ordered {
+            "LEFT JOIN briskdb_document_index_ordering AS o ON o.index_id = d.index_id"
+        } else {
+            ""
+        };
         let mut statement = connection
-            .prepare(
-                "SELECT i.index_name, i.spec_bson, i.is_unique, i.is_builtin, i.lifecycle_state, d.index_id
+            .prepare(&format!(
+                "SELECT i.index_name, i.spec_bson, i.is_unique, i.is_builtin, i.lifecycle_state, d.index_id, {capability_column}
                  FROM briskdb_document_indexes AS i
                  LEFT JOIN briskdb_document_index_identities AS d
                    ON d.collection_id = i.collection_id AND d.index_name = i.index_name
+                 {capability_join}
                  WHERE i.collection_id = ?1
-                 ORDER BY i.index_name COLLATE BINARY",
-            )
+                 ORDER BY i.index_name COLLATE BINARY"
+            ))
             .map_err(sqlite_error::storage)?;
         let rows = statement
             .query_map([to_sqlite_id(collection_id)?], |row| {
@@ -3460,6 +3571,7 @@ mod enabled {
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, bool>(6)?,
                 ))
             })
             .map_err(sqlite_error::storage)?
@@ -3467,7 +3579,7 @@ mod enabled {
             .map_err(sqlite_error::storage)?;
         let expected_id = builtin_id_specification()?;
         let mut indexes = Vec::with_capacity(rows.len());
-        for (name, spec_bson, unique, built_in, lifecycle, index_id) in rows {
+        for (name, spec_bson, unique, built_in, lifecycle, index_id, ordered) in rows {
             if let Some(control) = control {
                 ensure_control_active(control, "while decoding document index metadata")?;
             }
@@ -3487,17 +3599,20 @@ mod enabled {
             {
                 return Err(corrupt("built-in document _id index metadata is invalid"));
             }
-            indexes.push(DocumentIndexMetadata::from_validated_parts(
-                DocumentIndexId::from_validated(positive_u64(
-                    index_id.ok_or_else(|| corrupt("document index identity is missing"))?,
-                    "document index identity",
-                )?),
-                name,
-                specification,
-                unique,
-                built_in,
-                lifecycle,
-            ));
+            indexes.push(
+                DocumentIndexMetadata::from_validated_parts(
+                    DocumentIndexId::from_validated(positive_u64(
+                        index_id.ok_or_else(|| corrupt("document index identity is missing"))?,
+                        "document index identity",
+                    )?),
+                    name,
+                    specification,
+                    unique,
+                    built_in,
+                    lifecycle,
+                )
+                .with_ordered_keys(ordered),
+            );
         }
         if let Some(control) = control {
             ensure_control_active(control, "after reading document index metadata")?;
@@ -4748,6 +4863,95 @@ mod enabled {
                 .unwrap();
             assert_eq!(second_page.len(), 1);
             assert_eq!(second_page[0].natural_order(), first_order + 2);
+
+            let mut seen = Vec::new();
+            let mut reads = 0;
+            storage
+                .visit_document_candidates_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    None,
+                    None,
+                    None,
+                    &cancellation,
+                    Some(&mut |_| reads += 1),
+                    |record| {
+                        seen.push(record.natural_order());
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            assert_eq!(seen, vec![first_order, first_order + 1, first_order + 2]);
+            assert_eq!(reads, 4, "three decoded rows and one end-of-stream read");
+            assert!(
+                !transaction.is_autocommit(),
+                "stream does not change caller transaction ownership"
+            );
+            seen.clear();
+            storage
+                .visit_document_candidates_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    None,
+                    None,
+                    None,
+                    &cancellation,
+                    None,
+                    |record| {
+                        seen.push(record.natural_order());
+                        Ok(false)
+                    },
+                )
+                .unwrap();
+            assert_eq!(seen, vec![first_order]);
+            let interrupted = CancellationToken::new();
+            let error = storage
+                .visit_document_candidates_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    None,
+                    None,
+                    None,
+                    &interrupted,
+                    None,
+                    |_| {
+                        interrupted.cancel();
+                        Ok(true)
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+            assert!(!transaction.is_autocommit());
+            // A malformed later record still fails validation. Cursor cleanup
+            // must leave the caller's savepoint and surrounding writes usable.
+            transaction
+                .execute_batch("SAVEPOINT stream_damage")
+                .unwrap();
+            transaction.execute(
+                "UPDATE briskdb_documents_v1 SET document_checksum = zeroblob(32) WHERE natural_order = ?1",
+                [first_order as i64 + 2],
+            ).unwrap();
+            let error = storage
+                .visit_document_candidates_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    None,
+                    None,
+                    None,
+                    &cancellation,
+                    None,
+                    |_| Ok(true),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            transaction
+                .execute_batch("ROLLBACK TO stream_damage; RELEASE stream_damage")
+                .unwrap();
+            assert!(!transaction.is_autocommit());
 
             for limit in [0, MAX_DOCUMENT_SHARD_SCAN_RECORDS + 1] {
                 assert_eq!(

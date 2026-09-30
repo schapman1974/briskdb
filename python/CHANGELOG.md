@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Eligible newly built ordinary secondary indexes now serve exact/inverse
+  ordered `find().sort()` reads and bounded top-K prefixes (#563), with added
+  index-build/write work for maintaining sort keys. Existing indexes are not
+  silently rebuilt, and matching create-index no-ops remain unchanged.
+  Local startup upgrades manifest v22 directly to v24 with digest 16; older
+  binaries reject that root. Keep a complete stopped-owner pre-upgrade backup.
+  Explicitly drop/recreate an old sort index with other processes closed to
+  enable ordered reads; stop writes before dropping a unique index. No new
+  package version or PyPI publication is implied by this source change.
+
 - Document-store startup now uses ordered ownership-key comparison and a
   physical record scan, reducing repeated reads of large BSON records (#550).
   Full startup integrity checks, index coverage and uniqueness, natural query

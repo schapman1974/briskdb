@@ -136,6 +136,13 @@ impl ReadStats {
         self.shard_mask.fetch_or(1_u64 << shard, Ordering::Relaxed);
     }
 
+    /// Streaming storage reports each row-read duration before invoking source
+    /// matching or window callbacks, retaining the ordinary read metric scope.
+    pub(super) fn streamed_storage_read(&self, shard: u16, elapsed: Duration) {
+        self.storage_read(shard);
+        self.storage_duration(shard, elapsed);
+    }
+
     /// The disabled path neither reads the clock nor allocates a timer.
     pub(super) fn observe_storage_read<T>(
         stats: Option<&Self>,

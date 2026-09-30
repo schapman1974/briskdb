@@ -1680,15 +1680,32 @@ impl Engine {
         let source = state.source.clone();
         let collection = state.collection_id;
         let aggregation = state.aggregation.is_some();
+        let sorter = state.sorter.clone();
         let native_count = state
             .aggregation
             .as_ref()
             .and_then(|state| state.count.as_ref())
             .is_some_and(|count| count.uses_native_count());
         self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
-            use crate::document::{DocumentReadAccess, DocumentScanReason};
+            use crate::document::{DocumentCandidateKind, DocumentReadAccess, DocumentScanReason};
             let mut check = || ensure_document_cpu_active(cancellation, &control);
             check()?;
+            let ordered = if !aggregation {
+                sorter
+                    .as_ref()
+                    .map(|sorter| {
+                        storage.document_ordered_probe(
+                            collection,
+                            sorter,
+                            source.matcher().map(Arc::as_ref),
+                            &mut check,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             // The request still owns schema admission. This uses the same
             // Ready cache and bounded selector as its actual reads, but keeps
             // only payload-free diagnostics, never retained probe authority.
@@ -1699,6 +1716,12 @@ impl Engine {
             } else if aggregation && !native_count {
                 DocumentReadAccess::Scan {
                     reason: DocumentScanReason::AggregationInput,
+                }
+            } else if let Some((index_id, _)) = ordered {
+                DocumentReadAccess::IndexCandidates {
+                    index_id,
+                    kind: DocumentCandidateKind::OrderedSort,
+                    key_count: 0,
                 }
             } else if let Some(matcher) = source.matcher() {
                 storage

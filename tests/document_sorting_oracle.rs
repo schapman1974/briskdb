@@ -44,8 +44,20 @@ fn sorting_matches_the_locked_tinymongo_oracle() {
                 };
                 keyed.push((sorter.key(document)?, document.get_first("_id").unwrap()));
             }
+            let mut encoded = keyed
+                .iter()
+                .map(|(key, id)| Ok((key.ordered_bytes()?, *id)))
+                .collect::<briskdb::core::EngineResult<Vec<_>>>()?;
+            encoded.sort_by(|left, right| left.0.cmp(&right.0));
             // Stable sorting must leave semantically equal keys in input order.
             keyed.sort_by(|left, right| left.0.cmp(&right.0));
+            assert!(
+                encoded
+                    .iter()
+                    .map(|(_, id)| id)
+                    .eq(keyed.iter().map(|(_, id)| id)),
+                "ordered-byte sort differs from owned keys in oracle case {count}"
+            );
             Ok(BsonValue::Array(
                 keyed.into_iter().map(|(_, id)| id.clone()).collect(),
             ))
