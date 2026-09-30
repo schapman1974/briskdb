@@ -169,6 +169,41 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Delete a stored flat role and all its memberships in one catalog commit.
+    /// Requires current DropRole authority on the target realm, including for a
+    /// missing role. Existing sessions retain their login but observe revoked
+    /// privileges on their next admission; recreating a name restores no grants.
+    /// Uses the same revision-checked, non-retrying publication as user commands.
+    /// Cancellation before admission skips the edit; after blocking work starts,
+    /// cancellation/timeout can have an uncertain result and must not be replayed.
+    pub async fn drop_role(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        name: SecurityName,
+    ) -> EngineResult<()> {
+        use crate::core::authorization::{Action, Resource};
+
+        let mut operation = self.operation_lifecycle(context)?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        let requirements = [(Action::DropRole, Resource::security_realm(name.realm())?)];
+        operation.check_before_start()?;
+        let result = self
+            .security_call_from_parent(&operation, move |authority| {
+                authority.update_authorized(&principal, &requirements, |catalog| {
+                    catalog.drop_role(&name)
+                })
+            })
+            .await;
+        operation.finish(result)
+    }
+
     async fn security_call<T, F>(&self, work: F) -> EngineResult<T>
     where
         T: Send + 'static,

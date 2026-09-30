@@ -18,9 +18,9 @@ pub use reads::{MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoReadMetrics};
 const COMMANDS: usize = MongoCommandKind::Other as usize + 1;
 #[cfg(test)]
 mod tests;
-const ERROR_CODES: [i32; 32] = [
-    1, 2, 9, 13, 14, 18, 20, 26, 27, 28, 40, 43, 48, 50, 52, 54, 56, 59, 66, 72, 73, 85, 86, 91,
-    112, 115, 197, 224, 237, 10334, 11000, 11601,
+const ERROR_CODES: [i32; 33] = [
+    1, 2, 9, 13, 14, 18, 20, 26, 27, 28, 31, 40, 43, 48, 50, 52, 54, 56, 59, 66, 72, 73, 85, 86,
+    91, 112, 115, 197, 224, 237, 10334, 11000, 11601,
 ];
 
 /// Inclusive histogram bounds in microseconds; the eighth bucket is overflow.
@@ -68,6 +68,7 @@ pub enum MongoCommandKind {
     RevokeRolesFromUser,
     UsersInfo,
     RolesInfo,
+    DropRole,
     Other,
 }
 
@@ -105,6 +106,7 @@ impl MongoCommandKind {
         Self::RevokeRolesFromUser,
         Self::UsersInfo,
         Self::RolesInfo,
+        Self::DropRole,
         Self::Other,
     ];
 
@@ -142,6 +144,7 @@ impl MongoCommandKind {
             "revokeRolesFromUser" => Self::RevokeRolesFromUser,
             "usersInfo" => Self::UsersInfo,
             "rolesInfo" => Self::RolesInfo,
+            "dropRole" => Self::DropRole,
             _ => Self::Other,
         }
     }
@@ -181,6 +184,7 @@ impl MongoCommandKind {
             Self::RevokeRolesFromUser => "revokeRolesFromUser",
             Self::UsersInfo => "usersInfo",
             Self::RolesInfo => "rolesInfo",
+            Self::DropRole => "dropRole",
             Self::Other => "other",
         }
     }

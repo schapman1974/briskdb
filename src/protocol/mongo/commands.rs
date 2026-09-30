@@ -12,6 +12,8 @@ mod read_options;
 #[cfg(feature = "auth-scram")]
 mod role_info;
 #[cfg(feature = "auth-scram")]
+mod roles;
+#[cfg(feature = "auth-scram")]
 mod user_info;
 #[cfg(feature = "auth-scram")]
 mod users;
@@ -115,6 +117,10 @@ impl CommandError {
     fn from_engine_error(error: &EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
+            #[cfg(feature = "auth-scram")]
+            if cause.is::<crate::core::security_catalog::RoleNotFound>() {
+                return Self::new(31, "RoleNotFound", "role does not exist");
+            }
             if cause.is::<crate::document::DocumentCollectionNotFound>() {
                 return Self {
                     missing_collection: true,
@@ -270,6 +276,8 @@ pub(super) enum Command {
     UserInfo(crate::core::security_catalog::UserInfoRequest),
     #[cfg(feature = "auth-scram")]
     RoleInfo(crate::core::security_catalog::RoleInfoRequest),
+    #[cfg(feature = "auth-scram")]
+    DropRole(crate::core::security_catalog::SecurityName),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -321,6 +329,10 @@ pub(super) fn prepare_with_limits(
     limits: super::MongoResourceLimits,
 ) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
+    #[cfg(feature = "auth-scram")]
+    if name == "dropRole" {
+        return Some(roles::prepare_drop(request, started, limits));
+    }
     #[cfg(feature = "auth-scram")]
     if name == "rolesInfo" {
         return Some(role_info::prepare(request, started, limits));
@@ -1475,6 +1487,17 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::DropRole(name) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                self.database
+                    .engine()
+                    .drop_role(session, context, name)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             #[cfg(feature = "auth-scram")]
             Command::RoleInfo(request) => {
                 if !self.secured() {

@@ -38,6 +38,18 @@ pub const MAX_SECURITY_USERS: usize = 1_024;
 pub const MAX_SECURITY_ROLES: usize = 1_024;
 pub const MAX_SECURITY_NAME_BYTES: usize = 128;
 
+/// A requested stored role is absent. Carries no realm/name or credentials.
+#[derive(Debug)]
+pub struct RoleNotFound;
+
+impl fmt::Display for RoleNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("role does not exist")
+    }
+}
+
+impl std::error::Error for RoleNotFound {}
+
 /// Exact, case-sensitive realm/name pair. No globbing, folding or normalization.
 /// User and role namespaces are separate even when their names are equal.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -245,7 +257,13 @@ impl SecurityCatalog {
 
     /// Remove memberships too: recreating this name never resurrects old grants.
     pub fn drop_role(&mut self, name: &SecurityName) -> EngineResult<()> {
-        self.roles.remove(name).ok_or_else(not_found)?;
+        self.roles.remove(name).ok_or_else(|| {
+            EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                "security role does not exist",
+                RoleNotFound,
+            )
+        })?;
         for user in self.users.values_mut() {
             user.roles.remove(name);
         }

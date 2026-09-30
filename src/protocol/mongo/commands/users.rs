@@ -74,19 +74,7 @@ pub(super) fn prepare(
                 return Err(CommandError::options());
             }
             "writeConcern" => {
-                let BsonValue::Document(concern) = value else {
-                    return Err(CommandError::options());
-                };
-                let mut seen_w = false;
-                for (key, value) in concern.iter() {
-                    if key != "w"
-                        || seen_w
-                        || !matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1))
-                    {
-                        return Err(CommandError::options());
-                    }
-                    seen_w = true;
-                }
+                write_concern(value)?;
             }
             _ => {}
         }
@@ -118,6 +106,22 @@ pub(super) fn prepare(
         deadline,
         advisory_hint: false,
     })
+}
+
+/// Security edits are acknowledged local commits; never pretend to satisfy
+/// replica-set/majority, unacknowledged or journal-option semantics.
+pub(super) fn write_concern(value: &BsonValue) -> Result<()> {
+    let BsonValue::Document(concern) = value else {
+        return Err(CommandError::options());
+    };
+    let mut seen_w = false;
+    for (key, value) in concern.iter() {
+        if key != "w" || seen_w || !matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1)) {
+            return Err(CommandError::options());
+        }
+        seen_w = true;
+    }
+    Ok(())
 }
 
 fn roles(request: &Request) -> Result<Vec<SecurityName>> {

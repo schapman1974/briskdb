@@ -464,6 +464,13 @@ database under differential/property tests.
   checking all requested realms before account existence, refreshing authority
   per request and enforcing metadata row/byte budgets. Credential export,
   expanded privileges and all-realm enumeration remain unsupported.
+  `dropRole` now uses exact-realm authorization and one revision-checked durable
+  deletion of the role plus every membership. Live sessions/cursors lose grants
+  on their next admission; recreation does not restore them. Anonymous roots,
+  unsupported options and unacknowledged edits are rejected; typed missing-role
+  errors remain distinct from revision/session failures. Native and real TLS
+  sync/async PyMongo tests cover revocation, cancellation and reopen. The broader
+  security/host-integration issue remains open.
   `rolesInfo` now inspects assigned roles or separately authorized role realms
   without policy/credential export; whole-realm listing requires `ViewRoles`.
   Live membership/credential checks, bounded output and restart behavior apply.
