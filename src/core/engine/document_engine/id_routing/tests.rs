@@ -164,6 +164,7 @@ async fn rows(
     options: DocumentReadOptions,
     shards: &[u16],
 ) -> Vec<BsonDocument> {
+    let sorted = options.sort().is_some();
     let mut result = routed(engine, session, find(filter, options), shards).await;
     let mut documents = Vec::new();
     loop {
@@ -174,17 +175,41 @@ async fn rows(
         let Some(id) = batch.cursor_id() else {
             break;
         };
-        result = routed(
-            engine,
-            session,
-            DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
-                ns(),
-                id,
-                DocumentReadOptions::new().with_batch_size(2).unwrap(),
-            )),
-            shards,
-        )
-        .await;
+        let continuation = DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
+            ns(),
+            id,
+            DocumentReadOptions::new().with_batch_size(2).unwrap(),
+        ));
+        if sorted {
+            let before = checkouts(engine);
+            result = call(engine, session, continuation).await;
+            assert_eq!(result.plan().unwrap().shards(), shards);
+            let DocumentResult::Cursor(page) = result.result() else {
+                panic!("cursor");
+            };
+            // Small immutable fixtures fit one retained window. Continuations
+            // now refetch only these output owners, rather than rescanning every
+            // planned shard. Assert the exact physical work, not just a subset.
+            let mut owners: Vec<_> = page
+                .documents()
+                .iter()
+                .map(|row| {
+                    engine
+                        .inner
+                        .database
+                        .storage
+                        .prepare_document_id(row.get_first("_id").unwrap())
+                        .unwrap()
+                        .1
+                })
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            assert!(owners.iter().all(|owner| shards.contains(owner)));
+            assert_touched(engine, &before, &owners);
+        } else {
+            result = routed(engine, session, continuation, shards).await;
+        }
     }
     documents
 }
