@@ -1163,14 +1163,16 @@ bounded to 16 MiB. In-memory runs use the same 16-MiB/65,536-key charge. Cursors
 normally merge sorted files lazily without rewriting them, retaining at most
 64 run frontiers with a conservative 16-MiB key charge plus read buffers.
 Larger frontier sets first undergo balanced materialized merge passes, decoding
-at most two keys at a time. At most 512 run handles exist during construction.
+at most two keys at a time. Construction retains at most 512 input run handles;
+a materialized merge additionally opens one output handle.
 Cursor prefetch holds at most
 256 keys, stopping after reaching 1 MiB (one large key may exceed that target),
 and is charged against the existing shared cursor memory quota. Encoded scratch
 bytes are capped at 256 MiB per sort and 1 GiB per engine, including both input
 and output runs during a merge and files retained by other cursors. Filesystem
 allocation overhead is separate. Oversized sorts fail with a resource-limit
-error rather than returning partial results or repeatedly rescanning.
+error instead of silently truncating results or indefinitely rescanning. Failure
+can occur during continuation; already delivered batches are not rolled back.
 
 Scratch files use the host's standard temporary directory and private anonymous
 handles. The OS removes them on last-close, including process termination;
