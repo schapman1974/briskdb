@@ -57,7 +57,7 @@ fn metrics_classify_only_fixed_names_codes_and_outcomes_without_payloads() {
         .complete(&doc([("ok", BsonValue::Int64(1))]), false);
     drop(metrics.command("find", Instant::now()));
     let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.commands().len(), 34);
+    assert_eq!(snapshot.commands().len(), 35);
     assert_eq!(snapshot.error_codes().count(), 33);
     assert_eq!(snapshot.errors_with_code(59), Some(1));
     assert_eq!(snapshot.errors_with_code(11000), Some(2));

@@ -471,6 +471,13 @@ database under differential/property tests.
   errors remain distinct from revision/session failures. Native and real TLS
   sync/async PyMongo tests cover revocation, cancellation and reopen. The broader
   security/host-integration issue remains open.
+  Bounded `createRole` now defines database-local flat data roles through the
+  same revision-checked authority, requiring both `CreateRole` and `GrantRole`
+  before existence lookup. Exact/non-system collection scopes, explicit data
+  actions, input/expanded-policy limits, no implicit membership, and Rust-side
+  confinement prevent cross-database/global/SQL/admin escalation. Real TLS
+  clients cover least privilege, persistence and deletion/recreation; inheritance,
+  role updates and authenticated host integration remain open.
   `rolesInfo` now inspects assigned roles or separately authorized role realms
   without policy/credential export; whole-realm listing requires `ViewRoles`.
   Live membership/credential checks, bounded output and restart behavior apply.

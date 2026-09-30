@@ -88,6 +88,63 @@ impl Engine {
         session: &Session,
         request: DocumentRequest,
     ) -> EngineResult<DocumentExecution> {
+        self.execute_document_authorized_by(session, request, None)
+            .await
+    }
+
+    /// Internal metadata needed by an already parsed Mongo data command is
+    /// authorized by that full command, not by database-wide listCollections.
+    /// Derive the probed namespace here: the adapter cannot substitute a second
+    /// target. This is not a reusable authorization token; current authority,
+    /// session ownership and all normal execution controls are checked afresh.
+    #[cfg(all(feature = "mongo", feature = "auth-scram"))]
+    pub(crate) async fn execute_document_collection_probe(
+        &self,
+        session: &Session,
+        request_id: crate::document::DocumentRequestId,
+        context: crate::core::RequestContext,
+        source: &DocumentCommand,
+    ) -> EngineResult<DocumentExecution> {
+        let namespace = match source {
+            DocumentCommand::Find(r) => r.namespace(),
+            DocumentCommand::Aggregate(r) => r.namespace(),
+            DocumentCommand::Count(r) => r.namespace(),
+            DocumentCommand::Distinct(r) => r.namespace(),
+            DocumentCommand::Insert(r) => r.namespace(),
+            DocumentCommand::Delete(r) => r.namespace(),
+            DocumentCommand::Update(r) => r.namespace(),
+            DocumentCommand::Replace(r) => r.namespace(),
+            DocumentCommand::FindOneAndUpdate(r) => r.namespace(),
+            DocumentCommand::FindOneAndReplace(r) => r.namespace(),
+            DocumentCommand::FindOneAndDelete(r) => r.namespace(),
+            DocumentCommand::CreateIndexes(r) => r.namespace(),
+            DocumentCommand::ListIndexMetadata(r) => r.namespace(),
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "command cannot authorize a collection probe",
+                ));
+            }
+        };
+        let probe = DocumentCommand::CollectionExists(
+            crate::document::DocumentCollectionExistsRequest::new(namespace.clone()),
+        );
+        self.execute_document_authorized_by(
+            session,
+            DocumentRequest::new(request_id, context, probe),
+            Some(source),
+        )
+        .await
+    }
+
+    // Only execute_document_collection_probe substitutes authorization, and it
+    // constructs the read-only probe from the authorizing command itself.
+    async fn execute_document_authorized_by(
+        &self,
+        session: &Session,
+        request: DocumentRequest,
+        _authorization: Option<&DocumentCommand>,
+    ) -> EngineResult<DocumentExecution> {
         let (request_id, context, command) = request.into_parts();
         let mut operation = self.operation_lifecycle(context)?;
         if session.owner != self.inner.id {
@@ -98,7 +155,11 @@ impl Engine {
         }
         #[cfg(feature = "auth-scram")]
         if let Err(error) = operation
-            .wait_preflight(self.authorize_document(session, &command, &operation))
+            .wait_preflight(self.authorize_document(
+                session,
+                _authorization.unwrap_or(&command),
+                &operation,
+            ))
             .await
         {
             return operation.finish(Err(error));

@@ -943,7 +943,8 @@ references. Account commands cannot target `local`. Passwords are bounded to
 `digestPassword` must be `true`; write concern must be omitted, `{}` or `{w: 1}`.
 Unknown/duplicate fields, unacknowledged writes, SHA-1, pre-digested passwords,
 custom data, authentication restrictions, comments, role-array replacement in
-`updateUser` and role-definition commands are unsupported. Catalog
+`updateUser`, role updates and inherited role definitions are unsupported. The
+bounded `createRole` subset is documented below. Catalog
 existence/conflict errors currently use BriskDB's generic wire error mapping,
 not every MongoDB administration-specific error code.
 
@@ -1045,8 +1046,60 @@ authorized catalog revision and never automatically replays a conflicting or
 uncertain write. Already-admitted work is not retroactively cancelled; a timeout
 after blocking work starts can leave an uncertain outcome. Sync/async PyMongo,
 live cursor revocation, independent-engine refresh and recreation/reopen are
-covered. This does not add role creation/updates, inheritance, automatic built-in
+covered. This does not add role updates, inheritance, automatic built-in
 roles, or Python/daemon/composed authenticated-host configuration; #188 stays open.
+
+`createRole` supports flat, database-local custom data roles through the same
+durable catalog. Current `CreateRole` **and** `GrantRole` on the command realm
+are required before checking whether the name exists, including for an empty
+policy. Both `privileges` and `roles` are required; `roles` must be empty. No
+membership, data database or collection is created by defining the role.
+Internal collection-existence probes recheck the complete source command's
+authority on its exact namespace; they do not require or grant database-wide
+listing rights. Explicit metadata commands still require their own privileges.
+
+```python
+# A TLS-authenticated operator with CreateRole and GrantRole on app:
+operator.app.command(
+    "createRole", "post_reader",
+    privileges=[{"resource": {"db": "app", "collection": "posts"},
+                 "actions": ["find", "listIndexes"]}],
+    roles=[], writeConcern={"w": 1},
+)
+# Assignment remains a separate authorized createUser/grantRolesToUser command.
+```
+
+Resources require exactly `{db: <command database>, collection: <string>}`.
+An empty collection selects non-system collections, **not** `system.*`;
+explicit collection names remain exact. Cross-database resources are rejected
+even for `admin` roles, as are empty database wildcards, cluster/anyResource,
+inheritance, administrative actions and authentication restrictions. This is
+a deliberately smaller subset of MongoDB's
+[`createRole`](https://www.mongodb.com/docs/manual/reference/command/createrole/)
+and [resource documents](https://www.mongodb.com/docs/manual/reference/resource-document/).
+
+Supported actions are `find`, `insert`, `update`, `remove`, `listIndexes`,
+`createIndex`, `dropIndex`, `createCollection`, `dropCollection`, and (only with
+empty collection) `listCollections` and `dropDatabase`. Nonempty policies add
+only BriskDB's database-admission grant, not implicit read/write rights.
+`createCollection` also includes the exact database-creation permission needed
+by BriskDB. An insert-only role can write existing collections; creating missing
+collections requires an explicit `createCollection` grant too. Empty policies
+grant nothing. Input is bounded to 256 privilege entries, 256 total input
+actions and 256 expanded grants; generated admission/schema grants count toward
+the last limit. Duplicate action inputs count before policy deduplication.
+
+As with deletion, only omitted/empty/`{w: 1}` write concern is accepted. Duplicate
+fields, comments, one-way frames, `local` and anonymous roots fail closed.
+Existing names return the current generic code 11000 without overwriting the
+policy; unauthorized callers receive code 13 for both present and absent names.
+Rust `Engine::create_document_role` independently enforces realm-confined
+document policies, session ownership and request controls. One current revision
+governs authorization and publication; no automatic retry follows a conflict or
+uncertain timeout. Existing catalog limits apply. Real sync/async TLS clients
+cover least privilege, exact/non-system scopes, persistence, and revocation after
+deleting/recreating a custom role. No security catalog format/version change is
+needed; full role administration and authenticated host integration remain open.
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -1717,7 +1770,7 @@ one-way responses. Unknown command names share `Other`; namespaces, query values
 identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
 (including their rejected outcomes), five user-management commands, `usersInfo`,
-`rolesInfo` and `dropRole`. Missing stored roles use the fixed code-31 counter.
+`rolesInfo`, `dropRole` and `createRole`. Missing stored roles use the fixed code-31 counter.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can
 span multiple commands.
