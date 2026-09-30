@@ -1280,6 +1280,73 @@ fn ordered_stream_preserves_caller_transactions_and_releases_early_stop_and_erro
 }
 
 #[test]
+fn ordered_audit_reuses_validated_record_order_without_a_second_record_read() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let id = CanonicalBsonKey::encode(&BsonValue::Int32(0)).unwrap();
+    let shard = storage.shard_for_key(id.as_bytes());
+    let connection = storage.open_unconfigured_shard(shard).unwrap();
+    let record = storage
+        .get_document_on_connection(
+            &connection,
+            collection,
+            shard,
+            &id,
+            &CancellationToken::new(),
+        )
+        .unwrap()
+        .unwrap();
+    let preparation = storage
+        .active_document_indexes(collection)
+        .unwrap()
+        .unwrap();
+    let expected = preparation
+        .prepare_for_storage_with_check(record.document(), &mut || Ok(()))
+        .unwrap();
+    let natural = document_natural_order_to_sqlite(record.natural_order()).unwrap();
+    connection
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "briskdb_documents_v1",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let validate = |natural| {
+        super::super::super::index_storage::validate_record_entries_with_layout(
+            &connection,
+            collection,
+            shard,
+            id.as_bytes(),
+            &record.checksum,
+            Some(&expected),
+            true,
+            natural,
+            &mut || Ok(()),
+        )
+    };
+    validate(Some(natural)).expect("audits must not reread the validated source record");
+    assert!(
+        validate(None).is_err(),
+        "the fallback must still read the source record"
+    );
+    for wrong in [0, -1, natural + 1] {
+        assert_eq!(
+            validate(Some(wrong)).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    validate(None).expect("point validation retains its source-record lookup");
+}
+
+#[test]
 fn ordered_startup_rejects_missing_empty_index_tables_and_damaged_coverage() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(temp.path(), 2).unwrap();
