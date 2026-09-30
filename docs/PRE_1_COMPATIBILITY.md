@@ -36,8 +36,9 @@ It may update `manifest.sqlite`, shard metadata, schema generations, or other
 files in the data directory. Treat startup of a newer binary as a storage
 mutation even when application rows do not change.
 
-The current version-18 migration accepts every exact historical version 1
-through 17. The v14-to-v15 transaction installs the idempotency-receipt
+The current local version-24 migration accepts every exact historical local
+version 1 through 22. The reserved NFS version 23 is not a local upgrade source.
+The v14-to-v15 transaction installs the idempotency-receipt
 downgrade fence; later eligible keyed writes may lazily create the optional
 shard-local receipt table. The v15-to-v16 transaction adds document identity
 high-water marks initialized from existing IDs, an empty deletion journal,
@@ -60,7 +61,13 @@ the upgraded root, including an interrupted physical upgrade.
 
 ## Required upgrade procedure
 
-The unreleased explicit storage-profile API leaves local roots at manifest v22.
+Local startup now upgrades v22 directly to v24 with semantic digest version 16
+and an older-reader/writer fence. This adds empty ordered-index capability
+metadata without rebuilding existing indexes or changing BSON records. To use
+ordered reads on an old ordinary secondary index, explicitly drop/recreate it
+with other processes closed; stop writes before dropping a unique index.
+Matching create-index no-ops remain unchanged. No package publication is implied
+by this unreleased format change.
 The reserved NFS v23 format is inspectable but not publicly openable; it has its
 own checksummed profile and downgrade fence. No normal startup converts local
 storage to NFS or vice versa. NFS selection fails before storage access until

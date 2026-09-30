@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 21 retains that separation. A SQL table can
+catalog, and the current format 24 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -29,8 +29,9 @@ Database names contain 1 to 63 UTF-8 bytes. A complete
 compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
-All eight document catalog tables and the index-storage layout and operation journals participate
-in semantic manifest digest version 14. Every supported mutation uses an immediate SQLite transaction,
+The document catalog tables, index-storage layout/operation journals, and
+ordered-index capabilities participate in semantic manifest digest version 16.
+Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -181,6 +182,41 @@ stay committed; only the currently admitted index has a restart obligation,
 and unstarted indexes survive an interrupted batch. Pending definitions use their
 existing single-manifest deletion within the same admission. No format bump.
 
+## Ordered secondary keys (version 24)
+
+The manifest's strict `briskdb_document_index_ordering(index_id,
+key_format_version)` table records version-1 ordered-key capabilities against
+permanent secondary-index identities. It is checksummed with the catalog and
+added empty by migration; existing Ready indexes are not silently rebuilt.
+New ordinary, non-sparse, non-partial builds register the capability with their
+existing build intent and publish Ready only after every shard commits coverage.
+Abort/drop cleanup removes capability metadata and physical entries. Ordinary
+record mutations maintain those entries in the same transaction as the record.
+
+The optional strict, WITHOUT ROWID shard table
+`briskdb_document_ordered_entries_v1` has primary key
+`(collection_id, id_key, index_id, direction)` and a cascading foreign key to
+the document record. Each eligible record/index stores directions `0` and `1`,
+its natural order, a nullable sort-key blob, entry checksum and format version 1.
+Non-null keys are 9–65,536 bytes. A null key is a checksummed fallback marker,
+not missing coverage. The covering `briskdb_document_ordered_scan_v1` index orders
+`(collection_id, index_id, direction, sort_key, natural_order, id_key,
+entry_checksum, entry_format_version)` for frontier seeks without SQLite sorting.
+The table/index are storage-owned, excluded from user SQL discovery and validated
+against their exact DDL, even when a capability's collection is empty.
+
+Keys start with `BBSO` and big-endian encoding version 1. Their self-delimiting
+BSON components preserve the shared sorter's type, numeric, object-field and
+direction semantics; they are not equality/routing keys. Forward and inverse
+array keys are independently derived. Checksums use the domain
+`briskdb.document-ordered-entry.v1` with terminating NUL and bind the collection,
+index, shard, ID, direction, key-or-null marker, natural order and exact record
+checksum. Startup checks complete two-direction coverage and rejects stale,
+missing, malformed or orphaned entries. A shard with a relevant null marker
+uses the fallback sorter; the marker probe and ordered stream share one short
+read snapshot. See [the engine contract](DOCUMENT_ENGINE.md#global-sorting-and-retained-pages)
+for query eligibility, bounded top-K reads and existing-index rebuild guidance.
+
 ## Provisioning and restart
 
 Collection creation first commits the database, provisioning collection,
@@ -194,7 +230,7 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 22 and validate its physical schema, but
+understand current manifest format 24 and validate its physical schema, but
 refuse to open a root containing collections or a pending deletion.
 
 Every built-in and declared index also has a durable root-wide `DocumentIndexId`.

@@ -37,7 +37,7 @@ replace busy handlers, disable SQLite's native locks, or change transaction scop
 | Local security store | DELETE | FULL, plus existing `fullfsync` | Existing opt-in authentication contract, unchanged |
 | NFS manifest, shards, global indexes, security store | PERSIST (also reads the persisted DELETE policy) | EXTRA | Internal profile integration; public NFS opens reject as unsupported |
 
-Local roots remain on manifest version 22; ordinary opens never convert between
+Local roots use manifest version 24; ordinary opens never convert between
 local and NFS profiles. Internal profile-aware initialization, reopen, schema
 migration, document/index lifecycle and pooled manifest readers carry a validated
 journal policy explicitly. The security store uses format 2 for rollback/EXTRA
@@ -101,7 +101,7 @@ PERSIST is connection-local, a read-only connection may report DELETE; the
 persisted policy remains authoritative for future compatible writers.
 
 An internal profile-specific initialization plan creates this format only from
-empty storage. The local migration plan stays at v22 and rejects v23 before
+empty storage. The local migration plan advances from v22 directly to v24 and rejects v23 before
 managed manifest/shard mutations. The read-only inspection plan's initializer
 and the v22-to-v23 migration slot reject conversion. New writable handles apply
 the checked EXTRA durability before metadata reads and reapply PERSIST only
@@ -111,21 +111,21 @@ not an old-client guarantee established by these local format tests. There is
 no supported in-place local/NFS conversion: retain a complete stopped-owner
 backup and use export/import into a new compatible root once NFS is enabled.
 
-## Current format: version 22 (unreleased)
+## Current format: version 24 (unreleased)
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `22` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `24` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it and the unkeyed checksums
 described below.
 
-Version 22 has thirty strict manifest tables and the partial unique
+Version 24 has thirty-one strict manifest tables and the partial unique
 allocation-owner index. It retains the routing, authoritative
 logical and document catalogs, physical layout, application-schema migration,
 integrity, generated-ID activation, allocation-owner lifecycle, recoverable
@@ -171,6 +171,19 @@ mode and fail closed. The standalone Rust Mongo TLS listener supports this mode
 with `mongo-tls,auth-scram` and the explicit authenticated builder. The marker is
 recognized independently of feature flags.
 
+The v22-to-v24 step adds an empty `briskdb_document_index_ordering` capability
+table, installs the version-24 older-reader/writer fence and advances the
+semantic digest to version 16. Version 23/digest 15 remain reserved for the
+unavailable NFS profile; this local migration does not enter or convert it.
+Accepted historical local versions 1 through 22 migrate through their existing
+steps before this one. A security-bound root still requires authenticated
+admission before any upgrade. Migration neither scans BSON nor rebuilds or
+activates existing indexes. Explicit ordinary index builds can subsequently
+publish record-bound ordered keys; see [document storage](DOCUMENT_STORAGE.md#ordered-secondary-keys-version-24).
+Older binaries reject the migrated root; restore a complete pre-upgrade backup
+to return to an older binary. Routing, record/equality encodings and journal
+policies do not change.
+
 The private catalog payload remains `BRKSEC01` unless a role uses the new
 non-system document-collection scope. Such catalogs use canonical `BRKSEC02`
 with a distinct checksum domain; older authenticated readers reject that payload
@@ -186,13 +199,21 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 22)
+        CHECK (requires_manifest_version >= 24)
 ) STRICT;
 
 CREATE TABLE briskdb_security_binding (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     format_version INTEGER NOT NULL CHECK (format_version = 1),
     store_id BLOB NOT NULL CHECK (typeof(store_id) = 'blob' AND length(store_id) = 16)
+) STRICT;
+
+CREATE TABLE briskdb_document_index_ordering (
+    index_id INTEGER PRIMARY KEY CHECK (index_id > 0),
+    key_format_version INTEGER NOT NULL CHECK (key_format_version = 1),
+    FOREIGN KEY (index_id)
+        REFERENCES briskdb_document_index_identities (index_id)
+        ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -794,7 +815,7 @@ CREATE TABLE briskdb_integrity (
 
 The manifest, metadata, routing, schema-catalog, shard-layout, and integrity
 tables each contain exactly one row, as does `briskdb_document_identities`.
-The version-22 downgrade-fence row is exactly `22`. The
+The version-24 downgrade-fence row is exactly `24`. The
 `briskdb_document_index_allocator` and `briskdb_document_index_storage` also
 contain exactly one row each.
 `briskdb_generated_table_ddl`, `briskdb_table_provisioning`,
@@ -805,8 +826,8 @@ table-provisioning declaration rows exist only while their transient parent row
 exists.
 The two integrity-version columns deliberately accept any positive integer so
 a future digest encoding can remain structurally readable long enough for an
-older binary to reject it as `FailedPrecondition`; v22 writers emit manifest
-digest version `14` and schema digest version `1`.
+older binary to reject it as `FailedPrecondition`; v24 writers emit manifest
+digest version `16` and schema digest version `1`.
 Zero or negative versions are malformed and are `DataCorruption`.
 `briskdb_manifest.shard_count` is immutable and is the initial routing modulus;
 it is also the live physical-shard count. Physical IDs are exactly
@@ -1372,8 +1393,8 @@ restart as repair after any reported `DataCorruption`; whole-shard corruption
 drills and failure handling remain issue #68. Those storage failures retain
 their own error kinds and do not themselves justify rebaselining data.
 
-Manifest digest version 14 is a full 32-byte, unkeyed BLAKE3 digest. The stream
-begins with `briskdb.manifest.semantic-root.v14` plus its terminating NUL. It
+Manifest digest version 16 is a full 32-byte, unkeyed BLAKE3 digest. The stream
+begins with `briskdb.manifest.semantic-root.v16` plus its terminating NUL. It
 then encodes the length-prefixed name `application_id` and its tagged integer,
 followed by the length-prefixed name `user_version` and its tagged integer.
 These tables and columns follow in fixed order:
@@ -1398,6 +1419,7 @@ These tables and columns follow in fixed order:
 | `briskdb_document_index_storage` | `singleton`, `entry_format_version`, `lifecycle_state`, `shard_count`, `next_shard` |
 | `briskdb_document_index_operation` | `singleton`, `index_id`, `operation_kind`, `operation_id`, `shard_count`, `next_shard` |
 | `briskdb_security_binding` | `singleton`, `format_version`, `store_id` |
+| `briskdb_document_index_ordering` | `index_id`, `key_format_version` |
 | `briskdb_schema_catalog` | `singleton`, `identifier_encoding_version`, `schema_generation`, `default_database_id` |
 | `briskdb_tables` | `table_id`, `database_id`, `table_name`, `placement`, `shard_key_column`, `shard_key_type` |
 | `briskdb_generated_ids` | `table_id`, `policy`, `generated_column`, `encoding_version`, `activation_state` |
@@ -1424,7 +1446,7 @@ self-reference; its version, database state, and schema digest fields are
 covered. Frozen SQL definitions, STRICT flags, indexes, and foreign keys are
 validated separately rather than encoded as semantic rows.
 
-Every BriskDB-owned v22 manifest mutation recalculates the root after its row
+Every BriskDB-owned v24 manifest mutation recalculates the root after its row
 changes and before the same transaction commits. Progress acknowledgement,
 migration publication/finalization, provisioning intent/progress/finalization,
 generated-table bridge transitions, layout publication, owner/activation state
@@ -1434,6 +1456,11 @@ semantic values instead of the raw SQLite file makes the root stable across WAL
 checkpoints, page relocation, and `VACUUM`; it deliberately does not cover
 SQLite page bytes, rollback journals, WAL, or shared memory.
 
+Digest version 14 remains frozen for local version-22 manifests: it omits
+ordered-index capabilities and retains its v14 domain. Digest version 15 is
+reserved for the NFS version-23 profile table and domain, not used by local v24.
+The ordered capability table is validated for exact schema, identity/definition
+references, supported version and bounded size before it can become authority.
 Digest versions 12 and 13 remain frozen for version-20 and version-21 manifests;
 they omit the security binding and retain their original domains. The v22 binding
 schema and bounded 16-byte ID are validated before generic checksum traversal.
@@ -1606,7 +1633,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 22 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 24 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -2418,6 +2445,9 @@ returning:
    candidates and reseals with digest version 13, also without rewriting data.
    The v21-to-v22 step adds the empty security binding, installs its downgrade
    fence and reseals with digest version 14 without enabling authentication.
+   The local v22-to-v24 step adds empty ordered-index capabilities, installs
+   its downgrade fence and reseals with digest version 16 without rebuilding
+   existing indexes. It skips the reserved NFS v23 profile entirely.
    Older formats therefore cannot be mistaken for checksummed,
    authoritative-catalog, allocator-authority, recoverable provisioning, or
    durable logical-to-physical DDL identity.
