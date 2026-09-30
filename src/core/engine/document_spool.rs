@@ -159,10 +159,34 @@ struct RunWriter {
     max_key_bytes: usize,
 }
 
+fn private_scratch_file(file: File) -> EngineResult<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // Linux's O_TMPFILE path can use the default creation mode instead of
+        // the 0600 mode used by tempfile's named-and-unlinked fallback. Secure
+        // the still-empty handle before a writer can place any sort keys in it;
+        // do not change the process-global umask while other workers run.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io)?;
+        // Some fallback filesystems can create a file but fail to unlink it.
+        // Never write keys to a handle that cannot meet the anonymous contract.
+        if file.metadata().map_err(io)?.nlink() != 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::StorageUnavailable,
+                "document sort scratch file is not anonymous",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 impl RunWriter {
     fn new(local: &Arc<Counter>, global: &Arc<Counter>) -> EngineResult<Self> {
+        let file = private_scratch_file(tempfile::tempfile().map_err(io)?)?;
         Ok(Self {
-            file: BufWriter::with_capacity(IO_CHUNK, tempfile::tempfile().map_err(io)?),
+            file: BufWriter::with_capacity(IO_CHUNK, file),
             charge: Charge {
                 local: local.clone(),
                 global: global.clone(),

@@ -262,6 +262,28 @@ fn oversized_keys_fail_before_allocating_a_temporary_run() {
 
 #[cfg(unix)]
 #[test]
+fn scratch_privacy_is_enforced_before_accepting_a_handle() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let file = tempfile::tempfile().unwrap();
+    // Reproduce Linux's permissive anonymous-file mode on any Unix host,
+    // without changing the global umask or weakening the production assertion.
+    file.set_permissions(std::fs::Permissions::from_mode(0o666))
+        .unwrap();
+    let file = private_scratch_file(file).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(metadata.nlink(), 0);
+    assert_eq!(metadata.len(), 0);
+
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let error = private_scratch_file(named.reopen().unwrap()).unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+    assert_eq!(named.as_file().metadata().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn scratch_files_are_private_and_have_no_directory_entry() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let budget = SpoolBudget::default();
