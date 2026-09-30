@@ -5,7 +5,10 @@
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -16,6 +19,7 @@ use super::{
 };
 use crate::{
     core::engine::document_cursor::{CursorState, ReadStats, SortPosition, SortWindow},
+    core::engine::document_spool::{SortSpool, SpoolPosition},
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, ResultLimits},
     document::{
         BsonDocument, DocumentCollectionId, DocumentMatcher, DocumentReadOptions, DocumentSortKey,
@@ -117,6 +121,31 @@ fn check(cancellation: &CancellationToken, deadline: Option<Instant>) -> EngineR
     Ok(())
 }
 
+enum SelectedPosition {
+    Memory(Arc<SortPosition>, u16),
+    Spool(Arc<SpoolPosition>),
+}
+
+impl SelectedPosition {
+    fn location(&self) -> (u64, u16) {
+        match self {
+            Self::Memory(position, shard) => (position.natural_order, *shard),
+            Self::Spool(position) => (position.natural_order, position.shard),
+        }
+    }
+}
+
+fn consume_position(state: &mut CursorState) {
+    if let Some(spool) = &mut state.sort_spool {
+        spool
+            .pending
+            .pop_front()
+            .expect("selected spooled position");
+    } else {
+        state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_ordered_window(
     storage: &Storage,
@@ -190,6 +219,113 @@ fn try_ordered_window(
 }
 
 impl Engine {
+    async fn build_document_sort_spool(
+        &self,
+        owner: ConnectionOwner,
+        state: &CursorState,
+        cancellation: RequestScope,
+        deadline: Option<Instant>,
+        matcher: Option<Arc<DocumentMatcher>>,
+    ) -> EngineResult<SortSpool> {
+        let builder = Arc::new(Mutex::new(self.inner.document_cursors.sort_spool_builder()));
+        let child_builder = builder.clone();
+        let engine = self.clone();
+        let collection = state.collection_id;
+        let sorter = state.sorter.clone().expect("sorted cursor");
+        let after = state.sort_after.clone();
+        let stats = state.read_stats.clone();
+        super::fanout::coordinate(
+            state.source.shards(self.shard_count()).collect(),
+            cancellation.clone(),
+            self.inner.shutdown_cancel.clone(),
+            deadline,
+            move |shard, cancellation| {
+                let engine = engine.clone();
+                let builder = child_builder.clone();
+                let sorter = sorter.clone();
+                let matcher = matcher.clone();
+                let after = after.clone();
+                let stats = stats.clone();
+                async move {
+                    engine
+                        .run_document_shard(
+                            shard,
+                            owner,
+                            cancellation,
+                            deadline,
+                            move |storage, connection, cancellation| {
+                                let mut natural_after = None;
+                                while let Some(record) = next_matching_document(
+                                    storage,
+                                    connection,
+                                    collection,
+                                    shard,
+                                    natural_after,
+                                    matcher.as_deref(),
+                                    cancellation,
+                                    deadline,
+                                    stats.as_deref(),
+                                )? {
+                                    validate_point_record(
+                                        &record,
+                                        collection,
+                                        shard,
+                                        record.id_key(),
+                                    )?;
+                                    natural_after = Some(record.natural_order());
+                                    let mut check = || check(cancellation, deadline);
+                                    let key = sorter
+                                        .key_validated_with_check(record.document(), &mut check)?;
+                                    let position = SortPosition {
+                                        key,
+                                        natural_order: record.natural_order(),
+                                    };
+                                    if after.as_ref().is_some_and(|after| position <= **after) {
+                                        continue;
+                                    }
+                                    let position = SpoolPosition {
+                                        key: position.key.ordered_bytes_with_check(&mut check)?,
+                                        natural_order: position.natural_order,
+                                        shard,
+                                    };
+                                    builder
+                                        .lock()
+                                        .map_err(|_| {
+                                            EngineError::new(
+                                                EngineErrorKind::Internal,
+                                                "document sort spool lock poisoned",
+                                            )
+                                        })?
+                                        .push(position, &mut check)?;
+                                }
+                                check(cancellation, deadline)
+                            },
+                        )
+                        .await
+                }
+            },
+        )
+        .await?;
+        let builder = Arc::try_unwrap(builder)
+            .map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "document sort spool still in use",
+                )
+            })?
+            .into_inner()
+            .map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "document sort spool lock poisoned",
+                )
+            })?;
+        self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
+            builder.finish(&mut || super::ensure_document_cpu_active(cancellation, &control))
+        })
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn scan_sorted_document_page(
         &self,
@@ -211,10 +347,11 @@ impl Engine {
         let mut result_bytes = cursor_page_base_bytes(state, self.shard_count(), options);
         loop {
             check(&cancellation, deadline)?;
-            if state
-                .sort_window
-                .as_ref()
-                .is_none_or(|window| window.entries.is_empty())
+            if state.sort_spool.is_none()
+                && state
+                    .sort_window
+                    .as_ref()
+                    .is_none_or(|window| window.entries.is_empty())
             {
                 if state
                     .sort_window
@@ -234,6 +371,8 @@ impl Engine {
                 // with the existing BSON/work/key limits (keys are at most 8 MiB).
                 let window = Arc::new(Mutex::new(Window::new(capacity, MAX_WINDOW_BYTES)));
                 let child_window = window.clone();
+                let fallback = Arc::new(AtomicBool::new(false));
+                let child_fallback = fallback.clone();
                 let engine = self.clone();
                 let scan_sorter = sorter.clone();
                 let scan_matcher = matcher.clone();
@@ -251,6 +390,7 @@ impl Engine {
                         let matcher = scan_matcher.clone();
                         let after = after.clone();
                         let stats = stats.clone();
+                        let fallback = child_fallback.clone();
                         async move {
                             engine
                                 .run_document_shard(
@@ -274,6 +414,7 @@ impl Engine {
                                         )? {
                                             return Ok(());
                                         }
+                                        fallback.store(true, AtomicOrdering::Relaxed);
                                         let mut natural_after = None;
                                         while let Some(record) = next_matching_document(
                                             storage,
@@ -340,43 +481,90 @@ impl Engine {
                         )
                     })?;
                 let truncated = window.truncated;
-                // Heap ordering and BSON key comparisons run inside admission too.
-                let entries = self
-                    .run_document_storage_task(
-                        cancellation.clone(),
-                        deadline,
-                        move |cancellation, control| {
-                            super::ensure_document_cpu_active(cancellation, &control)?;
-                            let mut keys = window.keys;
-                            let mut entries = std::collections::VecDeque::with_capacity(keys.len());
-                            while let Some(entry) = keys.pop() {
+                if truncated
+                    && fallback.load(AtomicOrdering::Relaxed)
+                    && state.remaining.is_none_or(|remaining| {
+                        state.skip.saturating_add(remaining) > window.keys.len() as u64
+                    })
+                {
+                    // The first bounded scan discovers overflow. One additional
+                    // scan creates sorted runs; no later page rescans the source.
+                    drop(window);
+                    state.sort_window = None;
+                    state.sort_spool = Some(
+                        self.build_document_sort_spool(
+                            owner,
+                            state,
+                            cancellation.clone(),
+                            deadline,
+                            matcher.clone(),
+                        )
+                        .await?,
+                    );
+                } else {
+                    // Heap ordering and BSON key comparisons run inside admission too.
+                    let entries = self
+                        .run_document_storage_task(
+                            cancellation.clone(),
+                            deadline,
+                            move |cancellation, control| {
                                 super::ensure_document_cpu_active(cancellation, &control)?;
-                                entries.push_front((Arc::new(entry.position), entry.shard));
-                            }
-                            super::ensure_document_cpu_active(cancellation, &control)?;
-                            Ok(entries)
-                        },
-                    )
-                    .await?;
-                state.sort_window = Some(SortWindow::new(entries, truncated));
+                                let mut keys = window.keys;
+                                let mut entries =
+                                    std::collections::VecDeque::with_capacity(keys.len());
+                                while let Some(entry) = keys.pop() {
+                                    super::ensure_document_cpu_active(cancellation, &control)?;
+                                    entries.push_front((Arc::new(entry.position), entry.shard));
+                                }
+                                super::ensure_document_cpu_active(cancellation, &control)?;
+                                Ok(entries)
+                            },
+                        )
+                        .await?;
+                    state.sort_window = Some(SortWindow::new(entries, truncated));
+                }
             }
-            while let Some((position, shard)) = state
-                .sort_window
-                .as_ref()
-                .and_then(|window| window.entries.front())
-                .cloned()
-            {
+            loop {
                 check(&cancellation, deadline)?;
+                let selected = if let Some(mut spool) = state.sort_spool.take() {
+                    if spool.pending.is_empty() {
+                        spool = self
+                            .run_document_storage_task(
+                                cancellation.clone(),
+                                deadline,
+                                move |cancellation, control| {
+                                    spool.advance(&mut || {
+                                        super::ensure_document_cpu_active(cancellation, &control)
+                                    })?;
+                                    Ok(spool)
+                                },
+                            )
+                            .await?;
+                    }
+                    let selected = spool.pending.front().cloned().map(SelectedPosition::Spool);
+                    state.sort_spool = Some(spool);
+                    selected
+                } else {
+                    state
+                        .sort_window
+                        .as_ref()
+                        .and_then(|window| window.entries.front())
+                        .cloned()
+                        .map(|(position, shard)| SelectedPosition::Memory(position, shard))
+                };
+                let Some(selected) = selected else {
+                    break;
+                };
                 if state.skip > 0 {
                     state.skip -= 1;
-                    state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
+                    consume_position(state);
                     continue;
                 }
                 if documents.len() as u64 >= requested {
                     return Ok((documents, true));
                 }
-                let natural_order = position.natural_order;
-                let expected = position.clone();
+                let (natural_order, shard) = selected.location();
+                let expected = selected;
                 let fetch_sorter = sorter.clone();
                 let fetch_matcher = matcher.clone();
                 let fetch_stats = state.read_stats.clone();
@@ -423,14 +611,31 @@ impl Engine {
                             else {
                                 return Ok(None);
                             };
-                            if !still_selected(
-                                record.document(),
-                                fetch_matcher.as_deref(),
-                                &fetch_sorter,
-                                &expected.key,
-                                fetch_stats.as_deref().map(|stats| (shard, stats)),
-                                &mut || check(cancellation, deadline),
-                            )? {
+                            let stats = fetch_stats.as_deref().map(|stats| (shard, stats));
+                            let mut check = || check(cancellation, deadline);
+                            let selected = match expected {
+                                SelectedPosition::Memory(expected, _) => still_selected(
+                                    record.document(),
+                                    fetch_matcher.as_deref(),
+                                    &fetch_sorter,
+                                    &expected.key,
+                                    stats,
+                                    &mut check,
+                                )?,
+                                SelectedPosition::Spool(expected) => match selected_key(
+                                    record.document(),
+                                    fetch_matcher.as_deref(),
+                                    &fetch_sorter,
+                                    stats,
+                                    &mut check,
+                                )? {
+                                    Some(key) => {
+                                        key.ordered_bytes_with_check(&mut check)? == expected.key
+                                    }
+                                    None => false,
+                                },
+                            };
+                            if !selected {
                                 return Ok(None);
                             }
                             Ok(Some(record))
@@ -438,7 +643,7 @@ impl Engine {
                     )
                     .await?;
                 let Some(record) = record else {
-                    state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
+                    consume_position(state);
                     continue;
                 };
                 let (document, encoded_len) = self
@@ -472,7 +677,7 @@ impl Engine {
                     ));
                 }
                 documents.push(document);
-                state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
+                consume_position(state);
                 if let Some(remaining) = &mut state.remaining {
                     *remaining -= 1;
                 }
@@ -480,7 +685,7 @@ impl Engine {
                     return Ok((documents, false));
                 }
             }
-            if !state.sort_window.as_ref().unwrap().truncated {
+            if state.sort_spool.is_some() || !state.sort_window.as_ref().unwrap().truncated {
                 return Ok((documents, false));
             }
             // Skip may span several bounded windows. Once any rows are
@@ -500,13 +705,23 @@ fn still_selected(
     stats: Option<(u16, &ReadStats)>,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<bool> {
+    Ok(selected_key(document, matcher, sorter, stats, check)?.as_ref() == Some(expected))
+}
+
+fn selected_key(
+    document: &BsonDocument,
+    matcher: Option<&DocumentMatcher>,
+    sorter: &DocumentSorter,
+    stats: Option<(u16, &ReadStats)>,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<Option<DocumentSortKey>> {
     check()?;
     if let Some(matcher) = matcher {
         if let Some((_, stats)) = stats {
             stats.match_document();
         }
         if !matcher.matches_with_check(document, check)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
     if let Some((shard, stats)) = stats {
@@ -514,7 +729,7 @@ fn still_selected(
     }
     let current = sorter.key_validated_with_check(document, check)?;
     check()?;
-    Ok(&current == expected)
+    Ok(Some(current))
 }
 
 #[cfg(test)]

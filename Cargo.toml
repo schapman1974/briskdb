@@ -90,6 +90,7 @@ documents = [
     "dep:dec",
     "dep:fancy-regex",
     "dep:num-bigint",
+    "dep:tempfile",
     "dep:time",
 ]
 # Opt-in Mongo transport foundation. No listener is enabled by default.
@@ -144,6 +145,7 @@ rustls-pemfile = { version = "2.2", optional = true }
 ring = { version = "=0.17.14", optional = true }
 stringprep = { version = "=0.1.5", optional = true }
 subtle = { version = "=2.6.1", optional = true }
+tempfile = { version = "3.23", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits", "preupdate_hook"] }
 same-file = "1.0"
 serde = { version = "1.0.229", features = ["derive"], optional = true }

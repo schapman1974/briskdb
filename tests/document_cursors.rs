@@ -14,6 +14,9 @@ use briskdb::{
     },
 };
 
+#[path = "document_cursors/spool.rs"]
+mod spool;
+
 fn namespace() -> DocumentNamespace {
     DocumentNamespace::new("app", "items").unwrap()
 }

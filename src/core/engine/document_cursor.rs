@@ -1,5 +1,5 @@
 //! Bounded, session-owned cursors. No SQLite handles survive a request. Find
-//! retains positions; aggregation also accounts for pipeline state and any
+//! retains positions and optional anonymous sort files; aggregation accounts for pipeline state and any
 //! bounded results produced by blocking stages.
 
 use std::{
@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::document_spool::{SortSpool, SpoolBudget, SpoolBuilder};
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
@@ -91,6 +92,7 @@ pub(super) struct CursorState {
     pub sorter: Option<Arc<DocumentSorter>>,
     pub sort_after: Option<Arc<SortPosition>>,
     pub sort_window: Option<SortWindow>,
+    pub sort_spool: Option<SortSpool>,
     pub after: Option<u64>,
     pub skip: u64,
     pub remaining: Option<u64>,
@@ -371,6 +373,11 @@ impl CursorState {
                     .map_or(0, SortWindow::retained_bytes),
             )
             .saturating_add(
+                self.sort_spool
+                    .as_ref()
+                    .map_or(0, SortSpool::retained_bytes),
+            )
+            .saturating_add(
                 self.aggregation
                     .as_ref()
                     .map_or(0, |state| state.retained_bytes()),
@@ -416,7 +423,7 @@ struct Inner {
 }
 
 #[derive(Default)]
-pub(super) struct CursorRegistry(Mutex<Inner>);
+pub(super) struct CursorRegistry(Mutex<Inner>, SpoolBudget);
 
 impl std::fmt::Debug for CursorRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -427,6 +434,10 @@ impl std::fmt::Debug for CursorRegistry {
 }
 
 impl CursorRegistry {
+    pub fn sort_spool_builder(&self) -> SpoolBuilder {
+        SpoolBuilder::new(&self.1)
+    }
+
     #[cfg(feature = "auth-scram")]
     pub fn security_requirements(
         &self,
@@ -699,6 +710,7 @@ mod tests {
             sorter: None,
             sort_after: None,
             sort_window: None,
+            sort_spool: None,
             after: None,
             skip: 0,
             remaining: None,
@@ -1030,6 +1042,61 @@ mod tests {
         );
         registry.close();
         assert!(registry.0.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn spooled_cursors_release_scratch_on_kill_owner_drop_failure_shutdown_and_expiry() {
+        use super::super::document_spool::SpoolPosition;
+        for mode in 0..5 {
+            let registry = Arc::new(CursorRegistry::default());
+            let mut builder = registry.sort_spool_builder();
+            builder
+                .push(
+                    SpoolPosition {
+                        key: vec![7; 32],
+                        natural_order: 1,
+                        shard: 0,
+                    },
+                    &mut || Ok(()),
+                )
+                .unwrap();
+            let mut spool = builder.finish(&mut || Ok(())).unwrap();
+            spool.advance(&mut || Ok(())).unwrap();
+            let mut cursor = state();
+            let base = cursor.retained_bytes();
+            cursor.sort_spool = Some(spool);
+            assert!(cursor.retained_bytes() >= base + 64 * 1024 + 32);
+            let owner = ConnectionOwner::new(91);
+            let namespace = cursor.namespace.clone();
+            let id = registry.insert(owner, cursor).unwrap();
+            assert!(registry.1.used_bytes() > 0);
+            match mode {
+                0 => {
+                    assert!(registry.kill(owner, &namespace, id));
+                }
+                1 => {
+                    drop(registry.owner(owner));
+                }
+                2 => {
+                    drop(registry.checkout(owner, &namespace, id).unwrap());
+                }
+                3 => {
+                    registry.close();
+                }
+                _ => {
+                    registry
+                        .0
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .get_mut(&id)
+                        .unwrap()
+                        .touched = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+                    assert!(registry.checkout(owner, &namespace, id).is_err());
+                }
+            }
+            assert_eq!(registry.1.used_bytes(), 0, "cleanup mode {mode}");
+        }
     }
 
     #[test]

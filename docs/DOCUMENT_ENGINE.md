@@ -1119,12 +1119,16 @@ at most 65,536 keys and a conservative 16-MiB heap charge across all shards;
 limited finds retain at most skip + limit + one lookahead position. Live keys
 and the queue's unshrunk allocation count against the existing shared 64-MiB
 cursor retention quota. Sets that fit one window require one scan and an
-O(n log n) key sort, followed by point refetches. Larger sets still rescan when
-the bounded window is exhausted; this is not an unbounded external sort.
+O(n log n) key sort, followed by point refetches. When fallback sorting exceeds
+that window and more rows are needed, one additional source scan writes sorted
+key runs into anonymous temporary files. Binary run merges provide bounded
+external O(n log n) sorting; subsequent cursor pages do not rescan the source.
+Small top-K queries and entirely index-ordered windows do not use scratch files.
 At most eight admitted shard workers scan
 and derive keys concurrently, each under the existing BSON allocation, 8-MiB
 key, and derivation-work limits. Heap comparison/updates hold a short shared
-mutex only inside blocking workers, never across an await. All children drain
+mutex only inside blocking workers, never across an await. Spool writes/merges
+also run inside admitted workers with cooperative checks. All children drain
 before extracting a window; errors discard it without publishing partial rows.
 Selected documents are then refetched in global order. Large skips can span several windows;
 memory-bound or window-bound pages may be shorter than the requested batch.
@@ -1137,7 +1141,27 @@ key cannot return an unrelated/nonmatching row at the old position. Concurrent
 writes do not have cross-batch snapshot semantics. New or moved keys are not
 added to an already retained window; moved sort keys can be missed or encountered
 again in a later window. Payload updates with unchanged matching/sort values
-are visible on refetch. Neither path provides external spill-to-disk execution.
+are visible on refetch. A spooled result fixes its candidate positions at build
+time but still refetches/rechecks current documents; it is not a BSON snapshot.
+
+The external sorter stores only versioned order-key bytes, natural order, shard
+IDs and per-entry checksums, never whole result documents. Encoded keys are
+bounded to 16 MiB. In-memory runs use the same 16-MiB/65,536-key charge; binary
+merges decode at most two run frontiers at a time. Cursor prefetch holds at most
+256 keys, stopping after reaching 1 MiB (one large key may exceed that target),
+and is charged against the existing shared cursor memory quota. Encoded scratch
+bytes are capped at 256 MiB per sort and 1 GiB per engine, including both input
+and output runs during a merge and files retained by other cursors. Filesystem
+allocation overhead is separate. Oversized sorts fail with a resource-limit
+error rather than returning partial results or repeatedly rescanning.
+
+Scratch files use the host's standard temporary directory and private anonymous
+handles. The OS removes them on last-close, including process termination;
+cursor kill, expiry pruning, failed continuation, session close and engine
+shutdown release the handles and disk reservations. No app-database SQLite
+handles are kept between pages. Hosts must provision local temporary space for
+large fallback sorts; scratch I/O failure rejects the operation without treating
+temporary-file damage as database corruption.
 
 The shared implementation handles missing/null ties, the empty-array position
 between MinKey and null, direction-sensitive array member selection, dotted

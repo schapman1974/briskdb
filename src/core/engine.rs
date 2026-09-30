@@ -7,6 +7,8 @@ use startup::StartupOperation;
 mod document_cursor;
 #[cfg(feature = "documents")]
 mod document_engine;
+#[cfg(feature = "documents")]
+mod document_spool;
 #[cfg(feature = "auth-scram")]
 mod security;
 #[cfg(feature = "documents")]

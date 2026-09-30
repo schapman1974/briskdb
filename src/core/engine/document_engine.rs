@@ -767,6 +767,7 @@ impl Engine {
                     sorter,
                     sort_after: None,
                     sort_window: None,
+                    sort_spool: None,
                     after: None,
                     skip: options.skip(),
                     remaining: options.limit(),
