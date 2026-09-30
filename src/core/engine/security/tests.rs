@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 mod contention;
+mod create_role;
 mod drop_role;
 #[cfg(feature = "documents")]
 mod non_system;

@@ -51,10 +51,10 @@ impl Engine {
 
     /// Open an activated root with its matching durable authority. Unlike
     /// ordinary startup this never initializes an unbound root or missing store.
-    /// Only explicitly authenticated document and typed user commands are supported;
+    /// Only authenticated document and typed user/role commands are supported;
     /// SQL and anonymous sessions fail closed. The standalone Mongo TLS adapter
     /// can authenticate document clients; other adapters still reject this mode.
-    /// Arbitrary Rust-host catalog edits remain trusted; typed user commands
+    /// Arbitrary Rust-host catalog edits remain trusted; typed user/role commands
     /// separately require current realm privileges.
     pub async fn open_authenticated(
         root: impl AsRef<Path>,
@@ -164,6 +164,63 @@ impl Engine {
             .security_call_from_parent(&operation, move |authority| {
                 authority
                     .update_authorized(&principal, &requirements, |catalog| command.apply(catalog))
+            })
+            .await;
+        operation.finish(result)
+    }
+
+    /// Create a flat document-data role confined to its own security realm.
+    /// Requires both CreateRole and GrantRole on that realm before checking for
+    /// an existing name. Only exact document database/collection grants and
+    /// non-system collection scopes in that database are accepted, even for
+    /// admin. No SQL, global, security-administration or inherited grants.
+    /// No user is assigned the new role automatically. Publication is one
+    /// revision-checked edit, never retried; after blocking work starts a
+    /// cancellation or timeout can have an uncertain result.
+    pub async fn create_document_role(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        name: SecurityName,
+        policy: crate::core::authorization::Policy,
+    ) -> EngineResult<()> {
+        use crate::core::authorization::{Action, DataDomain, Resource, ScopeValue};
+
+        let mut operation = self.operation_lifecycle(context)?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        for grant in policy.privileges() {
+            let confined = match grant.scope().stored_value() {
+                ScopeValue::Exact(resource) => {
+                    resource.domain() == Some(DataDomain::Document)
+                        && resource.database_name() == Some(name.realm())
+                }
+                ScopeValue::NonSystemDocumentCollections(database) => database == name.realm(),
+                _ => false,
+            };
+            if !confined {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "document role privileges must be confined to their own database",
+                ));
+            }
+        }
+        let realm = Resource::security_realm(name.realm())?;
+        let requirements = [
+            (Action::CreateRole, realm.clone()),
+            (Action::GrantRole, realm),
+        ];
+        operation.check_before_start()?;
+        let result = self
+            .security_call_from_parent(&operation, move |authority| {
+                authority.update_authorized(&principal, &requirements, |catalog| {
+                    catalog.create_role(name, policy)
+                })
             })
             .await;
         operation.finish(result)

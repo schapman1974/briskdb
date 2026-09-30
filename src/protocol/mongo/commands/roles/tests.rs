@@ -1,6 +1,209 @@
 use super::*;
 use crate::protocol::mongo::MongoResourceLimits;
 
+fn creation(privileges: Vec<BsonValue>) -> Request {
+    let mut request = request(BsonValue::from("unused"));
+    request.database = "app".into();
+    request.body = fields([
+        ("createRole", BsonValue::from("private-custom")),
+        ("privileges", BsonValue::Array(privileges)),
+        ("roles", BsonValue::Array(vec![])),
+        ("$db", BsonValue::from("app")),
+    ]);
+    request
+}
+
+fn privilege(database: &str, collection: &str, actions: &[&str]) -> BsonValue {
+    BsonValue::Document(fields([
+        (
+            "resource",
+            BsonValue::Document(fields([
+                ("db", BsonValue::from(database)),
+                ("collection", BsonValue::from(collection)),
+            ])),
+        ),
+        (
+            "actions",
+            BsonValue::Array(
+                actions
+                    .iter()
+                    .map(|value| BsonValue::from(*value))
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn created(input: &Request) -> Result<Prepared> {
+    prepare_create(input, Instant::now(), MongoResourceLimits::default())
+}
+
+#[test]
+fn custom_data_roles_map_only_explicit_actions_and_never_expand_collection_scopes() {
+    use crate::core::authorization::{Action, DataDomain, Resource};
+    let input = creation(vec![
+        privilege("app", "", &["find"]),
+        privilege(
+            "app",
+            "posts",
+            &["insert", "createCollection", "listIndexes"],
+        ),
+    ]);
+    let Command::CreateRole(name, policy) = created(&input).unwrap().command else {
+        panic!("wrong command")
+    };
+    assert_eq!(name, SecurityName::new("app", "private-custom").unwrap());
+    assert!(super::super::prepare(&input, false).unwrap().is_ok());
+    let object = |db, collection| Resource::object(DataDomain::Document, db, collection).unwrap();
+    assert!(policy.allows(Action::ReadData, &object("app", "any")));
+    assert!(!policy.allows(Action::ReadData, &object("app", "system.js")));
+    assert!(!policy.allows(Action::ReadData, &object("other", "posts")));
+    assert!(policy.allows(Action::InsertData, &object("app", "posts")));
+    assert!(!policy.allows(Action::InsertData, &object("app", "other")));
+    assert!(!policy.allows(Action::UpdateData, &object("app", "posts")));
+    assert!(policy.allows(Action::CreateObject, &object("app", "posts")));
+    assert!(!policy.allows(Action::CreateObject, &object("app", "other")));
+    assert!(policy.allows(
+        Action::CreateDatabase,
+        &Resource::database(DataDomain::Document, "app").unwrap()
+    ));
+    assert!(!policy.allows(Action::GrantRole, &Resource::security_realm("app").unwrap()));
+    let Command::CreateRole(_, empty) = created(&creation(vec![])).unwrap().command else {
+        panic!("wrong command")
+    };
+    assert_eq!(empty.privilege_count(), 0);
+    for action in [
+        "find",
+        "insert",
+        "update",
+        "remove",
+        "createCollection",
+        "dropCollection",
+        "createIndex",
+        "dropIndex",
+        "listIndexes",
+        "listCollections",
+        "dropDatabase",
+    ] {
+        assert!(
+            created(&creation(vec![privilege("app", "", &[action])])).is_ok(),
+            "{action}"
+        );
+    }
+}
+
+#[test]
+fn custom_roles_reject_unsupported_resources_options_and_unbounded_input() {
+    // Expansion reserves room for database admission and counts duplicate inputs.
+    assert!(created(&creation(vec![privilege("app", "posts", &["find"; 255])])).is_ok());
+    assert!(created(&creation(vec![privilege("app", "posts", &["find"; 256])])).is_err());
+    assert!(
+        created(&creation(vec![privilege(
+            "app",
+            "posts",
+            &["createCollection"; 127]
+        )]))
+        .is_ok()
+    );
+    assert!(
+        created(&creation(vec![privilege(
+            "app",
+            "posts",
+            &["createCollection"; 128]
+        )]))
+        .is_err()
+    );
+    for grants in [
+        vec![privilege("other", "posts", &["find"])],
+        vec![privilege("", "posts", &["find"])],
+        vec![privilege("app", "posts", &["grantRole"])],
+        vec![privilege("app", "posts", &["listCollections"])],
+        vec![privilege("app", "posts", &["dropDatabase"])],
+        vec![privilege("app", "posts", &[])],
+        vec![BsonValue::Null],
+        vec![privilege("app", "posts", &["find"]); 257],
+        vec![privilege("app", "posts", &["find"; 257])],
+    ] {
+        assert!(created(&creation(grants)).is_err());
+    }
+    for (key, value) in [
+        ("createRole", BsonValue::from("duplicate")),
+        ("privileges", BsonValue::Array(vec![])),
+        ("roles", BsonValue::Array(vec![])),
+        ("$db", BsonValue::from("app")),
+        ("authenticationRestrictions", BsonValue::Array(vec![])),
+        ("comment", BsonValue::from("private-comment")),
+        (
+            "writeConcern",
+            BsonValue::Document(fields([("w", BsonValue::Int32(0))])),
+        ),
+    ] {
+        let mut input = creation(vec![]);
+        input.body.push(key, value).unwrap();
+        let error = created(&input).err().unwrap();
+        assert!(!format!("{:?}", error.document()).contains("private"));
+    }
+    for body in [
+        fields([
+            ("createRole", BsonValue::from("x")),
+            ("roles", BsonValue::Array(vec![])),
+        ]),
+        fields([
+            ("createRole", BsonValue::from("x")),
+            ("privileges", BsonValue::Array(vec![])),
+        ]),
+        fields([
+            ("createRole", BsonValue::from("x")),
+            ("roles", BsonValue::Array(vec![BsonValue::from("read")])),
+            ("privileges", BsonValue::Array(vec![])),
+        ]),
+    ] {
+        let mut input = creation(vec![]);
+        input.body = body;
+        assert!(created(&input).is_err());
+    }
+    for variant in 0..4 {
+        let mut input = creation(vec![]);
+        match variant {
+            0 => input.more_to_come = true,
+            1 => input.legacy_handshake = true,
+            2 => input.database = "local".into(),
+            _ => input.sequences.push(wire::DocumentSequence {
+                identifier: "private".into(),
+                documents: vec![],
+            }),
+        }
+        assert!(created(&input).is_err());
+    }
+    assert_eq!(
+        prepare_create(
+            &creation(vec![]),
+            Instant::now() - Duration::from_secs(30),
+            MongoResourceLimits::default()
+        )
+        .err()
+        .unwrap()
+        .code,
+        50
+    );
+    // Nested duplicate/unknown keys must not select an arbitrary first value.
+    for resource in [
+        fields([
+            ("db", BsonValue::from("app")),
+            ("db", BsonValue::from("other")),
+            ("collection", BsonValue::from("")),
+        ]),
+        fields([("cluster", BsonValue::Boolean(true))]),
+        fields([("anyResource", BsonValue::Boolean(true))]),
+    ] {
+        let grant = fields([
+            ("resource", BsonValue::Document(resource)),
+            ("actions", BsonValue::Array(vec![BsonValue::from("find")])),
+        ]);
+        assert!(created(&creation(vec![BsonValue::Document(grant)])).is_err());
+    }
+}
+
 #[test]
 fn missing_roles_have_a_typed_mapping_not_a_generic_precondition_alias() {
     let mut catalog = crate::core::security_catalog::SecurityCatalog::new();

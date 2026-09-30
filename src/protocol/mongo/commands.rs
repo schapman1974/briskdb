@@ -278,6 +278,11 @@ pub(super) enum Command {
     RoleInfo(crate::core::security_catalog::RoleInfoRequest),
     #[cfg(feature = "auth-scram")]
     DropRole(crate::core::security_catalog::SecurityName),
+    #[cfg(feature = "auth-scram")]
+    CreateRole(
+        crate::core::security_catalog::SecurityName,
+        crate::core::authorization::Policy,
+    ),
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
@@ -332,6 +337,10 @@ pub(super) fn prepare_with_limits(
     #[cfg(feature = "auth-scram")]
     if name == "dropRole" {
         return Some(roles::prepare_drop(request, started, limits));
+    }
+    #[cfg(feature = "auth-scram")]
+    if name == "createRole" {
+        return Some(roles::prepare_create(request, started, limits));
     }
     #[cfg(feature = "auth-scram")]
     if name == "rolesInfo" {
@@ -1432,7 +1441,27 @@ impl Executor {
         identity: DocumentRequestId,
         context: &RequestContext,
         namespace: &DocumentNamespace,
+        source: &DocumentCommand,
     ) -> Result<bool> {
+        #[cfg(feature = "auth-scram")]
+        if self.secured() {
+            let execution = self
+                .database
+                .engine()
+                .execute_document_collection_probe(session, identity, context.clone(), source)
+                .await?;
+            self.metrics.observe_read(&execution);
+            return match execution.into_parts().2 {
+                DocumentResult::CollectionExists(exists) => Ok(exists),
+                _ => Err(CommandError::new(
+                    1,
+                    "InternalError",
+                    "unexpected engine result",
+                )),
+            };
+        }
+        #[cfg(not(feature = "auth-scram"))]
+        let _ = source;
         let command = DocumentCommand::CollectionExists(DocumentCollectionExistsRequest::new(
             namespace.clone(),
         ));
@@ -1452,6 +1481,7 @@ impl Executor {
         identity: DocumentRequestId,
         context: &RequestContext,
         namespace: &DocumentNamespace,
+        source: &DocumentCommand,
     ) -> Result<()> {
         let cancellation = context.cancellation_token();
         let deadline = tokio::time::Instant::from_std(context.deadline().expect("Mongo deadline"));
@@ -1460,7 +1490,10 @@ impl Executor {
             _ = cancellation.cancelled() => return Err(CommandError::new(11601, "Interrupted", "command interrupted")),
             guard = tokio::time::timeout_at(deadline, self.creation.lock()) => guard.map_err(|_| CommandError::new(50, "MaxTimeMSExpired", "command deadline exceeded"))?,
         };
-        if !self.exists(session, identity, context, namespace).await? {
+        if !self
+            .exists(session, identity, context, namespace, source)
+            .await?
+        {
             let command = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
                 namespace.clone(),
                 DocumentCollectionOptions::empty(),
@@ -1487,6 +1520,17 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::CreateRole(name, policy) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                self.database
+                    .engine()
+                    .create_document_role(session, context, name, policy)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             #[cfg(feature = "auth-scram")]
             Command::DropRole(name) => {
                 if !self.secured() {
@@ -1566,7 +1610,7 @@ impl Executor {
                 let namespace = request.namespace().clone();
                 let command = DocumentCommand::CreateIndexes(request);
                 self.authorize_early(session, &context, &command).await?;
-                self.ensure_collection(session, identity, &context, &namespace)
+                self.ensure_collection(session, identity, &context, &namespace, &command)
                     .await?;
                 match self.call(session, identity, &context, command).await? {
                     DocumentResult::IndexesBuilt { before, after } => {
@@ -1681,11 +1725,12 @@ impl Executor {
                 };
                 let upsert = is_upsert(&command);
                 let exists = if upsert {
-                    self.ensure_collection(session, identity, &context, namespace)
+                    self.ensure_collection(session, identity, &context, namespace, &command)
                         .await?;
                     true
                 } else {
-                    self.exists(session, identity, &context, namespace).await?
+                    self.exists(session, identity, &context, namespace, &command)
+                        .await?
                 };
                 let (value, upserted_id) = if !exists {
                     (None, None)
@@ -1728,7 +1773,10 @@ impl Executor {
                 let namespace = request.namespace().clone();
                 let command = DocumentCommand::FindOneAndDelete(request);
                 self.authorize_early(session, &context, &command).await?;
-                let value = if !self.exists(session, identity, &context, &namespace).await? {
+                let value = if !self
+                    .exists(session, identity, &context, &namespace, &command)
+                    .await?
+                {
                     None
                 } else {
                     match self.call(session, identity, &context, command).await? {
@@ -1784,9 +1832,14 @@ impl Executor {
                             };
                             let upsert = is_upsert(&update);
                             if upsert {
-                                self.ensure_collection(session, identity, &context, namespace)
-                                    .await?;
-                            } else if !self.exists(session, identity, &context, namespace).await? {
+                                self.ensure_collection(
+                                    session, identity, &context, namespace, &update,
+                                )
+                                .await?;
+                            } else if !self
+                                .exists(session, identity, &context, namespace, &update)
+                                .await?
+                            {
                                 continue;
                             }
                             let statement_context = if has_upserts {
@@ -1901,7 +1954,10 @@ impl Executor {
                     let namespace = delete.namespace().clone();
                     let command = DocumentCommand::Delete(delete);
                     self.authorize_early(session, &context, &command).await?;
-                    if !self.exists(session, identity, &context, &namespace).await? {
+                    if !self
+                        .exists(session, identity, &context, &namespace, &command)
+                        .await?
+                    {
                         continue;
                     }
                     // Operational failures can follow committed shard writes.
@@ -1938,7 +1994,7 @@ impl Executor {
                 let namespace = insert.namespace().clone();
                 let command = DocumentCommand::Insert(insert);
                 self.authorize_early(session, &context, &command).await?;
-                self.ensure_collection(session, identity, &context, &namespace)
+                self.ensure_collection(session, identity, &context, &namespace, &command)
                     .await?;
                 match self.call(session, identity, &context, command).await {
                     Ok(DocumentResult::Insert(result)) => {
@@ -1983,7 +2039,10 @@ impl Executor {
                 let namespace = distinct.namespace().clone();
                 let command = DocumentCommand::Distinct(distinct);
                 self.authorize_early(session, &context, &command).await?;
-                if !self.exists(session, identity, &context, &namespace).await? {
+                if !self
+                    .exists(session, identity, &context, &namespace, &command)
+                    .await?
+                {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("values", BsonValue::Array(Vec::new())),
@@ -2005,7 +2064,10 @@ impl Executor {
                 let namespace = count.namespace().clone();
                 let command = DocumentCommand::Count(count);
                 self.authorize_early(session, &context, &command).await?;
-                if !self.exists(session, identity, &context, &namespace).await? {
+                if !self
+                    .exists(session, identity, &context, &namespace, &command)
+                    .await?
+                {
                     return Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("n", BsonValue::Int64(0)),
@@ -2077,7 +2139,11 @@ impl Executor {
                 if !direct_find || empty_single_batch {
                     self.authorize_early(session, &context, &command).await?;
                 }
-                if list_indexes && !self.exists(session, identity, &context, &namespace).await? {
+                if list_indexes
+                    && !self
+                        .exists(session, identity, &context, &namespace, &command)
+                        .await?
+                {
                     return Err(CommandError::new(
                         26,
                         "NamespaceNotFound",
@@ -2091,7 +2157,9 @@ impl Executor {
                 // the original admission/health check before returning empty.
                 if !metadata
                     && (!direct_find || empty_single_batch)
-                    && !self.exists(session, identity, &context, &namespace).await?
+                    && !self
+                        .exists(session, identity, &context, &namespace, &command)
+                        .await?
                 {
                     return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
