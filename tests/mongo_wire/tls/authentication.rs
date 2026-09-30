@@ -21,6 +21,9 @@ mod users;
 #[path = "authentication/data_roles.rs"]
 mod data_roles;
 
+#[path = "authentication/drop_role.rs"]
+mod drop_role;
+
 fn assert_audit_fields(events: &[capture::Fields]) {
     let mut connections = std::collections::BTreeMap::new();
     let mut identities = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();

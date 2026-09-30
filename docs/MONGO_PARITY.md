@@ -1018,6 +1018,36 @@ Normal engine ownership/lifecycle, metadata row/byte limits and wire response
 limits apply. Sync/async PyMongo, durable refresh/reopen, membership revocation,
 credential rotation and queued cancellation are covered by local tests.
 
+`dropRole` deletes a stored flat role and all user memberships in one durable
+security-catalog commit. It requires current `DropRole` authority on that exact
+security realm, including when the role is absent; there is no implicit
+self-service grant. Existing logins remain authenticated, but subsequent data
+requests and retained cursor continuations lose the deleted role's privileges.
+Recreating the same role name does not restore memberships. A user can delete
+their own administrative role if authorized, losing its authority on the next
+request. These semantics follow the supported portion of MongoDB's
+[`dropRole` contract](https://www.mongodb.com/docs/manual/reference/command/droprole/).
+
+```python
+# A TLS-authenticated operator with DropRole on app:
+operator.app.command("dropRole", "temporary_reader", writeConcern={"w": 1})
+```
+
+Only a bounded role-name string and omitted/empty/`{w: 1}` write concern are
+accepted; majority/unacknowledged/journal options, comments, duplicate/unknown
+fields, one-way frames and the `local` realm are rejected before mutation.
+An authorized missing role returns redacted code 31 (`RoleNotFound`); an
+unauthorized request returns code 13 without revealing existence. Anonymous
+roots cannot use this command. Rust callers use `Engine::drop_role` with an
+owned `SecurityName`, session and `RequestContext`; the same current-authority,
+ownership, cancellation and deadline checks apply. Publication compares the
+authorized catalog revision and never automatically replays a conflicting or
+uncertain write. Already-admitted work is not retroactively cancelled; a timeout
+after blocking work starts can leave an uncertain outcome. Sync/async PyMongo,
+live cursor revocation, independent-engine refresh and recreation/reopen are
+covered. This does not add role creation/updates, inheritance, automatic built-in
+roles, or Python/daemon/composed authenticated-host configuration; #188 stays open.
+
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
 
@@ -1686,7 +1716,8 @@ separate started, in-flight, completed, failed, aborted and deliberately suppres
 one-way responses. Unknown command names share `Other`; namespaces, query values,
 identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
-(including their rejected outcomes), five user-management commands and `usersInfo`.
+(including their rejected outcomes), five user-management commands, `usersInfo`,
+`rolesInfo` and `dropRole`. Missing stored roles use the fixed code-31 counter.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can
 span multiple commands.
