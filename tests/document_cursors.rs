@@ -220,6 +220,71 @@ async fn projected_cursors_filter_original_values_and_budget_only_returned_field
 }
 
 #[tokio::test]
+async fn sorted_pagination_scans_once_instead_of_once_per_batch() {
+    for count in [32, 257, 1205] {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open(root.path(), 4).await.unwrap();
+        let session = engine.session();
+        seed(&engine, &session, count).await;
+        for batch in [7, 101] {
+            let options = DocumentReadOptions::new()
+                .with_execution_stats(true)
+                .with_sort(
+                    DocumentSort::new(
+                        BsonDocument::from_entries([("rank", BsonValue::Int32(-1))]).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .with_batch_size(batch)
+                .unwrap();
+            let execution = call(&engine, &session, find(options)).await;
+            let first = execution.read_stats().unwrap();
+            assert_eq!(
+                first.documents_examined(),
+                count as u64 + batch.min(count as u64)
+            );
+            let mut examined = first.documents_examined();
+            let mut reads = first.storage_reads();
+            let (mut id, mut rows) = cursor(execution);
+            while let Some(current) = id {
+                let execution = call(
+                    &engine,
+                    &session,
+                    DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
+                        namespace(),
+                        current,
+                        DocumentReadOptions::new()
+                            .with_execution_stats(true)
+                            .with_batch_size(batch)
+                            .unwrap(),
+                    )),
+                )
+                .await;
+                let stats = execution.read_stats().unwrap();
+                let page_size = match execution.result() {
+                    DocumentResult::Cursor(page) => page.documents().len() as u64,
+                    _ => panic!("cursor result"),
+                };
+                assert_eq!(
+                    stats.documents_examined(),
+                    page_size,
+                    "no repeated key scan"
+                );
+                examined += stats.documents_examined();
+                reads += stats.storage_reads();
+                let (next, page) = cursor(execution);
+                rows.extend(page);
+                id = next;
+            }
+            assert_eq!(ids(&rows), (0..count).rev().collect::<Vec<_>>());
+            assert_eq!(examined, 2 * count as u64);
+            assert_eq!(reads, 2 * count as u64 + 4);
+        }
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn sorted_cursors_apply_global_skip_limit_before_projection_across_windows() {
     let root = tempfile::tempdir().unwrap();
     let engine = Engine::open(root.path(), 4).await.unwrap();

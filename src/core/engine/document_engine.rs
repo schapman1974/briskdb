@@ -766,6 +766,7 @@ impl Engine {
                     projection,
                     sorter,
                     sort_after: None,
+                    sort_window: None,
                     after: None,
                     skip: options.skip(),
                     remaining: options.limit(),

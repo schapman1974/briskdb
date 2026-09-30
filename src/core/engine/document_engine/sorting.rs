@@ -1,6 +1,6 @@
 //! Bounded global top-key windows. Until sorted indexes exist, each window
-//! scans matching documents again. Only keys/positions, never result documents
-//! or SQLite leases, survive a scan or a cursor continuation.
+//! scans matching documents again, but its remaining positions survive cursor
+//! continuations. No result documents or SQLite leases are retained.
 
 use std::{
     cmp::Ordering,
@@ -15,7 +15,7 @@ use super::{
     result_size_overflow, validate_point_record,
 };
 use crate::{
-    core::engine::document_cursor::{CursorState, ReadStats, SortPosition},
+    core::engine::document_cursor::{CursorState, ReadStats, SortPosition, SortWindow},
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, ResultLimits},
     document::{
         BsonDocument, DocumentMatcher, DocumentReadOptions, DocumentSortKey, DocumentSorter,
@@ -23,8 +23,8 @@ use crate::{
     storage::ConnectionOwner,
 };
 
-const MAX_WINDOW_KEYS: u64 = 1024;
-const MAX_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WINDOW_KEYS: u64 = 65_536;
+const MAX_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
 struct Entry {
     position: SortPosition,
@@ -138,139 +138,156 @@ impl Engine {
         let mut result_bytes = cursor_page_base_bytes(state, self.shard_count(), options);
         loop {
             check(&cancellation, deadline)?;
-            let capacity = state
-                .skip
-                .saturating_add(requested)
-                .saturating_add(1)
-                .min(MAX_WINDOW_KEYS) as usize;
-            // One global heap, not one 64-MiB allocation per shard. Only admitted
-            // blocking workers compare keys or hold this mutex; never across an
-            // await. At most eight decodes/key derivations are in flight, each
-            // with the existing BSON/work/key limits (keys are at most 8 MiB).
-            let window = Arc::new(Mutex::new(Window::new(capacity, MAX_WINDOW_BYTES)));
-            let child_window = window.clone();
-            let engine = self.clone();
-            let scan_sorter = sorter.clone();
-            let scan_matcher = matcher.clone();
-            let after = state.sort_after.clone();
-            let stats = state.read_stats.clone();
-            super::fanout::coordinate(
-                state.source.shards(self.shard_count()).collect(),
-                cancellation.clone(),
-                self.inner.shutdown_cancel.clone(),
-                deadline,
-                move |shard, cancellation| {
-                    let engine = engine.clone();
-                    let window = child_window.clone();
-                    let sorter = scan_sorter.clone();
-                    let matcher = scan_matcher.clone();
-                    let after = after.clone();
-                    let stats = stats.clone();
-                    async move {
-                        engine
-                            .run_document_shard(
-                                shard,
-                                owner,
-                                cancellation,
-                                deadline,
-                                move |storage, connection, cancellation| {
-                                    let mut natural_after = None;
-                                    while let Some(record) = next_matching_document(
-                                        storage,
-                                        connection,
-                                        collection_id,
-                                        shard,
-                                        natural_after,
-                                        matcher.as_deref(),
-                                        cancellation,
-                                        deadline,
-                                        stats.as_deref(),
-                                    )? {
-                                        validate_point_record(
-                                            &record,
+            if state
+                .sort_window
+                .as_ref()
+                .is_none_or(|window| window.entries.is_empty())
+            {
+                if state
+                    .sort_window
+                    .as_ref()
+                    .is_some_and(|window| !window.truncated)
+                {
+                    return Ok((documents, false));
+                }
+                let capacity = state
+                    .skip
+                    .saturating_add(state.remaining.unwrap_or(MAX_WINDOW_KEYS))
+                    .saturating_add(1)
+                    .min(MAX_WINDOW_KEYS) as usize;
+                // One global heap, not one allocation per shard. Only admitted
+                // blocking workers compare keys or hold this mutex; never across an
+                // await. At most eight decodes/key derivations are in flight, each
+                // with the existing BSON/work/key limits (keys are at most 8 MiB).
+                let window = Arc::new(Mutex::new(Window::new(capacity, MAX_WINDOW_BYTES)));
+                let child_window = window.clone();
+                let engine = self.clone();
+                let scan_sorter = sorter.clone();
+                let scan_matcher = matcher.clone();
+                let after = state.sort_after.clone();
+                let stats = state.read_stats.clone();
+                super::fanout::coordinate(
+                    state.source.shards(self.shard_count()).collect(),
+                    cancellation.clone(),
+                    self.inner.shutdown_cancel.clone(),
+                    deadline,
+                    move |shard, cancellation| {
+                        let engine = engine.clone();
+                        let window = child_window.clone();
+                        let sorter = scan_sorter.clone();
+                        let matcher = scan_matcher.clone();
+                        let after = after.clone();
+                        let stats = stats.clone();
+                        async move {
+                            engine
+                                .run_document_shard(
+                                    shard,
+                                    owner,
+                                    cancellation,
+                                    deadline,
+                                    move |storage, connection, cancellation| {
+                                        let mut natural_after = None;
+                                        while let Some(record) = next_matching_document(
+                                            storage,
+                                            connection,
                                             collection_id,
                                             shard,
-                                            record.id_key(),
-                                        )?;
-                                        natural_after = Some(record.natural_order());
-                                        let key = sorter.key_validated_with_check(
-                                            record.document(),
-                                            &mut || check(cancellation, deadline),
-                                        )?;
-                                        let position = SortPosition {
-                                            key,
-                                            natural_order: record.natural_order(),
-                                        };
-                                        if after.as_ref().is_none_or(|after| position > **after) {
-                                            let mut window = window.lock().map_err(|_| {
-                                                EngineError::new(
-                                                    EngineErrorKind::Internal,
-                                                    "document sort window lock poisoned",
-                                                )
-                                            })?;
+                                            natural_after,
+                                            matcher.as_deref(),
+                                            cancellation,
+                                            deadline,
+                                            stats.as_deref(),
+                                        )? {
+                                            validate_point_record(
+                                                &record,
+                                                collection_id,
+                                                shard,
+                                                record.id_key(),
+                                            )?;
+                                            natural_after = Some(record.natural_order());
+                                            let key = sorter.key_validated_with_check(
+                                                record.document(),
+                                                &mut || check(cancellation, deadline),
+                                            )?;
+                                            let position = SortPosition {
+                                                key,
+                                                natural_order: record.natural_order(),
+                                            };
+                                            if after.as_ref().is_none_or(|after| position > **after)
+                                            {
+                                                let mut window = window.lock().map_err(|_| {
+                                                    EngineError::new(
+                                                        EngineErrorKind::Internal,
+                                                        "document sort window lock poisoned",
+                                                    )
+                                                })?;
+                                                check(cancellation, deadline)?;
+                                                window.consider(Entry { position, shard })?;
+                                            }
                                             check(cancellation, deadline)?;
-                                            window.consider(Entry { position, shard })?;
                                         }
-                                        check(cancellation, deadline)?;
-                                    }
-                                    Ok(())
-                                },
-                            )
-                            .await
-                    }
-                },
-            )
-            .await?;
-            // All children have drained, including on error. No partial window
-            // is published. Arrival order may shorten a byte-trimmed page, but
-            // its keys always form a global prefix with natural-order ties.
-            let window = Arc::try_unwrap(window)
-                .map_err(|_| {
-                    EngineError::new(
-                        EngineErrorKind::Internal,
-                        "document sort window still in use",
-                    )
-                })?
-                .into_inner()
-                .map_err(|_| {
-                    EngineError::new(
-                        EngineErrorKind::Internal,
-                        "document sort window lock poisoned",
-                    )
-                })?;
-            let truncated = window.truncated;
-            // Heap ordering and BSON key comparisons run inside admission too.
-            let entries = self
-                .run_document_storage_task(
-                    cancellation.clone(),
-                    deadline,
-                    move |cancellation, control| {
-                        super::ensure_document_cpu_active(cancellation, &control)?;
-                        let mut keys = window.keys;
-                        let mut entries = Vec::with_capacity(keys.len());
-                        while let Some(entry) = keys.pop() {
-                            super::ensure_document_cpu_active(cancellation, &control)?;
-                            entries.push(entry);
+                                        Ok(())
+                                    },
+                                )
+                                .await
                         }
-                        entries.reverse();
-                        super::ensure_document_cpu_active(cancellation, &control)?;
-                        Ok(entries)
                     },
                 )
                 .await?;
-            for entry in entries {
+                // All children have drained, including on error. No partial window
+                // is published. Arrival order may shorten a byte-trimmed page, but
+                // its keys always form a global prefix with natural-order ties.
+                let window = Arc::try_unwrap(window)
+                    .map_err(|_| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "document sort window still in use",
+                        )
+                    })?
+                    .into_inner()
+                    .map_err(|_| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "document sort window lock poisoned",
+                        )
+                    })?;
+                let truncated = window.truncated;
+                // Heap ordering and BSON key comparisons run inside admission too.
+                let entries = self
+                    .run_document_storage_task(
+                        cancellation.clone(),
+                        deadline,
+                        move |cancellation, control| {
+                            super::ensure_document_cpu_active(cancellation, &control)?;
+                            let mut keys = window.keys;
+                            let mut entries = std::collections::VecDeque::with_capacity(keys.len());
+                            while let Some(entry) = keys.pop() {
+                                super::ensure_document_cpu_active(cancellation, &control)?;
+                                entries.push_front((Arc::new(entry.position), entry.shard));
+                            }
+                            super::ensure_document_cpu_active(cancellation, &control)?;
+                            Ok(entries)
+                        },
+                    )
+                    .await?;
+                state.sort_window = Some(SortWindow::new(entries, truncated));
+            }
+            while let Some((position, shard)) = state
+                .sort_window
+                .as_ref()
+                .and_then(|window| window.entries.front())
+                .cloned()
+            {
                 check(&cancellation, deadline)?;
                 if state.skip > 0 {
                     state.skip -= 1;
-                    state.sort_after = Some(Arc::new(entry.position));
+                    state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
                     continue;
                 }
                 if documents.len() as u64 >= requested {
                     return Ok((documents, true));
                 }
-                let natural_order = entry.position.natural_order;
-                let shard = entry.shard;
-                let position = Arc::new(entry.position);
+                let natural_order = position.natural_order;
                 let expected = position.clone();
                 let fetch_sorter = sorter.clone();
                 let fetch_matcher = matcher.clone();
@@ -333,7 +350,7 @@ impl Engine {
                     )
                     .await?;
                 let Some(record) = record else {
-                    state.sort_after = Some(position);
+                    state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
                     continue;
                 };
                 let (document, encoded_len) = self
@@ -367,7 +384,7 @@ impl Engine {
                     ));
                 }
                 documents.push(document);
-                state.sort_after = Some(position);
+                state.sort_after = Some(state.sort_window.as_mut().unwrap().consume());
                 if let Some(remaining) = &mut state.remaining {
                     *remaining -= 1;
                 }
@@ -375,7 +392,7 @@ impl Engine {
                     return Ok((documents, false));
                 }
             }
-            if !truncated {
+            if !state.sort_window.as_ref().unwrap().truncated {
                 return Ok((documents, false));
             }
             // Skip may span several bounded windows. Once any rows are

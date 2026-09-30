@@ -85,6 +85,7 @@ impl Engine {
             projection: None,
             sorter: None,
             sort_after: None,
+            sort_window: None,
             after: None,
             skip: 0,
             remaining: None,

@@ -1070,14 +1070,22 @@ leaves natural order unchanged.
 Sorting uses original matched values before global skip/limit and projection.
 Equal BSON keys use durable natural order as the tie-breaker across shards and
 pages. Exact-ID queries retain point routing while still validating their sort
-keys. Cursors retain the compiled sort and last consumed key/position, and
+keys. Cursors retain the compiled sort, last consumed key/position, and the
+remaining key/position window, and
 reject attempts to change the sort on continuation. Growing keys are charged
 again against the shared cursor retention quota; an over-quota continuation
 fails and releases its cursor.
 
-Until sorted indexes are available, each bounded window rescans matching
-documents on the routed shards. A window retains at most 1024 keys and a conservative
-64-MiB heap charge across all shards. At most eight admitted shard workers scan
+Until sorted indexes are available, each bounded window scans matching
+documents on the routed shards. Its remaining keys survive continuation, so
+small result batches do not repeatedly rescan the collection. A window retains
+at most 65,536 keys and a conservative 16-MiB heap charge across all shards;
+limited finds retain at most skip + limit + one lookahead position. Live keys
+and the queue's unshrunk allocation count against the existing shared 64-MiB
+cursor retention quota. Sets that fit one window require one scan and an
+O(n log n) key sort, followed by point refetches. Larger sets still rescan when
+the bounded window is exhausted; this is not an unbounded external sort.
+At most eight admitted shard workers scan
 and derive keys concurrently, each under the existing BSON allocation, 8-MiB
 key, and derivation-work limits. Heap comparison/updates hold a short shared
 mutex only inside blocking workers, never across an await. All children drain
@@ -1090,8 +1098,10 @@ key derivation, heap extraction, and fetches in admitted workers. No result
 documents or SQLite leases are retained between requests. Selected rows are
 rechecked after fetch, so deletion, a changed filter match, or a changed sort
 key cannot return an unrelated/nonmatching row at the old position. Concurrent
-writes do not have cross-batch snapshot semantics; moved sort keys can be missed
-or encountered again at a later position. This is bounded in-memory sorting,
+writes do not have cross-batch snapshot semantics. New or moved keys are not
+added to an already retained window; moved sort keys can be missed or encountered
+again in a later window. Payload updates with unchanged matching/sort values
+are visible on refetch. This is bounded in-memory sorting,
 not indexed sorting or external spill-to-disk execution.
 
 The shared implementation handles missing/null ties, the empty-array position

@@ -90,6 +90,7 @@ pub(super) struct CursorState {
     pub projection: Option<Arc<DocumentProjector>>,
     pub sorter: Option<Arc<DocumentSorter>>,
     pub sort_after: Option<Arc<SortPosition>>,
+    pub sort_window: Option<SortWindow>,
     pub after: Option<u64>,
     pub skip: u64,
     pub remaining: Option<u64>,
@@ -315,6 +316,41 @@ pub(super) struct SortPosition {
     pub natural_order: u64,
 }
 
+/// Retained sort metadata only. BSON payloads and storage leases never enter
+/// this queue. Popping keys releases their allocations, but not the deque's
+/// backing allocation, which remains charged until the window is replaced.
+pub(super) struct SortWindow {
+    pub entries: VecDeque<(Arc<SortPosition>, u16)>,
+    pub truncated: bool,
+    key_bytes: usize,
+}
+
+impl SortWindow {
+    pub fn new(entries: VecDeque<(Arc<SortPosition>, u16)>, truncated: bool) -> Self {
+        let key_bytes = entries
+            .iter()
+            .map(|(position, _)| position.key.retained_bytes())
+            .sum();
+        Self {
+            entries,
+            truncated,
+            key_bytes,
+        }
+    }
+
+    pub fn consume(&mut self) -> Arc<SortPosition> {
+        let (position, _) = self.entries.pop_front().expect("selected sort position");
+        self.key_bytes -= position.key.retained_bytes();
+        position
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.key_bytes
+            .saturating_add(self.entries.capacity().saturating_mul(128))
+            .saturating_add(std::mem::size_of::<Self>())
+    }
+}
+
 impl CursorState {
     pub fn finish_read_stats(&mut self) -> Option<DocumentReadStats> {
         self.read_stats.take().map(|stats| stats.snapshot())
@@ -322,6 +358,11 @@ impl CursorState {
 
     fn retained_bytes(&self) -> usize {
         4096usize
+            .saturating_add(
+                self.sort_window
+                    .as_ref()
+                    .map_or(0, SortWindow::retained_bytes),
+            )
             .saturating_add(
                 self.aggregation
                     .as_ref()
@@ -650,6 +691,7 @@ mod tests {
             projection: None,
             sorter: None,
             sort_after: None,
+            sort_window: None,
             after: None,
             skip: 0,
             remaining: None,
@@ -927,6 +969,60 @@ mod tests {
                 .kind(),
             EngineErrorKind::LimitExceeded
         );
+    }
+
+    #[test]
+    fn retained_sort_windows_charge_live_keys_and_unshrunk_backing_storage() {
+        let sorter = DocumentSorter::compile(
+            &BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap(),
+        )
+        .unwrap();
+        let position = Arc::new(SortPosition {
+            key: sorter
+                .key(
+                    &BsonDocument::from_entries([(
+                        "v",
+                        BsonValue::String("x".repeat(7 * 1024 * 1024)),
+                    )])
+                    .unwrap(),
+                )
+                .unwrap(),
+            natural_order: 1,
+        });
+        let mut entries = VecDeque::with_capacity(32);
+        entries.push_back((position.clone(), 0));
+        let mut window = SortWindow::new(entries, false);
+        let before = window.retained_bytes();
+        assert_eq!(window.consume().natural_order, 1);
+        assert_eq!(
+            before - window.retained_bytes(),
+            position.key.retained_bytes()
+        );
+        assert!(window.retained_bytes() >= 32 * 128);
+
+        let registry = Arc::new(CursorRegistry::default());
+        for owner in 1..=9 {
+            let mut retained = state();
+            retained.sort_window = Some(SortWindow::new(
+                VecDeque::from([(position.clone(), 0)]),
+                false,
+            ));
+            assert!(retained.retained_bytes() > position.key.retained_bytes());
+            registry
+                .insert(ConnectionOwner::new(owner), retained)
+                .unwrap();
+        }
+        let mut retained = state();
+        retained.sort_window = Some(SortWindow::new(VecDeque::from([(position, 0)]), false));
+        assert_eq!(
+            registry
+                .insert(ConnectionOwner::new(10), retained)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        registry.close();
+        assert!(registry.0.lock().unwrap().entries.is_empty());
     }
 
     #[test]
