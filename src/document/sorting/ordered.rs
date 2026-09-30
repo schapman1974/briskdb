@@ -112,6 +112,13 @@ impl Encoder<'_> {
     fn string(&mut self, bytes: &[u8]) -> EngineResult<()> {
         for chunk in bytes.chunks(CHECK_CHUNK) {
             (self.check)()?;
+            // The overwhelmingly common no-NUL case can use the byte slice's
+            // optimized search, then copy once. Walking every byte through
+            // split_inclusive is costly when external runs contain long keys.
+            if !chunk.contains(&0) {
+                self.extend(chunk)?;
+                continue;
+            }
             for run in chunk.split_inclusive(|byte| *byte == 0) {
                 self.extend(run)?;
                 if run.last() == Some(&0) {

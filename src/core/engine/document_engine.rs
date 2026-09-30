@@ -767,6 +767,8 @@ impl Engine {
                     sorter,
                     sort_after: None,
                     sort_window: None,
+                    sort_spool: None,
+                    allow_sort_spill: options.allow_disk_use().unwrap_or(true),
                     after: None,
                     skip: options.skip(),
                     remaining: options.limit(),
@@ -809,6 +811,7 @@ impl Engine {
                     || options.limit().is_some()
                     || options.projection().is_some()
                     || options.sort().is_some()
+                    || options.allow_disk_use().is_some()
                 {
                     return Err(EngineError::new(
                         EngineErrorKind::InvalidArgument,
@@ -2240,6 +2243,11 @@ fn require_count_options(options: &DocumentReadOptions) -> EngineResult<()> {
 }
 
 fn require_catalog_read_options(options: &DocumentReadOptions) -> EngineResult<()> {
+    if options.allow_disk_use().is_some() {
+        return Err(unsupported(
+            "disk-use policy is only supported for document find",
+        ));
+    }
     if options.projection().is_some() {
         return Err(unsupported(
             "projection is only supported for document find",

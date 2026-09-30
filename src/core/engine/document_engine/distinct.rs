@@ -54,6 +54,8 @@ impl Engine {
             sorter: None,
             sort_after: None,
             sort_window: None,
+            sort_spool: None,
+            allow_sort_spill: false,
             after: None,
             skip: 0,
             remaining: None,

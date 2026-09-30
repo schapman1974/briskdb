@@ -6,6 +6,17 @@ sort specifications are eligible; sparse/partial, prefix-only compound and
 built-in `_id_` sorts retain the fallback path. Maintaining directional keys
 adds write/index-build work. This source change is not a package publication.
 
+Large fallback `find()` sorts now use bounded anonymous temporary key files
+instead of an unbounded number of collection rescans. Small top-K queries and
+modest overflow retain in-memory windows. Scratch is limited to 256 MiB per
+sort and 1 GiB per engine; provision space in the host temporary directory.
+PyMongo `allow_disk_use=False` prohibits spilling across all cursor batches.
+Resource or temporary-file failures can terminate continuation after earlier
+batches have been delivered. Selected documents are refetched and rechecked;
+this does not add snapshot semantics or aggregation spilling. Filtered counts
+also stream validated candidates through one statement per shard rather than
+repeatedly preparing one-row reads.
+
 Local roots use manifest version 24 and semantic digest 16. Accepted source
 versions are exact historical local formats 1 through 22; reserved NFS v23 is
 not a local upgrade source. Startup adds empty ordered-key capability metadata

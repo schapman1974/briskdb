@@ -259,6 +259,8 @@ async fn selected_shards_still_deliver_unmatched_input_to_the_original_runner() 
         sorter: None,
         sort_after: None,
         sort_window: None,
+        sort_spool: None,
+        allow_sort_spill: false,
         after: None,
         skip: 0,
         remaining: None,

@@ -21,6 +21,49 @@ fn key(value: BsonValue, descending: bool) -> DocumentSortKey {
     }
 }
 
+#[test]
+fn long_string_fast_path_preserves_nul_escaping_at_check_chunk_boundaries() {
+    let length = CHECK_CHUNK * 3 + 17;
+    for nul in [
+        None,
+        Some(0),
+        Some(CHECK_CHUNK - 1),
+        Some(CHECK_CHUNK),
+        Some(CHECK_CHUNK + 1),
+        Some(length - 1),
+    ] {
+        let mut input = vec![b'x'; length];
+        if let Some(nul) = nul {
+            input[nul] = 0;
+        }
+        let mut expected = Vec::new();
+        for &byte in &input {
+            expected.push(byte);
+            if byte == 0 {
+                expected.push(255);
+            }
+        }
+        expected.extend_from_slice(&[0, 0]);
+        let mut calls = 0;
+        let actual = {
+            let mut check = || {
+                calls += 1;
+                Ok(())
+            };
+            let mut encoder = Encoder {
+                bytes: Vec::new(),
+                steps: 0,
+                max_bytes: MAX_BYTES,
+                check: &mut check,
+            };
+            encoder.string(&input).unwrap();
+            encoder.bytes
+        };
+        assert_eq!(actual, expected);
+        assert!(calls >= length / CHECK_CHUNK);
+    }
+}
+
 fn scalar() -> impl Strategy<Value = BsonValue> {
     prop_oneof![
         Just(BsonValue::MinKey),

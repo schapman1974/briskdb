@@ -172,6 +172,7 @@ pub struct DocumentReadOptions {
     batch_byte_limit: Option<NonZeroU64>,
     plan_diagnostics: bool,
     execution_stats: bool,
+    allow_disk_use: Option<bool>,
 }
 
 impl DocumentReadOptions {
@@ -186,6 +187,7 @@ impl DocumentReadOptions {
             batch_byte_limit: None,
             plan_diagnostics: false,
             execution_stats: false,
+            allow_disk_use: None,
         }
     }
 
@@ -221,6 +223,21 @@ impl DocumentReadOptions {
 
     pub const fn execution_stats(&self) -> bool {
         self.execution_stats
+    }
+
+    /// Control temporary key files for sorted find cursors. Omitted defaults
+    /// to bounded automatic spilling. False never creates scratch files: a
+    /// sort exceeding the bounded in-memory scan budget returns LimitExceeded.
+    /// This find-only policy is retained across cursor continuations; get-more
+    /// cannot change it. Aggregation spilling is not supported.
+    #[must_use]
+    pub const fn with_allow_disk_use(mut self, enabled: bool) -> Self {
+        self.allow_disk_use = Some(enabled);
+        self
+    }
+
+    pub const fn allow_disk_use(&self) -> Option<bool> {
+        self.allow_disk_use
     }
 
     #[must_use]
@@ -302,7 +319,8 @@ impl DocumentReadOptions {
     }
 
     /// Extract the original payload/pagination fields. Read `plan_diagnostics()`
-    /// and `execution_stats()` before consuming if the opt-in flags are needed.
+    /// `execution_stats()` and `allow_disk_use()` before consuming if those
+    /// independent policies are needed.
     pub fn into_parts(
         self,
     ) -> (
@@ -345,6 +363,7 @@ impl fmt::Debug for DocumentReadOptions {
             .field("batch_byte_limit", &self.batch_byte_limit())
             .field("plan_diagnostics", &self.plan_diagnostics)
             .field("execution_stats", &self.execution_stats)
+            .field("allow_disk_use", &self.allow_disk_use)
             .finish()
     }
 }
@@ -477,6 +496,19 @@ mod tests {
                 .is_err()
         );
         assert!(!format!("{options:?}").contains("correct horse"));
+    }
+
+    #[test]
+    fn disk_use_policy_distinguishes_omission_and_explicit_booleans() {
+        assert_eq!(DocumentReadOptions::new().allow_disk_use(), None);
+        for allow in [false, true] {
+            let options = DocumentReadOptions::new().with_allow_disk_use(allow);
+            assert_eq!(options.clone().allow_disk_use(), Some(allow));
+            assert_eq!(
+                options.with_allow_disk_use(!allow).allow_disk_use(),
+                Some(!allow)
+            );
+        }
     }
 
     #[test]

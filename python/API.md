@@ -571,9 +571,19 @@ expression, positional, and numeric-array-index projections are unsupported.
 `sort` accepts an ordered mapping such as `{"priority": -1, "_id": 1}` with up
 to 32 numeric `1`/`-1` directions. An empty mapping preserves natural order.
 Sorting uses original values before skip/limit and projection; equal BSON keys
-retain durable natural order. It persists across cursor batches. Bounded sorting
-windows currently rescan matching documents; large skips may require several
-scans and an internal window/memory boundary may return a short batch. Metadata
+retain durable natural order. Eligible newly built secondary indexes provide
+ordered reads; other sorts retain a bounded key window across batches. Larger
+fallback sorts use anonymous temporary key files. Modest overflow stays in
+memory, but fallback scanning is capped at eight windows plus one spool scan,
+independent of batch count (normally two scans for large sets). Scratch is
+limited to 256 MiB per sort and 1 GiB per
+engine (including merge copies); selected documents are refetched, not cached
+as a snapshot. Temporary-file or resource-limit failures reject the operation.
+PyMongo clients can use `.allow_disk_use(False)` (or `allow_disk_use=False` on
+`find`) to prohibit scratch files across all batches; a sort beyond the bounded
+memory scan budget then fails with a resource-limit error. Omitted or `True`
+permits bounded spilling for find, not aggregation.
+An internal memory/result-byte boundary may return a short batch. Metadata
 and expression sorts are unsupported. Python pair-list sort shorthand is not
 part of the embedded API; ordinary PyMongo chaining works through the wire API.
 

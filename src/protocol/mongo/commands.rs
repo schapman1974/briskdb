@@ -925,6 +925,9 @@ pub(super) fn prepare_with_limits(
                 }
             })?;
             let mut options = observed_read_options(read_metrics);
+            if let Some(BsonValue::Boolean(allow)) = request.body.get_first("allowDiskUse") {
+                options = options.with_allow_disk_use(*allow);
+            }
             if let Some(BsonValue::Document(projection)) = request.body.get_first("projection") {
                 DocumentProjector::compile_with_check(projection, &mut || {
                     if started.elapsed() >= timeout {
