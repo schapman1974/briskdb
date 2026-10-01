@@ -492,14 +492,24 @@ fn directory_file_bytes(directory: &std::path::Path) -> u64 {
                     directory.display()
                 )
             });
-            let metadata = entry.metadata().unwrap_or_else(|error| {
+            let entry_type = entry.file_type().unwrap_or_else(|error| {
                 panic!(
-                    "read benchmark file metadata {}: {error}",
+                    "read benchmark entry type {}: {error}",
                     entry.path().display()
                 )
             });
-            if metadata.is_file() {
-                metadata.len()
+            if entry_type.is_file() {
+                entry
+                    .metadata()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "read benchmark file metadata {}: {error}",
+                            entry.path().display()
+                        )
+                    })
+                    .len()
+            } else if entry_type.is_dir() {
+                directory_file_bytes(&entry.path())
             } else {
                 0
             }
