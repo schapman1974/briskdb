@@ -1,5 +1,6 @@
-use super::*;
+use briskdb::core::{ContentionJitter, ContentionPolicy, EngineErrorKind};
 use clap::Parser;
+use std::time::Duration;
 
 fn backoff() -> Vec<&'static str> {
     vec![
@@ -146,7 +147,7 @@ fn daemon_environment_and_cli_precedence_are_isolated() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "cli_contention::tests::daemon_environment_and_cli_precedence_are_isolated",
+            "cli_contention_tests::daemon_environment_and_cli_precedence_are_isolated",
         ])
         .env_clear()
         .env(MARKER, "1")

@@ -15,6 +15,10 @@ const DEADLINE: Duration = Duration::from_secs(15);
 #[path = "mongo_server/tls.rs"]
 mod tls;
 
+#[cfg(all(feature = "mongo-tls", feature = "auth-scram"))]
+#[path = "mongo_server/authenticated.rs"]
+mod authenticated;
+
 #[path = "mongo_server/reload.rs"]
 mod reload;
 

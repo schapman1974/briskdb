@@ -1,4 +1,7 @@
 mod cli_contention;
+#[cfg(test)]
+#[path = "cli_contention/tests.rs"]
+mod cli_contention_tests;
 
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
