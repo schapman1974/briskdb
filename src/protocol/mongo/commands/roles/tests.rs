@@ -2,6 +2,69 @@ use super::*;
 use crate::protocol::mongo::MongoResourceLimits;
 
 #[test]
+fn role_privilege_projection_round_trips_the_complete_supported_action_subset() {
+    use crate::core::{
+        ResultLimits,
+        security_catalog::{RoleInfoRequest, tests as fixtures},
+    };
+    let (mut catalog, user, role) = fixtures::setup();
+    let inputs = vec![
+        privilege(
+            role.realm(),
+            "",
+            &[
+                "find",
+                "insert",
+                "update",
+                "remove",
+                "listIndexes",
+                "createIndex",
+                "dropIndex",
+                "createCollection",
+                "dropCollection",
+                "listCollections",
+                "dropDatabase",
+            ],
+        ),
+        privilege(role.realm(), "system.js", &["find", "createCollection"]),
+    ];
+    let policy = data_policy(role.realm(), &inputs, true).unwrap();
+    catalog.replace_role(&role, policy.clone()).unwrap();
+    let principal = fixtures::login(&catalog, &user);
+    let rows = catalog
+        .role_info(
+            &principal,
+            &RoleInfoRequest::names([role.clone()])
+                .unwrap()
+                .with_document_privileges(true),
+            ResultLimits::default(),
+        )
+        .unwrap();
+    let encoded = rows[0]
+        .document_privileges()
+        .unwrap()
+        .iter()
+        .map(|entry| privilege(entry.database(), entry.collection(), &[entry.action()]))
+        .collect::<Vec<_>>();
+    assert_eq!(data_policy(role.realm(), &encoded, true).unwrap(), policy);
+    let reply = super::super::role_info::reply(rows);
+    let Some(BsonValue::Array(roles)) = reply.get_first("roles") else {
+        panic!("missing roles")
+    };
+    let BsonValue::Document(role) = &roles[0] else {
+        panic!("missing role")
+    };
+    assert_eq!(
+        role.get_first("privileges"),
+        Some(&BsonValue::Array(encoded))
+    );
+    assert_eq!(
+        role.get_first("privileges"),
+        role.get_first("inheritedPrivileges")
+    );
+}
+
+#[test]
 fn update_role_distinguishes_empty_replacement_from_omission_and_rejects_inheritance() {
     let prepare =
         |input: &Request| prepare_update(input, Instant::now(), MongoResourceLimits::default());

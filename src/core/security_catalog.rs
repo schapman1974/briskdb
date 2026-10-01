@@ -33,7 +33,7 @@ pub use mongo_data_roles::MongoDataRole;
 pub(crate) use mongo_data_roles::validate_document_role_policy;
 pub(crate) use mongo_data_roles::validate_document_role_revocations;
 pub use record::{MAX_SECURITY_CATALOG_RECORD_BYTES, SecurityCatalogRecord};
-pub use role_info::{MAX_ROLE_INFO_SELECTORS, RoleInfo, RoleInfoRequest};
+pub use role_info::{DocumentRolePrivilege, MAX_ROLE_INFO_SELECTORS, RoleInfo, RoleInfoRequest};
 pub use user_info::{MAX_USER_INFO_SELECTORS, UserInfo, UserInfoRequest};
 
 pub const MAX_SECURITY_USERS: usize = 1_024;

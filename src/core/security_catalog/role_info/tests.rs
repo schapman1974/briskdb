@@ -5,6 +5,165 @@ use crate::core::{
 };
 
 #[test]
+fn privilege_projection_obeys_wire_input_bounds_and_rejects_mixed_exports() {
+    use crate::core::authorization::DataDomain;
+    let (mut catalog, user, role) = fixtures::setup();
+    let principal = fixtures::login(&catalog, &user);
+    let request = RoleInfoRequest::names([role.clone()])
+        .unwrap()
+        .with_document_privileges(true);
+    let db = Resource::database(DataDomain::Document, role.realm()).unwrap();
+    for count in [127, 128] {
+        let mut grants = vec![
+            Privilege::new(Action::ConnectDatabase, Scope::exact(db.clone())).unwrap(),
+            Privilege::new(Action::CreateDatabase, Scope::exact(db.clone())).unwrap(),
+        ];
+        grants.extend((0..count).map(|n| {
+            Privilege::new(
+                Action::CreateObject,
+                Scope::exact(
+                    Resource::object(DataDomain::Document, role.realm(), &format!("c{n}")).unwrap(),
+                ),
+            )
+            .unwrap()
+        }));
+        catalog
+            .replace_role(&role, Policy::new(grants).unwrap())
+            .unwrap();
+        let rows = catalog.role_info(&principal, &request, ResultLimits::default());
+        if count == 127 {
+            assert_eq!(rows.unwrap()[0].document_privileges().unwrap().len(), count);
+        } else {
+            assert_eq!(rows.unwrap_err().kind(), EngineErrorKind::Unsupported);
+        }
+    }
+    let valid = SecurityName::new(role.realm(), "aaa_valid").unwrap();
+    catalog
+        .create_role(valid.clone(), Policy::default())
+        .unwrap();
+    catalog
+        .set_user_roles(&user, [role.clone(), valid.clone()])
+        .unwrap();
+    let mixed = RoleInfoRequest::names([valid, role.clone()])
+        .unwrap()
+        .with_document_privileges(true);
+    assert_eq!(
+        catalog
+            .role_info(&principal, &mixed, ResultLimits::default())
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Unsupported
+    );
+    // Authorization precedes even unsupported-policy inspection.
+    let unauthorized =
+        RoleInfoRequest::names([role.clone(), SecurityName::new("other", "missing").unwrap()])
+            .unwrap()
+            .with_document_privileges(true);
+    assert_eq!(
+        catalog
+            .role_info(&principal, &unauthorized, ResultLimits::default())
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::PermissionDenied
+    );
+}
+
+#[test]
+fn document_privilege_inspection_is_opt_in_lossless_bounded_and_current() {
+    use crate::core::authorization::DataDomain;
+    let (mut catalog, user, role) = fixtures::setup();
+    let db = Resource::database(DataDomain::Document, role.realm()).unwrap();
+    let read = Privilege::new(
+        Action::ReadData,
+        Scope::exact(
+            Resource::object(DataDomain::Document, role.realm(), "private_posts").unwrap(),
+        ),
+    )
+    .unwrap();
+    let admission = Privilege::new(Action::ConnectDatabase, Scope::exact(db.clone())).unwrap();
+    let valid = Policy::new([read.clone(), admission.clone()]).unwrap();
+    catalog.replace_role(&role, valid.clone()).unwrap();
+    let principal = fixtures::login(&catalog, &user);
+    let names = RoleInfoRequest::names([role.clone()]).unwrap();
+    let expanded = names.clone().with_document_privileges(true);
+    let before = catalog.to_record().unwrap();
+    assert!(
+        catalog
+            .role_info(&principal, &names, ResultLimits::default())
+            .unwrap()[0]
+            .document_privileges()
+            .is_none()
+    );
+    let rows = catalog
+        .role_info(&principal, &expanded, ResultLimits::default())
+        .unwrap();
+    let grants = rows[0].document_privileges().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].database(), role.realm());
+    assert_eq!(grants[0].collection(), "private_posts");
+    assert_eq!(grants[0].action(), "find");
+    assert!(!format!("{grants:?}").contains("private_posts"));
+    assert_eq!(
+        catalog
+            .role_info(&principal, &expanded, ResultLimits::new(10, 500).unwrap())
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::LimitExceeded
+    );
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    // Neither missing nor extra admission can be silently invented/omitted.
+    for invalid in [
+        Policy::new([read]).unwrap(),
+        Policy::new([admission.clone()]).unwrap(),
+        Policy::combine([
+            &valid,
+            &Policy::new([Privilege::new(Action::CreateDatabase, Scope::exact(db)).unwrap()])
+                .unwrap(),
+        ])
+        .unwrap(),
+        Policy::new([
+            admission,
+            Privilege::new(
+                Action::ReadData,
+                Scope::database(DataDomain::Document, role.realm()).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        catalog.replace_role(&role, invalid).unwrap();
+        assert_eq!(
+            catalog
+                .role_info(&principal, &expanded, ResultLimits::default())
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+        assert!(
+            catalog
+                .role_info(&principal, &names, ResultLimits::default())
+                .is_ok()
+        );
+    }
+    catalog.replace_role(&role, Policy::default()).unwrap();
+    assert_eq!(
+        catalog
+            .role_info(&principal, &expanded, ResultLimits::default())
+            .unwrap()[0]
+            .document_privileges(),
+        Some([].as_slice())
+    );
+    catalog.set_user_roles(&user, []).unwrap();
+    assert_eq!(
+        catalog
+            .role_info(&principal, &expanded, ResultLimits::default())
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::PermissionDenied
+    );
+}
+
+#[test]
 fn role_info_assigned_names_are_visible_but_other_names_and_realms_require_view_roles() {
     let (mut catalog, user, role) = fixtures::setup();
     let principal = fixtures::login(&catalog, &user);

@@ -16,6 +16,22 @@ def role_metadata(name, database="app"):
             "isBuiltin": False, "roles": [], "inheritedRoles": []}
 
 
+def check_privileges(row, name, database="app"):
+    assert row["privileges"] == row["inheritedPrivileges"]
+    actions = {"find", "listIndexes"}
+    if name == "readWrite":
+        actions |= {"insert", "update", "remove", "createCollection",
+                    "dropCollection", "createIndex", "dropIndex"}
+    expected = {(database, collection, action)
+                for collection in ("", "system.js") for action in actions}
+    expected.add((database, "", "listCollections"))
+    actual = {(entry["resource"]["db"], entry["resource"]["collection"], action)
+              for entry in row["privileges"] for action in entry["actions"]}
+    assert actual == expected, (actual, expected)
+    assert {key: value for key, value in row.items()
+            if key not in ("privileges", "inheritedPrivileges")} == role_metadata(name, database)
+
+
 def checks():
     with pymongo.MongoClient(URI, **options("profile_writer")) as writer, \
          pymongo.MongoClient(URI, **options("profile_reader")) as reader:
@@ -80,7 +96,12 @@ def checks():
         assert operator.admin.command("rolesInfo", "profile_operator")["roles"] == [role_metadata("profile_operator", "admin")]
         denied(lambda: operator.admin.command("rolesInfo", 1))
         denied(lambda: operator.app.command("rolesInfo", ["read", {"role": "missing", "db": "other"}]))
-        for fields in [dict(showPrivileges=True), dict(showPrivileges="asUserFragment"),
+        for row in operator.app.command("rolesInfo", 1, showPrivileges=True)["roles"]:
+            check_privileges(row, row["role"])
+        # Host administration policy has no lossless Mongo data representation.
+        denied(lambda: operator.admin.command("rolesInfo", "profile_operator", showPrivileges=True), 115)
+        denied(lambda: operator.app.command("rolesInfo", ["read", {"role": "missing", "db": "other"}], showPrivileges=True))
+        for fields in [dict(showPrivileges="asUserFragment"),
                        dict(showBuiltinRoles=True), dict(showAuthenticationRestrictions=True),
                        dict(comment="private-role-comment")]:
             denied(lambda fields=fields: operator.app.command("rolesInfo", 1, **fields), 72)
@@ -103,6 +124,7 @@ def checks():
             denied(lambda: next(cursor))
             denied(lambda: user.app.items.find_one())
             denied(lambda: user.app.command("rolesInfo", "read"))
+            denied(lambda: user.app.command("rolesInfo", "read", showPrivileges=True))
             assert user.accounts.command("usersInfo", "profile_managed")["users"][0]["roles"] == []
             cursor.close()
 
@@ -111,6 +133,7 @@ async def async_checks():
     async with pymongo.AsyncMongoClient(URI, **options("profile_reader")) as reader:
         assert (await reader.app.command("rolesInfo", "read", showPrivileges=False,
                                          showBuiltinRoles=False, showAuthenticationRestrictions=False))["roles"] == [role_metadata("read")]
+        check_privileges((await reader.app.command("rolesInfo", "read", showPrivileges=True))["roles"][0], "read")
         assert (await reader.app.items.find_one({"_id": 0}))["n"] == 11
         try:
             await reader.app.items.insert_one({"_id": 100})

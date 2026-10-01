@@ -113,7 +113,7 @@ pub(crate) fn exchange(attempt: &ScramAttempt, password: &str) -> (ScramSha256, 
     (client, transcript, proof)
 }
 
-pub(super) fn login(catalog: &SecurityCatalog, user: &SecurityName) -> Principal {
+pub(crate) fn login(catalog: &SecurityCatalog, user: &SecurityName) -> Principal {
     let attempt = catalog.begin_scram(user).unwrap();
     let (mut client, transcript, proof) = exchange(&attempt, PASSWORD);
     let (principal, signature) = catalog

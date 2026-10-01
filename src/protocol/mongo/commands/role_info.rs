@@ -32,7 +32,10 @@ pub(super) fn prepare(
         seen |= 1 << index;
         match field {
             // No partial/misleading export of Brisk-specific policies or built-ins.
-            "showPrivileges" | "showAuthenticationRestrictions" | "showBuiltinRoles"
+            "showPrivileges" if !matches!(value, BsonValue::Boolean(_)) => {
+                return Err(CommandError::options());
+            }
+            "showAuthenticationRestrictions" | "showBuiltinRoles"
                 if *value != BsonValue::Boolean(false) =>
             {
                 return Err(CommandError::options());
@@ -67,7 +70,9 @@ pub(super) fn prepare(
         ));
     }
     Ok(Prepared {
-        command: Command::RoleInfo(selection),
+        command: Command::RoleInfo(selection.with_document_privileges(
+            request.body.get_first("showPrivileges") == Some(&BsonValue::Boolean(true)),
+        )),
         deadline,
         advisory_hint: false,
     })
@@ -104,7 +109,7 @@ pub(super) fn reply(roles: Vec<RoleInfo>) -> BsonDocument {
         .into_iter()
         .map(|role| {
             let name = role.name();
-            BsonValue::Document(fields([
+            let mut document = fields([
                 (
                     "_id",
                     BsonValue::from(format!("{}.{}", name.realm(), name.name())),
@@ -114,7 +119,34 @@ pub(super) fn reply(roles: Vec<RoleInfo>) -> BsonDocument {
                 ("isBuiltin", BsonValue::Boolean(false)),
                 ("roles", BsonValue::Array(vec![])),
                 ("inheritedRoles", BsonValue::Array(vec![])),
-            ]))
+            ]);
+            if let Some(privileges) = role.document_privileges() {
+                let values: Vec<_> = privileges
+                    .iter()
+                    .map(|privilege| {
+                        BsonValue::Document(fields([
+                            (
+                                "resource",
+                                BsonValue::Document(fields([
+                                    ("db", BsonValue::from(privilege.database())),
+                                    ("collection", BsonValue::from(privilege.collection())),
+                                ])),
+                            ),
+                            (
+                                "actions",
+                                BsonValue::Array(vec![BsonValue::from(privilege.action())]),
+                            ),
+                        ]))
+                    })
+                    .collect();
+                document
+                    .push("privileges", BsonValue::Array(values.clone()))
+                    .expect("fixed field");
+                document
+                    .push("inheritedPrivileges", BsonValue::Array(values))
+                    .expect("fixed field");
+            }
+            BsonValue::Document(document)
         })
         .collect();
     fields([
