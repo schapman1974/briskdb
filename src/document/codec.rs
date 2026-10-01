@@ -186,6 +186,13 @@ pub fn encode_document(document: &BsonDocument) -> BsonResult<Vec<u8>> {
     encode_document_with_options(document, &BsonCodecOptions::default())
 }
 
+/// Run the default encoder's complete size/depth/name preflight without
+/// materializing bytes. Typed BSON values already enforce scalar invariants
+/// (in particular regex C strings); callers retain their usual work budgets.
+pub(crate) fn validated_document_len(document: &BsonDocument) -> BsonResult<usize> {
+    encoded_document_len(document, &BsonCodecOptions::default(), 1, "$")
+}
+
 /// Encode one BSON document with explicit limits and representation choices.
 pub fn encode_document_with_options(
     document: &BsonDocument,
@@ -972,6 +979,65 @@ fn push_bounded_to(target: &mut String, value: &str, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_only_length_matches_materialized_encoding() {
+        let nested = BsonDocument::from_entries([("inside", BsonValue::Int64(42))]).unwrap();
+        let values = [
+            BsonValue::Double(-0.0),
+            BsonValue::String("Unicode λ and embedded \0".into()),
+            BsonValue::Document(nested.clone()),
+            BsonValue::Array(vec![BsonValue::Null; 123]),
+            BsonValue::Binary(BsonBinary::new(2, vec![7; 123])),
+            BsonValue::Binary(BsonBinary::new(128, vec![7; 123])),
+            BsonValue::Uuid(BsonUuid::new([42; 16], UuidRepresentation::Standard)),
+            BsonValue::Uuid(BsonUuid::new([42; 16], UuidRepresentation::PythonLegacy)),
+            BsonValue::ObjectId(BsonObjectId::from_bytes([42; 12])),
+            BsonValue::DateTime(BsonDateTime::from_millis(i64::MIN)),
+            BsonValue::Timestamp(BsonTimestamp::new(u32::MAX, u32::MAX)),
+            BsonValue::Decimal128(BsonDecimal128::parse("1.2345").unwrap()),
+            BsonValue::Boolean(true),
+            BsonValue::Null,
+            BsonValue::RegularExpression(BsonRegex::new("pattern", "mi").unwrap()),
+            BsonValue::JavaScript(BsonJavaScript::new("return 1")),
+            BsonValue::JavaScript(BsonJavaScript::with_scope("return inside", nested)),
+            BsonValue::Int32(123),
+            BsonValue::Int64(i64::MAX),
+            BsonValue::MinKey,
+            BsonValue::MaxKey,
+        ];
+        for value in values {
+            let document = BsonDocument::from_entries([("value", value)]).unwrap();
+            assert_eq!(
+                validated_document_len(&document).unwrap(),
+                encode_document(&document).unwrap().len()
+            );
+        }
+    }
+
+    #[test]
+    fn validation_only_preserves_encoder_rejections() {
+        let mut deep = BsonDocument::new();
+        for _ in 0..BSON_MAX_NESTING_DEPTH {
+            deep = BsonDocument::from_entries([("nested", BsonValue::Document(deep))]).unwrap();
+        }
+        let large = BsonDocument::from_entries([(
+            "large",
+            BsonValue::String("x".repeat(BSON_MAX_DOCUMENT_BYTES)),
+        )])
+        .unwrap();
+        let duplicates = decode_document_with_options(
+            &empty_key_null_document(2),
+            &BsonCodecOptions::new().with_duplicate_field_policy(DuplicateFieldPolicy::Preserve),
+        )
+        .unwrap();
+        for document in [deep, large, duplicates] {
+            let expected = encode_document(&document).unwrap_err();
+            let actual = validated_document_len(&document).unwrap_err();
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+    }
 
     #[test]
     fn document_batch_shares_one_decode_budget() {
