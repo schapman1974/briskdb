@@ -50,6 +50,62 @@ unknown-commit-outcome tests. No write capability will be enabled solely because
 SQLite exposes an `xUpdate` callback. The [Python API](python/API.md#remote-sqlite-addon)
 states the current bounds and unsupported behavior.
 
+### Original ISAM backend experiment (unreleased)
+
+Tracked by [#534](https://github.com/schapman1974/briskdb/issues/534). This replaces
+the unfinished SQLite/EFS direction in #509 and #512–#516, closed as superseded,
+not completed. The native path will use no SQLite for records, indexes, catalog,
+receipts, transactions or query execution; the existing SQLite mode stays intact.
+
+SQLite remains the supported default. An independent, opt-in `experimental-isam`
+Rust feature in the local prototype exposes `briskdb::isam` record primitives; it does **not** select
+an ISAM backend in `BriskDb`, Python, SQL, Mongo, or any listener. This original
+implementation has no VBISAM dependency, source port, or file-format compatibility.
+It stays in this repository under the existing license; no licensing change or
+release is part of the experiment.
+
+The first local slice provides fixed-width byte keys, bounded values, indexed
+point/range reads, and atomic insert/put/delete batches in a checksummed,
+copy-on-write B+ tree. Retained file handles avoid per-row open/close/catalog
+work. Batch writes coalesce changes to touched pages. Readers briefly share a
+publication lock, capture a root, and scan immutable pages concurrently with
+writer preparation and later commits. Writers to one file serialize; publishing
+the root takes a short exclusive publication lock. Independent files have
+independent locks. Lock-admission retry limits are configurable, including open;
+mutations are never automatically replayed after an uncertain commit.
+
+This is a Unix-only local prototype, not a claim of fast EFS/NFS operation or
+full backend compatibility. It uses an original versioned file plus a retained
+`.writer.lock` sidecar. Snapshot/publication locks cover the actual data file;
+the sidecar serializes writer preparation. Do not unlink/replace either while
+handles are live.
+Old pages accumulate; space reclamation, bounded snapshots, crash/power-loss
+qualification, mount/cache-coherence behavior, and sustained contention/fairness
+remain open. Local model/corruption/process tests do not prove those guarantees.
+
+Implementation queue (all remain open; the local prototype is not merged):
+
+- [ ] [#535](https://github.com/schapman1974/briskdb/issues/535) — land/harden the original record core and format contract
+- [ ] [#536](https://github.com/schapman1974/briskdb/issues/536) — mixed-workload benchmarks and I/O budgets
+- [ ] [#537](https://github.com/schapman1974/briskdb/issues/537) — record/key locks and concurrent same-file writers
+- [ ] [#538](https://github.com/schapman1974/briskdb/issues/538) — durable recovery, lock loss and stale-writer safety
+- [ ] [#539](https://github.com/schapman1974/briskdb/issues/539) — native catalog and backend isolation
+- [ ] [#540](https://github.com/schapman1974/briskdb/issues/540) — typed variable-size records and atomic secondary indexes
+- [ ] [#541](https://github.com/schapman1974/briskdb/issues/541) — stable write identity and uncertain-commit reconciliation
+- [ ] [#542](https://github.com/schapman1974/briskdb/issues/542) — native SQL/document execution with explicit capability limits
+- [ ] [#543](https://github.com/schapman1974/briskdb/issues/543) — backend selection, Python/client integration and invocation lifecycle
+- [ ] [#544](https://github.com/schapman1974/briskdb/issues/544) — snapshot bounds, space reclamation and backup/restore
+- [ ] [#545](https://github.com/schapman1974/briskdb/issues/545) — staged independent-host EFS correctness/performance qualification
+- [ ] [#546](https://github.com/schapman1974/briskdb/issues/546) — later opt-in insert-only available-shard placement
+
+Start with #535, then #536/#537. The native catalog (#539) can proceed after the
+foundation without blocking storage-core measurements. #545 separates an early
+isolated, disposable-data EFS probe from final release qualification; the early
+probe need not wait for full query/client compatibility. Optional alternate-shard
+placement is not an initial one-shard test gate. Issue dependencies and acceptance
+criteria are authoritative. Preserve SQLite and its existing APIs throughout;
+do not resume the earlier SQLite/NFS work or enable its public gate as a shortcut.
+
 ### What compatibility means
 
 PostgreSQL and MySQL support has three distinct layers:
@@ -641,31 +697,27 @@ requires an earlier dependency:
    tracing, online backup and restore, fault testing, and compatibility gates.
 9. [ ] **Complete serverless support.** Define atomic snapshot storage,
    ephemeral-runtime lifecycle adapters, warm reuse, and fenced writer
-   guarantees. The separate EFS-only [NFS mode track (#509)](https://github.com/schapman1974/briskdb/issues/509)
-   does not require snapshot storage: persisted profiles and rollback journaling
-   (#511), cross-host locks/fencing (#512–#513), durable insert retry identity
-   (#514), and real multi-host qualification (#516) precede support claims.
+   guarantees. The separate direct-EFS [native ISAM track (#534)](https://github.com/schapman1974/briskdb/issues/534)
+   uses no SQLite storage or execution and does not require snapshot restore into
+   Lambda. Its same-file concurrent writer protocol (#537), recovery/fencing
+   (#538), native catalog (#539), write identity (#541), invocation integration
+   (#543) and independent-host qualification (#545) precede support claims.
    Configurable contention budgets (#510) now cover configured Engine admission,
    startup, SQLite/Brisk waits, maintenance and virtual-table paths, with the
    same policy exposed through Rust/Python, managed Mongo and daemon settings.
-   Future NFS paths must reuse this budget; it cannot bound stalled kernel I/O.
-   Optional
-   insert-only placement (#515) follows safe fixed routing. NFS qualification
-   must measure cold/warm metadata round trips, including manifest validation,
-   handle reuse and DELETE/PERSIST journal churn; do not copy databases into
-   Lambda or omit coherence checks to improve those measurements.
-   The unreleased profile implementation exposes explicit Rust/Python/CLI
-   selection, a fenced NFS-only manifest v23, and internal rollback-journal
-   integration for manifest, shards, document/global indexes and security stores.
-   Local roots remain v22; public NFS opens still fail closed pending runtime
-   locking/recovery and independent-host qualification. First cloud testing
-   targets isolated fixed-routing CRUD; optional placement is not a prerequisite
-   for that bounded test and must not be inferred from its results.
-   An explicitly invoked [source-test runner](python/SERVERLESS.md#isolated-efs-source-test-runner-not-public-nfs-support)
-   now prepares that first experiment: exact Linux mount gating, one retained
-   root lock, SQL/document checks and before/after-commit process-exit recovery.
-   It is test-only, serializes complete open/work/close scopes, and does not
-   establish independent-host results or stale-writer fencing by itself.
+   Native paths must reuse this budget; it cannot bound stalled kernel I/O.
+   Optional insert-only placement (#546) follows safe fixed routing and is not
+   required for the early one-shard experiment. Measurements (#536/#545) must
+   include cold/warm catalog and lock traffic, same-file independent-writer
+   progress, retained-handle freshness and actual NFS RPC counts; do not omit
+   coherence or durability checks to improve results.
+   The old SQLite/NFS epic #509 and its unfinished children #512–#516 are closed
+   as superseded, not completed. Completed #510/#511 and the test-only SQLite
+   [source runner](python/SERVERLESS.md#isolated-efs-source-test-runner-not-public-nfs-support)
+   remain historical groundwork; no merged code is removed. Existing local
+   SQLite roots/behavior remain unchanged, and public SQLite/NFS opens remain
+   disabled. #194/#196 and #195's original snapshot-provider lifecycle remain
+   separate; #195's direct-EFS addendum now points to #543/#545.
 10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential

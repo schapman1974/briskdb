@@ -11,6 +11,11 @@ pub mod server;
 pub mod sql;
 pub mod storage;
 
+/// Original experimental record store, separate from the SQLite engine.
+/// Not yet connected to SQL, documents, or the Python/wire interfaces.
+#[cfg(all(unix, feature = "experimental-isam"))]
+pub use storage::isam;
+
 mod sqlite_error;
 
 // Preserve the original public module path while frontends migrate to the
