@@ -116,6 +116,13 @@ experimental-vtab = ["rusqlite/vtab"]
 # Original, experimental indexed-record storage primitives (Unix only).
 # This is not yet a SQL/document backend and never changes SQLite defaults.
 experimental-isam = []
+# Opt-in matched ISAM/SQLite benchmark harness with JSON row-serialization timing.
+isam-benchmark = [
+    "embedded",
+    "experimental-isam",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 anyhow = { version = "1.0", optional = true }

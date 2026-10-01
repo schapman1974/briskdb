@@ -268,7 +268,7 @@ Run the bounded automated smoke check:
 
 ```bash
 cargo test --locked --no-default-features \
-  --features embedded,experimental-isam \
+  --features isam-benchmark \
   --test isam_benchmark bounded_comparison_smoke
 ```
 
@@ -281,7 +281,7 @@ manual smoke:
 BRISKDB_ISAM_BENCH_SAMPLES=5 \
 BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
 cargo test --locked --no-default-features \
-  --features embedded,experimental-isam \
+  --features isam-benchmark \
   --test isam_benchmark release_isam_sqlite_comparison -- \
   --ignored --exact --nocapture
 ```
@@ -293,7 +293,7 @@ For a candidate comparison, use a quiet host and release mode with the default
 BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
 BRISKDB_ISAM_BENCH_OUTPUT=target/isam-benchmark.tsv \
 cargo test --release --locked --no-default-features \
-  --features embedded,experimental-isam \
+  --features isam-benchmark \
   --test isam_benchmark release_isam_sqlite_comparison -- \
   --ignored --exact --nocapture
 ```
@@ -308,6 +308,16 @@ supplied explicitly so the artifact records the tested tree. Header metadata
 records total byte growth across all fixture directories during the run; it is
 not attributed to an individual workload. Criterion is not required: samples and
 machine-readable results are produced by this bounded harness.
+`result_json_serialization_36` measures serialization of the same 36-row
+`[{"id": ..., "body": ...}]` JSON row shape for ISAM and SQLite. Database reads
+and conversion into that shared shape happen outside the timed interval; this
+isolates JSON encoding cost and is not a complete HTTP response or transport
+benchmark.
+
+The CI workflow has a separate, opt-in `isam_benchmark` dispatch input. When
+selected, it runs the 100-sample Linux release comparison and retains both the
+TSV and full run log as a 90-day artifact, including unsuccessful runs. It does
+not run on ordinary pushes or pull requests.
 For four-writer waves, additional per-worker rows report each independent
 writer's completion latency and successful sample count; a failed write aborts
 the run rather than silently counting as progress.
@@ -318,7 +328,8 @@ physical shards because the public database requires at least two; every row
 and operation is routed to the same shard. Both database paths retain open
 handles for warm operations. The measured workloads are open-existing,
 point-read, range-36, atomic 36-row insert, 36-row refresh, 36-row delete,
-same-key duplicate rejection, and synchronized four-writer disjoint-key waves.
+same-key duplicate rejection, matched result JSON serialization for 36 rows,
+and synchronized four-writer disjoint-key waves.
 Writes use each backend's normal durable commit path; the SQLite fixture uses
 BriskDB's existing local WAL/FULL policy.
 
@@ -335,9 +346,10 @@ the storage code during open/validation; it does not include implicit kernel
 work performed by file opens, reads, writes, or syncs. Peak RSS is
 process-wide for the full harness, not per operation. The publication timer
 includes root-lock admission, root write, and final sync, so it overlaps those
-phase counters. Result serialization is not separately timed. The report
-schema is versioned because fields may be added; keep the matching schema
-metadata with each archived TSV.
+phase counters. The separate JSON measurement times only serialization of the
+common row shape; it excludes database reads and value-to-row conversion. The
+report schema is versioned because fields may be added; keep the matching
+schema metadata with each archived TSV.
 Local results on macOS/Linux do not predict shared-filesystem performance.
 
 The first fully instrumented optimized run was recorded against commit
@@ -374,9 +386,9 @@ transaction or locking guarantees. This is a baseline, not a release gate or a
 claim that ISAM is a performance win: small-chunk writes and same-file
 contention currently lose to BriskDB SQLite. Prospective pass/fail budgets
 remain unset until workload priorities and target storage are agreed. Result
-conversion/serialization is not separately timed, and SQLite logical
-I/O/RPC/phase counters are unavailable. Do not treat these local results as
-NFS/EFS evidence.
+conversion and full response/transport serialization are not separately timed,
+and SQLite logical I/O/RPC/phase counters are unavailable. Do not treat these
+local results as NFS/EFS evidence.
 
 ## Run and compare
 

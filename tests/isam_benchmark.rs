@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "experimental-isam", feature = "embedded"))]
+#![cfg(all(unix, feature = "isam-benchmark"))]
 
 use std::{
     fs,
@@ -12,9 +12,10 @@ use std::{
 
 use briskdb::{
     core::Value,
-    isam::{Layout, LockPolicy, Mutation, OperationStats, Store},
+    isam::{Layout, LockPolicy, Mutation, OperationStats, Record, Store},
     storage::Database,
 };
+use serde::Serialize;
 
 const CHAPTER_ROWS: usize = 36;
 const SEED_CHAPTERS: u32 = 10;
@@ -239,6 +240,18 @@ impl FlatFileFixture {
 struct SqlWrite {
     sql: String,
     params: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct JsonBenchRow<'a> {
+    id: &'a str,
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+struct OwnedJsonBenchRow {
+    id: String,
+    body: String,
 }
 
 fn main_key(chapter: u32, verse: usize) -> String {
@@ -577,6 +590,44 @@ fn record_count(result: &briskdb::core::ResultSet) -> usize {
     result.rows().len()
 }
 
+fn json_rows_from_records(records: &[Record]) -> Vec<JsonBenchRow<'_>> {
+    records
+        .iter()
+        .map(|record| JsonBenchRow {
+            id: std::str::from_utf8(&record.key).expect("benchmark key is UTF-8"),
+            body: std::str::from_utf8(&record.value).expect("benchmark body is UTF-8"),
+        })
+        .collect()
+}
+
+fn json_rows_from_result(result: &briskdb::core::ResultSet) -> Vec<JsonBenchRow<'_>> {
+    result
+        .rows()
+        .iter()
+        .map(|row| JsonBenchRow {
+            id: row
+                .get(0)
+                .and_then(Value::as_str)
+                .expect("SQLite benchmark id is text"),
+            body: row
+                .get(1)
+                .and_then(Value::as_str)
+                .expect("SQLite benchmark body is text"),
+        })
+        .collect()
+}
+
+fn expected_json_rows(chapter: u32) -> Vec<u8> {
+    let offset = chapter - SEED_FIRST_CHAPTER;
+    let rows: Vec<_> = (0..CHAPTER_ROWS)
+        .map(|verse| OwnedJsonBenchRow {
+            id: main_key(chapter, verse),
+            body: format!("seed-{offset}-{verse}"),
+        })
+        .collect();
+    serde_json::to_vec(&rows).unwrap()
+}
+
 #[test]
 fn bounded_comparison_smoke() {
     let directory = tempfile::tempdir().unwrap();
@@ -585,6 +636,8 @@ fn bounded_comparison_smoke() {
     let report = fs::read_to_string(report_path).unwrap();
     assert!(report.starts_with("# schema=isam-benchmark-v5\t"));
     assert!(report.contains("isam\trange_36\t"));
+    assert!(report.contains("isam\tresult_json_serialization_36\t"));
+    assert!(report.contains("sqlite\tresult_json_serialization_36\t"));
     assert!(report.contains("sqlite\tchunk_delete_36\t"));
     assert!(report.contains("isam_writer_3\tdisjoint_writer_latency\t"));
     assert!(report.contains("# disk_growth_bytes\tisam="));
@@ -702,6 +755,53 @@ fn run_comparison(samples: usize, report_path: &std::path::Path) {
         start.elapsed()
     });
     measurements.extend([isam_range, sqlite_range]);
+
+    let isam_serialization = measure_isam("result_json_serialization_36", samples, |sample| {
+        let chapter = SEED_FIRST_CHAPTER + (sample as u32 % SEED_CHAPTERS);
+        let records = isam
+            .store
+            .read_batch()
+            .unwrap()
+            .range(
+                main_key(chapter, 0).as_bytes(),
+                Some(chapter_end(chapter).as_bytes()),
+                CHAPTER_ROWS,
+            )
+            .unwrap();
+        assert_eq!(records.len(), CHAPTER_ROWS);
+        let rows = json_rows_from_records(&records);
+        let expected = expected_json_rows(chapter);
+        let start = Instant::now();
+        let encoded = serde_json::to_vec(&rows).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(encoded, expected);
+        black_box(encoded);
+        (elapsed, OperationStats::default())
+    });
+    let sqlite_serialization = measure_sqlite("result_json_serialization_36", samples, |sample| {
+        let chapter = SEED_FIRST_CHAPTER + (sample as u32 % SEED_CHAPTERS);
+        let result = sqlite
+            .database
+            .query(
+                "benchmark",
+                SQLITE_RANGE,
+                &[
+                    Value::from(main_key(chapter, 0)),
+                    Value::from(chapter_end(chapter)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(record_count(&result), CHAPTER_ROWS);
+        let rows = json_rows_from_result(&result);
+        let expected = expected_json_rows(chapter);
+        let start = Instant::now();
+        let encoded = serde_json::to_vec(&rows).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(encoded, expected);
+        black_box(encoded);
+        elapsed
+    });
+    measurements.extend([isam_serialization, sqlite_serialization]);
 
     let flat_point = measure_flat_file("point_read", samples, |_| {
         let start = Instant::now();

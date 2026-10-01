@@ -93,8 +93,9 @@ chunk writes/deletes, conflicts, and four same-file disjoint writers against
 BriskDB SQLite and a non-transactional fixed-file control. These logical
 counters are not NFS RPC measurements, and local macOS/Linux results are not
 EFS qualification. #536 remains open: the baseline still needs distinct
-result-conversion/serialization timing, automatic CI artifact retention, and
-agreed prospective gates before it can be considered complete. ISAM's
+matched JSON row-serialization timing and an opt-in CI artifact workflow are
+now included. #536 remains open until prospective latency, throughput, metadata,
+and correctness gates are agreed for the intended storage. ISAM's
 root/page I/O, sync, publication and lock-admission timings are diagnostic and
 overlap as documented.
 Format v2 refuses experimental v1 files and fails closed on ambiguous root
