@@ -127,83 +127,85 @@ fn read_child(
     Ok(node)
 }
 
-fn append(
-    file: &File,
-    snapshot: &mut Snapshot,
-    node: &Node,
-    counters: &OperationCounters,
-) -> Result<Record> {
-    let offset = snapshot.end;
-    let end = offset
-        .checked_add(PAGE_BYTES as u64)
-        .filter(|end| *end <= i64::MAX as u64)
-        .ok_or(Error::Invalid("file size exhausted"))?;
-    let mut bytes = [0; PAGE_BYTES];
-    bytes[..8].copy_from_slice(MAGIC);
-    bytes[8..16].copy_from_slice(&offset.to_le_bytes());
-    bytes[16..24].copy_from_slice(&snapshot.generation.to_le_bytes());
-    bytes[24] = node.level;
-    bytes[26..28].copy_from_slice(&(node.entries.len() as u16).to_le_bytes());
-    let width = stride(snapshot.layout, node.level);
-    let key_bytes = usize::from(snapshot.layout.key_bytes);
-    for (i, entry) in node.entries.iter().enumerate() {
-        let start = PREFIX + i * width;
-        bytes[start..start + key_bytes].copy_from_slice(&entry.key);
-        let body = start + key_bytes;
-        if node.level == 0 {
-            bytes[body..body + 2].copy_from_slice(&(entry.value.len() as u16).to_le_bytes());
-            bytes[body + 2..body + 2 + entry.value.len()].copy_from_slice(&entry.value);
-        } else {
-            bytes[body..body + 8].copy_from_slice(&entry.value);
-        }
-    }
-    format::seal(&mut bytes);
-    counters.page_writes.fetch_add(1, Ordering::Relaxed);
-    let started = Instant::now();
-    let result = file.write_all_at(&bytes, offset);
-    counters
-        .page_write_ns
-        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    result?;
-    snapshot.end = end;
-    Ok(Record {
-        key: node.entries.last().unwrap().key.clone(),
-        value: offset.to_le_bytes().to_vec(),
-    })
+#[derive(Debug, Clone, Copy)]
+enum PageRef {
+    Existing(u64),
+    New(usize),
 }
 
-fn persist(
-    file: &File,
-    snapshot: &mut Snapshot,
-    node: Node,
-    counters: &OperationCounters,
-) -> Result<Vec<Record>> {
-    let mut references = Vec::new();
-    for entries in node.entries.chunks(capacity(snapshot.layout, node.level)) {
-        references.push(append(
-            file,
-            snapshot,
-            &Node {
-                level: node.level,
-                entries: entries.to_vec(),
-            },
-            counters,
-        )?);
+#[derive(Debug)]
+enum PlannedValue {
+    Inline(Vec<u8>),
+    Child(PageRef),
+}
+
+#[derive(Debug)]
+struct PlannedEntry {
+    key: Vec<u8>,
+    value: PlannedValue,
+}
+
+#[derive(Debug)]
+struct PlannedPage {
+    level: u8,
+    entries: Vec<PlannedEntry>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BatchPlan {
+    pages: Vec<PlannedPage>,
+    root: Option<PageRef>,
+}
+
+impl BatchPlan {
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len()
     }
-    Ok(references)
+}
+
+pub(crate) fn prepare_batch(
+    file: &File,
+    snapshot: Snapshot,
+    mutations: &[Mutation],
+    counters: &OperationCounters,
+) -> Result<BatchPlan> {
+    let root = if snapshot.root == 0 {
+        Node {
+            level: 0,
+            entries: Vec::new(),
+        }
+    } else {
+        read_node(file, snapshot, snapshot.root, counters)?
+    };
+    let mut level = root.level;
+    let mut ordered: Vec<_> = mutations.iter().collect();
+    // Stable ordering preserves insert/put/delete semantics for repeated keys.
+    ordered.sort_by(|a, b| a.key().cmp(b.key()));
+    let mut pages = Vec::new();
+    let mut changed = change_batch(file, snapshot, root, &ordered, &mut pages, counters)?;
+    while changed.len() > 1 {
+        if level == MAX_LEVEL {
+            return Err(Error::Invalid("tree depth exhausted"));
+        }
+        level += 1;
+        changed = emit_pages(snapshot.layout, level, changed, &mut pages)?;
+    }
+    let root = changed.first().map(|entry| match entry.value {
+        PlannedValue::Child(reference) => reference,
+        PlannedValue::Inline(_) => unreachable!("leaf entries cannot be tree roots"),
+    });
+    Ok(BatchPlan { pages, root })
 }
 
 fn change_batch(
     file: &File,
-    snapshot: &mut Snapshot,
-    mut node: Node,
+    snapshot: Snapshot,
+    node: Node,
     mutations: &[&Mutation],
+    pages: &mut Vec<PlannedPage>,
     counters: &OperationCounters,
-) -> Result<Vec<Record>> {
+) -> Result<Vec<PlannedEntry>> {
     if node.level == 0 {
-        // This bounded map contains one leaf plus this batch's changes, never
-        // the whole database. Coalesce before writing: one new page per changed
-        // leaf, not a rewrite of the index path for every individual record.
         let mut records: std::collections::BTreeMap<_, _> =
             node.entries.into_iter().map(|r| (r.key, r.value)).collect();
         for mutation in mutations {
@@ -222,75 +224,155 @@ fn change_batch(
                 }
             }
         }
-        node.entries = records
-            .into_iter()
-            .map(|(key, value)| Record { key, value })
-            .collect();
-    } else {
-        let mut replacement = Vec::new();
-        let mut consumed = 0;
-        for position in 0..node.entries.len() {
-            let count = if position + 1 == node.entries.len() {
-                mutations.len() - consumed
-            } else {
-                mutations[consumed..]
-                    .partition_point(|m| m.key() <= node.entries[position].key.as_slice())
-            };
-            if count == 0 {
-                replacement.push(node.entries[position].clone());
-            } else {
-                let descendant = read_child(file, *snapshot, &node, position, counters)?;
-                replacement.extend(change_batch(
-                    file,
-                    snapshot,
-                    descendant,
-                    &mutations[consumed..consumed + count],
-                    counters,
-                )?);
-                consumed += count;
-            }
-        }
-        node.entries = replacement;
+        return emit_pages(
+            snapshot.layout,
+            0,
+            records
+                .into_iter()
+                .map(|(key, value)| PlannedEntry {
+                    key,
+                    value: PlannedValue::Inline(value),
+                })
+                .collect(),
+            pages,
+        );
     }
-    persist(file, snapshot, node, counters)
+
+    let mut replacement = Vec::new();
+    let mut consumed = 0;
+    for position in 0..node.entries.len() {
+        let count = if position + 1 == node.entries.len() {
+            mutations.len() - consumed
+        } else {
+            mutations[consumed..]
+                .partition_point(|m| m.key() <= node.entries[position].key.as_slice())
+        };
+        if count == 0 {
+            replacement.push(PlannedEntry {
+                key: node.entries[position].key.clone(),
+                value: PlannedValue::Child(PageRef::Existing(child(&node.entries[position]))),
+            });
+        } else {
+            let descendant = read_child(file, snapshot, &node, position, counters)?;
+            replacement.extend(change_batch(
+                file,
+                snapshot,
+                descendant,
+                &mutations[consumed..consumed + count],
+                pages,
+                counters,
+            )?);
+            consumed += count;
+        }
+    }
+    emit_pages(snapshot.layout, node.level, replacement, pages)
 }
 
-pub(crate) fn apply_batch(
-    file: &File,
-    snapshot: &mut Snapshot,
-    mutations: &[Mutation],
-    counters: &OperationCounters,
-) -> Result<()> {
-    let root = if snapshot.root == 0 {
-        Node {
-            level: 0,
-            entries: Vec::new(),
-        }
-    } else {
-        read_node(file, *snapshot, snapshot.root, counters)?
-    };
-    let mut level = root.level;
-    let mut ordered: Vec<_> = mutations.iter().collect();
-    // Stable ordering preserves insert/put/delete semantics for repeated keys.
-    ordered.sort_by(|a, b| a.key().cmp(b.key()));
-    let mut changed = change_batch(file, snapshot, root, &ordered, counters)?;
-    while changed.len() > 1 {
-        if level == MAX_LEVEL {
-            return Err(Error::Invalid("tree depth exhausted"));
-        }
-        level += 1;
-        changed = persist(
-            file,
-            snapshot,
-            Node {
-                level,
-                entries: changed,
-            },
-            counters,
-        )?;
+fn emit_pages(
+    layout: Layout,
+    level: u8,
+    entries: Vec<PlannedEntry>,
+    pages: &mut Vec<PlannedPage>,
+) -> Result<Vec<PlannedEntry>> {
+    let mut result = Vec::new();
+    for chunk in entries.chunks(capacity(layout, level)) {
+        let page_id = pages.len();
+        pages.push(PlannedPage {
+            level,
+            entries: chunk
+                .iter()
+                .map(|entry| PlannedEntry {
+                    key: entry.key.clone(),
+                    value: match &entry.value {
+                        PlannedValue::Inline(value) => PlannedValue::Inline(value.clone()),
+                        PlannedValue::Child(reference) => PlannedValue::Child(*reference),
+                    },
+                })
+                .collect(),
+        });
+        result.push(PlannedEntry {
+            key: chunk.last().expect("non-empty tree page").key.clone(),
+            value: PlannedValue::Child(PageRef::New(page_id)),
+        });
     }
-    snapshot.root = changed.first().map(child).unwrap_or(0);
-    Ok(())
+    Ok(result)
+}
+
+pub(crate) fn write_plan(
+    file: &File,
+    base: Snapshot,
+    mut next: Snapshot,
+    start: u64,
+    plan: &BatchPlan,
+    counters: &OperationCounters,
+) -> Result<Snapshot> {
+    if plan.pages.is_empty() {
+        next.root = 0;
+        return Ok(next);
+    }
+    if start < base.end || start % PAGE_BYTES as u64 != 0 {
+        return Err(Error::Invalid("invalid append reservation"));
+    }
+    let pages_bytes = (plan.pages.len() as u64)
+        .checked_mul(PAGE_BYTES as u64)
+        .ok_or(Error::Invalid("append reservation overflow"))?;
+    let end = start
+        .checked_add(pages_bytes)
+        .filter(|end| *end <= i64::MAX as u64)
+        .ok_or(Error::Invalid("file size exhausted"))?;
+    let mut offsets = Vec::with_capacity(plan.pages.len());
+    for index in 0..plan.pages.len() {
+        offsets.push(start + index as u64 * PAGE_BYTES as u64);
+    }
+
+    for (index, page) in plan.pages.iter().enumerate() {
+        let mut bytes = [0; PAGE_BYTES];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..16].copy_from_slice(&offsets[index].to_le_bytes());
+        bytes[16..24].copy_from_slice(&next.generation.to_le_bytes());
+        bytes[24] = page.level;
+        bytes[26..28].copy_from_slice(&(page.entries.len() as u16).to_le_bytes());
+        let width = stride(next.layout, page.level);
+        let key_bytes = usize::from(next.layout.key_bytes);
+        for (position, entry) in page.entries.iter().enumerate() {
+            let entry_start = PREFIX + position * width;
+            bytes[entry_start..entry_start + key_bytes].copy_from_slice(&entry.key);
+            let body = entry_start + key_bytes;
+            match &entry.value {
+                PlannedValue::Inline(value) if page.level == 0 => {
+                    bytes[body..body + 2].copy_from_slice(&(value.len() as u16).to_le_bytes());
+                    bytes[body + 2..body + 2 + value.len()].copy_from_slice(value);
+                }
+                PlannedValue::Child(reference) if page.level != 0 => {
+                    let child_offset = match reference {
+                        PageRef::Existing(offset) => *offset,
+                        PageRef::New(page_id) => *offsets
+                            .get(*page_id)
+                            .ok_or(Error::Corrupt("forward reference in tree plan"))?,
+                    };
+                    bytes[body..body + 8].copy_from_slice(&child_offset.to_le_bytes());
+                }
+                _ => return Err(Error::Corrupt("planned tree value at invalid level")),
+            }
+        }
+        format::seal(&mut bytes);
+        counters.page_writes.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = file.write_all_at(&bytes, offsets[index]);
+        counters
+            .page_write_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result?;
+    }
+    next.root = match plan.root {
+        Some(PageRef::Existing(offset)) => offset,
+        Some(PageRef::New(page_id)) => *offsets
+            .get(page_id)
+            .ok_or(Error::Corrupt("tree root reference outside plan"))?,
+        None => 0,
+    };
+    next.end = end;
+    Ok(next)
 }
 
 pub(crate) fn get(

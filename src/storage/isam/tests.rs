@@ -127,7 +127,14 @@ fn persists_ordered_ranges_and_reopens_without_sqlite() {
         .map(|e| e.unwrap().file_name())
         .collect();
     names.sort();
-    assert_eq!(names, ["records.isam", "records.isam.writer.lock"]);
+    assert_eq!(
+        names,
+        [
+            "records.isam",
+            "records.isam.keylocks",
+            "records.isam.writer.lock"
+        ]
+    );
 }
 
 #[test]
@@ -193,6 +200,47 @@ fn snapshots_do_not_block_writes_and_reused_handles_refresh() {
 }
 
 #[test]
+fn writable_open_migrates_a_missing_key_lock_sidecar_after_read_only_open() {
+    let (directory, store) = open_fixture(2, 4);
+    let path = directory.path().join("records.isam");
+    drop(store);
+    let key_locks = directory.path().join("records.isam.keylocks");
+    std::fs::remove_file(&key_locks).unwrap();
+
+    let mut reader = Store::open_read_only(&path).unwrap();
+    assert!(!key_locks.exists());
+    assert!(matches!(
+        reader.write_batch(&[Mutation::insert(b"aa", b"v")]),
+        Err(Error::ReadOnly)
+    ));
+    drop(reader);
+
+    let mut writer = Store::open(&path).unwrap();
+    assert_eq!(std::fs::metadata(&key_locks).unwrap().len(), 4096);
+    writer
+        .write_batch(&[Mutation::insert(b"aa", b"v")])
+        .unwrap();
+    assert_eq!(
+        writer.read_batch().unwrap().get(b"aa").unwrap(),
+        Some(b"v".to_vec())
+    );
+}
+
+#[test]
+fn writable_open_rejects_a_malformed_key_lock_sidecar() {
+    let (directory, store) = open_fixture(2, 4);
+    let key_locks = directory.path().join("records.isam.keylocks");
+    drop(store);
+    std::fs::write(&key_locks, [0_u8; 4096]).unwrap();
+
+    assert!(matches!(
+        Store::open(directory.path().join("records.isam")),
+        Err(Error::Corrupt(_))
+    ));
+    assert_eq!(std::fs::metadata(key_locks).unwrap().len(), 4096);
+}
+
+#[test]
 fn one_read_admission_covers_many_records_and_counts_logical_io() {
     let (_directory, mut store) = open_fixture(9, 32);
     let mutations: Vec<_> = (0..36_u16)
@@ -222,6 +270,213 @@ fn one_read_admission_covers_many_records_and_counts_logical_io() {
 }
 
 #[test]
+fn disjoint_same_file_writers_prepare_concurrently_and_rebase_roots() {
+    let (directory, _created) = open_fixture(2, 4);
+    let path = directory.path().join("records.isam");
+    let first_key = b"aa";
+    let second_key = (0_u8..=u8::MAX)
+        .map(|byte| [b'k', byte])
+        .find(|candidate| {
+            locking::key_lock_stripe(first_key) != locking::key_lock_stripe(candidate)
+        })
+        .unwrap();
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let mut observer = Store::open(&path).unwrap();
+    let first_paused = std::sync::atomic::AtomicBool::new(false);
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let first_writer = std::thread::spawn(move || {
+        let mut first = first;
+        first.write_with_hook(&[Mutation::insert(first_key, b"one")], |point| {
+            if point == CommitPoint::PagesSynced
+                && !first_paused.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                prepared_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(())
+        })
+    });
+    if prepared_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+        let _ = release_tx.send(());
+        let _ = first_writer.join();
+        panic!("first same-file writer did not reach page preparation");
+    }
+
+    let (second_prepared_tx, second_prepared_rx) = std::sync::mpsc::channel();
+    let second_writer = std::thread::spawn(move || {
+        let mut second = second;
+        second.write_with_hook(&[Mutation::insert(second_key, b"two")], |point| {
+            if point == CommitPoint::PagesSynced {
+                second_prepared_tx.send(()).unwrap();
+            }
+            Ok(())
+        })
+    });
+    if second_prepared_rx
+        .recv_timeout(Duration::from_secs(3))
+        .is_err()
+    {
+        release_tx.send(()).unwrap();
+        let _ = first_writer.join();
+        let _ = second_writer.join();
+        panic!("disjoint same-file writer could not prepare concurrently");
+    }
+    second_writer.join().unwrap().unwrap();
+    assert_eq!(
+        observer.read_batch().unwrap().get(&second_key).unwrap(),
+        Some(b"two".to_vec()),
+        "a reader must observe a disjoint writer while another writer is prepared"
+    );
+    release_tx.send(()).unwrap();
+    first_writer.join().unwrap().unwrap();
+
+    let read = observer.read_batch().unwrap();
+    assert_eq!(read.get(first_key).unwrap(), Some(b"one".to_vec()));
+    assert_eq!(read.get(&second_key).unwrap(), Some(b"two".to_vec()));
+    assert_eq!(read.verify().unwrap(), 2);
+}
+
+#[test]
+fn same_key_writers_serialize_and_the_waiter_rebases() {
+    let (directory, mut created) = open_fixture(2, 4);
+    created
+        .write_batch(&[Mutation::insert(b"aa", b"old")])
+        .unwrap();
+    let path = directory.path().join("records.isam");
+    let first = Store::open(&path).unwrap();
+    let sibling = Store::open(&path).unwrap();
+    let mut second = Store::open_with_policy(
+        &path,
+        LockPolicy::new(Duration::from_secs(2), Duration::from_millis(2)).unwrap(),
+    )
+    .unwrap();
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let first_writer = std::thread::spawn(move || {
+        let mut first = first;
+        first.write_with_hook(&[Mutation::put(b"aa", b"one")], |point| {
+            if point == CommitPoint::PagesSynced {
+                prepared_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(())
+        })
+    });
+    prepared_rx.recv().unwrap();
+    drop(sibling);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let second_writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = second.write_batch(&[Mutation::put(b"aa", b"two")]);
+        done_tx.send(result.is_ok()).unwrap();
+        result
+    });
+    started_rx.recv().unwrap();
+    assert!(
+        done_rx.try_recv().is_err(),
+        "same-key writer must wait for the owning stripe"
+    );
+    release_tx.send(()).unwrap();
+    first_writer.join().unwrap().unwrap();
+    second_writer.join().unwrap().unwrap();
+    assert_eq!(
+        created.read_batch().unwrap().get(b"aa").unwrap(),
+        Some(b"two".to_vec())
+    );
+}
+
+#[test]
+fn key_lock_worker() {
+    let Some(path) = std::env::var_os("BRISK_ISAM_KEY_LOCK_PATH") else {
+        return;
+    };
+    let key = std::env::var("BRISK_ISAM_KEY_LOCK_KEY").unwrap();
+    let ready = PathBuf::from(std::env::var_os("BRISK_ISAM_KEY_LOCK_READY").unwrap());
+    let store = Store::open(path).unwrap();
+    let key_lock = store
+        .key_locks
+        .as_ref()
+        .expect("writable test store has key locks")
+        .acquire_stripes(
+            &[key.as_bytes()],
+            LockPolicy::default().deadline(),
+            LockPolicy::default().interval(),
+            &store.counters,
+        )
+        .unwrap();
+    std::fs::write(ready, b"ready").unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    drop(key_lock);
+}
+
+#[test]
+fn key_lock_ranges_are_process_visible_and_release_on_exit() {
+    let (directory, _created) = open_fixture(2, 4);
+    let path = directory.path().join("records.isam");
+    let ready = directory.path().join("child-ready");
+    let key = b"aa";
+    let store = Store::open(&path).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "storage::isam::tests::key_lock_worker"])
+        .env("BRISK_ISAM_KEY_LOCK_PATH", &path)
+        .env("BRISK_ISAM_KEY_LOCK_KEY", std::str::from_utf8(key).unwrap())
+        .env("BRISK_ISAM_KEY_LOCK_READY", &ready)
+        .spawn()
+        .unwrap();
+    while !ready.exists() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(
+        store
+            .key_locks
+            .as_ref()
+            .expect("writable test store has key locks")
+            .acquire_stripes(
+                &[key],
+                LockPolicy::new(Duration::from_millis(15), Duration::from_millis(2))
+                    .unwrap()
+                    .deadline(),
+                Duration::from_millis(2),
+                &store.counters,
+            ),
+        Err(Error::Busy)
+    ));
+    let distinct_key = (0_u8..=u8::MAX)
+        .map(|byte| [b'k', byte])
+        .find(|candidate| locking::key_lock_stripe(key) != locking::key_lock_stripe(candidate))
+        .unwrap();
+    let distinct_lock = store
+        .key_locks
+        .as_ref()
+        .expect("writable test store has key locks")
+        .acquire_stripes(
+            &[&distinct_key],
+            LockPolicy::default().deadline(),
+            LockPolicy::default().interval(),
+            &store.counters,
+        )
+        .unwrap();
+    drop(distinct_lock);
+    assert!(child.wait().unwrap().success());
+    store
+        .key_locks
+        .as_ref()
+        .expect("writable test store has key locks")
+        .acquire_stripes(
+            &[key],
+            LockPolicy::default().deadline(),
+            LockPolicy::default().interval(),
+            &store.counters,
+        )
+        .unwrap();
+}
+
+#[test]
 fn operation_stats_handle_observes_close_after_store_drop() {
     let (directory, mut store) = open_fixture(2, 4);
     store
@@ -230,13 +485,13 @@ fn operation_stats_handle_observes_close_after_store_drop() {
     drop(store);
     let store = Store::open(directory.path().join("records.isam")).unwrap();
     let stats = store.operation_stats_handle();
-    assert_eq!(stats.snapshot().file_opens, 2);
-    assert_eq!(stats.snapshot().file_stats, 3);
+    assert_eq!(stats.snapshot().file_opens, 3);
+    assert!(stats.snapshot().file_stats >= 4);
     assert!(stats.snapshot().root_read_ns > 0);
     assert!(stats.snapshot().page_read_ns > 0);
     assert_eq!(stats.snapshot().file_closes, 0);
     drop(store);
-    assert_eq!(stats.snapshot().file_closes, 2);
+    assert_eq!(stats.snapshot().file_closes, 3);
 }
 
 #[test]
@@ -451,6 +706,23 @@ fn lock_retries_are_bounded_and_can_succeed_after_release() {
     ));
     drop(lock);
     peer.write_batch(&[Mutation::insert(b"aa", b"x")]).unwrap();
+    let key_lock = writer
+        .key_locks
+        .as_ref()
+        .unwrap()
+        .acquire_stripes(
+            &[b"aa"],
+            LockPolicy::default().deadline(),
+            LockPolicy::default().interval(),
+            &writer.counters,
+        )
+        .unwrap();
+    assert!(matches!(
+        peer.write_batch(&[Mutation::put(b"aa", b"y")]),
+        Err(Error::Busy)
+    ));
+    drop(key_lock);
+    peer.write_batch(&[Mutation::put(b"aa", b"y")]).unwrap();
 }
 
 #[test]
