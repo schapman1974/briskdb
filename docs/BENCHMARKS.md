@@ -256,6 +256,64 @@ operating-system caches after Criterion's warm-up period; neither measures first
 process access or a cold page cache. A deliberate change to either workload
 contract must be documented before comparing it with an older result.
 
+## Experimental ISAM and SQLite comparison
+
+Issue [#536](https://github.com/schapman1974/briskdb/issues/536) adds a
+release-mode comparative harness for the opt-in original ISAM store, the
+existing BriskDB SQLite backend, and a raw fixed-record file control. It is
+diagnostic, ignored by normal test runs, and does not create performance
+thresholds or qualify NFS/EFS.
+
+Run a short smoke test with five samples:
+
+```bash
+BRISKDB_ISAM_BENCH_SAMPLES=5 \
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+cargo test --locked --no-default-features \
+  --features embedded,experimental-isam \
+  --test isam_benchmark release_isam_sqlite_comparison -- \
+  --ignored --exact --nocapture
+```
+
+For a candidate comparison, use a quiet host and release mode with the default
+100 samples:
+
+```bash
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+BRISKDB_ISAM_BENCH_OUTPUT=target/isam-benchmark.tsv \
+cargo test --release --locked --no-default-features \
+  --features embedded,experimental-isam \
+  --test isam_benchmark release_isam_sqlite_comparison -- \
+  --ignored --exact --nocapture
+```
+
+`BRISKDB_ISAM_BENCH_SAMPLES` changes the sample count; at least two are
+required. The TSV reports mean/low/high and p50/p95/p99 elapsed time,
+workload-iteration throughput, ISAM logical page/root read/write counts, sync
+calls, retained data/lock descriptor opens/closes, lock requests/retries/wait
+time, and process peak RSS. The revision field is supplied explicitly so the
+artifact records the tested tree. Criterion is not required: samples and
+machine-readable results are produced by this bounded harness.
+
+The paired fixtures use the same 11-byte key and 128-byte payload, a single
+logical routing key, and 36-row chapter-style ranges. BriskDB SQLite uses two
+physical shards because the public database requires at least two; every row
+and operation is routed to the same shard. Both database paths retain open
+handles for warm operations. The measured workloads are open-existing,
+point-read, range-36, atomic 36-row insert, 36-row refresh, 36-row delete,
+same-key duplicate rejection, and synchronized four-writer disjoint-key waves.
+Writes use each backend's normal durable commit path; the SQLite fixture uses
+BriskDB's existing local WAL/FULL policy.
+
+The raw flat-file control provides direct fixed-offset point/range reads and
+36-record overwrite+sync timings. It has no database lock, atomic batch, index,
+or recovery semantics; treat it as a simple filesystem floor, not an
+equivalent database competitor. SQLite logical I/O/RPC counts are unavailable
+from this harness. ISAM counters are application call counts, not syscall,
+filesystem metadata, or NFS RPC counts; collect actual NFS/EFS RPC telemetry
+separately. Peak RSS is process-wide for the full harness, not per operation.
+Local results on macOS/Linux do not predict shared-filesystem performance.
+
 ## Run and compare
 
 First verify the workloads. Dedicated tests assert exact read results,

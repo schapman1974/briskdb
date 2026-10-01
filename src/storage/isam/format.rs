@@ -1,4 +1,5 @@
-use super::{Error, Layout, Result};
+use super::{Error, Layout, OperationCounters, Result};
+use std::sync::atomic::Ordering;
 use std::{fs::File, os::unix::fs::FileExt};
 
 pub(crate) const PAGE_BYTES: usize = 4096;
@@ -30,7 +31,11 @@ pub(crate) fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-pub(crate) fn write_snapshot(file: &File, snapshot: Snapshot) -> Result<()> {
+pub(super) fn write_snapshot(
+    file: &File,
+    snapshot: Snapshot,
+    counters: &OperationCounters,
+) -> Result<()> {
     let mut bytes = [0; PAGE_BYTES];
     bytes[..8].copy_from_slice(MAGIC);
     bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
@@ -40,6 +45,7 @@ pub(crate) fn write_snapshot(file: &File, snapshot: Snapshot) -> Result<()> {
     bytes[24..32].copy_from_slice(&snapshot.root.to_le_bytes());
     bytes[32..40].copy_from_slice(&snapshot.end.to_le_bytes());
     seal(&mut bytes);
+    counters.root_writes.fetch_add(1, Ordering::Relaxed);
     file.write_all_at(&bytes, (snapshot.generation % 2) * PAGE_BYTES as u64)?;
     Ok(())
 }
@@ -81,7 +87,10 @@ fn decode(bytes: &[u8], slot: u64) -> Result<Option<Snapshot>> {
 }
 
 /// One root read per batch, not a stat/open/catalog lookup for each record.
-pub(crate) fn read_snapshot(file: &File) -> Result<Snapshot> {
+pub(super) fn read_snapshot(file: &File, counters: Option<&OperationCounters>) -> Result<Snapshot> {
+    if let Some(counters) = counters {
+        counters.root_reads.fetch_add(1, Ordering::Relaxed);
+    }
     let mut bytes = [0; HEADER_BYTES as usize];
     file.read_exact_at(&mut bytes, 0).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {

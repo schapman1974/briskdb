@@ -1,8 +1,9 @@
-use super::{Error, Result};
+use super::{Error, OperationCounters, Result};
 use std::{
     fs::File,
     io,
     os::fd::AsRawFd,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -40,7 +41,26 @@ pub(crate) struct Guard<'a> {
 }
 
 impl<'a> Guard<'a> {
+    #[cfg(test)]
     pub(crate) fn acquire(file: &'a File, exclusive: bool, policy: LockPolicy) -> Result<Self> {
+        Self::acquire_inner(file, exclusive, policy, None)
+    }
+
+    pub(super) fn acquire_counted(
+        file: &'a File,
+        exclusive: bool,
+        policy: LockPolicy,
+        counters: &OperationCounters,
+    ) -> Result<Self> {
+        Self::acquire_inner(file, exclusive, policy, Some(counters))
+    }
+
+    fn acquire_inner(
+        file: &'a File,
+        exclusive: bool,
+        policy: LockPolicy,
+        counters: Option<&OperationCounters>,
+    ) -> Result<Self> {
         let operation = if exclusive {
             libc::LOCK_EX
         } else {
@@ -48,8 +68,16 @@ impl<'a> Guard<'a> {
         } | libc::LOCK_NB;
         let started = Instant::now();
         loop {
+            if let Some(counters) = counters {
+                counters.lock_requests.fetch_add(1, Ordering::Relaxed);
+            }
             // SAFETY: the borrowed descriptor is live; flock retains no pointer.
             if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                if let Some(counters) = counters {
+                    counters
+                        .lock_wait_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 return Ok(Self {
                     file,
                     owner_pid: std::process::id(),
@@ -61,10 +89,23 @@ impl<'a> Guard<'a> {
             {
                 return Err(error.into());
             }
+            if let Some(counters) = counters {
+                counters.lock_retries.fetch_add(1, Ordering::Relaxed);
+            }
             let Some(left) = policy.timeout.checked_sub(started.elapsed()) else {
+                if let Some(counters) = counters {
+                    counters
+                        .lock_wait_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 return Err(Error::Busy);
             };
             if left.is_zero() {
+                if let Some(counters) = counters {
+                    counters
+                        .lock_wait_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 return Err(Error::Busy);
             }
             std::thread::sleep(left.min(policy.interval));

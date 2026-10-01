@@ -6,6 +6,18 @@ store. It is an original BriskDB format, not VBISAM, and is not selected by
 default. There is no format conversion, catalog, secondary index, compaction,
 or NFS/EFS qualification.
 
+## Logical operation diagnostics
+
+Each `Store` exposes a snapshot of its per-handle logical operation counters;
+an `OperationStatsHandle` can retain access to final close counts after the
+store is dropped. Counters include data/sidecar opens and closes, root and
+tree-page reads/writes, sync calls, lock requests/retries, and accumulated
+lock-admission wait time. They count application-level calls, not kernel
+syscalls, filesystem metadata operations, or NFS RPCs. They do not include
+directory opens or measure time spent in page I/O, serialization, or root
+publication. Use external filesystem/client telemetry when measuring remote
+filesystem traffic.
+
 ## Identity, creation, and locking
 
 `Store::create` uses create-new semantics for the data file and never adopts or
