@@ -113,6 +113,9 @@ mysql = []
 # Statically compile rusqlite's virtual-table API for the no-fork sharded-table
 # prototype. This does not enable SQLite's runtime extension loader.
 experimental-vtab = ["rusqlite/vtab"]
+# Original, experimental indexed-record storage primitives (Unix only).
+# This is not yet a SQL/document backend and never changes SQLite defaults.
+experimental-isam = []
 
 [dependencies]
 anyhow = { version = "1.0", optional = true }

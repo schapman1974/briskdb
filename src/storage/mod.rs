@@ -2,6 +2,8 @@
 
 pub(crate) mod contention;
 mod document;
+#[cfg(all(unix, feature = "experimental-isam"))]
+pub mod isam;
 mod profile;
 #[cfg(feature = "documents")]
 pub(crate) use document::{

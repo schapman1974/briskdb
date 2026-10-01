@@ -1,3 +1,71 @@
+# Experimental original ISAM record-store format
+
+The Unix-only `experimental-isam` feature exposes an unreleased, opt-in record
+store. It is an original BriskDB format, not VBISAM, and is not selected by
+`BriskDb`, SQL, document, Python, or wire APIs. SQLite remains the supported
+default. There is no format conversion, catalog, secondary index, compaction,
+or NFS/EFS qualification.
+
+## Identity, creation, and locking
+
+`Store::create` uses create-new semantics for the data file and never adopts or
+truncates an existing path. A store at `name.isam` has a separate
+`name.isam.writer.lock` sidecar. Both must be regular files with one hard link
+and owner-only permissions; final path components are opened without following
+symlinks. The identity currently consists of these retained file descriptors
+and their inode identities, the `BRISAM01` format marker/version, and the
+selected root tuple `(layout, generation, root offset, committed end)`. The
+format does not yet contain a persistent database UUID or detect replacement
+of a path while a handle is live. Do not rename, unlink, replace, or recreate
+either file while any process may hold it; external replacement is unsupported.
+
+The data file's advisory shared lock protects a short snapshot/root read; the
+exclusive lock protects root publication. The sidecar's exclusive lock
+currently serializes each writer's full prepare-and-publish operation.
+Immutable copy-on-write pages let an already captured snapshot be read without
+holding a lock for every record. These are local Unix semantics only: they do
+not establish NFSv4/EFS lock visibility, freshness, or stale-writer safety.
+
+Creation writes two 4096-byte root slots, writes generation 1 in slot 1, syncs
+the data and sidecar, and syncs the parent directory. An error during creation
+can leave an absent, incomplete, or apparently complete file/sidecar pair;
+there is no automatic repair or cleanup. `open` never initializes missing
+files. Inspect and remove a failed creation only after confirming no process
+can still hold either file. A lock sidecar is never safely removed while the
+store may be live.
+
+## Version 1 layout and bounds
+
+Each root slot has magic `BRISAM01`, little-endian format version `1`, persisted
+fixed key width and maximum value width, generation, root page offset, committed
+file end, zeroed reserved bytes, and a BLAKE3 checksum over the preceding 4064
+bytes. Generation parity selects its slot. When both slots validate they must
+have the same layout and adjacent generations; the higher generation is the
+snapshot. Unknown versions, invalid checksummed fields, and malformed pages
+are rejected. A checksum is corruption detection, not authentication.
+
+Tree pages are 4096 bytes, have magic `BRIPAGE1`, their own offset and
+generation, level and entry count, sorted keys, zero padding, and a BLAKE3
+checksum. Leaves store bounded values; branches store each child's maximum key
+and page offset. Pages are append-only and copy-on-write. Keys are fixed-width
+unsigned byte strings ordered lexicographically. Key widths are 1–128 bytes,
+values are 0–1024 bytes, batches and range results are capped at 4096 records,
+tree depth at 31, and file offsets at `i64::MAX`. Capacity is determined by
+the persisted layout and page format.
+
+A commit writes changed pages, syncs the data file, writes the alternate root
+slot, then syncs the data file again. Failures before root publication are
+reported as uncommitted I/O errors; a root write or final sync failure is
+reported as `CommitUnknown` and must be reconciled, not blindly retried. A
+process-exit test is not a power-loss test. A damaged root slot may be treated
+as an interrupted alternate-slot write and the other valid slot selected; the
+durable-recovery issue must still resolve how to distinguish that case from
+later corruption of an acknowledged root. Do not infer power-loss guarantees
+from local tests.
+
+Old pages accumulate. Snapshot bounds, reclamation, native catalog/query/API
+support, and NFS/EFS qualification are separate work.
+
 # Manifest storage format and migrations
 
 `manifest.sqlite` is BriskDB-owned storage. It is not a user database and is

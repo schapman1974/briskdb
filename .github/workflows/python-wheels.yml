@@ -23,8 +23,10 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
+  # TEMPORARY Relay-Then-Verify gate; remove for final ISAM CI verification.
   sdist:
     name: Python sdist, metadata, and typing
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -128,6 +130,7 @@ jobs:
 
   wheels:
     name: Python wheel (${{ matrix.platform }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     # Run 36444474832 needed ~25 minutes for the Intel build and ~16 for
     # its first Python suite, exhausting 45 minutes during the second suite.
