@@ -246,6 +246,38 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Replace a flat role's document policy without changing memberships.
+    /// Requires explicit RevokeRole on all security realms and, when replacing
+    /// privileges (including an empty list), GrantRole on the target realm.
+    /// `None` clears the already-empty inheritance list without editing grants.
+    /// Authorization and replacement share one refreshed catalog revision.
+    pub async fn update_document_role(
+        &self,
+        session: &Session,
+        context: RequestContext,
+        name: SecurityName,
+        replacement: Option<crate::core::authorization::Policy>,
+    ) -> EngineResult<()> {
+        let mut operation = self.operation_lifecycle(context)?;
+        let _session = operation.wait_pending(self.ready_session(session)).await?;
+        let principal = session.principal.clone().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::PermissionDenied,
+                "authentication is required",
+            )
+        })?;
+        if let Some(policy) = &replacement {
+            crate::core::security_catalog::validate_document_role_policy(&name, policy)?;
+        }
+        operation.check_before_start()?;
+        let result = self
+            .security_call_from_parent(&operation, move |authority| {
+                authority.update_document_role_authorized(&principal, &name, replacement)
+            })
+            .await;
+        operation.finish(result)
+    }
+
     /// Remove exact database-local document action/scope pairs. Requires current
     /// RevokeRole on the exact realm before lookup, even for empty/no-op removal.
     /// Existing memberships and unrelated/internal database admission grants are

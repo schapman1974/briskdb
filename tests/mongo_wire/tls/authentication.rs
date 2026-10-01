@@ -32,6 +32,8 @@ mod grant_role_privileges;
 
 #[path = "authentication/revoke_role_privileges.rs"]
 mod revoke_role_privileges;
+#[path = "authentication/update_role.rs"]
+mod update_role;
 
 fn assert_audit_fields(events: &[capture::Fields]) {
     let mut connections = std::collections::BTreeMap::new();

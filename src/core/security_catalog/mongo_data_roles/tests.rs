@@ -1,6 +1,101 @@
 use super::*;
 
 #[test]
+fn document_role_replacement_rejects_affected_user_union_overflow_atomically() {
+    use super::super::tests::credential;
+    let mut catalog = SecurityCatalog::new();
+    let role = SecurityName::new("app", "target").unwrap();
+    let other = SecurityName::new("app", "other").unwrap();
+    catalog
+        .create_role(role.clone(), Policy::default())
+        .unwrap();
+    catalog
+        .create_role(
+            other.clone(),
+            Policy::new((0..256).map(|n| exact_grant(&format!("c{n}")))).unwrap(),
+        )
+        .unwrap();
+    catalog
+        .create_user(
+            SecurityName::new("accounts", "alice").unwrap(),
+            credential(),
+            [role.clone(), other],
+        )
+        .unwrap();
+    let before = catalog.to_record().unwrap();
+    assert_eq!(
+        catalog
+            .update_document_role(&role, Some(Policy::new([exact_grant("extra")]).unwrap()))
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::LimitExceeded
+    );
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    // A duplicate grant at the union bound is still a valid replacement.
+    catalog
+        .update_document_role(&role, Some(Policy::new([exact_grant("c0")]).unwrap()))
+        .unwrap();
+}
+
+#[test]
+fn document_role_replacement_clears_policy_but_preserves_members_and_other_roles() {
+    use super::super::tests::{credential, login};
+    let mut catalog = SecurityCatalog::new();
+    let role = SecurityName::new("app", "custom").unwrap();
+    let backup = SecurityName::new("app", "backup").unwrap();
+    let user = SecurityName::new("accounts", "alice").unwrap();
+    let resource = Resource::object(DataDomain::Document, "app", "posts").unwrap();
+    catalog
+        .create_role(
+            role.clone(),
+            MongoDataRole::ReadWrite.policy("app").unwrap(),
+        )
+        .unwrap();
+    catalog
+        .create_role(backup.clone(), Policy::new([exact_grant("posts")]).unwrap())
+        .unwrap();
+    catalog
+        .create_user(user.clone(), credential(), [role.clone(), backup.clone()])
+        .unwrap();
+    let before = catalog.to_record().unwrap();
+    catalog.update_document_role(&role, None).unwrap();
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    let broad =
+        Policy::new([
+            Privilege::new(Action::ReadData, Scope::all_databases(DataDomain::Document)).unwrap(),
+        ])
+        .unwrap();
+    assert!(catalog.update_document_role(&role, Some(broad)).is_err());
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+    catalog
+        .update_document_role(&role, Some(Policy::default()))
+        .unwrap();
+    assert_eq!(catalog.roles[&role], Policy::default());
+    assert_eq!(
+        catalog.users[&user].roles,
+        BTreeSet::from([role.clone(), backup])
+    );
+    catalog
+        .authorize(&login(&catalog, &user), Action::ReadData, &resource)
+        .unwrap();
+    assert!(
+        catalog
+            .authorize(&login(&catalog, &user), Action::InsertData, &resource)
+            .is_err()
+    );
+    let restored = SecurityCatalog::from_record(catalog.to_record().unwrap().as_bytes()).unwrap();
+    assert_eq!(catalog.roles, restored.roles);
+    assert_eq!(catalog.users[&user].roles, restored.users[&user].roles);
+    let before = catalog.to_record().unwrap();
+    assert!(
+        catalog
+            .update_document_role(&SecurityName::new("app", "missing").unwrap(), None)
+            .is_err()
+    );
+    assert_eq!(before.as_bytes(), catalog.to_record().unwrap().as_bytes());
+}
+
+#[test]
 fn document_role_revocation_matches_pairs_not_coverage_and_preserves_other_grants() {
     use super::super::tests::{credential, login};
     let mut catalog = SecurityCatalog::new();

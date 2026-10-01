@@ -82,6 +82,67 @@ enum PolicyCommand {
     Revoke,
 }
 
+pub(super) fn prepare_update(
+    request: &Request,
+    started: Instant,
+    limits: super::super::MongoResourceLimits,
+) -> Result<Prepared> {
+    if request.more_to_come || request.legacy_handshake || !request.sequences.is_empty() {
+        return Err(CommandError::options());
+    }
+    if request.database == "local" {
+        return Err(CommandError::unsupported());
+    }
+    let allowed = ["updateRole", "privileges", "roles", "writeConcern", "$db"];
+    let mut seen = 0u8;
+    for (field, value) in request.body.iter() {
+        let index = allowed
+            .iter()
+            .position(|candidate| *candidate == field)
+            .ok_or_else(CommandError::options)?;
+        if seen & (1 << index) != 0 {
+            return Err(CommandError::invalid());
+        }
+        seen |= 1 << index;
+        if field == "writeConcern" {
+            users::write_concern(value)?;
+        }
+    }
+    let Some(BsonValue::String(name)) = request.body.get_first("updateRole") else {
+        return Err(CommandError::invalid());
+    };
+    let name = SecurityName::new(&request.database, name)?;
+    if let Some(value) = request.body.get_first("roles") {
+        let BsonValue::Array(roles) = value else {
+            return Err(CommandError::invalid());
+        };
+        if !roles.is_empty() {
+            return Err(CommandError::options());
+        }
+    }
+    let replacement = match request.body.get_first("privileges") {
+        Some(BsonValue::Array(privileges)) => {
+            Some(data_policy(&request.database, privileges, true)?)
+        }
+        Some(_) => return Err(CommandError::invalid()),
+        None if request.body.get_first("roles").is_some() => None,
+        None => return Err(CommandError::invalid()),
+    };
+    let deadline = started + limits.command_timeout();
+    if Instant::now() >= deadline {
+        return Err(CommandError::new(
+            50,
+            "MaxTimeMSExpired",
+            "command deadline exceeded",
+        ));
+    }
+    Ok(Prepared {
+        command: Command::UpdateRole(name, replacement),
+        deadline,
+        advisory_hint: false,
+    })
+}
+
 fn prepare_policy(
     request: &Request,
     started: Instant,

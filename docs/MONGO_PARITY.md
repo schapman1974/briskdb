@@ -943,8 +943,8 @@ references. Account commands cannot target `local`. Passwords are bounded to
 `digestPassword` must be `true`; write concern must be omitted, `{}` or `{w: 1}`.
 Unknown/duplicate fields, unacknowledged writes, SHA-1, pre-digested passwords,
 custom data, authentication restrictions, comments, role-array replacement in
-`updateUser`, `updateRole` and inherited role definitions are unsupported. The
-bounded `createRole` subset is documented below. Catalog
+`updateUser` and inherited role definitions are unsupported. The
+bounded `createRole` and `updateRole` subsets are documented below. Catalog
 existence/conflict errors currently use BriskDB's generic wire error mapping,
 not every MongoDB administration-specific error code.
 
@@ -1046,7 +1046,7 @@ authorized catalog revision and never automatically replays a conflicting or
 uncertain write. Already-admitted work is not retroactively cancelled; a timeout
 after blocking work starts can leave an uncertain outcome. Sync/async PyMongo,
 live cursor revocation, independent-engine refresh and recreation/reopen are
-covered. This does not add `updateRole`, inheritance, automatic built-in
+covered. This does not add inheritance, automatic built-in
 roles, or Python/daemon/composed authenticated-host configuration; #188 stays open.
 
 `createRole` supports flat, database-local custom data roles through the same
@@ -1131,8 +1131,8 @@ same current authority, session ownership and request controls. Authorization
 and publication share a single catalog revision, with no automatic replay after
 conflict or uncertain timeout. Live clients, independent-engine refresh,
 credential/administrator revocation, policy-limit failure and restart persistence
-are tested. Full `updateRole`, inheritance and expanded privilege export remain
-unsupported.
+are tested. Inheritance and expanded privilege export remain unsupported;
+the flat `updateRole` subset is described below.
 
 `revokePrivilegesFromRole` removes exact action/resource pairs from an existing
 database-local role. Current `RevokeRole` on the exact command database is
@@ -1172,8 +1172,38 @@ are still required. Hosts needing to remove those internal grants explicitly
 must use trusted catalog policy replacement or delete the role. Native document
 revocation rejects these internal actions as inputs as well. Input remains
 bounded to 256 privilege entries and 256 actions before deduplication; no new
-grants or memberships are introduced. Full role replacement, inheritance,
-expanded privilege export and authenticated host integration remain open.
+grants or memberships are introduced. Inheritance, expanded privilege export
+and authenticated host integration remain open.
+
+`updateRole` replaces a flat role's complete privileges while preserving its
+identity and user memberships. It uses the same database-local resource/action
+subset and strict write concerns as `createRole`. Supply `privileges`, `roles`,
+or both; the only supported `roles` value is `[]`. Omitting `privileges` with
+`roles=[]` leaves grants unchanged, whereas `privileges=[]` removes all grants
+from this role, including its internal database-admission grants. Other assigned
+roles retain their permissions. Nonempty inheritance, authentication restrictions,
+comments, cross-database and cluster grants remain unsupported.
+
+Following the [MongoDB updateRole authorization contract](https://www.mongodb.com/docs/manual/reference/command/updaterole/),
+the caller must have explicit `RevokeRole` with `Scope::all_security_realms()`;
+enumerating grants over currently existing realms is insufficient. This bounded
+implementation additionally requires `GrantRole` on the target realm whenever
+`privileges` is supplied, including an empty array. Authority is refreshed and
+checked before role lookup using the same revision as atomic publication; an
+authorized missing role returns redacted code 31. Native callers use
+`Engine::update_document_role` with `Some(policy)` for replacement and `None`
+for the empty-inheritance-only operation. Cancellation and uncertain outcomes
+follow the other role commands, with no automatic replay. Existing sessions and
+cursor continuations observe revocation at their next admission.
+
+```python
+operator.app.command(
+    "updateRole", "post_reader",
+    privileges=[{"resource": {"db": "app", "collection": "posts"},
+                 "actions": ["find"]}],
+    roles=[],
+)
+```
 
 An already-encrypted, running standalone listener can explicitly reload its
 certificate, private key and handshake budget together, without rebinding:
@@ -1837,7 +1867,7 @@ pipeline; this does not replace its matching, pagination or grouping semantics.
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task
-failures, 33 fixed command families, 32 fixed error codes plus an unknown-code
+failures, fixed command families, 32 fixed error codes plus an unknown-code
 counter, write-error occurrences and response-size rejections. Command counters
 separate started, in-flight, completed, failed, aborted and deliberately suppressed
 one-way responses. Unknown command names share `Other`; namespaces, query values,
@@ -1845,7 +1875,7 @@ identities and diagnostic text never become labels or retained metric data.
 The fixed families include SASL start/continue, legacy authentication/logout
 (including their rejected outcomes), five user-management commands, `usersInfo`,
 `rolesInfo`, `dropRole`, `createRole`, `grantPrivilegesToRole` and
-`revokePrivilegesFromRole`. Missing stored
+`revokePrivilegesFromRole` and `updateRole`. Missing stored
 roles use the fixed code-31 counter.
 Code 18 (`AuthenticationFailed`) has its own fixed error counter; command counts
 do not represent distinct users or successful logins, since a SASL exchange can

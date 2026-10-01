@@ -101,6 +101,30 @@ impl MongoDataRole {
 }
 
 impl SecurityCatalog {
+    /// Trusted replacement of the flat role's complete document policy. `None`
+    /// represents clearing the already-empty inheritance list and leaves grants
+    /// unchanged. Memberships remain attached to the existing role identity.
+    pub fn update_document_role(
+        &mut self,
+        name: &SecurityName,
+        policy: Option<Policy>,
+    ) -> EngineResult<()> {
+        if let Some(policy) = &policy {
+            validate_document_role_policy(name, policy)?;
+        }
+        if !self.roles.contains_key(name) {
+            return Err(EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                "security role does not exist",
+                RoleNotFound,
+            ));
+        }
+        if let Some(policy) = policy {
+            self.replace_role(name, policy)?;
+        }
+        Ok(())
+    }
+
     /// Trusted removal of exact action/scope pairs, not resource coverage.
     /// Preserve all other grants and memberships, including internal admission
     /// grants which may support other permissions or have been host-provisioned.
