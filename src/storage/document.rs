@@ -3098,6 +3098,11 @@ mod enabled {
                 .map_err(sqlite_error::storage)?;
             let mut ordered_audit =
                 super::ordered_storage::StartupAudit::new(ordered_statement.as_mut())?;
+            let mut equality_statement = connection
+                .prepare(super::index_storage::STARTUP_EQUALITY_SQL)
+                .map_err(sqlite_error::storage)?;
+            let mut equality_audit =
+                super::index_storage::EqualityStartupAudit::new(&mut equality_statement)?;
             let mut statement = connection.prepare(STARTUP_RECORDS_SQL).map_err(|error| {
                 shard_read_error(error, "failed to inspect stored BSON documents")
             })?;
@@ -3177,8 +3182,7 @@ mod enabled {
                         ));
                     }
                 }
-                super::index_storage::validate_equality_record_entries(
-                    &connection,
+                equality_audit.validate_record(
                     collection_id,
                     shard,
                     &id_key,
@@ -3206,6 +3210,7 @@ mod enabled {
                     .or_insert(natural_order);
             }
             ordered_audit.finish()?;
+            equality_audit.finish()?;
         }
 
         let allocators = load_natural_order_allocators(manifest_connection)?;

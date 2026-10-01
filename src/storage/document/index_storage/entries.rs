@@ -271,6 +271,46 @@ pub(in crate::storage::document) fn validate_equality_record_entries(
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<()> {
     check()?;
+    let mut statement = connection
+        .prepare_cached(RECORD_ENTRIES_SQL)
+        .map_err(|error| shard_read_error(error, "failed to inspect document index entries"))?;
+    let mut rows = statement
+        .query(params![sqlite_id(collection.get())?, id_key])
+        .map_err(|error| shard_read_error(error, "failed to inspect document index entries"))?;
+    validate_equality_rows(
+        collection,
+        shard,
+        id_key,
+        record_checksum,
+        expected,
+        check,
+        |visit| {
+            while let Some(row) = rows
+                .next()
+                .map_err(|error| shard_read_error(error, "failed to read document index entry"))?
+            {
+                visit(row)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Share exact bounded coverage validation between point queries and startup's
+/// borrowed-row stream. The visitor must supply only this source record's rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_equality_rows(
+    collection: DocumentCollectionId,
+    shard: u16,
+    id_key: &[u8],
+    record_checksum: &[u8; 32],
+    expected: Option<&PreparedDocumentIndexEntries>,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+    mut visit_rows: impl FnMut(
+        &mut dyn FnMut(&rusqlite::Row<'_>) -> EngineResult<()>,
+    ) -> EngineResult<()>,
+) -> EngineResult<()> {
+    check()?;
     let mut missing = HashMap::<u64, HashSet<&[u8]>>::new();
     let mut missing_count = 0;
     if let Some(expected) = expected {
@@ -312,16 +352,7 @@ pub(in crate::storage::document) fn validate_equality_record_entries(
             }
         }
     }
-    let mut statement = connection
-        .prepare_cached(RECORD_ENTRIES_SQL)
-        .map_err(|error| shard_read_error(error, "failed to inspect document index entries"))?;
-    let mut rows = statement
-        .query(params![sqlite_id(collection.get())?, id_key])
-        .map_err(|error| shard_read_error(error, "failed to inspect document index entries"))?;
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| shard_read_error(error, "failed to read document index entry"))?
-    {
+    visit_rows(&mut |row| {
         check()?;
         let index: i64 = row
             .get(0)
@@ -360,7 +391,8 @@ pub(in crate::storage::document) fn validate_equality_record_entries(
             ));
         }
         missing_count -= 1;
-    }
+        Ok(())
+    })?;
     if missing_count != 0 {
         return Err(corrupt(
             "document index is missing authoritative record entries",
