@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::encode_document;
 use crate::document::{
     BsonDecimal128, BsonObjectId, BsonValue, DocumentCollectionOptions, DocumentDatabaseId,
     DocumentIndexKey, DocumentIndexLifecycle, DocumentIndexMetadata, DocumentPlacement,

@@ -9,7 +9,7 @@ use crate::{
     document::{
         BsonDocument, BsonErrorContext, DocumentCandidateKind, DocumentCollectionId,
         DocumentCollectionMetadata, DocumentIndexId, DocumentIndexMetadata, DocumentMatcher,
-        DocumentReadAccess, encode_document, memory,
+        DocumentReadAccess, codec::validated_document_len, memory,
     },
 };
 use std::error::Error;
@@ -368,10 +368,9 @@ impl DocumentIndexPreparation {
         budget.charge(self.retained_bytes)?;
         // Charge traversal even for unindexed fields or an empty index set.
         // No repeated whole-document BSON allocation for each index.
-        let validated = encode_document(document)
+        let validated_len = validated_document_len(document)
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-        budget.charge(validated.len())?;
-        drop(validated);
+        budget.charge(validated_len)?;
         // The codec checks depth before the recursive heap-charge traversal.
         let bytes = memory::document_bytes(document, MAX_WORK_BYTES, &mut || budget.step())?;
         budget.charge(bytes)?;
