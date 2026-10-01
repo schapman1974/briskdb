@@ -193,6 +193,81 @@ fn snapshots_do_not_block_writes_and_reused_handles_refresh() {
 }
 
 #[test]
+fn one_read_admission_covers_many_records_and_counts_logical_io() {
+    let (_directory, mut store) = open_fixture(9, 32);
+    let mutations: Vec<_> = (0..36_u16)
+        .map(|verse| {
+            Mutation::insert(
+                format!("JHN003{verse:03}").into_bytes(),
+                format!("verse {verse}").into_bytes(),
+            )
+        })
+        .collect();
+    store.write_batch(&mutations).unwrap();
+    store.reset_operation_stats();
+
+    let batch = store.read_batch().unwrap();
+    let verses = batch.range(b"JHN003000", Some(b"JHN004000"), 36).unwrap();
+    assert_eq!(verses.len(), 36);
+    drop(batch);
+
+    let stats = store.operation_stats();
+    assert_eq!(stats.file_opens, 0);
+    assert_eq!(stats.root_reads, 1);
+    assert!(stats.root_read_ns > 0);
+    assert_eq!(stats.lock_requests, 1);
+    assert_eq!(stats.lock_retries, 0);
+    assert!(stats.page_reads < 36);
+    assert!(stats.page_read_ns > 0);
+}
+
+#[test]
+fn operation_stats_handle_observes_close_after_store_drop() {
+    let (directory, mut store) = open_fixture(2, 4);
+    store
+        .write_batch(&[Mutation::insert(b"aa", b"val")])
+        .unwrap();
+    drop(store);
+    let store = Store::open(directory.path().join("records.isam")).unwrap();
+    let stats = store.operation_stats_handle();
+    assert_eq!(stats.snapshot().file_opens, 2);
+    assert_eq!(stats.snapshot().file_stats, 3);
+    assert!(stats.snapshot().root_read_ns > 0);
+    assert!(stats.snapshot().page_read_ns > 0);
+    assert_eq!(stats.snapshot().file_closes, 0);
+    drop(store);
+    assert_eq!(stats.snapshot().file_closes, 2);
+}
+
+#[test]
+fn lock_wait_and_retries_are_included_in_operation_stats() {
+    let (directory, store) = open_fixture(2, 4);
+    let mut peer = Store::open_with_policy(
+        directory.path().join("records.isam"),
+        LockPolicy::new(Duration::from_millis(15), Duration::from_millis(2)).unwrap(),
+    )
+    .unwrap();
+    let lock = Guard::acquire(&store.writer_lock, true, LockPolicy::default()).unwrap();
+    assert!(matches!(
+        peer.write_batch(&[Mutation::insert(b"aa", b"val")]),
+        Err(Error::Busy)
+    ));
+    drop(lock);
+
+    let stats = peer.operation_stats();
+    assert!(stats.lock_requests > 0);
+    assert!(stats.lock_retries > 0);
+    assert!(stats.lock_wait_ns > 0);
+    peer.write_batch(&[Mutation::insert(b"aa", b"val")])
+        .unwrap();
+    let stats = peer.operation_stats();
+    assert!(stats.root_write_ns > 0);
+    assert!(stats.page_write_ns > 0);
+    assert!(stats.sync_ns > 0);
+    assert!(stats.publication_ns > 0);
+}
+
+#[test]
 fn readers_and_independent_file_writers_progress_during_write_preparation() {
     let (directory, mut writer) = open_fixture(2, 8);
     writer
@@ -236,7 +311,7 @@ fn interrupted_alternate_root_write_preserves_the_last_published_generation() {
     store
         .write_batch(&[Mutation::insert(b"aa", b"old")])
         .unwrap();
-    let committed = read_snapshot(&store.file).unwrap();
+    let committed = read_snapshot(&store.file, None).unwrap();
     // Damage only the inactive slot as an interrupted next-generation write
     // would do. The previously acknowledged root must remain usable.
     let inactive = ((committed.generation + 1) % 2) * format::PAGE_BYTES as u64;
@@ -278,7 +353,7 @@ fn multilevel_splits_updates_and_deletes_match_an_independent_map() {
         })
         .collect();
     store.write_batch(&initial).unwrap();
-    let initial_snapshot = read_snapshot(&store.file).unwrap();
+    let initial_snapshot = read_snapshot(&store.file, None).unwrap();
     // Small leaf/branch fanout forces both kinds of split in this fixture.
     let mut root_level = [0];
     store
@@ -393,7 +468,10 @@ fn rejects_foreign_truncated_symlinked_and_aliased_files_without_changing_them()
     assert!(Store::open(&link).is_err());
     let (_good_directory, store) = open_fixture(2, 4);
     store.file.set_len(10).unwrap();
-    assert!(matches!(read_snapshot(&store.file), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        read_snapshot(&store.file, None),
+        Err(Error::Corrupt(_))
+    ));
     let (directory, _store) = open_fixture(2, 4);
     std::fs::hard_link(
         directory.path().join("records.isam"),
@@ -425,25 +503,31 @@ fn rejects_group_or_world_access_on_data_and_lock_files() {
 fn rejects_checksummed_unknown_format_versions_and_reserved_header_bytes() {
     for version in [0_u16, 2_u16] {
         let (_directory, store) = open_fixture(2, 4);
-        let snapshot = read_snapshot(&store.file).unwrap();
+        let snapshot = read_snapshot(&store.file, None).unwrap();
         let slot = snapshot.generation % 2 * format::PAGE_BYTES as u64;
         let mut header = [0; format::PAGE_BYTES];
         store.file.read_exact_at(&mut header, slot).unwrap();
         header[8..10].copy_from_slice(&version.to_le_bytes());
         format::seal(&mut header);
         store.file.write_all_at(&header, slot).unwrap();
-        assert!(matches!(read_snapshot(&store.file), Err(Error::Corrupt(_))));
+        assert!(matches!(
+            read_snapshot(&store.file, None),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     let (_directory, store) = open_fixture(2, 4);
-    let snapshot = read_snapshot(&store.file).unwrap();
+    let snapshot = read_snapshot(&store.file, None).unwrap();
     let slot = snapshot.generation % 2 * format::PAGE_BYTES as u64;
     let mut header = [0; format::PAGE_BYTES];
     store.file.read_exact_at(&mut header, slot).unwrap();
     header[40] = 1;
     format::seal(&mut header);
     store.file.write_all_at(&header, slot).unwrap();
-    assert!(matches!(read_snapshot(&store.file), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        read_snapshot(&store.file, None),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -469,7 +553,7 @@ fn refuses_corrupt_pages_instead_of_falling_back_to_old_committed_data() {
         .write_batch(&[Mutation::insert(b"aa", b"old")])
         .unwrap();
     store.write_batch(&[Mutation::put(b"aa", b"new")]).unwrap();
-    let snapshot = read_snapshot(&store.file).unwrap();
+    let snapshot = read_snapshot(&store.file, None).unwrap();
     store
         .file
         .write_all_at(&[0xff], snapshot.root + 50)
@@ -486,7 +570,10 @@ fn refuses_corrupt_pages_instead_of_falling_back_to_old_committed_data() {
         .file
         .write_all_at(&[0xff; format::HEADER_BYTES as usize], 0)
         .unwrap();
-    assert!(matches!(read_snapshot(&store.file), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        read_snapshot(&store.file, None),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -496,7 +583,7 @@ fn rejects_checksummed_invalid_root_bounds_and_page_cycles() {
         .map(|i| Mutation::insert(wide_key(i), b"value"))
         .collect();
     store.write_batch(&operations).unwrap();
-    let snapshot = read_snapshot(&store.file).unwrap();
+    let snapshot = read_snapshot(&store.file, None).unwrap();
     let mut page = [0; format::PAGE_BYTES];
     store.file.read_exact_at(&mut page, snapshot.root).unwrap();
     assert!(page[24] > 0);
@@ -512,7 +599,10 @@ fn rejects_checksummed_invalid_root_bounds_and_page_cycles() {
     page[32..40].copy_from_slice(&1_u64.to_le_bytes());
     format::seal(&mut page);
     store.file.write_all_at(&page, header_offset).unwrap();
-    assert!(matches!(read_snapshot(&store.file), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        read_snapshot(&store.file, None),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]

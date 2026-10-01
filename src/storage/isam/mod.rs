@@ -39,6 +39,10 @@ use std::{
     io,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use format::{HEADER_BYTES, Snapshot, read_snapshot, write_snapshot};
@@ -47,6 +51,110 @@ pub use locking::LockPolicy;
 
 /// Maximum mutations in a transaction or records returned by one range call.
 pub const MAX_BATCH_RECORDS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct OperationCounters {
+    file_opens: AtomicU64,
+    file_closes: AtomicU64,
+    file_stats: AtomicU64,
+    root_reads: AtomicU64,
+    root_writes: AtomicU64,
+    page_reads: AtomicU64,
+    page_writes: AtomicU64,
+    root_read_ns: AtomicU64,
+    root_write_ns: AtomicU64,
+    page_read_ns: AtomicU64,
+    page_write_ns: AtomicU64,
+    syncs: AtomicU64,
+    sync_ns: AtomicU64,
+    publication_ns: AtomicU64,
+    lock_requests: AtomicU64,
+    lock_retries: AtomicU64,
+    lock_wait_ns: AtomicU64,
+}
+
+/// Logical operation counts and selected phase timings from this store handle.
+///
+/// These measure application-level calls and durations, not operating-system
+/// syscall totals or NFS RPCs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperationStats {
+    pub file_opens: u64,
+    pub file_closes: u64,
+    pub file_stats: u64,
+    pub root_reads: u64,
+    pub root_writes: u64,
+    pub page_reads: u64,
+    pub page_writes: u64,
+    pub root_read_ns: u64,
+    pub root_write_ns: u64,
+    pub page_read_ns: u64,
+    pub page_write_ns: u64,
+    pub syncs: u64,
+    pub sync_ns: u64,
+    pub publication_ns: u64,
+    pub lock_requests: u64,
+    pub lock_retries: u64,
+    pub lock_wait_ns: u64,
+}
+
+impl OperationCounters {
+    fn snapshot(&self) -> OperationStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        OperationStats {
+            file_opens: load(&self.file_opens),
+            file_closes: load(&self.file_closes),
+            file_stats: load(&self.file_stats),
+            root_reads: load(&self.root_reads),
+            root_writes: load(&self.root_writes),
+            page_reads: load(&self.page_reads),
+            page_writes: load(&self.page_writes),
+            root_read_ns: load(&self.root_read_ns),
+            root_write_ns: load(&self.root_write_ns),
+            page_read_ns: load(&self.page_read_ns),
+            page_write_ns: load(&self.page_write_ns),
+            syncs: load(&self.syncs),
+            sync_ns: load(&self.sync_ns),
+            publication_ns: load(&self.publication_ns),
+            lock_requests: load(&self.lock_requests),
+            lock_retries: load(&self.lock_retries),
+            lock_wait_ns: load(&self.lock_wait_ns),
+        }
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.file_opens,
+            &self.file_closes,
+            &self.file_stats,
+            &self.root_reads,
+            &self.root_writes,
+            &self.page_reads,
+            &self.page_writes,
+            &self.root_read_ns,
+            &self.root_write_ns,
+            &self.page_read_ns,
+            &self.page_write_ns,
+            &self.syncs,
+            &self.sync_ns,
+            &self.publication_ns,
+            &self.lock_requests,
+            &self.lock_retries,
+            &self.lock_wait_ns,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationStatsHandle(Arc<OperationCounters>);
+
+impl OperationStatsHandle {
+    pub fn snapshot(&self) -> OperationStats {
+        self.0.snapshot()
+    }
+}
 
 /// Errors distinguish pre-commit failures from an uncertain publication outcome.
 #[derive(Debug)]
@@ -182,6 +290,7 @@ pub struct Store {
     policy: LockPolicy,
     writable: bool,
     owner_pid: u32,
+    counters: Arc<OperationCounters>,
 }
 
 impl Store {
@@ -189,11 +298,14 @@ impl Store {
     /// A failed creation may leave an incomplete file; it is not auto-repaired.
     pub fn create(path: impl AsRef<Path>, layout: Layout) -> Result<Self> {
         let path = path.as_ref();
+        let counters = Arc::new(OperationCounters::default());
         let file = options(true).create_new(true).open(path)?;
-        let guard = Guard::acquire(&file, true, LockPolicy::default())?;
+        counters.file_opens.fetch_add(1, Ordering::Relaxed);
+        let guard = Guard::acquire_counted(&file, true, LockPolicy::default(), &counters)?;
         let writer_lock = options(true)
             .create_new(true)
             .open(writer_lock_path(path)?)?;
+        counters.file_opens.fetch_add(1, Ordering::Relaxed);
         file.set_len(HEADER_BYTES)?;
         let initial = Snapshot {
             layout,
@@ -201,16 +313,16 @@ impl Store {
             root: 0,
             end: HEADER_BYTES,
         };
-        write_snapshot(&file, initial)?;
-        file.sync_all()?;
-        writer_lock.sync_all()?;
+        write_snapshot(&file, initial, &counters)?;
+        sync_file(&file, &counters)?;
+        sync_file(&writer_lock, &counters)?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
+        sync_file(&File::open(parent)?, &counters)?;
         drop(guard);
-        Ok(Self::from_file(file, writer_lock, layout, true))
+        Ok(Self::from_file(file, writer_lock, layout, true, counters))
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -230,24 +342,34 @@ impl Store {
 
     fn open_inner(path: &Path, writable: bool, policy: LockPolicy) -> Result<Self> {
         let file = options(writable).open(path)?;
-        check_regular(&file)?;
+        let counters = Arc::new(OperationCounters::default());
+        counters.file_opens.fetch_add(1, Ordering::Relaxed);
+        check_regular(&file, &counters)?;
         let writer_lock = options(writable).open(writer_lock_path(path)?)?;
-        check_regular(&writer_lock)?;
+        counters.file_opens.fetch_add(1, Ordering::Relaxed);
+        check_regular(&writer_lock, &counters)?;
+        counters.file_stats.fetch_add(1, Ordering::Relaxed);
         if writer_lock.metadata()?.len() != 0 {
             return Err(Error::Corrupt("invalid writer lock file"));
         }
-        let guard = Guard::acquire(&file, false, policy)?;
-        let snapshot = read_snapshot(&file)?;
+        let guard = Guard::acquire_counted(&file, false, policy, &counters)?;
+        let snapshot = read_snapshot(&file, Some(&counters))?;
         if snapshot.root != 0 {
-            tree::read_node(&file, snapshot, snapshot.root)?;
+            tree::read_node(&file, snapshot, snapshot.root, &counters)?;
         }
         drop(guard);
-        let mut store = Self::from_file(file, writer_lock, snapshot.layout, writable);
+        let mut store = Self::from_file(file, writer_lock, snapshot.layout, writable, counters);
         store.policy = policy;
         Ok(store)
     }
 
-    fn from_file(file: File, writer_lock: File, layout: Layout, writable: bool) -> Self {
+    fn from_file(
+        file: File,
+        writer_lock: File,
+        layout: Layout,
+        writable: bool,
+        counters: Arc<OperationCounters>,
+    ) -> Self {
         Self {
             file,
             writer_lock,
@@ -255,11 +377,28 @@ impl Store {
             writable,
             policy: LockPolicy::default(),
             owner_pid: std::process::id(),
+            counters,
         }
     }
 
     pub const fn layout(&self) -> Layout {
         self.layout
+    }
+
+    /// Return application-level counts since the last reset.
+    pub fn operation_stats(&self) -> OperationStats {
+        self.counters.snapshot()
+    }
+
+    /// Retain a read-only view of these counters, including after the store closes.
+    pub fn operation_stats_handle(&self) -> OperationStatsHandle {
+        OperationStatsHandle(Arc::clone(&self.counters))
+    }
+
+    /// Reset application-level counts. This does not reset filesystem caches or
+    /// any server-side NFS counters.
+    pub fn reset_operation_stats(&mut self) {
+        self.counters.reset();
     }
 
     /// Configure bounded admission retries only. Mutations are never retried.
@@ -276,18 +415,19 @@ impl Store {
 
     pub fn read_batch(&mut self) -> Result<ReadBatch<'_>> {
         self.check_process()?;
-        let guard = Guard::acquire(&self.file, false, self.policy)?;
+        let guard = Guard::acquire_counted(&self.file, false, self.policy, &self.counters)?;
         let snapshot = self.snapshot()?;
         drop(guard);
         Ok(ReadBatch {
             file: &self.file,
             snapshot,
             owner_pid: self.owner_pid,
+            counters: Arc::clone(&self.counters),
         })
     }
 
     fn snapshot(&self) -> Result<Snapshot> {
-        let snapshot = read_snapshot(&self.file)?;
+        let snapshot = read_snapshot(&self.file, Some(&self.counters))?;
         if snapshot.layout != self.layout {
             return Err(Error::Corrupt("record layout changed"));
         }
@@ -323,26 +463,53 @@ impl Store {
         if mutations.is_empty() {
             return Ok(());
         }
-        let _writer = Guard::acquire(&self.writer_lock, true, self.policy)?;
-        let root_guard = Guard::acquire(&self.file, false, self.policy)?;
+        let _writer = Guard::acquire_counted(&self.writer_lock, true, self.policy, &self.counters)?;
+        let root_guard = Guard::acquire_counted(&self.file, false, self.policy, &self.counters)?;
         let mut next = self.snapshot()?;
         drop(root_guard);
         next.generation = next
             .generation
             .checked_add(1)
             .ok_or(Error::Invalid("generation exhausted"))?;
-        tree::apply_batch(&self.file, &mut next, mutations)?;
+        tree::apply_batch(&self.file, &mut next, mutations, &self.counters)?;
         hook(CommitPoint::PagesWritten)?;
-        self.file.sync_all()?;
+        sync_file(&self.file, &self.counters)?;
         hook(CommitPoint::PagesSynced)?;
-        let _publication = Guard::acquire(&self.file, true, self.policy)?;
-        write_snapshot(&self.file, next).map_err(|e| match e {
-            Error::Io(e) => Error::CommitUnknown(e),
-            other => other,
-        })?;
-        hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
-        self.file.sync_all().map_err(Error::CommitUnknown)?;
-        Ok(())
+        let publication_started = std::time::Instant::now();
+        let publication_result = (|| {
+            let _publication =
+                Guard::acquire_counted(&self.file, true, self.policy, &self.counters)?;
+            write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
+                Error::Io(e) => Error::CommitUnknown(e),
+                other => other,
+            })?;
+            hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
+            sync_file(&self.file, &self.counters).map_err(Error::CommitUnknown)?;
+            Ok(())
+        })();
+        self.counters.publication_ns.fetch_add(
+            publication_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        publication_result
+    }
+}
+
+fn sync_file(file: &File, counters: &OperationCounters) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    let result = file.sync_all();
+    counters
+        .sync_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if result.is_ok() {
+        counters.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.counters.file_closes.fetch_add(2, Ordering::Relaxed);
     }
 }
 
@@ -355,7 +522,8 @@ fn writer_lock_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(name))
 }
 
-fn check_regular(file: &File) -> Result<()> {
+fn check_regular(file: &File, counters: &OperationCounters) -> Result<()> {
+    counters.file_stats.fetch_add(1, Ordering::Relaxed);
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 {
         return Err(Error::Invalid(
@@ -392,6 +560,7 @@ pub struct ReadBatch<'a> {
     file: &'a File,
     snapshot: Snapshot,
     owner_pid: u32,
+    counters: Arc<OperationCounters>,
 }
 
 impl ReadBatch<'_> {
@@ -402,7 +571,7 @@ impl ReadBatch<'_> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_process()?;
         self.snapshot.layout.check_key(key)?;
-        tree::get(self.file, self.snapshot, key)
+        tree::get(self.file, self.snapshot, key, &self.counters)
     }
 
     /// Ordered half-open range `[start, end)`, with a hard record limit.
@@ -419,14 +588,14 @@ impl ReadBatch<'_> {
         if limit > MAX_BATCH_RECORDS {
             return Err(Error::Invalid("read limit exceeds record limit"));
         }
-        tree::range(self.file, self.snapshot, start, end, limit)
+        tree::range(self.file, self.snapshot, start, end, limit, &self.counters)
     }
 
     /// Traverse the live tree and check every parent/child ordering boundary.
     /// This is an offline diagnostic, not part of the normal read hot path.
     pub fn verify(&self) -> Result<u64> {
         self.check_process()?;
-        tree::verify(self.file, self.snapshot)
+        tree::verify(self.file, self.snapshot, &self.counters)
     }
 
     fn check_process(&self) -> Result<()> {

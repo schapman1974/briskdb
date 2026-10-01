@@ -58,7 +58,7 @@ not completed. The native path will use no SQLite for records, indexes, catalog,
 receipts, transactions or query execution; the existing SQLite mode stays intact.
 
 SQLite remains the supported default. An independent, opt-in `experimental-isam`
-Rust feature in the local prototype exposes `briskdb::isam` record primitives; it does **not** select
+Rust feature exposes `briskdb::isam` record primitives; it does **not** select
 an ISAM backend in `BriskDb`, Python, SQL, Mongo, or any listener. This original
 implementation has no VBISAM dependency, source port, or file-format compatibility.
 It stays in this repository under the existing license; no licensing change or
@@ -79,13 +79,26 @@ full backend compatibility. It uses an original versioned file plus a retained
 `.writer.lock` sidecar. Snapshot/publication locks cover the actual data file;
 the sidecar serializes writer preparation. Do not unlink/replace either while
 handles are live.
+
+Per-handle diagnostics expose logical file open/close/stat and root/page
+operations, sync calls, lock requests/retries, and admission wait time. The
+ignored #536 comparison
+harness measures retained/open-existing paths, point and 36-row range reads,
+chunk writes/deletes, conflicts, and four same-file disjoint writers against
+BriskDB SQLite and a non-transactional fixed-file control. These logical
+counters are not NFS RPC measurements, and local macOS/Linux results are not
+EFS qualification. #536 remains open: the baseline still needs distinct
+result-conversion/serialization timing, automatic CI artifact retention, and
+agreed prospective gates before it can be considered complete. ISAM's
+root/page I/O, sync, publication and lock-admission timings are diagnostic and
+overlap as documented.
 Old pages accumulate; space reclamation, bounded snapshots, crash/power-loss
 qualification, mount/cache-coherence behavior, and sustained contention/fairness
 remain open. Local model/corruption/process tests do not prove those guarantees.
 
-Implementation queue (all remain open; the local prototype is not merged):
+Implementation queue:
 
-- [ ] [#535](https://github.com/schapman1974/briskdb/issues/535) — land/harden the original record core and format contract
+- [x] [#535](https://github.com/schapman1974/briskdb/issues/535) — land/harden the original record core and format contract (merged in #583)
 - [ ] [#536](https://github.com/schapman1974/briskdb/issues/536) — mixed-workload benchmarks and I/O budgets
 - [ ] [#537](https://github.com/schapman1974/briskdb/issues/537) — record/key locks and concurrent same-file writers
 - [ ] [#538](https://github.com/schapman1974/briskdb/issues/538) — durable recovery, lock loss and stale-writer safety
@@ -98,8 +111,9 @@ Implementation queue (all remain open; the local prototype is not merged):
 - [ ] [#545](https://github.com/schapman1974/briskdb/issues/545) — staged independent-host EFS correctness/performance qualification
 - [ ] [#546](https://github.com/schapman1974/briskdb/issues/546) — later opt-in insert-only available-shard placement
 
-Start with #535, then #536/#537. The native catalog (#539) can proceed after the
-foundation without blocking storage-core measurements. #545 separates an early
+The #535 foundation is merged. Proceed with #536/#537. The native catalog
+(#539) can proceed after the foundation without blocking storage-core
+measurements. #545 separates an early
 isolated, disposable-data EFS probe from final release qualification; the early
 probe need not wait for full query/client compatibility. Optional alternate-shard
 placement is not an initial one-shard test gate. Issue dependencies and acceptance

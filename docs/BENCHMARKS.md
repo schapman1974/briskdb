@@ -256,6 +256,128 @@ operating-system caches after Criterion's warm-up period; neither measures first
 process access or a cold page cache. A deliberate change to either workload
 contract must be documented before comparing it with an older result.
 
+## Experimental ISAM and SQLite comparison
+
+Issue [#536](https://github.com/schapman1974/briskdb/issues/536) adds a
+release-mode comparative harness for the opt-in original ISAM store, the
+existing BriskDB SQLite backend, and a raw fixed-record file control. It is
+diagnostic, ignored by normal test runs, and does not create performance
+thresholds or qualify NFS/EFS.
+
+Run the bounded automated smoke check:
+
+```bash
+cargo test --locked --no-default-features \
+  --features embedded,experimental-isam \
+  --test isam_benchmark bounded_comparison_smoke
+```
+
+The ordinary feature-enabled test verifies workload correctness, report schema,
+disk-growth metadata, and per-writer rows without asserting machine-dependent
+performance. To run the ignored release comparison with a short five-sample
+manual smoke:
+
+```bash
+BRISKDB_ISAM_BENCH_SAMPLES=5 \
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+cargo test --locked --no-default-features \
+  --features embedded,experimental-isam \
+  --test isam_benchmark release_isam_sqlite_comparison -- \
+  --ignored --exact --nocapture
+```
+
+For a candidate comparison, use a quiet host and release mode with the default
+100 samples:
+
+```bash
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+BRISKDB_ISAM_BENCH_OUTPUT=target/isam-benchmark.tsv \
+cargo test --release --locked --no-default-features \
+  --features embedded,experimental-isam \
+  --test isam_benchmark release_isam_sqlite_comparison -- \
+  --ignored --exact --nocapture
+```
+
+`BRISKDB_ISAM_BENCH_SAMPLES` changes the sample count; at least two are
+required. The TSV reports mean/low/high and p50/p95/p99 elapsed time,
+workload-iteration throughput, ISAM logical page/root read/write counts, sync
+calls, retained data/lock descriptor opens/closes, explicit file metadata
+(`fstat`) calls, root/page I/O and sync timings, publication duration, lock
+requests/retries/wait time, and process peak RSS. The revision field is
+supplied explicitly so the artifact records the tested tree. Header metadata
+records total byte growth across all fixture directories during the run; it is
+not attributed to an individual workload. Criterion is not required: samples and
+machine-readable results are produced by this bounded harness.
+For four-writer waves, additional per-worker rows report each independent
+writer's completion latency and successful sample count; a failed write aborts
+the run rather than silently counting as progress.
+
+The paired fixtures use the same 11-byte key and 128-byte payload, a single
+logical routing key, and 36-row chapter-style ranges. BriskDB SQLite uses two
+physical shards because the public database requires at least two; every row
+and operation is routed to the same shard. Both database paths retain open
+handles for warm operations. The measured workloads are open-existing,
+point-read, range-36, atomic 36-row insert, 36-row refresh, 36-row delete,
+same-key duplicate rejection, and synchronized four-writer disjoint-key waves.
+Writes use each backend's normal durable commit path; the SQLite fixture uses
+BriskDB's existing local WAL/FULL policy.
+
+The `NA` values in SQLite and flat-file logical-counter columns mean those
+counters are unavailable, not zero. The raw flat-file control provides direct
+fixed-offset point/range reads and
+36-record overwrite+sync timings. It has no database lock, atomic batch, index,
+or recovery semantics; treat it as a simple filesystem floor, not an
+equivalent database competitor. SQLite logical I/O/RPC counts are unavailable
+from this harness. ISAM counters are application call counts, not syscall,
+filesystem metadata, or NFS RPC counts; collect actual NFS/EFS RPC telemetry
+separately. The ISAM file-stat column counts explicit metadata calls made by
+the storage code during open/validation; it does not include implicit kernel
+work performed by file opens, reads, writes, or syncs. Peak RSS is
+process-wide for the full harness, not per operation. The publication timer
+includes root-lock admission, root write, and final sync, so it overlaps those
+phase counters. Result serialization is not separately timed. The report
+schema is versioned because fields may be added; keep the matching schema
+metadata with each archived TSV.
+Local results on macOS/Linux do not predict shared-filesystem performance.
+
+The first fully instrumented optimized run was recorded against commit
+`27e99ba` (Rust and Cargo 1.94.1, Darwin 25.6.0 ARM64, 100 samples, warm local
+temporary directories). The complete v5 TSV is
+[isam-27e99ba-macos-arm64.tsv](../benchmarks/results/isam-27e99ba-macos-arm64.tsv).
+The earlier v1 artifact from the initial smoke revision remains available at
+[isam-fc0f9fe-macos-arm64.tsv](../benchmarks/results/isam-fc0f9fe-macos-arm64.tsv).
+Selected latency percentiles, in microseconds:
+
+| Workload | ISAM p50 / p95 | SQLite p50 / p95 |
+| --- | ---: | ---: |
+| Open existing | 68 / 118 | 27,745 / 31,212 |
+| Point read | 31 / 35 | 658 / 1,107 |
+| Range of 36 | 40 / 48 | 660 / 1,106 |
+| Insert 36 | 8,093 / 10,974 | 1,062 / 1,686 |
+| Refresh 36 | 8,839 / 13,531 | 672 / 1,395 |
+| Delete 36 | 7,915 / 11,183 | 1,014 / 1,684 |
+| Same-key conflict | 34 / 71 | 665 / 1,193 |
+| Four disjoint writers | 35,172 / 41,030 | 3,220 / 5,869 |
+
+The four-writer ISAM wave averaged 56 lock requests, 44 retries, and 55.0 ms
+of accumulated lock-wait time across its four store handles, exposing the
+current same-file writer-serialization bottleneck. A single 36-row read used
+one lock request and three logical page reads. Per-writer p50 completion
+latencies were 24.2, 25.2, 27.1, and 9.0 ms for ISAM (100 successes per
+writer); consult the TSV for the full distributions. Whole-run directory
+growth was 7,991,296 bytes for ISAM, 196,608 bytes for SQLite, and 10,008
+bytes for the fixed-file control. These totals combine all workloads and
+include each backend's differing storage/reclamation behavior.
+
+The fixed-file control is faster for reads and refreshes, but offers no
+transaction or locking guarantees. This is a baseline, not a release gate or a
+claim that ISAM is a performance win: small-chunk writes and same-file
+contention currently lose to BriskDB SQLite. Prospective pass/fail budgets
+remain unset until workload priorities and target storage are agreed. Result
+conversion/serialization is not separately timed, and SQLite logical
+I/O/RPC/phase counters are unavailable. Do not treat these local results as
+NFS/EFS evidence.
+
 ## Run and compare
 
 First verify the workloads. Dedicated tests assert exact read results,

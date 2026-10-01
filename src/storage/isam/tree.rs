@@ -1,10 +1,10 @@
 //! An original copy-on-write B+ tree. Branch entries store a child's maximum
 //! key, so bounded range traversal needs no mutable links between leaf pages.
 use super::{
-    Error, Layout, Mutation, Record, Result,
+    Error, Layout, Mutation, OperationCounters, Record, Result,
     format::{self, CHECKSUM_START, HEADER_BYTES, PAGE_BYTES, Snapshot, u16_at, u64_at},
 };
-use std::{fs::File, os::unix::fs::FileExt};
+use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::Instant};
 
 const PREFIX: usize = 40;
 const MAX_LEVEL: u8 = 31;
@@ -33,12 +33,23 @@ fn child(entry: &Record) -> u64 {
     u64_at(&entry.value, 0)
 }
 
-pub(crate) fn read_node(file: &File, snapshot: Snapshot, offset: u64) -> Result<Node> {
+pub(crate) fn read_node(
+    file: &File,
+    snapshot: Snapshot,
+    offset: u64,
+    counters: &OperationCounters,
+) -> Result<Node> {
     if offset < HEADER_BYTES || offset >= snapshot.end || offset % PAGE_BYTES as u64 != 0 {
         return Err(Error::Corrupt("page pointer outside committed bounds"));
     }
     let mut bytes = [0; PAGE_BYTES];
-    file.read_exact_at(&mut bytes, offset).map_err(|e| {
+    counters.page_reads.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = file.read_exact_at(&mut bytes, offset);
+    counters
+        .page_read_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result.map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             Error::Corrupt("truncated tree page")
         } else {
@@ -98,9 +109,15 @@ pub(crate) fn read_node(file: &File, snapshot: Snapshot, offset: u64) -> Result<
     Ok(Node { level, entries })
 }
 
-fn read_child(file: &File, snapshot: Snapshot, parent: &Node, index: usize) -> Result<Node> {
+fn read_child(
+    file: &File,
+    snapshot: Snapshot,
+    parent: &Node,
+    index: usize,
+    counters: &OperationCounters,
+) -> Result<Node> {
     let reference = &parent.entries[index];
-    let node = read_node(file, snapshot, child(reference))?;
+    let node = read_node(file, snapshot, child(reference), counters)?;
     if node.level + 1 != parent.level
         || node.entries.last().unwrap().key != reference.key
         || (index > 0 && node.entries[0].key <= parent.entries[index - 1].key)
@@ -110,7 +127,12 @@ fn read_child(file: &File, snapshot: Snapshot, parent: &Node, index: usize) -> R
     Ok(node)
 }
 
-fn append(file: &File, snapshot: &mut Snapshot, node: &Node) -> Result<Record> {
+fn append(
+    file: &File,
+    snapshot: &mut Snapshot,
+    node: &Node,
+    counters: &OperationCounters,
+) -> Result<Record> {
     let offset = snapshot.end;
     let end = offset
         .checked_add(PAGE_BYTES as u64)
@@ -136,7 +158,13 @@ fn append(file: &File, snapshot: &mut Snapshot, node: &Node) -> Result<Record> {
         }
     }
     format::seal(&mut bytes);
-    file.write_all_at(&bytes, offset)?;
+    counters.page_writes.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = file.write_all_at(&bytes, offset);
+    counters
+        .page_write_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result?;
     snapshot.end = end;
     Ok(Record {
         key: node.entries.last().unwrap().key.clone(),
@@ -144,7 +172,12 @@ fn append(file: &File, snapshot: &mut Snapshot, node: &Node) -> Result<Record> {
     })
 }
 
-fn persist(file: &File, snapshot: &mut Snapshot, node: Node) -> Result<Vec<Record>> {
+fn persist(
+    file: &File,
+    snapshot: &mut Snapshot,
+    node: Node,
+    counters: &OperationCounters,
+) -> Result<Vec<Record>> {
     let mut references = Vec::new();
     for entries in node.entries.chunks(capacity(snapshot.layout, node.level)) {
         references.push(append(
@@ -154,6 +187,7 @@ fn persist(file: &File, snapshot: &mut Snapshot, node: Node) -> Result<Vec<Recor
                 level: node.level,
                 entries: entries.to_vec(),
             },
+            counters,
         )?);
     }
     Ok(references)
@@ -164,6 +198,7 @@ fn change_batch(
     snapshot: &mut Snapshot,
     mut node: Node,
     mutations: &[&Mutation],
+    counters: &OperationCounters,
 ) -> Result<Vec<Record>> {
     if node.level == 0 {
         // This bounded map contains one leaf plus this batch's changes, never
@@ -204,25 +239,27 @@ fn change_batch(
             if count == 0 {
                 replacement.push(node.entries[position].clone());
             } else {
-                let descendant = read_child(file, *snapshot, &node, position)?;
+                let descendant = read_child(file, *snapshot, &node, position, counters)?;
                 replacement.extend(change_batch(
                     file,
                     snapshot,
                     descendant,
                     &mutations[consumed..consumed + count],
+                    counters,
                 )?);
                 consumed += count;
             }
         }
         node.entries = replacement;
     }
-    persist(file, snapshot, node)
+    persist(file, snapshot, node, counters)
 }
 
 pub(crate) fn apply_batch(
     file: &File,
     snapshot: &mut Snapshot,
     mutations: &[Mutation],
+    counters: &OperationCounters,
 ) -> Result<()> {
     let root = if snapshot.root == 0 {
         Node {
@@ -230,13 +267,13 @@ pub(crate) fn apply_batch(
             entries: Vec::new(),
         }
     } else {
-        read_node(file, *snapshot, snapshot.root)?
+        read_node(file, *snapshot, snapshot.root, counters)?
     };
     let mut level = root.level;
     let mut ordered: Vec<_> = mutations.iter().collect();
     // Stable ordering preserves insert/put/delete semantics for repeated keys.
     ordered.sort_by(|a, b| a.key().cmp(b.key()));
-    let mut changed = change_batch(file, snapshot, root, &ordered)?;
+    let mut changed = change_batch(file, snapshot, root, &ordered, counters)?;
     while changed.len() > 1 {
         if level == MAX_LEVEL {
             return Err(Error::Invalid("tree depth exhausted"));
@@ -249,23 +286,29 @@ pub(crate) fn apply_batch(
                 level,
                 entries: changed,
             },
+            counters,
         )?;
     }
     snapshot.root = changed.first().map(child).unwrap_or(0);
     Ok(())
 }
 
-pub(crate) fn get(file: &File, snapshot: Snapshot, key: &[u8]) -> Result<Option<Vec<u8>>> {
+pub(crate) fn get(
+    file: &File,
+    snapshot: Snapshot,
+    key: &[u8],
+    counters: &OperationCounters,
+) -> Result<Option<Vec<u8>>> {
     if snapshot.root == 0 {
         return Ok(None);
     }
-    let mut node = read_node(file, snapshot, snapshot.root)?;
+    let mut node = read_node(file, snapshot, snapshot.root, counters)?;
     while node.level != 0 {
         let index = node.entries.partition_point(|r| r.key.as_slice() < key);
         if index == node.entries.len() {
             return Ok(None);
         }
-        node = read_child(file, snapshot, &node, index)?;
+        node = read_child(file, snapshot, &node, index, counters)?;
     }
     Ok(node
         .entries
@@ -280,62 +323,86 @@ pub(crate) fn range(
     start: &[u8],
     end: Option<&[u8]>,
     limit: usize,
+    counters: &OperationCounters,
 ) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     if snapshot.root != 0 && limit != 0 && end != Some(start) {
-        let node = read_node(file, snapshot, snapshot.root)?;
-        visit(file, snapshot, node, start, end, limit, &mut records)?;
+        let node = read_node(file, snapshot, snapshot.root, counters)?;
+        RangeVisitor {
+            file,
+            snapshot,
+            start,
+            end,
+            limit,
+            counters,
+            records: &mut records,
+        }
+        .visit(node)?;
     }
     Ok(records)
 }
 
-fn visit(
-    file: &File,
+struct RangeVisitor<'a> {
+    file: &'a File,
     snapshot: Snapshot,
-    node: Node,
-    start: &[u8],
-    end: Option<&[u8]>,
+    start: &'a [u8],
+    end: Option<&'a [u8]>,
     limit: usize,
-    out: &mut Vec<Record>,
-) -> Result<()> {
-    if node.level == 0 {
-        for entry in node.entries {
-            if end.is_some_and(|end| entry.key.as_slice() >= end) || out.len() == limit {
-                break;
-            }
-            if entry.key.as_slice() >= start {
-                out.push(entry);
-            }
-        }
-    } else {
-        for i in 0..node.entries.len() {
-            if out.len() == limit
-                || (i > 0 && end.is_some_and(|end| node.entries[i - 1].key.as_slice() >= end))
-            {
-                break;
-            }
-            if node.entries[i].key.as_slice() >= start {
-                let descendant = read_child(file, snapshot, &node, i)?;
-                visit(file, snapshot, descendant, start, end, limit, out)?;
-            }
-        }
-    }
-    Ok(())
+    counters: &'a OperationCounters,
+    records: &'a mut Vec<Record>,
 }
 
-pub(crate) fn verify(file: &File, snapshot: Snapshot) -> Result<u64> {
+impl RangeVisitor<'_> {
+    fn visit(&mut self, node: Node) -> Result<()> {
+        if node.level == 0 {
+            for entry in node.entries {
+                if self.end.is_some_and(|end| entry.key.as_slice() >= end)
+                    || self.records.len() == self.limit
+                {
+                    break;
+                }
+                if entry.key.as_slice() >= self.start {
+                    self.records.push(entry);
+                }
+            }
+        } else {
+            for i in 0..node.entries.len() {
+                if self.records.len() == self.limit
+                    || (i > 0
+                        && self
+                            .end
+                            .is_some_and(|end| node.entries[i - 1].key.as_slice() >= end))
+                {
+                    break;
+                }
+                if node.entries[i].key.as_slice() >= self.start {
+                    let descendant = read_child(self.file, self.snapshot, &node, i, self.counters)?;
+                    self.visit(descendant)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn verify(file: &File, snapshot: Snapshot, counters: &OperationCounters) -> Result<u64> {
     if snapshot.root == 0 {
         return Ok(0);
     }
-    fn walk(file: &File, snapshot: Snapshot, node: Node) -> Result<(u64, Vec<u8>)> {
+    fn walk(
+        file: &File,
+        snapshot: Snapshot,
+        node: Node,
+        counters: &OperationCounters,
+    ) -> Result<(u64, Vec<u8>)> {
         if node.level == 0 {
             return Ok((node.entries.len() as u64, node.entries[0].key.clone()));
         }
         let mut total: u64 = 0;
         let mut first = Vec::new();
         for i in 0..node.entries.len() {
-            let descendant = read_child(file, snapshot, &node, i)?;
-            let (count, minimum) = walk(file, snapshot, descendant)?;
+            let descendant = read_child(file, snapshot, &node, i, counters)?;
+            let (count, minimum) = walk(file, snapshot, descendant, counters)?;
             if i == 0 {
                 first = minimum;
             } else if minimum <= node.entries[i - 1].key {
@@ -347,5 +414,11 @@ pub(crate) fn verify(file: &File, snapshot: Snapshot) -> Result<u64> {
         }
         Ok((total, first))
     }
-    Ok(walk(file, snapshot, read_node(file, snapshot, snapshot.root)?)?.0)
+    Ok(walk(
+        file,
+        snapshot,
+        read_node(file, snapshot, snapshot.root, counters)?,
+        counters,
+    )?
+    .0)
 }
