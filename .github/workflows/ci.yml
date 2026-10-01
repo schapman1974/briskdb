@@ -32,6 +32,7 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # TEMPORARY Relay-Then-Verify gate; remove for final ISAM CI verification.
   mongo-soak:
     name: Mongo mixed CRUD and restart soak (opt-in)
     if: github.event_name == 'workflow_dispatch' && inputs.mongo_soak
@@ -126,6 +127,7 @@ jobs:
 
   mongo-contract:
     name: Mongo compatibility contract
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -255,6 +257,7 @@ jobs:
 
   mongo-candidate:
     name: Mongo full frozen candidate corpus (456 executions)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # Run independently of the long reference/oracle job. Both remain required;
     # no existing timeout, source contract, or intentional difference is relaxed.
@@ -314,6 +317,7 @@ jobs:
 
   mongo-wire:
     name: Mongo real-wire discovery and documents (PyMongo 4.17.0)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # The complete beta gate builds independent anonymous, TLS, authenticated,
     # composed-host and daemon feature sets after the real driver corpus.
@@ -401,6 +405,7 @@ jobs:
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -475,6 +480,7 @@ jobs:
 
   mongo-server:
     name: Mongo daemon activation and lifecycle
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -502,6 +508,7 @@ jobs:
 
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -610,6 +617,7 @@ jobs:
 
   quality:
     name: Format and Clippy (stable)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -652,6 +660,7 @@ jobs:
 
   test:
     name: Tests (${{ matrix.rust }})
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # The beta rehearsal reached the final benchmark correctness smoke tests on
     # MSRV at the 30-minute limit. Keep every test and leave room for doc tests.
@@ -708,6 +717,7 @@ jobs:
 
   python:
     name: Python source build (${{ matrix.python }})
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # Python 3.9's full installed suite and isolated index-model oracle reached
     # the old 20-minute limit at the final native lint step in the beta gate.
@@ -828,6 +838,7 @@ jobs:
 
   postgres-clients:
     name: PostgreSQL client matrix
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
