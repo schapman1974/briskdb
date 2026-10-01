@@ -18,6 +18,105 @@ fn open_fixture(key_bytes: u16, value_bytes: u16) -> (tempfile::TempDir, Store) 
 }
 
 #[test]
+fn native_catalog_persists_identity_and_versioned_schema_without_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalog.isam");
+    let mut catalog = NativeCatalog::create(&path).unwrap();
+    let identity = catalog.identity();
+    let initial_generation = catalog.generation().unwrap();
+    let definition = TableDefinition {
+        name: "verses".to_owned(),
+        schema_version: 1,
+        columns: vec![
+            ColumnDefinition {
+                name: "book".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDefinition {
+                name: "number".to_owned(),
+                column_type: ColumnType::UInt64,
+                nullable: false,
+            },
+            ColumnDefinition {
+                name: "body".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        indexes: vec![IndexDefinition {
+            name: "book_number".to_owned(),
+            columns: vec!["book".to_owned(), "number".to_owned()],
+            unique: true,
+        }],
+    };
+    catalog.create_table(&definition).unwrap();
+    assert_eq!(catalog.generation().unwrap(), initial_generation + 1);
+    assert_eq!(catalog.table("verses").unwrap(), Some(definition.clone()));
+    assert_eq!(catalog.tables().unwrap(), vec![definition]);
+    let committed_generation = catalog.generation().unwrap();
+    assert!(matches!(
+        catalog.create_table(&TableDefinition {
+            name: "verses".to_owned(),
+            schema_version: 2,
+            columns: vec![ColumnDefinition {
+                name: "body".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: false,
+            }],
+            indexes: Vec::new(),
+        }),
+        Err(Error::Duplicate)
+    ));
+    assert_eq!(catalog.generation().unwrap(), committed_generation);
+    drop(catalog);
+
+    let mut reopened = NativeCatalog::open(&path).unwrap();
+    assert_eq!(reopened.identity(), identity);
+    assert_eq!(reopened.tables().unwrap().len(), 1);
+    reopened.drop_table("verses").unwrap();
+    assert!(reopened.table("verses").unwrap().is_none());
+    assert!(reopened.tables().unwrap().is_empty());
+}
+
+#[test]
+fn native_catalog_rejects_invalid_schema_and_non_catalog_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalog.isam");
+    let mut catalog = NativeCatalog::create(&path).unwrap();
+    let before = catalog.generation().unwrap();
+    let invalid = TableDefinition {
+        name: "items".to_owned(),
+        schema_version: 1,
+        columns: vec![
+            ColumnDefinition {
+                name: "id".to_owned(),
+                column_type: ColumnType::UInt64,
+                nullable: false,
+            },
+            ColumnDefinition {
+                name: "id".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: true,
+            },
+        ],
+        indexes: Vec::new(),
+    };
+    assert!(matches!(
+        catalog.create_table(&invalid),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(catalog.generation().unwrap(), before);
+
+    let other_path = directory.path().join("records.isam");
+    let _other = Store::create(&other_path, Layout::new(128, 1024).unwrap()).unwrap();
+    assert!(matches!(
+        NativeCatalog::open(other_path),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
 fn layout_and_mutation_bounds_are_checked_without_publishing() {
     for (key, value) in [(0, 1), (129, 1), (1, 1025)] {
         assert!(Layout::new(key, value).is_err());
@@ -809,7 +908,7 @@ fn rejects_checksummed_unknown_format_versions_and_reserved_header_bytes() {
 
 #[test]
 fn rejects_experimental_v1_files_without_migration() {
-    let (_directory, store) = open_fixture(2, 4);
+    let (directory, store) = open_fixture(2, 4);
     let snapshot = read_snapshot(&store.file, None).unwrap();
     let slot = snapshot.generation % 2 * format::PAGE_BYTES as u64;
     let mut header = [0; format::PAGE_BYTES];
@@ -819,7 +918,7 @@ fn rejects_experimental_v1_files_without_migration() {
     format::seal(&mut header);
     store.file.write_all_at(&header, slot).unwrap();
     assert!(matches!(
-        read_snapshot(&store.file, None),
+        Store::open(directory.path().join("records.isam")),
         Err(Error::Corrupt(_))
     ));
 }

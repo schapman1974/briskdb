@@ -8,11 +8,13 @@
 //! only while publishing/synchronizing the new root. A read batch reloads the root;
 //! it never caches the entire database in memory.
 //!
-//! SQLite remains BriskDB's normal backend. These primitives are not yet wired
-//! into SQL, documents, catalogs, or the Python/wire interfaces. The format is
-//! experimental; there is no migration, compaction, secondary index, or EFS/NFS
-//! qualification. Do not use for authoritative data. Never unlink/replace a live
-//! file, bypass its locks, or reuse a handle inherited across `fork`.
+//! SQLite remains BriskDB's normal backend. A standalone `NativeCatalog`
+//! persists native schema metadata, but neither it nor these record primitives
+//! is wired into SQL, documents, or Python/wire backend selection. The format
+//! is experimental; there is no migration, compaction, secondary index, or
+//! EFS/NFS qualification. Do not use for authoritative data. Never unlink or
+//! replace a live file, bypass its locks, or reuse a handle inherited across
+//! `fork`.
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +31,7 @@
 
 #![cfg(unix)]
 
+mod catalog;
 mod format;
 mod locking;
 mod tree;
@@ -45,6 +48,9 @@ use std::{
     },
 };
 
+pub use catalog::{
+    CatalogIdentity, ColumnDefinition, ColumnType, IndexDefinition, NativeCatalog, TableDefinition,
+};
 use format::{HEADER_BYTES, Snapshot, read_snapshot, write_snapshot};
 use locking::{Guard, KeyLockFile};
 pub use locking::{KEY_LOCK_STRIPES, LockPolicy};

@@ -115,8 +115,25 @@ Ambiguous root damage fails closed and requires operator recovery; automatic
 fallback can silently discard acknowledged data. A process-exit test is not a
 power-loss test. Do not infer power-loss guarantees from local tests.
 
-Old pages accumulate. Snapshot bounds, reclamation, native catalog/query/API
-support, and NFS/EFS qualification are separate work.
+## Native schema catalog
+
+`NativeCatalog` stores only native metadata records in a separate ISAM file;
+it does not create or open `manifest.sqlite`. Its root record (`BRICAT01`)
+identifies the ISAM format version, catalog-record version, and a random
+16-byte catalog identity. Table declarations (`BRITBL01`) persist a schema
+version, bounded column definitions, and bounded index declarations. Names are
+case-sensitive ASCII identifiers of at most 63 bytes; each table declaration
+must fit in one 1024-byte value. The catalog supports at most 64 columns, 32
+index declarations, and 8 columns per declared index, subject to that encoded
+record size limit.
+
+Catalog declarations are metadata only: index declarations do not create
+physical indexes or enforce uniqueness, and table declarations are not yet
+connected to SQL/document execution or backend selection. Catalog DDL records
+and the root identity are committed together. The catalog's table listing is
+bounded to 4096 declarations and returns an error if more are present. Old pages
+accumulate. Snapshot bounds, reclamation, native query/API integration, and
+NFS/EFS qualification are separate work.
 
 # Manifest storage format and migrations
 

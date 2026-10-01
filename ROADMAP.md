@@ -80,6 +80,11 @@ full backend compatibility. It uses an original versioned file plus a retained
 the sidecar serializes writer preparation. Do not unlink/replace either while
 handles are live.
 
+The low-level API now also includes a native-only metadata catalog with stable
+catalog identity and versioned table/column/index declarations. It is not yet a
+`BriskDb` backend: SQL/document execution, physical secondary indexes,
+client/backend selection, and secured-root integration remain unsupported.
+
 Per-handle diagnostics expose logical file open/close/stat and root/page
 operations, sync calls, lock requests/retries, and admission wait time. The
 ignored #536 comparison

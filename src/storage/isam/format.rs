@@ -4,6 +4,7 @@ use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::Instant
 pub(crate) const PAGE_BYTES: usize = 4096;
 pub(crate) const HEADER_BYTES: u64 = 2 * PAGE_BYTES as u64;
 pub(crate) const CHECKSUM_START: usize = PAGE_BYTES - 32;
+pub(crate) const FORMAT_VERSION: u16 = 2;
 const MAGIC: &[u8; 8] = b"BRISAM02";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +38,7 @@ pub(super) fn write_snapshot(
 ) -> Result<()> {
     let mut bytes = [0; PAGE_BYTES];
     bytes[..8].copy_from_slice(MAGIC);
-    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     bytes[10..12].copy_from_slice(&snapshot.layout.key_bytes.to_le_bytes());
     bytes[12..14].copy_from_slice(&snapshot.layout.max_value_bytes.to_le_bytes());
     bytes[16..24].copy_from_slice(&snapshot.generation.to_le_bytes());
@@ -67,7 +68,7 @@ fn decode(bytes: &[u8], slot: u64) -> Result<Option<Snapshot>> {
             ))
         };
     }
-    if &bytes[..8] != MAGIC || u16_at(bytes, 8) != 2 {
+    if &bytes[..8] != MAGIC || u16_at(bytes, 8) != FORMAT_VERSION {
         return Err(Error::Corrupt("unknown file magic or format version"));
     }
     if bytes[14..16]
