@@ -14,6 +14,7 @@ mod grant_role_privileges;
 mod non_system;
 mod revoke_role_privileges;
 mod role_info;
+mod update_role;
 mod user_info;
 mod user_management;
 

@@ -177,6 +177,29 @@ impl DurableSecurityCatalog {
         self.update_current(edit)
     }
 
+    /// Mongo replacement can remove host-provisioned grants in any realm.
+    /// Require explicit all-realm revocation authority, not an enumeration of
+    /// today's realms. Check and publication use the same refreshed revision.
+    pub(crate) fn update_document_role_authorized(
+        &mut self,
+        principal: &Principal,
+        name: &SecurityName,
+        replacement: Option<crate::core::authorization::Policy>,
+    ) -> EngineResult<()> {
+        use crate::core::authorization::{Policy, Scope};
+        self.refresh()?;
+        let policy: Policy = self.catalog.current_policy(principal)?;
+        if !policy.privileges().any(|grant| {
+            grant.action() == Action::RevokeRole && grant.scope() == &Scope::all_security_realms()
+        }) {
+            return Err(super::denied());
+        }
+        if replacement.is_some() {
+            policy.authorize(Action::GrantRole, &Resource::security_realm(name.realm())?)?;
+        }
+        self.update_current(|catalog| catalog.update_document_role(name, replacement))
+    }
+
     fn update_current<T>(
         &mut self,
         edit: impl FnOnce(&mut SecurityCatalog) -> EngineResult<T>,

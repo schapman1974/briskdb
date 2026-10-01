@@ -289,6 +289,11 @@ pub(super) enum Command {
         crate::core::authorization::Policy,
     ),
     #[cfg(feature = "auth-scram")]
+    UpdateRole(
+        crate::core::security_catalog::SecurityName,
+        Option<crate::core::authorization::Policy>,
+    ),
+    #[cfg(feature = "auth-scram")]
     RevokeRolePrivileges(
         crate::core::security_catalog::SecurityName,
         crate::core::authorization::Policy,
@@ -347,6 +352,10 @@ pub(super) fn prepare_with_limits(
     #[cfg(feature = "auth-scram")]
     if name == "dropRole" {
         return Some(roles::prepare_drop(request, started, limits));
+    }
+    #[cfg(feature = "auth-scram")]
+    if name == "updateRole" {
+        return Some(roles::prepare_update(request, started, limits));
     }
     #[cfg(feature = "auth-scram")]
     if name == "createRole" {
@@ -1538,6 +1547,17 @@ impl Executor {
             ));
         }
         match command {
+            #[cfg(feature = "auth-scram")]
+            Command::UpdateRole(name, replacement) => {
+                if !self.secured() {
+                    return Err(CommandError::unsupported());
+                }
+                self.database
+                    .engine()
+                    .update_document_role(session, context, name, replacement)
+                    .await?;
+                Ok(fields([("ok", BsonValue::Double(1.0))]))
+            }
             #[cfg(feature = "auth-scram")]
             Command::RevokeRolePrivileges(name, removals) => {
                 if !self.secured() {

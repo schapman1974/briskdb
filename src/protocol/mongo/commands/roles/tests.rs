@@ -1,6 +1,64 @@
 use super::*;
 use crate::protocol::mongo::MongoResourceLimits;
 
+#[test]
+fn update_role_distinguishes_empty_replacement_from_omission_and_rejects_inheritance() {
+    let prepare =
+        |input: &Request| prepare_update(input, Instant::now(), MongoResourceLimits::default());
+    for replacement in [false, true] {
+        let mut input = creation(vec![]);
+        input.body = fields([
+            ("updateRole", BsonValue::from("private-role")),
+            ("roles", BsonValue::Array(vec![])),
+            ("$db", BsonValue::from("app")),
+        ]);
+        if replacement {
+            input
+                .body
+                .push("privileges", BsonValue::Array(vec![]))
+                .unwrap();
+        }
+        let Command::UpdateRole(_, policy) = prepare(&input).unwrap().command else {
+            panic!("wrong command")
+        };
+        assert_eq!(policy.is_some(), replacement);
+        assert!(super::super::prepare(&input, false).unwrap().is_ok());
+    }
+    for (field, value) in [
+        ("roles", BsonValue::Array(vec![BsonValue::from("read")])),
+        ("privileges", BsonValue::Null),
+        (
+            "privileges",
+            BsonValue::Array(vec![privilege("other", "posts", &["find"])]),
+        ),
+        ("authenticationRestrictions", BsonValue::Array(vec![])),
+        ("comment", BsonValue::from("private")),
+    ] {
+        let mut input = creation(vec![]);
+        input.body = fields([
+            ("updateRole", BsonValue::from("private-role")),
+            (field, value),
+            ("$db", BsonValue::from("app")),
+        ]);
+        assert!(prepare(&input).is_err());
+    }
+    let mut input = creation(vec![]);
+    input.body = fields([
+        ("updateRole", BsonValue::from("private-role")),
+        ("$db", BsonValue::from("app")),
+    ]);
+    assert!(prepare(&input).is_err());
+    input
+        .body
+        .push("privileges", BsonValue::Array(vec![]))
+        .unwrap();
+    input
+        .body
+        .push("privileges", BsonValue::Array(vec![]))
+        .unwrap();
+    assert!(prepare(&input).is_err());
+}
+
 fn revoking(privileges: Vec<BsonValue>) -> Request {
     let mut input = creation(vec![]);
     input.body = fields([
