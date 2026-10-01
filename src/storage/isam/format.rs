@@ -1,6 +1,5 @@
 use super::{Error, Layout, OperationCounters, Result};
-use std::sync::atomic::Ordering;
-use std::{fs::File, os::unix::fs::FileExt};
+use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::Instant};
 
 pub(crate) const PAGE_BYTES: usize = 4096;
 pub(crate) const HEADER_BYTES: u64 = 2 * PAGE_BYTES as u64;
@@ -46,7 +45,12 @@ pub(super) fn write_snapshot(
     bytes[32..40].copy_from_slice(&snapshot.end.to_le_bytes());
     seal(&mut bytes);
     counters.root_writes.fetch_add(1, Ordering::Relaxed);
-    file.write_all_at(&bytes, (snapshot.generation % 2) * PAGE_BYTES as u64)?;
+    let started = Instant::now();
+    let result = file.write_all_at(&bytes, (snapshot.generation % 2) * PAGE_BYTES as u64);
+    counters
+        .root_write_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result?;
     Ok(())
 }
 
@@ -92,7 +96,14 @@ pub(super) fn read_snapshot(file: &File, counters: Option<&OperationCounters>) -
         counters.root_reads.fetch_add(1, Ordering::Relaxed);
     }
     let mut bytes = [0; HEADER_BYTES as usize];
-    file.read_exact_at(&mut bytes, 0).map_err(|e| {
+    let started = Instant::now();
+    let result = file.read_exact_at(&mut bytes, 0);
+    if let Some(counters) = counters {
+        counters
+            .root_read_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    result.map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             Error::Corrupt("truncated root headers")
         } else {

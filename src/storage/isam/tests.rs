@@ -214,16 +214,26 @@ fn one_read_admission_covers_many_records_and_counts_logical_io() {
     let stats = store.operation_stats();
     assert_eq!(stats.file_opens, 0);
     assert_eq!(stats.root_reads, 1);
+    assert!(stats.root_read_ns > 0);
     assert_eq!(stats.lock_requests, 1);
     assert_eq!(stats.lock_retries, 0);
     assert!(stats.page_reads < 36);
+    assert!(stats.page_read_ns > 0);
 }
 
 #[test]
 fn operation_stats_handle_observes_close_after_store_drop() {
-    let (_directory, store) = open_fixture(2, 4);
+    let (directory, mut store) = open_fixture(2, 4);
+    store
+        .write_batch(&[Mutation::insert(b"aa", b"val")])
+        .unwrap();
+    drop(store);
+    let store = Store::open(directory.path().join("records.isam")).unwrap();
     let stats = store.operation_stats_handle();
     assert_eq!(stats.snapshot().file_opens, 2);
+    assert_eq!(stats.snapshot().file_stats, 3);
+    assert!(stats.snapshot().root_read_ns > 0);
+    assert!(stats.snapshot().page_read_ns > 0);
     assert_eq!(stats.snapshot().file_closes, 0);
     drop(store);
     assert_eq!(stats.snapshot().file_closes, 2);
@@ -248,6 +258,13 @@ fn lock_wait_and_retries_are_included_in_operation_stats() {
     assert!(stats.lock_requests > 0);
     assert!(stats.lock_retries > 0);
     assert!(stats.lock_wait_ns > 0);
+    peer.write_batch(&[Mutation::insert(b"aa", b"val")])
+        .unwrap();
+    let stats = peer.operation_stats();
+    assert!(stats.root_write_ns > 0);
+    assert!(stats.page_write_ns > 0);
+    assert!(stats.sync_ns > 0);
+    assert!(stats.publication_ns > 0);
 }
 
 #[test]

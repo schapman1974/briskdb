@@ -41,11 +41,18 @@ struct Measurement {
 struct OperationTotal {
     file_opens: u128,
     file_closes: u128,
+    file_stats: u128,
     root_reads: u128,
     root_writes: u128,
     page_reads: u128,
     page_writes: u128,
+    root_read_ns: u128,
+    root_write_ns: u128,
+    page_read_ns: u128,
+    page_write_ns: u128,
     syncs: u128,
+    sync_ns: u128,
+    publication_ns: u128,
     lock_requests: u128,
     lock_retries: u128,
     lock_wait_ns: u128,
@@ -55,11 +62,18 @@ impl OperationTotal {
     fn add(&mut self, stats: OperationStats) {
         self.file_opens += u128::from(stats.file_opens);
         self.file_closes += u128::from(stats.file_closes);
+        self.file_stats += u128::from(stats.file_stats);
         self.root_reads += u128::from(stats.root_reads);
         self.root_writes += u128::from(stats.root_writes);
         self.page_reads += u128::from(stats.page_reads);
         self.page_writes += u128::from(stats.page_writes);
+        self.root_read_ns += u128::from(stats.root_read_ns);
+        self.root_write_ns += u128::from(stats.root_write_ns);
+        self.page_read_ns += u128::from(stats.page_read_ns);
+        self.page_write_ns += u128::from(stats.page_write_ns);
         self.syncs += u128::from(stats.syncs);
+        self.sync_ns += u128::from(stats.sync_ns);
+        self.publication_ns += u128::from(stats.publication_ns);
         self.lock_requests += u128::from(stats.lock_requests);
         self.lock_retries += u128::from(stats.lock_retries);
         self.lock_wait_ns += u128::from(stats.lock_wait_ns);
@@ -70,14 +84,21 @@ impl OperationTotal {
             return String::new();
         }
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.file_opens / samples as u128,
             self.file_closes / samples as u128,
+            self.file_stats / samples as u128,
             self.root_reads / samples as u128,
             self.root_writes / samples as u128,
             self.page_reads / samples as u128,
             self.page_writes / samples as u128,
+            self.root_read_ns / samples as u128,
+            self.root_write_ns / samples as u128,
+            self.page_read_ns / samples as u128,
+            self.page_write_ns / samples as u128,
             self.syncs / samples as u128,
+            self.sync_ns / samples as u128,
+            self.publication_ns / samples as u128,
             self.lock_requests / samples as u128,
             self.lock_retries / samples as u128,
             self.lock_wait_ns / samples as u128,
@@ -290,11 +311,18 @@ fn stats_delta(before: OperationStats, after: OperationStats) -> OperationStats 
     OperationStats {
         file_opens: after.file_opens - before.file_opens,
         file_closes: after.file_closes - before.file_closes,
+        file_stats: after.file_stats - before.file_stats,
         root_reads: after.root_reads - before.root_reads,
         root_writes: after.root_writes - before.root_writes,
         page_reads: after.page_reads - before.page_reads,
         page_writes: after.page_writes - before.page_writes,
+        root_read_ns: after.root_read_ns - before.root_read_ns,
+        root_write_ns: after.root_write_ns - before.root_write_ns,
+        page_read_ns: after.page_read_ns - before.page_read_ns,
+        page_write_ns: after.page_write_ns - before.page_write_ns,
         syncs: after.syncs - before.syncs,
+        sync_ns: after.sync_ns - before.sync_ns,
+        publication_ns: after.publication_ns - before.publication_ns,
         lock_requests: after.lock_requests - before.lock_requests,
         lock_retries: after.lock_retries - before.lock_retries,
         lock_wait_ns: after.lock_wait_ns - before.lock_wait_ns,
@@ -320,11 +348,18 @@ fn measure_isam(
         operations: Some(OperationStats {
             file_opens: total.file_opens.min(u64::MAX as u128) as u64,
             file_closes: total.file_closes.min(u64::MAX as u128) as u64,
+            file_stats: total.file_stats.min(u64::MAX as u128) as u64,
             root_reads: total.root_reads.min(u64::MAX as u128) as u64,
             root_writes: total.root_writes.min(u64::MAX as u128) as u64,
             page_reads: total.page_reads.min(u64::MAX as u128) as u64,
             page_writes: total.page_writes.min(u64::MAX as u128) as u64,
+            root_read_ns: total.root_read_ns.min(u64::MAX as u128) as u64,
+            root_write_ns: total.root_write_ns.min(u64::MAX as u128) as u64,
+            page_read_ns: total.page_read_ns.min(u64::MAX as u128) as u64,
+            page_write_ns: total.page_write_ns.min(u64::MAX as u128) as u64,
             syncs: total.syncs.min(u64::MAX as u128) as u64,
+            sync_ns: total.sync_ns.min(u64::MAX as u128) as u64,
+            publication_ns: total.publication_ns.min(u64::MAX as u128) as u64,
             lock_requests: total.lock_requests.min(u64::MAX as u128) as u64,
             lock_retries: total.lock_retries.min(u64::MAX as u128) as u64,
             lock_wait_ns: total.lock_wait_ns.min(u64::MAX as u128) as u64,
@@ -375,11 +410,18 @@ fn stats_from_total(total: OperationTotal) -> OperationStats {
     OperationStats {
         file_opens: total.file_opens.min(u64::MAX as u128) as u64,
         file_closes: total.file_closes.min(u64::MAX as u128) as u64,
+        file_stats: total.file_stats.min(u64::MAX as u128) as u64,
         root_reads: total.root_reads.min(u64::MAX as u128) as u64,
         root_writes: total.root_writes.min(u64::MAX as u128) as u64,
         page_reads: total.page_reads.min(u64::MAX as u128) as u64,
         page_writes: total.page_writes.min(u64::MAX as u128) as u64,
+        root_read_ns: total.root_read_ns.min(u64::MAX as u128) as u64,
+        root_write_ns: total.root_write_ns.min(u64::MAX as u128) as u64,
+        page_read_ns: total.page_read_ns.min(u64::MAX as u128) as u64,
+        page_write_ns: total.page_write_ns.min(u64::MAX as u128) as u64,
         syncs: total.syncs.min(u64::MAX as u128) as u64,
+        sync_ns: total.sync_ns.min(u64::MAX as u128) as u64,
+        publication_ns: total.publication_ns.min(u64::MAX as u128) as u64,
         lock_requests: total.lock_requests.min(u64::MAX as u128) as u64,
         lock_retries: total.lock_retries.min(u64::MAX as u128) as u64,
         lock_wait_ns: total.lock_wait_ns.min(u64::MAX as u128) as u64,
@@ -399,18 +441,25 @@ fn measurement_line(measurement: &Measurement) -> String {
             OperationTotal {
                 file_opens: u128::from(stats.file_opens),
                 file_closes: u128::from(stats.file_closes),
+                file_stats: u128::from(stats.file_stats),
                 root_reads: u128::from(stats.root_reads),
                 root_writes: u128::from(stats.root_writes),
                 page_reads: u128::from(stats.page_reads),
                 page_writes: u128::from(stats.page_writes),
+                root_read_ns: u128::from(stats.root_read_ns),
+                root_write_ns: u128::from(stats.root_write_ns),
+                page_read_ns: u128::from(stats.page_read_ns),
+                page_write_ns: u128::from(stats.page_write_ns),
                 syncs: u128::from(stats.syncs),
+                sync_ns: u128::from(stats.sync_ns),
+                publication_ns: u128::from(stats.publication_ns),
                 lock_requests: u128::from(stats.lock_requests),
                 lock_retries: u128::from(stats.lock_retries),
                 lock_wait_ns: u128::from(stats.lock_wait_ns),
             }
             .average(count)
         })
-        .unwrap_or_else(|| "\t\t\t\t\t\t\t\t\t".to_owned());
+        .unwrap_or_else(|| vec!["NA"; 17].join("\t"));
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         measurement.backend,
@@ -433,24 +482,59 @@ fn output_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/isam-benchmark.tsv"))
 }
 
-fn save_report(measurements: &[Measurement], peak_rss_bytes: u64) {
+fn directory_file_bytes(directory: &std::path::Path) -> u64 {
+    fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("list benchmark directory {}: {error}", directory.display()))
+        .map(|entry| {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!(
+                    "read benchmark directory entry {}: {error}",
+                    directory.display()
+                )
+            });
+            let metadata = entry.metadata().unwrap_or_else(|error| {
+                panic!(
+                    "read benchmark file metadata {}: {error}",
+                    entry.path().display()
+                )
+            });
+            if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            }
+        })
+        .try_fold(0_u64, u64::checked_add)
+        .expect("benchmark directory byte count overflow")
+}
+
+fn save_report(
+    measurements: &[Measurement],
+    peak_rss_bytes: u64,
+    disk_growth_bytes: [i128; 3],
+    path: &std::path::Path,
+) {
     let mut report = format!(
-        "# schema=isam-benchmark-v1\trun_revision={}\thost={}-{}\tpeak_rss_bytes={}\n",
+        "# schema=isam-benchmark-v5\trun_revision={}\thost={}-{}\tpeak_rss_bytes={}\n",
         std::env::var("BRISKDB_ISAM_REVISION").unwrap_or_else(|_| "unspecified".into()),
         std::env::consts::OS,
         std::env::consts::ARCH,
         peak_rss_bytes
     );
-    report.push_str("backend\tworkload\tsamples\tmean_ns\tlow_ns\thigh_ns\tp50_ns\tp95_ns\tp99_ns\tthroughput_ops_s\tavg_file_opens\tavg_file_closes\tavg_root_reads\tavg_root_writes\tavg_page_reads\tavg_page_writes\tavg_syncs\tavg_lock_requests\tavg_lock_retries\tavg_lock_wait_ns\n");
+    report.push_str(&format!(
+        "# disk_growth_bytes\tisam={}\tsqlite={}\tflat_file={}\n",
+        disk_growth_bytes[0], disk_growth_bytes[1], disk_growth_bytes[2]
+    ));
+    report.push_str("backend\tworkload\tsamples\tmean_ns\tlow_ns\thigh_ns\tp50_ns\tp95_ns\tp99_ns\tthroughput_ops_s\tavg_file_opens\tavg_file_closes\tavg_file_stats\tavg_root_reads\tavg_root_writes\tavg_page_reads\tavg_page_writes\tavg_root_read_ns\tavg_root_write_ns\tavg_page_read_ns\tavg_page_write_ns\tavg_syncs\tavg_sync_ns\tavg_publication_ns\tavg_lock_requests\tavg_lock_retries\tavg_lock_wait_ns\n");
     for measurement in measurements {
         report.push_str(&measurement_line(measurement));
         report.push('\n');
     }
-    let path = output_path();
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create benchmark report directory");
     }
-    fs::write(&path, &report)
+    fs::write(path, &report)
         .unwrap_or_else(|error| panic!("write ISAM benchmark report {}: {error}", path.display()));
     print!("{report}");
 }
@@ -484,13 +568,42 @@ fn record_count(result: &briskdb::core::ResultSet) -> usize {
 }
 
 #[test]
+fn bounded_comparison_smoke() {
+    let directory = tempfile::tempdir().unwrap();
+    let report_path = directory.path().join("isam-benchmark.tsv");
+    run_comparison(2, &report_path);
+    let report = fs::read_to_string(report_path).unwrap();
+    assert!(report.starts_with("# schema=isam-benchmark-v5\t"));
+    assert!(report.contains("isam\trange_36\t"));
+    assert!(report.contains("sqlite\tchunk_delete_36\t"));
+    assert!(report.contains("isam_writer_3\tdisjoint_writer_latency\t"));
+    assert!(report.contains("# disk_growth_bytes\tisam="));
+    let mut lines = report.lines().filter(|line| !line.starts_with('#'));
+    let column_count = lines.next().unwrap().split('\t').count();
+    for line in lines {
+        assert_eq!(line.split('\t').count(), column_count, "malformed TSV row");
+    }
+}
+
+#[test]
 #[ignore = "release-mode comparative ISAM/SQLite benchmark; see docs/BENCHMARKS.md"]
 fn release_isam_sqlite_comparison() {
-    let samples = sample_count();
+    run_comparison(sample_count(), &output_path());
+}
+
+fn run_comparison(samples: usize, report_path: &std::path::Path) {
     assert!(samples >= 2, "at least two samples are required");
     let peak_rss_start = peak_rss_bytes();
     let mut isam = IsamFixture::seeded();
     let sqlite = SqliteFixture::seeded();
+    let mut isam_empty = IsamFixture::new_empty();
+    let sqlite_empty = SqliteFixture::new_empty();
+    let flat = FlatFileFixture::seeded();
+    let isam_bytes_before = directory_file_bytes(isam._directory.path())
+        + directory_file_bytes(isam_empty._directory.path());
+    let sqlite_bytes_before = directory_file_bytes(sqlite._directory.path())
+        + directory_file_bytes(sqlite_empty._directory.path());
+    let flat_bytes_before = directory_file_bytes(flat._directory.path());
     let mut measurements = Vec::new();
 
     let isam_open = measure_isam("open_existing", samples, |_| {
@@ -580,7 +693,6 @@ fn release_isam_sqlite_comparison() {
     });
     measurements.extend([isam_range, sqlite_range]);
 
-    let flat = FlatFileFixture::seeded();
     let flat_point = measure_flat_file("point_read", samples, |_| {
         let start = Instant::now();
         let record = flat.read_point(SEED_FIRST_CHAPTER, 0);
@@ -601,8 +713,6 @@ fn release_isam_sqlite_comparison() {
     });
     measurements.extend([flat_point, flat_range]);
 
-    let mut isam_empty = IsamFixture::new_empty();
-    let sqlite_empty = SqliteFixture::new_empty();
     let isam_insert = measure_isam("chunk_insert_36", samples, |sample| {
         let chapter = 1_000_000 + sample as u32;
         let mutations = seed_mutations(chapter, 1, "insert");
@@ -749,20 +859,30 @@ fn release_isam_sqlite_comparison() {
     let mut isam_writer_durations = Vec::with_capacity(samples);
     let mut isam_writer_total = OperationTotal::default();
     let mut sqlite_writer_durations = Vec::with_capacity(samples);
+    let mut isam_writer_latency: [Vec<u128>; 4] =
+        std::array::from_fn(|_| Vec::with_capacity(samples));
+    let mut sqlite_writer_latency: [Vec<u128>; 4] =
+        std::array::from_fn(|_| Vec::with_capacity(samples));
     for _ in 0..samples {
         let before: Vec<_> = isam_writers.iter().map(Store::operation_stats).collect();
         let start = Instant::now();
         let barrier = Arc::new(Barrier::new(5));
         thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(4);
             for (worker, store) in isam_writers.iter_mut().enumerate() {
                 let barrier = Arc::clone(&barrier);
                 let operations = &isam_writer_ops[worker];
-                scope.spawn(move || {
+                handles.push(scope.spawn(move || {
                     barrier.wait();
+                    let start = Instant::now();
                     store.write_batch(operations).unwrap();
-                });
+                    start.elapsed().as_nanos()
+                }));
             }
             barrier.wait();
+            for (worker, handle) in handles.into_iter().enumerate() {
+                isam_writer_latency[worker].push(handle.join().unwrap());
+            }
         });
         isam_writer_durations.push(start.elapsed().as_nanos());
         let after: Vec<_> = isam_writers.iter().map(Store::operation_stats).collect();
@@ -773,12 +893,14 @@ fn release_isam_sqlite_comparison() {
         let start = Instant::now();
         let barrier = Arc::new(Barrier::new(5));
         thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(4);
             for worker in 0..4 {
                 let barrier = Arc::clone(&barrier);
                 let database = Arc::clone(&shared_sqlite);
                 let key = main_key(SEED_FIRST_CHAPTER + worker, 0);
-                scope.spawn(move || {
+                handles.push(scope.spawn(move || {
                     barrier.wait();
+                    let start = Instant::now();
                     database
                         .execute(
                             "benchmark",
@@ -786,9 +908,13 @@ fn release_isam_sqlite_comparison() {
                             &[Value::from(key.clone()), Value::from("multiwriter")],
                         )
                         .unwrap();
-                });
+                    start.elapsed().as_nanos()
+                }));
             }
             barrier.wait();
+            for (worker, handle) in handles.into_iter().enumerate() {
+                sqlite_writer_latency[worker].push(handle.join().unwrap());
+            }
         });
         sqlite_writer_durations.push(start.elapsed().as_nanos());
     }
@@ -804,6 +930,41 @@ fn release_isam_sqlite_comparison() {
         durations: sqlite_writer_durations,
         operations: None,
     });
+    for worker in 0..4 {
+        measurements.push(Measurement {
+            backend: [
+                "isam_writer_0",
+                "isam_writer_1",
+                "isam_writer_2",
+                "isam_writer_3",
+            ][worker],
+            workload: "disjoint_writer_latency",
+            durations: std::mem::take(&mut isam_writer_latency[worker]),
+            operations: None,
+        });
+        measurements.push(Measurement {
+            backend: [
+                "sqlite_writer_0",
+                "sqlite_writer_1",
+                "sqlite_writer_2",
+                "sqlite_writer_3",
+            ][worker],
+            workload: "disjoint_writer_latency",
+            durations: std::mem::take(&mut sqlite_writer_latency[worker]),
+            operations: None,
+        });
+    }
     let rss = peak_rss_bytes().max(peak_rss_start);
-    save_report(&measurements, rss);
+    let disk_growth = [
+        i128::from(
+            directory_file_bytes(isam._directory.path())
+                + directory_file_bytes(isam_empty._directory.path()),
+        ) - i128::from(isam_bytes_before),
+        i128::from(
+            directory_file_bytes(sqlite._directory.path())
+                + directory_file_bytes(sqlite_empty._directory.path()),
+        ) - i128::from(sqlite_bytes_before),
+        i128::from(directory_file_bytes(flat._directory.path())) - i128::from(flat_bytes_before),
+    ];
+    save_report(&measurements, rss, disk_growth, report_path);
 }

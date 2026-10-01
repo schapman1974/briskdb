@@ -56,28 +56,43 @@ pub const MAX_BATCH_RECORDS: usize = 4096;
 struct OperationCounters {
     file_opens: AtomicU64,
     file_closes: AtomicU64,
+    file_stats: AtomicU64,
     root_reads: AtomicU64,
     root_writes: AtomicU64,
     page_reads: AtomicU64,
     page_writes: AtomicU64,
+    root_read_ns: AtomicU64,
+    root_write_ns: AtomicU64,
+    page_read_ns: AtomicU64,
+    page_write_ns: AtomicU64,
     syncs: AtomicU64,
+    sync_ns: AtomicU64,
+    publication_ns: AtomicU64,
     lock_requests: AtomicU64,
     lock_retries: AtomicU64,
     lock_wait_ns: AtomicU64,
 }
 
-/// Logical operation counts from this retained store handle.
+/// Logical operation counts and selected phase timings from this store handle.
 ///
-/// These count application-level operations, not operating-system/NFS RPCs.
+/// These measure application-level calls and durations, not operating-system
+/// syscall totals or NFS RPCs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OperationStats {
     pub file_opens: u64,
     pub file_closes: u64,
+    pub file_stats: u64,
     pub root_reads: u64,
     pub root_writes: u64,
     pub page_reads: u64,
     pub page_writes: u64,
+    pub root_read_ns: u64,
+    pub root_write_ns: u64,
+    pub page_read_ns: u64,
+    pub page_write_ns: u64,
     pub syncs: u64,
+    pub sync_ns: u64,
+    pub publication_ns: u64,
     pub lock_requests: u64,
     pub lock_retries: u64,
     pub lock_wait_ns: u64,
@@ -89,11 +104,18 @@ impl OperationCounters {
         OperationStats {
             file_opens: load(&self.file_opens),
             file_closes: load(&self.file_closes),
+            file_stats: load(&self.file_stats),
             root_reads: load(&self.root_reads),
             root_writes: load(&self.root_writes),
             page_reads: load(&self.page_reads),
             page_writes: load(&self.page_writes),
+            root_read_ns: load(&self.root_read_ns),
+            root_write_ns: load(&self.root_write_ns),
+            page_read_ns: load(&self.page_read_ns),
+            page_write_ns: load(&self.page_write_ns),
             syncs: load(&self.syncs),
+            sync_ns: load(&self.sync_ns),
+            publication_ns: load(&self.publication_ns),
             lock_requests: load(&self.lock_requests),
             lock_retries: load(&self.lock_retries),
             lock_wait_ns: load(&self.lock_wait_ns),
@@ -104,11 +126,18 @@ impl OperationCounters {
         for counter in [
             &self.file_opens,
             &self.file_closes,
+            &self.file_stats,
             &self.root_reads,
             &self.root_writes,
             &self.page_reads,
             &self.page_writes,
+            &self.root_read_ns,
+            &self.root_write_ns,
+            &self.page_read_ns,
+            &self.page_write_ns,
             &self.syncs,
+            &self.sync_ns,
+            &self.publication_ns,
             &self.lock_requests,
             &self.lock_retries,
             &self.lock_wait_ns,
@@ -285,16 +314,13 @@ impl Store {
             end: HEADER_BYTES,
         };
         write_snapshot(&file, initial, &counters)?;
-        file.sync_all()?;
-        counters.syncs.fetch_add(1, Ordering::Relaxed);
-        writer_lock.sync_all()?;
-        counters.syncs.fetch_add(1, Ordering::Relaxed);
+        sync_file(&file, &counters)?;
+        sync_file(&writer_lock, &counters)?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
-        counters.syncs.fetch_add(1, Ordering::Relaxed);
+        sync_file(&File::open(parent)?, &counters)?;
         drop(guard);
         Ok(Self::from_file(file, writer_lock, layout, true, counters))
     }
@@ -318,10 +344,11 @@ impl Store {
         let file = options(writable).open(path)?;
         let counters = Arc::new(OperationCounters::default());
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
-        check_regular(&file)?;
+        check_regular(&file, &counters)?;
         let writer_lock = options(writable).open(writer_lock_path(path)?)?;
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
-        check_regular(&writer_lock)?;
+        check_regular(&writer_lock, &counters)?;
+        counters.file_stats.fetch_add(1, Ordering::Relaxed);
         if writer_lock.metadata()?.len() != 0 {
             return Err(Error::Corrupt("invalid writer lock file"));
         }
@@ -446,19 +473,38 @@ impl Store {
             .ok_or(Error::Invalid("generation exhausted"))?;
         tree::apply_batch(&self.file, &mut next, mutations, &self.counters)?;
         hook(CommitPoint::PagesWritten)?;
-        self.file.sync_all()?;
-        self.counters.syncs.fetch_add(1, Ordering::Relaxed);
+        sync_file(&self.file, &self.counters)?;
         hook(CommitPoint::PagesSynced)?;
-        let _publication = Guard::acquire_counted(&self.file, true, self.policy, &self.counters)?;
-        write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
-            Error::Io(e) => Error::CommitUnknown(e),
-            other => other,
-        })?;
-        hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
-        self.file.sync_all().map_err(Error::CommitUnknown)?;
-        self.counters.syncs.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        let publication_started = std::time::Instant::now();
+        let publication_result = (|| {
+            let _publication =
+                Guard::acquire_counted(&self.file, true, self.policy, &self.counters)?;
+            write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
+                Error::Io(e) => Error::CommitUnknown(e),
+                other => other,
+            })?;
+            hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
+            sync_file(&self.file, &self.counters).map_err(Error::CommitUnknown)?;
+            Ok(())
+        })();
+        self.counters.publication_ns.fetch_add(
+            publication_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        publication_result
     }
+}
+
+fn sync_file(file: &File, counters: &OperationCounters) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    let result = file.sync_all();
+    counters
+        .sync_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if result.is_ok() {
+        counters.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 impl Drop for Store {
@@ -476,7 +522,8 @@ fn writer_lock_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(name))
 }
 
-fn check_regular(file: &File) -> Result<()> {
+fn check_regular(file: &File, counters: &OperationCounters) -> Result<()> {
+    counters.file_stats.fetch_add(1, Ordering::Relaxed);
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 {
         return Err(Error::Invalid(

@@ -10,13 +10,17 @@ or NFS/EFS qualification.
 
 Each `Store` exposes a snapshot of its per-handle logical operation counters;
 an `OperationStatsHandle` can retain access to final close counts after the
-store is dropped. Counters include data/sidecar opens and closes, root and
-tree-page reads/writes, sync calls, lock requests/retries, and accumulated
-lock-admission wait time. They count application-level calls, not kernel
-syscalls, filesystem metadata operations, or NFS RPCs. They do not include
-directory opens or measure time spent in page I/O, serialization, or root
-publication. Use external filesystem/client telemetry when measuring remote
-filesystem traffic.
+store is dropped. Counters include data/sidecar opens and closes, explicit
+file-metadata calls, root and tree-page reads/writes, sync calls, lock
+requests/retries, and accumulated lock-admission wait time. Timings cover
+explicit root/page I/O and sync calls plus the root-publication critical
+section; the publication duration includes lock admission, root write, and
+final sync, so those values overlap and must not be summed. Timings exclude
+result serialization and are diagnostic, not a replacement for end-to-end
+latency. The counters count application-level calls, not kernel syscall totals
+or NFS RPCs. The metadata counter excludes implicit kernel work performed by
+file opens, reads, writes, and syncs. Use external filesystem/client telemetry
+when measuring remote filesystem traffic.
 
 ## Identity, creation, and locking
 

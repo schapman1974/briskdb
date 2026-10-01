@@ -4,7 +4,7 @@ use super::{
     Error, Layout, Mutation, OperationCounters, Record, Result,
     format::{self, CHECKSUM_START, HEADER_BYTES, PAGE_BYTES, Snapshot, u16_at, u64_at},
 };
-use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering};
+use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::Instant};
 
 const PREFIX: usize = 40;
 const MAX_LEVEL: u8 = 31;
@@ -44,7 +44,12 @@ pub(crate) fn read_node(
     }
     let mut bytes = [0; PAGE_BYTES];
     counters.page_reads.fetch_add(1, Ordering::Relaxed);
-    file.read_exact_at(&mut bytes, offset).map_err(|e| {
+    let started = Instant::now();
+    let result = file.read_exact_at(&mut bytes, offset);
+    counters
+        .page_read_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result.map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             Error::Corrupt("truncated tree page")
         } else {
@@ -154,7 +159,12 @@ fn append(
     }
     format::seal(&mut bytes);
     counters.page_writes.fetch_add(1, Ordering::Relaxed);
-    file.write_all_at(&bytes, offset)?;
+    let started = Instant::now();
+    let result = file.write_all_at(&bytes, offset);
+    counters
+        .page_write_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result?;
     snapshot.end = end;
     Ok(Record {
         key: node.entries.last().unwrap().key.clone(),
@@ -318,53 +328,61 @@ pub(crate) fn range(
     let mut records = Vec::new();
     if snapshot.root != 0 && limit != 0 && end != Some(start) {
         let node = read_node(file, snapshot, snapshot.root, counters)?;
-        visit(
+        RangeVisitor {
             file,
             snapshot,
-            node,
             start,
             end,
             limit,
-            &mut records,
             counters,
-        )?;
+            records: &mut records,
+        }
+        .visit(node)?;
     }
     Ok(records)
 }
 
-fn visit(
-    file: &File,
+struct RangeVisitor<'a> {
+    file: &'a File,
     snapshot: Snapshot,
-    node: Node,
-    start: &[u8],
-    end: Option<&[u8]>,
+    start: &'a [u8],
+    end: Option<&'a [u8]>,
     limit: usize,
-    out: &mut Vec<Record>,
-    counters: &OperationCounters,
-) -> Result<()> {
-    if node.level == 0 {
-        for entry in node.entries {
-            if end.is_some_and(|end| entry.key.as_slice() >= end) || out.len() == limit {
-                break;
+    counters: &'a OperationCounters,
+    records: &'a mut Vec<Record>,
+}
+
+impl RangeVisitor<'_> {
+    fn visit(&mut self, node: Node) -> Result<()> {
+        if node.level == 0 {
+            for entry in node.entries {
+                if self.end.is_some_and(|end| entry.key.as_slice() >= end)
+                    || self.records.len() == self.limit
+                {
+                    break;
+                }
+                if entry.key.as_slice() >= self.start {
+                    self.records.push(entry);
+                }
             }
-            if entry.key.as_slice() >= start {
-                out.push(entry);
+        } else {
+            for i in 0..node.entries.len() {
+                if self.records.len() == self.limit
+                    || (i > 0
+                        && self
+                            .end
+                            .is_some_and(|end| node.entries[i - 1].key.as_slice() >= end))
+                {
+                    break;
+                }
+                if node.entries[i].key.as_slice() >= self.start {
+                    let descendant = read_child(self.file, self.snapshot, &node, i, self.counters)?;
+                    self.visit(descendant)?;
+                }
             }
         }
-    } else {
-        for i in 0..node.entries.len() {
-            if out.len() == limit
-                || (i > 0 && end.is_some_and(|end| node.entries[i - 1].key.as_slice() >= end))
-            {
-                break;
-            }
-            if node.entries[i].key.as_slice() >= start {
-                let descendant = read_child(file, snapshot, &node, i, counters)?;
-                visit(file, snapshot, descendant, start, end, limit, out, counters)?;
-            }
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn verify(file: &File, snapshot: Snapshot, counters: &OperationCounters) -> Result<u64> {

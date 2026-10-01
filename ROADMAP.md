@@ -80,13 +80,18 @@ full backend compatibility. It uses an original versioned file plus a retained
 the sidecar serializes writer preparation. Do not unlink/replace either while
 handles are live.
 
-Per-handle diagnostics expose logical file/root/page operations, sync calls,
-lock requests/retries, and admission wait time. The ignored #536 comparison
+Per-handle diagnostics expose logical file open/close/stat and root/page
+operations, sync calls, lock requests/retries, and admission wait time. The
+ignored #536 comparison
 harness measures retained/open-existing paths, point and 36-row range reads,
 chunk writes/deletes, conflicts, and four same-file disjoint writers against
 BriskDB SQLite and a non-transactional fixed-file control. These logical
 counters are not NFS RPC measurements, and local macOS/Linux results are not
-EFS qualification.
+EFS qualification. #536 remains open: the baseline still needs distinct
+result-conversion/serialization timing, automatic CI artifact retention, and
+agreed prospective gates before it can be considered complete. ISAM's
+root/page I/O, sync, publication and lock-admission timings are diagnostic and
+overlap as documented.
 Old pages accumulate; space reclamation, bounded snapshots, crash/power-loss
 qualification, mount/cache-coherence behavior, and sustained contention/fairness
 remain open. Local model/corruption/process tests do not prove those guarantees.
