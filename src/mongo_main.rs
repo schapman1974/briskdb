@@ -4,7 +4,9 @@ mod cli_contention;
 use briskdb::{
     core::EngineOptions,
     protocol::mongo::MongoTlsConfig,
-    server::{AuthenticatedMongoConfig, run_authenticated_mongo},
+    server::{
+        AuthenticatedMongoConfig, AuthenticatedMongoOptions, run_authenticated_mongo_with_options,
+    },
 };
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
@@ -16,6 +18,10 @@ use tracing_subscriber::EnvFilter;
     about = "Serve an already provisioned BriskDB security root over Mongo TLS/SCRAM only"
 )]
 struct Args {
+    /// On Unix, reload TLS files on SIGHUP; never revokes established sessions.
+    #[arg(long, env = "BRISKDB_RELOAD_ON_SIGHUP", default_value_t = false,
+        action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    reload_on_sighup: bool,
     #[command(flatten)]
     contention: cli_contention::ContentionArgs,
     /// Existing security-bound root; never creates credentials or enables anonymous access.
@@ -58,8 +64,14 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("briskdb=info")),
         )
         .init();
-    let (config, options) = Args::parse().into_parts()?;
-    run_authenticated_mongo(config, options).await
+    let args = Args::parse();
+    let process = if args.reload_on_sighup {
+        AuthenticatedMongoOptions::default().with_sighup_reload()
+    } else {
+        AuthenticatedMongoOptions::default()
+    };
+    let (config, options) = args.into_parts()?;
+    run_authenticated_mongo_with_options(config, options, process).await
 }
 
 #[cfg(test)]
@@ -84,12 +96,21 @@ mod tests {
             .into_parts()
             .unwrap();
         assert_eq!(config.listen, "127.0.0.1:27017".parse().unwrap());
-        for option in [
-            "--listen",
-            "--admin-listen",
-            "--postgres-listen",
-            "--reload-on-sighup",
-        ] {
+        assert!(!Args::try_parse_from(required).unwrap().reload_on_sighup);
+        assert!(
+            Args::try_parse_from(required.into_iter().chain(["--reload-on-sighup"]))
+                .unwrap()
+                .reload_on_sighup
+        );
+        assert!(
+            !Args::try_parse_from(required.into_iter().chain(["--reload-on-sighup=false"]))
+                .unwrap()
+                .reload_on_sighup
+        );
+        assert!(
+            Args::try_parse_from(required.into_iter().chain(["--reload-on-sighup=maybe"])).is_err()
+        );
+        for option in ["--listen", "--admin-listen", "--postgres-listen"] {
             assert!(
                 Args::try_parse_from(required.into_iter().chain([option, "127.0.0.1:9999"]))
                     .is_err()

@@ -1,6 +1,10 @@
 """Verified TLS, independent sync/async identities and persistence in the real daemon."""
 import asyncio
 import sys
+import os
+import signal
+import time
+from pathlib import Path
 import pymongo
 from pymongo.errors import OperationFailure
 
@@ -35,6 +39,43 @@ with pymongo.MongoClient(uri, **options("writer")) as writer, \
     invalid = dict(options("reader"), password="incorrect")
     with pymongo.MongoClient(uri, **invalid) as bad:
         denied(lambda: bad.app.items.find_one(), 18)
+    if len(sys.argv) > 4:
+        # Each client also owns monitoring sockets. Release completed probes
+        # before retaining sync + async sessions and opening a fresh client.
+        writer.close()
+        anonymous.close()
+        pid, key, log = int(sys.argv[4]), Path(sys.argv[5]), Path(sys.argv[6])
+        cert = Path(certificate)
+        fixtures = Path(__file__).parent / "fixtures" / "postgres-tls"
+
+        def reload_identity(expected, count):
+            os.kill(pid, signal.SIGHUP)
+            until = time.monotonic() + 15
+            while log.read_text().count(expected) < count:
+                assert time.monotonic() < until, log.read_text()
+                time.sleep(0.01)
+
+        async def retained_async():
+            async with pymongo.AsyncMongoClient(uri, **options("reader")) as retained:
+                assert await retained.app.items.count_documents({}) == iteration + 1
+                cert.write_bytes((fixtures / "rotated.crt").read_bytes())
+                key.write_bytes((fixtures / "rotated.key").read_bytes())
+                reload_identity("listener security reloaded", 1)
+                # Both pre-existing authenticated connections keep their rights.
+                assert reader.app.items.count_documents({}) == iteration + 1
+                assert await retained.app.items.count_documents({}) == iteration + 1
+                denied(lambda: reader.app.items.insert_one({"_id": 997}))
+                with pymongo.MongoClient(uri, **options("reader")) as fresh:
+                    assert fresh.app.items.count_documents({}) == iteration + 1
+                key.write_bytes((fixtures / "server.key").read_bytes())
+                reload_identity("listener security reload rejected", 1)
+                with pymongo.MongoClient(uri, **options("reader")) as fresh:
+                    assert fresh.app.items.count_documents({}) == iteration + 1
+                cert.write_bytes((fixtures / "server.crt").read_bytes())
+                reload_identity("listener security reloaded", 2)
+                assert await retained.app.items.count_documents({}) == iteration + 1
+
+        asyncio.run(retained_async())
 
 
 async def check_async():
