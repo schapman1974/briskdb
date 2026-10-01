@@ -304,9 +304,9 @@ workload-iteration throughput, ISAM logical page/root read/write counts, sync
 calls, retained data/lock descriptor opens/closes, explicit file metadata
 (`fstat`) calls, root/page I/O and sync timings, publication duration, lock
 requests/retries/wait time, and process peak RSS. The revision field is
-supplied explicitly so the artifact records the tested tree. Header metadata records total byte growth
-across all fixture directories during the run; it is not attributed to an
-individual workload. Criterion is not required: samples and
+supplied explicitly so the artifact records the tested tree. Header metadata
+records total byte growth across all fixture directories during the run; it is
+not attributed to an individual workload. Criterion is not required: samples and
 machine-readable results are produced by this bounded harness.
 For four-writer waves, additional per-worker rows report each independent
 writer's completion latency and successful sample count; a failed write aborts
@@ -335,39 +335,48 @@ the storage code during open/validation; it does not include implicit kernel
 work performed by file opens, reads, writes, or syncs. Peak RSS is
 process-wide for the full harness, not per operation. The publication timer
 includes root-lock admission, root write, and final sync, so it overlaps those
-phase counters. Result serialization is not separately timed. The report schema is
-versioned because fields may be added; keep the matching schema metadata with
-each archived TSV.
+phase counters. Result serialization is not separately timed. The report
+schema is versioned because fields may be added; keep the matching schema
+metadata with each archived TSV.
 Local results on macOS/Linux do not predict shared-filesystem performance.
 
-An initial optimized local run was recorded against commit `fc0f9fe` (Rust and
-Cargo 1.94.1, Darwin 25.6.0 ARM64, 100 samples, warm local temporary
-directories). The complete TSV is
+The first fully instrumented optimized run was recorded against commit
+`27e99ba` (Rust and Cargo 1.94.1, Darwin 25.6.0 ARM64, 100 samples, warm local
+temporary directories). The complete v5 TSV is
+[isam-27e99ba-macos-arm64.tsv](../benchmarks/results/isam-27e99ba-macos-arm64.tsv).
+The earlier v1 artifact from the initial smoke revision remains available at
 [isam-fc0f9fe-macos-arm64.tsv](../benchmarks/results/isam-fc0f9fe-macos-arm64.tsv).
 Selected latency percentiles, in microseconds:
 
 | Workload | ISAM p50 / p95 | SQLite p50 / p95 |
 | --- | ---: | ---: |
-| Open existing | 58 / 92 | 27,397 / 32,671 |
-| Point read | 30 / 33 | 628 / 1,006 |
-| Range of 36 | 39 / 48 | 614 / 973 |
-| Insert 36 | 9,011 / 11,668 | 989 / 1,427 |
-| Refresh 36 | 8,706 / 11,855 | 680 / 1,274 |
-| Delete 36 | 8,253 / 13,061 | 964 / 1,442 |
-| Same-key conflict | 33 / 35 | 627 / 1,304 |
-| Four disjoint writers | 36,108 / 49,715 | 3,467 / 5,921 |
+| Open existing | 68 / 118 | 27,745 / 31,212 |
+| Point read | 31 / 35 | 658 / 1,107 |
+| Range of 36 | 40 / 48 | 660 / 1,106 |
+| Insert 36 | 8,093 / 10,974 | 1,062 / 1,686 |
+| Refresh 36 | 8,839 / 13,531 | 672 / 1,395 |
+| Delete 36 | 7,915 / 11,183 | 1,014 / 1,684 |
+| Same-key conflict | 34 / 71 | 665 / 1,193 |
+| Four disjoint writers | 35,172 / 41,030 | 3,220 / 5,869 |
 
-The four-writer ISAM wave averaged 57 lock requests, 45 retries, and 57.2 ms
+The four-writer ISAM wave averaged 56 lock requests, 44 retries, and 55.0 ms
 of accumulated lock-wait time across its four store handles, exposing the
 current same-file writer-serialization bottleneck. A single 36-row read used
-one lock request and three logical page reads. The fixed-file control is faster
-for reads and refreshes, but offers no transaction or locking guarantees. This
-is a baseline, not a release gate or a claim that ISAM is a performance win:
-small-chunk writes and same-file contention currently lose to BriskDB SQLite.
-Prospective pass/fail budgets remain unset until workload priorities and target
-storage are agreed; phase-level data I/O/publication/result-serialization
-timings and automated CI archival are also still needed. Do not treat these
-local results as NFS/EFS evidence.
+one lock request and three logical page reads. Per-writer p50 completion
+latencies were 24.2, 25.2, 27.1, and 9.0 ms for ISAM (100 successes per
+writer); consult the TSV for the full distributions. Whole-run directory
+growth was 7,991,296 bytes for ISAM, 196,608 bytes for SQLite, and 10,008
+bytes for the fixed-file control. These totals combine all workloads and
+include each backend's differing storage/reclamation behavior.
+
+The fixed-file control is faster for reads and refreshes, but offers no
+transaction or locking guarantees. This is a baseline, not a release gate or a
+claim that ISAM is a performance win: small-chunk writes and same-file
+contention currently lose to BriskDB SQLite. Prospective pass/fail budgets
+remain unset until workload priorities and target storage are agreed. Result
+conversion/serialization is not separately timed, and SQLite logical
+I/O/RPC/phase counters are unavailable. Do not treat these local results as
+NFS/EFS evidence.
 
 ## Run and compare
 
