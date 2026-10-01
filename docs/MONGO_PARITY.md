@@ -1003,6 +1003,8 @@ removes that inspection right on the next request.
 print(client.app.command("rolesInfo", "read")["roles"])
 # An operator with ViewRoles on app can list its stored roles.
 print(operator.app.command("rolesInfo", 1)["roles"])
+# Inspect reproducible document privileges for one's assigned role.
+print(client.app.command("rolesInfo", "read", showPrivileges=True)["roles"])
 ```
 
 Selectors are a string, `{role: "read", db: "app"}`, at most 64 string/object
@@ -1011,9 +1013,19 @@ realm/name-ordered output; authorized missing roles are omitted. An empty array
 still validates the current login. Replies contain `_id`, `role`, `db`,
 `isBuiltin: false`, `roles: []` and `inheritedRoles: []`: all current catalog
 roles, including the explicitly provisioned data profiles, are stored flat
-roles, not protected/automatic built-ins. No policy/credential export or
-inheritance is implied. `showPrivileges`, `showAuthenticationRestrictions` and
-`showBuiltinRoles` accept only omitted/`false`; expanded forms, comments,
+roles, not protected/automatic built-ins. `showPrivileges: true` additionally
+returns equal `privileges` and `inheritedPrivileges` arrays for these flat roles.
+Only the losslessly representable database-local Mongo data-policy subset is
+exported, using the same actions/resources as `createRole`. Internal admission
+grants are omitted only when recreating the exported privileges would derive
+exactly those grants. Host policies with extra/missing admission, SQL, broad
+database/server/security scopes, or other unrepresentable grants fail the whole
+request with code 115, never a misleading partial permission list. Empty roles
+export empty arrays. Exports also obey the creation command's pre-deduplication
+grant limit, including implicit admission entries. This is not a general policy
+or credential export.
+`showAuthenticationRestrictions` and `showBuiltinRoles` accept only omitted/`false`;
+inheritance, `showPrivileges: "asUserFragment"`, comments,
 filters, unknown/duplicate fields and all-realm selection are unsupported.
 Normal engine ownership/lifecycle, metadata row/byte limits and wire response
 limits apply. Sync/async PyMongo, durable refresh/reopen, membership revocation,
@@ -1131,7 +1143,7 @@ same current authority, session ownership and request controls. Authorization
 and publication share a single catalog revision, with no automatic replay after
 conflict or uncertain timeout. Live clients, independent-engine refresh,
 credential/administrator revocation, policy-limit failure and restart persistence
-are tested. Inheritance and expanded privilege export remain unsupported;
+are tested. Inheritance and general host-policy export remain unsupported;
 the flat `updateRole` subset is described below.
 
 `revokePrivilegesFromRole` removes exact action/resource pairs from an existing
@@ -1172,7 +1184,7 @@ are still required. Hosts needing to remove those internal grants explicitly
 must use trusted catalog policy replacement or delete the role. Native document
 revocation rejects these internal actions as inputs as well. Input remains
 bounded to 256 privilege entries and 256 actions before deduplication; no new
-grants or memberships are introduced. Inheritance, expanded privilege export
+grants or memberships are introduced. Inheritance, general host-policy export
 and authenticated host integration remain open.
 
 `updateRole` replaces a flat role's complete privileges while preserving its

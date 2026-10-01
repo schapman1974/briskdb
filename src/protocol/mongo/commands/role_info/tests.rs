@@ -19,7 +19,7 @@ fn check(request: &Request) -> Result<Prepared> {
 }
 
 #[test]
-fn role_info_accepts_only_bounded_selectors_and_explicitly_unexpanded_metadata() {
+fn role_info_accepts_bounded_selectors_and_boolean_privilege_expansion() {
     let named = BsonValue::Document(fields([
         ("role", BsonValue::from("private-role")),
         ("db", BsonValue::from("other")),
@@ -48,6 +48,11 @@ fn role_info_accepts_only_bounded_selectors_and_explicitly_unexpanded_metadata()
             BsonValue::from("asUserFragment"),
         ] {
             let mut invalid = request(named.clone());
+            if field == "showPrivileges" && value == BsonValue::Boolean(true) {
+                invalid.body.push(field, value).unwrap();
+                assert!(check(&invalid).is_ok());
+                continue;
+            }
             invalid.body.push(field, value).unwrap();
             assert!(check(&invalid).is_err());
         }

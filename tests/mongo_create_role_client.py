@@ -43,6 +43,12 @@ def initial():
             }), 72)
         assert operator.app.command("rolesInfo", "invalid-role")["roles"] == []
         assert operator.app.command("createRole", "post_reader", privileges=privileges("posts", "find", "listIndexes"), roles=[], writeConcern={"w": 1})["ok"] == 1
+        exported = operator.app.command("rolesInfo", "post_reader", showPrivileges=True)["roles"][0]
+        assert exported["privileges"] == exported["inheritedPrivileges"]
+        assert {action for entry in exported["privileges"] for action in entry["actions"]} == {"find", "listIndexes"}
+        assert all(entry["resource"] == {"db": "app", "collection": "posts"} for entry in exported["privileges"])
+        operator.app.command("createRole", "roundtrip_reader", privileges=exported["privileges"], roles=[])
+        assert operator.app.command("rolesInfo", "roundtrip_reader", showPrivileges=True)["roles"][0]["privileges"] == exported["privileges"]
         # Duplicate-name rejection must leave the original read-only policy intact.
         denied(lambda: operator.app.command("createRole", "post_reader", privileges=privileges("", "insert"), roles=[]), 11000)
         with pymongo.MongoClient(URI, **options("create_only")) as denied_client:
@@ -104,6 +110,9 @@ async def reopened():
     async with pymongo.AsyncMongoClient(URI, **options("role_creator")) as operator, \
                pymongo.AsyncMongoClient(URI, **app_options("custom_reader")) as reader:
         assert len((await operator.app.command("rolesInfo", "post_reader"))["roles"]) == 1
+        exported = (await reader.app.command("rolesInfo", "post_reader", showPrivileges=True))["roles"][0]
+        assert exported["privileges"] == exported["inheritedPrivileges"]
+        assert {action for entry in exported["privileges"] for action in entry["actions"]} == {"find", "listIndexes"}
         assert await reader.app.posts.count_documents({}) == 5
         cursor = reader.app.posts.find().batch_size(1)
         assert (await anext(cursor))["_id"] in range(5)

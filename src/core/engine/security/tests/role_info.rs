@@ -139,9 +139,20 @@ async fn role_info_obeys_live_membership_realm_revocation_ownership_and_reopen()
 
 #[tokio::test]
 async fn role_info_applies_result_limits_and_queued_controls_without_catalog_edits() {
+    check_role_info_queued_controls(false).await;
+}
+
+#[tokio::test]
+async fn expanded_role_info_applies_result_limits_and_queued_controls_without_catalog_edits() {
+    check_role_info_queued_controls(true).await;
+}
+
+async fn check_role_info_queued_controls(expanded: bool) {
     let (root, engine) = secure(&[]).await;
     let actor = login(&engine).await;
-    let own = RoleInfoRequest::names([role()]).unwrap();
+    let own = RoleInfoRequest::names([role()])
+        .unwrap()
+        .with_document_privileges(expanded);
     let before = fs::read(root.path().join("security.sqlite")).unwrap();
     assert_eq!(
         engine
