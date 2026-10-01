@@ -186,6 +186,11 @@ path = "src/main.rs"
 required-features = ["server-cli"]
 
 [[bin]]
+name = "briskdb-mongo"
+path = "src/mongo_main.rs"
+required-features = ["server-cli", "mongo-tls", "auth-scram"]
+
+[[bin]]
 name = "briskdb-import"
 path = "src/bin/briskdb-import.rs"
 required-features = ["sqlite-import-cli"]

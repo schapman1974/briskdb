@@ -4,6 +4,10 @@
 mod daemon;
 #[cfg(feature = "server")]
 pub use daemon::DaemonOptions;
+#[cfg(all(feature = "server", feature = "mongo-tls", feature = "auth-scram"))]
+mod authenticated_mongo;
+#[cfg(all(feature = "server", feature = "mongo-tls", feature = "auth-scram"))]
+pub use authenticated_mongo::{AuthenticatedMongoConfig, run_authenticated_mongo};
 mod http_tls;
 pub use http_tls::HttpTlsConfig;
 #[cfg(feature = "mongo")]

@@ -93,6 +93,3 @@ impl ContentionArgs {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

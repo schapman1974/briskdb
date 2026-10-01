@@ -8,7 +8,7 @@ use std::{
 };
 use tokio_rustls::rustls;
 
-fn identity(root: &Path, rotated: bool) -> (PathBuf, PathBuf) {
+pub(super) fn identity(root: &Path, rotated: bool) -> (PathBuf, PathBuf) {
     let certificate = root.join("server.crt");
     let key = root.join("server.key");
     let (cert_bytes, key_bytes): (&[u8], &[u8]) = if rotated {
@@ -50,7 +50,7 @@ fn address(text: &str) -> SocketAddr {
         .unwrap()
 }
 
-fn connect(
+pub(super) fn connect(
     address: SocketAddr,
     certificate: Option<&Path>,
     name: &'static str,

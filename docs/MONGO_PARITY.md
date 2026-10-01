@@ -770,7 +770,7 @@ For an ordinary root, readiness reports `anonymous_tls_loopback`.
 
 The standalone Rust host supports `mongo-tls,auth-scram` with an explicitly
 activated security root. This is **not** enabled in the beta Python wheel,
-Python `serve`/`patch`, daemon or composed `AttachedServer` paths. Those retain
+Python `serve`/`patch`, ordinary `briskdb` daemon or composed `AttachedServer` paths. Those retain
 their existing anonymous loopback boundaries. Secure roots currently support
 document and scoped user commands, not SQL or shared PostgreSQL/HTTP/SQLite-remote authentication.
 
@@ -785,6 +785,28 @@ See [the provisioning contract](ARCHITECTURE.md#authenticated-document-engine-un
 There is no implicit admin or public provisioning endpoint. Initial roles and an
 operator account must be provisioned by the trusted host; authorized users can
 then use the bounded wire commands below.
+
+For a process-owned listener, the separate `briskdb-mongo` executable opens
+**only authenticated Mongo over TLS**, with no HTTP, administration or PostgreSQL
+companion listeners. Build it with `server-cli,mongo-tls,auth-scram`:
+
+```bash
+cargo run --locked --no-default-features --features server-cli,mongo-tls,auth-scram \
+  --bin briskdb-mongo -- --data-dir ./secured-data --shards 4 \
+  --mongo-listen 127.0.0.1:27017 --mongo-tls-cert ./server.crt \
+  --mongo-tls-key ./server.key
+```
+
+The root, exact shard count and TLS files are required; this command does not
+provision accounts or convert anonymous roots. TLS is prepared before opening
+storage. Non-loopback binding requires an explicit address. SIGINT/SIGTERM drain
+the listener and owned engine (Ctrl-C on Windows, subject to security-root platform
+support). Engine limits retain their defaults; the shared `--contention-*`
+options configure contention without replaying application writes. Companion
+listener flags and `--reload-on-sighup` are rejected: certificate reload is not
+implemented for this dedicated command yet. Rust process hosts may call
+`server::run_authenticated_mongo(AuthenticatedMongoConfig, EngineOptions)` with
+explicit engine limits. Existing composed-host security guards remain unchanged.
 
 Open that already-provisioned root and explicitly start TLS:
 
