@@ -46,8 +46,8 @@ use std::{
 };
 
 use format::{HEADER_BYTES, Snapshot, read_snapshot, write_snapshot};
-use locking::Guard;
-pub use locking::LockPolicy;
+use locking::{Guard, KeyLockFile};
+pub use locking::{KEY_LOCK_STRIPES, LockPolicy};
 
 /// Maximum mutations in a transaction or records returned by one range call.
 pub const MAX_BATCH_RECORDS: usize = 4096;
@@ -166,6 +166,7 @@ pub enum Error {
     Duplicate,
     ReadOnly,
     WrongProcess,
+    LockRegistryPoisoned,
     /// Root publication was attempted, but its durable outcome is unknown.
     /// Reopen/reconcile by key; do not blindly retry non-idempotent work.
     CommitUnknown(io::Error),
@@ -181,6 +182,7 @@ impl fmt::Display for Error {
             Self::Duplicate => f.write_str("ISAM key already exists"),
             Self::ReadOnly => f.write_str("ISAM handle is read-only"),
             Self::WrongProcess => f.write_str("reopen ISAM handles after fork"),
+            Self::LockRegistryPoisoned => f.write_str("ISAM lock registry is poisoned"),
             Self::CommitUnknown(e) => write!(f, "ISAM commit outcome is unknown: {e}"),
         }
     }
@@ -286,6 +288,7 @@ impl Mutation {
 pub struct Store {
     file: File,
     writer_lock: File,
+    key_locks: Option<Arc<KeyLockFile>>,
     layout: Layout,
     policy: LockPolicy,
     writable: bool,
@@ -306,6 +309,7 @@ impl Store {
             .create_new(true)
             .open(writer_lock_path(path)?)?;
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
+        let key_locks = KeyLockFile::create(&key_lock_path(path)?, Arc::clone(&counters))?;
         file.set_len(HEADER_BYTES)?;
         let initial = Snapshot {
             layout,
@@ -322,7 +326,14 @@ impl Store {
             .unwrap_or(Path::new("."));
         sync_file(&File::open(parent)?, &counters)?;
         drop(guard);
-        Ok(Self::from_file(file, writer_lock, layout, true, counters))
+        Ok(Self::from_file(
+            file,
+            writer_lock,
+            Some(key_locks),
+            layout,
+            true,
+            counters,
+        ))
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -341,6 +352,7 @@ impl Store {
     }
 
     fn open_inner(path: &Path, writable: bool, policy: LockPolicy) -> Result<Self> {
+        let deadline = policy.deadline();
         let file = options(writable).open(path)?;
         let counters = Arc::new(OperationCounters::default());
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
@@ -352,13 +364,31 @@ impl Store {
         if writer_lock.metadata()?.len() != 0 {
             return Err(Error::Corrupt("invalid writer lock file"));
         }
-        let guard = Guard::acquire_counted(&file, false, policy, &counters)?;
+        let guard = Guard::acquire_until(&file, false, deadline, policy.interval(), &counters)?;
         let snapshot = read_snapshot(&file, Some(&counters))?;
         if snapshot.root != 0 {
             tree::read_node(&file, snapshot, snapshot.root, &counters)?;
         }
         drop(guard);
-        let mut store = Self::from_file(file, writer_lock, snapshot.layout, writable, counters);
+        let key_locks = if writable {
+            Some(KeyLockFile::open_or_create(
+                &key_lock_path(path)?,
+                &writer_lock,
+                Arc::clone(&counters),
+                deadline,
+                policy.interval(),
+            )?)
+        } else {
+            None
+        };
+        let mut store = Self::from_file(
+            file,
+            writer_lock,
+            key_locks,
+            snapshot.layout,
+            writable,
+            counters,
+        );
         store.policy = policy;
         Ok(store)
     }
@@ -366,6 +396,7 @@ impl Store {
     fn from_file(
         file: File,
         writer_lock: File,
+        key_locks: Option<Arc<KeyLockFile>>,
         layout: Layout,
         writable: bool,
         counters: Arc<OperationCounters>,
@@ -373,6 +404,7 @@ impl Store {
         Self {
             file,
             writer_lock,
+            key_locks,
             layout,
             writable,
             policy: LockPolicy::default(),
@@ -463,35 +495,105 @@ impl Store {
         if mutations.is_empty() {
             return Ok(());
         }
-        let _writer = Guard::acquire_counted(&self.writer_lock, true, self.policy, &self.counters)?;
-        let root_guard = Guard::acquire_counted(&self.file, false, self.policy, &self.counters)?;
-        let mut next = self.snapshot()?;
-        drop(root_guard);
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or(Error::Invalid("generation exhausted"))?;
-        tree::apply_batch(&self.file, &mut next, mutations, &self.counters)?;
-        hook(CommitPoint::PagesWritten)?;
-        sync_file(&self.file, &self.counters)?;
-        hook(CommitPoint::PagesSynced)?;
-        let publication_started = std::time::Instant::now();
-        let publication_result = (|| {
-            let _publication =
-                Guard::acquire_counted(&self.file, true, self.policy, &self.counters)?;
-            write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
-                Error::Io(e) => Error::CommitUnknown(e),
-                other => other,
-            })?;
-            hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
-            sync_file(&self.file, &self.counters).map_err(Error::CommitUnknown)?;
-            Ok(())
-        })();
-        self.counters.publication_ns.fetch_add(
-            publication_started.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
-        publication_result
+        let deadline = self.policy.deadline();
+        let _legacy_compatibility = Guard::acquire_until(
+            &self.writer_lock,
+            false,
+            deadline,
+            self.policy.interval(),
+            &self.counters,
+        )?;
+        let keys: Vec<_> = mutations.iter().map(Mutation::key).collect();
+        let key_locks = self
+            .key_locks
+            .as_ref()
+            .ok_or(Error::Corrupt("writable store has no key-lock table"))?;
+        let _key_stripes =
+            key_locks.acquire_stripes(&keys, deadline, self.policy.interval(), &self.counters)?;
+        loop {
+            let root_guard = Guard::acquire_until(
+                &self.file,
+                false,
+                deadline,
+                self.policy.interval(),
+                &self.counters,
+            )?;
+            let base = self.snapshot()?;
+            drop(root_guard);
+            let mut next = base;
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or(Error::Invalid("generation exhausted"))?;
+            let plan = tree::prepare_batch(&self.file, base, mutations, &self.counters)?;
+            let start = self.reserve_page_range(base, plan.page_count(), deadline)?;
+            next = tree::write_plan(&self.file, base, next, start, &plan, &self.counters)?;
+            hook(CommitPoint::PagesWritten)?;
+            sync_file(&self.file, &self.counters)?;
+            hook(CommitPoint::PagesSynced)?;
+
+            let publication_started = std::time::Instant::now();
+            let publication_result: Result<bool> = (|| {
+                let _publication = Guard::acquire_until(
+                    &self.file,
+                    true,
+                    deadline,
+                    self.policy.interval(),
+                    &self.counters,
+                )?;
+                let latest = self.snapshot()?;
+                if latest != base {
+                    return Ok(false);
+                }
+                write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
+                    Error::Io(e) => Error::CommitUnknown(e),
+                    other => other,
+                })?;
+                hook(CommitPoint::RootWritten).map_err(Error::CommitUnknown)?;
+                sync_file(&self.file, &self.counters).map_err(Error::CommitUnknown)?;
+                Ok(true)
+            })();
+            self.counters.publication_ns.fetch_add(
+                publication_started.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            if publication_result? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn reserve_page_range(
+        &self,
+        base: Snapshot,
+        pages: usize,
+        deadline: locking::LockDeadline,
+    ) -> Result<u64> {
+        if pages == 0 {
+            return Ok(base.end);
+        }
+        let _allocation = Guard::acquire_until(
+            &self.file,
+            true,
+            deadline,
+            self.policy.interval(),
+            &self.counters,
+        )?;
+        self.counters.file_stats.fetch_add(1, Ordering::Relaxed);
+        let physical_end = self.file.metadata()?.len();
+        let start = physical_end.max(base.end);
+        if start % format::PAGE_BYTES as u64 != 0 {
+            return Err(Error::Corrupt("unaligned physical append position"));
+        }
+        let bytes = (pages as u64)
+            .checked_mul(format::PAGE_BYTES as u64)
+            .ok_or(Error::Invalid("append reservation overflow"))?;
+        let reserved_end = start
+            .checked_add(bytes)
+            .filter(|end| *end <= i64::MAX as u64)
+            .ok_or(Error::Invalid("file size exhausted"))?;
+        self.file.set_len(reserved_end)?;
+        Ok(start)
     }
 }
 
@@ -519,6 +621,15 @@ fn writer_lock_path(path: &Path) -> Result<PathBuf> {
         .ok_or(Error::Invalid("missing file name"))?
         .to_os_string();
     name.push(".writer.lock");
+    Ok(path.with_file_name(name))
+}
+
+fn key_lock_path(path: &Path) -> Result<PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or(Error::Invalid("missing file name"))?
+        .to_os_string();
+    name.push(".keylocks");
     Ok(path.with_file_name(name))
 }
 

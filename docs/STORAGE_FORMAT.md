@@ -36,8 +36,41 @@ of a path while a handle is live. Do not rename, unlink, replace, or recreate
 either file while any process may hold it; external replacement is unsupported.
 
 The data file's advisory shared lock protects a short snapshot/root read; the
-exclusive lock protects root publication. The sidecar's exclusive lock
-currently serializes each writer's full prepare-and-publish operation.
+exclusive lock protects root publication and append-range reservation. The
+empty `.writer.lock` sidecar retains a legacy whole-writer compatibility fence.
+The versioned `.keylocks` sidecar stores 64 deterministic FNV-1a key-lock
+stripes, using one-byte POSIX range locks at fixed offsets. Writers acquire
+deduplicated stripe IDs in ascending order. A stripe collision conservatively
+serializes unrelated keys; it cannot grant access to conflicting keys. The
+mapping, stripe count, and lock-file version are format-stable and must not be
+changed in place. Batches can hold at most 64 range locks per store and no
+whole-file fallback is allowed on exhaustion. The key-lock descriptor is
+process-shared among local handles so closing another descriptor cannot drop
+the process's POSIX locks. Legacy writers' exclusive `.writer.lock` lock
+excludes new writers holding the shared compatibility lock.
+
+Each mutation batch owns exclusive stripes for its keys; the format currently
+has no record-level shared lock mode. Readers instead capture one immutable
+root snapshot under shared publication admission and then read without holding
+key locks. A batch has no read set: disjoint-key writes are rebased and merged,
+while same-key mutations serialize. Callers must not treat a prior read or a
+range scan as a lock-protected read-modify-write transaction; phantom
+protection and serializable multi-key transactions are not provided.
+
+For a write, the shared legacy fence and sorted key stripes remain held while
+the writer captures a root, prepares immutable pages, reserves a non-overlapping
+append range under a brief exclusive data-file lock, writes and syncs those
+pages, then acquires exclusive publication admission. It publishes only if the
+captured root is still current; otherwise it replans against the new root and
+leaves the unreferenced pages as orphans. Readers hold shared publication
+admission only while capturing a root. Lock waits consume one finite
+operation-wide admission deadline and return `Busy` when it expires. Synchronous
+filesystem I/O itself is not cancellable or deadline-bounded by this policy.
+
+These primitives are a local locking design only. POSIX locks are process-wide
+and descriptor close behavior is subtle; independent-host EFS/NFS visibility,
+lease loss, stale-writer fencing, and lock-budget headroom require separate
+qualification.
 Immutable copy-on-write pages let an already captured snapshot be read without
 holding a lock for every record. These are local Unix semantics only: they do
 not establish NFSv4/EFS lock visibility, freshness, or stale-writer safety.
