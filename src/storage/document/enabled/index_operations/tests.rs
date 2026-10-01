@@ -1347,7 +1347,8 @@ fn ordered_audit_reuses_validated_record_order_without_a_second_record_read() {
 }
 
 #[test]
-fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
+fn startup_streams_match_point_checks_and_reject_coverage_damage() {
+    use super::super::super::index_storage::{EqualityStartupAudit, STARTUP_EQUALITY_SQL};
     use super::super::super::ordered_storage::{STARTUP_ORDERED_SQL, StartupAudit};
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
@@ -1422,9 +1423,22 @@ fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
         })
         .collect();
     let run = |check: &mut dyn FnMut() -> EngineResult<()>| {
+        let _snapshot = connection
+            .is_autocommit()
+            .then(|| connection.unchecked_transaction().unwrap());
         let mut statement = connection.prepare(STARTUP_ORDERED_SQL).unwrap();
         let mut audit = StartupAudit::new(Some(&mut statement))?;
+        let mut equality_statement = connection.prepare(STARTUP_EQUALITY_SQL).unwrap();
+        let mut equality = EqualityStartupAudit::new(&mut equality_statement)?;
         for (record, expected) in &records {
+            equality.validate_record(
+                record.collection_id(),
+                0,
+                record.id_key.as_bytes(),
+                &record.checksum,
+                expected.as_ref(),
+                check,
+            )?;
             audit.validate_record(
                 record.collection_id(),
                 0,
@@ -1435,7 +1449,8 @@ fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
                 check,
             )?;
         }
-        audit.finish()
+        audit.finish()?;
+        equality.finish()
     };
     connection
         .authorizer(Some(|context: AuthContext<'_>| match context.action {
@@ -1460,6 +1475,25 @@ fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
     connection
         .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
         .unwrap();
+    for damage in [
+        "DELETE FROM briskdb_document_index_entries_v1",
+        "UPDATE briskdb_document_index_entries_v1 SET entry_checksum=zeroblob(32)",
+        "UPDATE briskdb_document_index_entries_v1 SET entry_format_version=2",
+        "UPDATE briskdb_document_index_entries_v1 SET index_id=index_id+1000",
+        "UPDATE briskdb_document_index_entries_v1 SET collection_id=999",
+        "UPDATE briskdb_document_index_entries_v1 SET id_key=zeroblob(9) WHERE id_key=(SELECT min(id_key) FROM briskdb_document_index_entries_v1)",
+        "UPDATE briskdb_document_index_entries_v1 SET id_key=x'ffffffffffffffffff' WHERE id_key=(SELECT max(id_key) FROM briskdb_document_index_entries_v1)",
+    ] {
+        connection.execute_batch("BEGIN").unwrap();
+        connection.execute_batch(damage).unwrap();
+        assert_eq!(
+            run(&mut || Ok(())).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption,
+            "{damage}"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+        run(&mut || Ok(())).unwrap();
+    }
     let (record, _) = &records[0];
     let (index, direction): (i64, i64) = connection.query_row(
         "SELECT index_id, direction FROM briskdb_document_ordered_entries_v1 WHERE collection_id=?1 AND id_key=?2 AND sort_key IS NOT NULL LIMIT 1",
@@ -1511,6 +1545,15 @@ fn ordered_startup_stream_matches_point_checks_and_rejects_coverage_damage() {
     }
     // Even when no records are handed to the stream, it must not silently ignore
     // entries left over at the end (the empty-record-table/orphan case).
+    let mut equality_statement = connection.prepare(STARTUP_EQUALITY_SQL).unwrap();
+    assert_eq!(
+        EqualityStartupAudit::new(&mut equality_statement)
+            .unwrap()
+            .finish()
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::DataCorruption
+    );
     let mut statement = connection.prepare(STARTUP_ORDERED_SQL).unwrap();
     assert_eq!(
         StartupAudit::new(Some(&mut statement))
