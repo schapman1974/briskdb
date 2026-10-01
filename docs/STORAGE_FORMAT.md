@@ -29,7 +29,7 @@ truncates an existing path. A store at `name.isam` has a separate
 `name.isam.writer.lock` sidecar. Both must be regular files with one hard link
 and owner-only permissions; final path components are opened without following
 symlinks. The identity currently consists of these retained file descriptors
-and their inode identities, the `BRISAM01` format marker/version, and the
+and their inode identities, the `BRISAM02` format marker/version, and the
 selected root tuple `(layout, generation, root offset, committed end)`. The
 format does not yet contain a persistent database UUID or detect replacement
 of a path while a handle is live. Do not rename, unlink, replace, or recreate
@@ -83,15 +83,20 @@ files. Inspect and remove a failed creation only after confirming no process
 can still hold either file. A lock sidecar is never safely removed while the
 store may be live.
 
-## Version 1 layout and bounds
+## Version 2 layout and bounds
 
-Each root slot has magic `BRISAM01`, little-endian format version `1`, persisted
+Each root slot has magic `BRISAM02`, little-endian format version `2`, persisted
 fixed key width and maximum value width, generation, root page offset, committed
 file end, zeroed reserved bytes, and a BLAKE3 checksum over the preceding 4064
 bytes. Generation parity selects its slot. When both slots validate they must
 have the same layout and adjacent generations; the higher generation is the
-snapshot. Unknown versions, invalid checksummed fields, and malformed pages
-are rejected. A checksum is corruption detection, not authentication.
+snapshot. Only an all-zero unused slot beside generation 1 is accepted. A
+nonzero invalid slot, a missing slot after generation 1, invalid checksummed
+fields, and malformed pages are rejected rather than selecting an older root:
+the format cannot distinguish a torn alternate-root write from later damage to
+an acknowledged root. Format v1 files are intentionally rejected; export their
+records and create a new v2 file. A checksum is corruption detection, not
+authentication.
 
 Tree pages are 4096 bytes, have magic `BRIPAGE1`, their own offset and
 generation, level and entry count, sorted keys, zero padding, and a BLAKE3
@@ -105,12 +110,10 @@ the persisted layout and page format.
 A commit writes changed pages, syncs the data file, writes the alternate root
 slot, then syncs the data file again. Failures before root publication are
 reported as uncommitted I/O errors; a root write or final sync failure is
-reported as `CommitUnknown` and must be reconciled, not blindly retried. A
-process-exit test is not a power-loss test. A damaged root slot may be treated
-as an interrupted alternate-slot write and the other valid slot selected; the
-durable-recovery issue must still resolve how to distinguish that case from
-later corruption of an acknowledged root. Do not infer power-loss guarantees
-from local tests.
+reported as `CommitUnknown` and must be reconciled, not blindly retried.
+Ambiguous root damage fails closed and requires operator recovery; automatic
+fallback can silently discard acknowledged data. A process-exit test is not a
+power-loss test. Do not infer power-loss guarantees from local tests.
 
 Old pages accumulate. Snapshot bounds, reclamation, native catalog/query/API
 support, and NFS/EFS qualification are separate work.

@@ -92,9 +92,13 @@ result-conversion/serialization timing, automatic CI artifact retention, and
 agreed prospective gates before it can be considered complete. ISAM's
 root/page I/O, sync, publication and lock-admission timings are diagnostic and
 overlap as documented.
-Old pages accumulate; space reclamation, bounded snapshots, crash/power-loss
-qualification, mount/cache-coherence behavior, and sustained contention/fairness
-remain open. Local model/corruption/process tests do not prove those guarantees.
+Format v2 refuses experimental v1 files and fails closed on ambiguous root
+damage instead of silently exposing an older root. This conservative local
+behavior is not durable-recovery proof: power-loss qualification, stale-writer
+fencing, lock-loss handling, mount/cache-coherence behavior, and independent-host
+EFS/NFS validation remain open. Old pages accumulate; space reclamation, bounded
+snapshots, and sustained contention/fairness also remain open. Local
+model/corruption/process tests do not prove those guarantees.
 
 Implementation queue:
 

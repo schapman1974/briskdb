@@ -4,7 +4,7 @@ use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::Instant
 pub(crate) const PAGE_BYTES: usize = 4096;
 pub(crate) const HEADER_BYTES: u64 = 2 * PAGE_BYTES as u64;
 pub(crate) const CHECKSUM_START: usize = PAGE_BYTES - 32;
-const MAGIC: &[u8; 8] = b"BRISAM01";
+const MAGIC: &[u8; 8] = b"BRISAM02";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Snapshot {
@@ -37,7 +37,7 @@ pub(super) fn write_snapshot(
 ) -> Result<()> {
     let mut bytes = [0; PAGE_BYTES];
     bytes[..8].copy_from_slice(MAGIC);
-    bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
     bytes[10..12].copy_from_slice(&snapshot.layout.key_bytes.to_le_bytes());
     bytes[12..14].copy_from_slice(&snapshot.layout.max_value_bytes.to_le_bytes());
     bytes[16..24].copy_from_slice(&snapshot.generation.to_le_bytes());
@@ -55,11 +55,19 @@ pub(super) fn write_snapshot(
 }
 
 fn decode(bytes: &[u8], slot: u64) -> Result<Option<Snapshot>> {
-    // A zero/partially written alternate slot is not a published generation.
+    // Only the untouched slot in a newly created file may be empty. Any other
+    // invalid slot is ambiguous: it could be an interrupted write or corruption
+    // of an acknowledged generation, so recovery must not select an older root.
     if !checksum_valid(bytes) {
-        return Ok(None);
+        return if bytes.iter().all(|byte| *byte == 0) {
+            Ok(None)
+        } else {
+            Err(Error::Corrupt(
+                "root slot checksum invalid; recovery is ambiguous",
+            ))
+        };
     }
-    if &bytes[..8] != MAGIC || u16_at(bytes, 8) != 1 {
+    if &bytes[..8] != MAGIC || u16_at(bytes, 8) != 2 {
         return Err(Error::Corrupt("unknown file magic or format version"));
     }
     if bytes[14..16]
@@ -120,7 +128,10 @@ pub(super) fn read_snapshot(file: &File, counters: Option<&OperationCounters>) -
             }
             Ok(if a.generation > b.generation { a } else { b })
         }
-        (Some(s), None) | (None, Some(s)) => Ok(s),
+        (Some(s), None) | (None, Some(s)) if s.generation == 1 => Ok(s),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(Error::Corrupt("missing root slot after initial generation"))
+        }
         (None, None) => Err(Error::Corrupt("no valid root header")),
     }
 }

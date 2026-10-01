@@ -561,33 +561,38 @@ fn readers_and_independent_file_writers_progress_during_write_preparation() {
 }
 
 #[test]
-fn interrupted_alternate_root_write_preserves_the_last_published_generation() {
+fn ambiguous_alternate_root_damage_fails_closed_instead_of_rolling_back() {
     let (directory, mut store) = open_fixture(2, 4);
     store
         .write_batch(&[Mutation::insert(b"aa", b"old")])
         .unwrap();
     let committed = read_snapshot(&store.file, None).unwrap();
-    // Damage only the inactive slot as an interrupted next-generation write
-    // would do. The previously acknowledged root must remain usable.
+    // This could be an interrupted next-generation write or later corruption
+    // of an acknowledged root. The format cannot prove which, so it must refuse
+    // to expose the older generation as though it were current.
     let inactive = ((committed.generation + 1) % 2) * format::PAGE_BYTES as u64;
     store.file.write_all_at(&[0xff; 123], inactive).unwrap();
     drop(store);
-    let mut reopened = Store::open(directory.path().join("records.isam")).unwrap();
-    assert_eq!(
-        reopened.read_batch().unwrap().generation(),
-        committed.generation
-    );
-    assert_eq!(
-        reopened.read_batch().unwrap().get(b"aa").unwrap(),
-        Some(b"old".to_vec())
-    );
-    reopened
-        .write_batch(&[Mutation::put(b"aa", b"new")])
+    assert!(matches!(
+        Store::open(directory.path().join("records.isam")),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn corruption_of_the_latest_acknowledged_root_never_falls_back() {
+    let (directory, mut store) = open_fixture(2, 4);
+    store
+        .write_batch(&[Mutation::insert(b"aa", b"ack")])
         .unwrap();
-    assert_eq!(
-        reopened.read_batch().unwrap().get(b"aa").unwrap(),
-        Some(b"new".to_vec())
-    );
+    let committed = read_snapshot(&store.file, None).unwrap();
+    let current_slot = committed.generation % 2 * format::PAGE_BYTES as u64;
+    store.file.write_all_at(&[0xff], current_slot + 48).unwrap();
+    drop(store);
+    assert!(matches!(
+        Store::open(directory.path().join("records.isam")),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 fn wide_key(value: u64) -> Vec<u8> {
@@ -773,7 +778,7 @@ fn rejects_group_or_world_access_on_data_and_lock_files() {
 
 #[test]
 fn rejects_checksummed_unknown_format_versions_and_reserved_header_bytes() {
-    for version in [0_u16, 2_u16] {
+    for version in [0_u16, 1_u16, 3_u16] {
         let (_directory, store) = open_fixture(2, 4);
         let snapshot = read_snapshot(&store.file, None).unwrap();
         let slot = snapshot.generation % 2 * format::PAGE_BYTES as u64;
@@ -794,6 +799,23 @@ fn rejects_checksummed_unknown_format_versions_and_reserved_header_bytes() {
     let mut header = [0; format::PAGE_BYTES];
     store.file.read_exact_at(&mut header, slot).unwrap();
     header[40] = 1;
+    format::seal(&mut header);
+    store.file.write_all_at(&header, slot).unwrap();
+    assert!(matches!(
+        read_snapshot(&store.file, None),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn rejects_experimental_v1_files_without_migration() {
+    let (_directory, store) = open_fixture(2, 4);
+    let snapshot = read_snapshot(&store.file, None).unwrap();
+    let slot = snapshot.generation % 2 * format::PAGE_BYTES as u64;
+    let mut header = [0; format::PAGE_BYTES];
+    store.file.read_exact_at(&mut header, slot).unwrap();
+    header[..8].copy_from_slice(b"BRISAM01");
+    header[8..10].copy_from_slice(&1_u16.to_le_bytes());
     format::seal(&mut header);
     store.file.write_all_at(&header, slot).unwrap();
     assert!(matches!(
@@ -993,7 +1015,7 @@ fn empty_root_encoding_has_stable_fields_and_padding() {
         .file
         .read_exact_at(&mut bytes, format::PAGE_BYTES as u64)
         .unwrap();
-    assert_eq!(&bytes[..16], b"BRISAM01\x01\x00\x09\x00\x00\x03\x00\x00");
+    assert_eq!(&bytes[..16], b"BRISAM02\x02\x00\x09\x00\x00\x03\x00\x00");
     assert_eq!(format::u64_at(&bytes, 16), 1);
     assert_eq!(format::u64_at(&bytes, 24), 0);
     assert_eq!(format::u64_at(&bytes, 32), 8192);
