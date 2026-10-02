@@ -44,6 +44,32 @@ session.close()
 db.close()
 ```
 
+## Optional S3/Parquet storage mode
+
+An opt-in Unix source build can combine ISAM metadata/file pruning, immutable
+SQLite base shards and S3 Parquet writes. Normal SQLite remains the default.
+Build a local wheel with `maturin build --manifest-path python/Cargo.toml
+--features s3-overlay` from the repository root, then install that wheel.
+Provision a **new** overlay with the [creation example](../README.md#optional-s3parquet-write-overlay-experimental-source-builds).
+
+```python
+import briskdb
+from briskdb.s3_overlay import OpenOptions
+
+with briskdb.open(
+    "/mnt/shared/my-overlay", storage_mode="s3-overlay",
+    overlay_options=OpenOptions(parquet_pruning=True, read_only=True),
+) as db:
+    print(db.query("SELECT * FROM events WHERE id = ?", ["event-1"]).rows)
+    print(db.settings())
+```
+
+This uses a separate synchronous SQL API, not the ordinary sessions,
+transactions, Mongo adapters or network listeners. Missing build support and
+incompatible flags fail explicitly. See [configuration and limits](../README.md#selecting-and-configuring-this-mode)
+and [fresh-per-request Lambda setup](SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
+The feature is experimental and is not automatically available in published wheels.
+
 ## Patch PyMongo for local testing
 
 The beta wheel includes `briskdb.patch()`, a TinyMongo-style

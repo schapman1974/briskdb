@@ -503,7 +503,7 @@ where
     Ok(all_shards(storage.shard_count()))
 }
 
-fn preflight_new_schema_migration(
+pub(super) fn preflight_new_schema_migration(
     storage: &Storage,
     sql: &str,
     control: Option<&Arc<OperationControl>>,
@@ -1193,6 +1193,32 @@ fn preflight_one_shard(
             })
         }
     }
+}
+
+#[cfg(all(unix, feature = "experimental-isam"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_native_metadata_shard(
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &shard::ShardLayout,
+    sql: &str,
+    target_digest: &[u8; 32],
+    control: Option<&Arc<OperationControl>>,
+) -> EngineResult<()> {
+    apply_one_shard(
+        ShardMigrationRequest {
+            path,
+            shard_id,
+            source_generation,
+            target_generation,
+            layout,
+            sql,
+            control,
+        },
+        Some(target_digest),
+    )
 }
 
 fn apply_one_shard(

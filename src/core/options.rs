@@ -208,6 +208,7 @@ impl Default for PreparedStatementLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
     storage_profile: super::StorageProfile,
+    metadata_backend: super::MetadataBackend,
     contention_policy: Option<super::ContentionPolicy>,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
@@ -242,6 +243,7 @@ impl EngineOptions {
 
         Ok(Self {
             storage_profile: super::StorageProfile::Local,
+            metadata_backend: super::MetadataBackend::Sqlite,
             contention_policy: None,
             connections_per_shard,
             queue_capacity_per_shard,
@@ -305,6 +307,16 @@ impl EngineOptions {
     /// Return the requested storage contract, independently of wire protocols.
     pub const fn storage_profile(&self) -> super::StorageProfile {
         self.storage_profile
+    }
+
+    /// Select catalog persistence without changing the SQLite data shards.
+    pub const fn with_metadata_backend(mut self, backend: super::MetadataBackend) -> Self {
+        self.metadata_backend = backend;
+        self
+    }
+
+    pub const fn metadata_backend(&self) -> super::MetadataBackend {
+        self.metadata_backend
     }
 
     /// Select the storage contract without converting an existing root.
@@ -398,6 +410,7 @@ impl EngineOptions {
     /// to reject a complete configuration before opening or creating storage.
     pub fn validate_for_shards(self, shard_count: u16) -> EngineResult<()> {
         self.storage_profile.require_available()?;
+        self.metadata_backend.require_available()?;
         crate::storage::validate_shard_count(shard_count)?;
         self.worker_limit(shard_count).map(|_| ())
     }
@@ -407,6 +420,7 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             storage_profile: super::StorageProfile::Local,
+            metadata_backend: super::MetadataBackend::Sqlite,
             contention_policy: None,
             connections_per_shard: DEFAULT_CONNECTIONS_PER_SHARD,
             queue_capacity_per_shard: DEFAULT_QUEUE_CAPACITY_PER_SHARD,

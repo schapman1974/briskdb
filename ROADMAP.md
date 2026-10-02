@@ -50,6 +50,22 @@ unknown-commit-outcome tests. No write capability will be enabled solely because
 SQLite exposes an `xUpdate` callback. The [Python API](python/API.md#remote-sqlite-addon)
 states the current bounds and unsupported behavior.
 
+### Optional S3/Parquet SQL overlay (unreleased source build)
+
+The separate `experimental-s3-overlay` mode now has an ISAM catalog, immutable
+indexed SQLite base snapshots, typed Parquet inserts/updates/tombstones in S3,
+conditional publication with lost-ack reconciliation, pending-aware SQL reads
+and joins, and concurrent-safe compaction. It exposes Rust, an explicit Python
+`briskdb.s3_overlay.Database`, and a one-shot native command adapter. Default
+BriskDB and its protocol adapters are unchanged. See the
+[usage and boundaries](README.md#optional-s3parquet-write-overlay-experimental-source-builds).
+
+Atomic modifying statements are deliberately partition-local. This is not
+Mongo/PostgreSQL overlay support or a transparent migration of existing roots.
+Automatic old-object/base reclamation, global transactions, online schema
+changes and production failure/restore qualification remain future work.
+No PyPI release is authorized by the experimental implementation or benchmark.
+
 ### Original ISAM backend experiment (unreleased)
 
 Tracked by [#534](https://github.com/schapman1974/briskdb/issues/534). This replaces
@@ -58,43 +74,90 @@ not completed. The native path will use no SQLite for records, indexes, catalog,
 receipts, transactions or query execution; the existing SQLite mode stays intact.
 
 SQLite remains the supported default. An independent, opt-in `experimental-isam`
-Rust feature exposes `briskdb::isam` record primitives; it does **not** select
-an ISAM backend in `BriskDb`, Python, SQL, Mongo, or any listener. This original
+Rust feature exposes `briskdb::isam` record primitives. A separate **hybrid
+metadata integration** now exposes `MetadataBackend::Isam` for SQL roots while
+keeping application data in SQLite shards. It is not the all-native data backend
+described by #534. Python source builds expose `Config(metadata_backend="isam")`;
+the CLI accepts `--metadata-backend isam`. Defaults stay SQLite. This original
 implementation has no VBISAM dependency, source port, or file-format compatibility.
 It stays in this repository under the existing license; no licensing change or
 release is part of the experiment.
+
+The hybrid slice persists routing identity, SQL table declarations, schema
+generation/checksums, and resumable schema-migration journals as native records
+in `manifest.isam`. Reopen/backend mismatch checks and durable-boundary process
+exit tests accompany the integration. It does not wrap SQLite pages or keep a
+hidden SQLite manifest. Metadata selection is independent of a future
+application-data storage plugin and does not lift the NFS gate.
+
+Still required before calling the hybrid metadata option complete: native
+document/collection/index metadata and lifecycle recovery; SQL global-index and
+generated-ID metadata; secured-root integration; complete compatibility,
+contention/cancellation, failure, and installed-wheel qualification. Those paths
+are deliberately unavailable, not redirected to SQLite metadata. Existing
+native-backend epic issues are not closed by this SQL-only slice.
 
 The first local slice provides fixed-width byte keys, bounded values, indexed
 point/range reads, and atomic insert/put/delete batches in a checksummed,
 copy-on-write B+ tree. Retained file handles avoid per-row open/close/catalog
 work. Batch writes coalesce changes to touched pages. Readers briefly share a
 publication lock, capture a root, and scan immutable pages concurrently with
-writer preparation and later commits. Writers to one file serialize; publishing
-the root takes a short exclusive publication lock. Independent files have
+writer preparation and later commits. Writers hold sorted, deduplicated key
+stripes, so disjoint writers can prepare concurrently in one file. A separate
+commit gate revalidates the plan before allocating/flushing pages, avoiding
+wasted durable work when another writer commits first. Both durability syncs
+and the final root recheck remain; publishing the root takes an exclusive
+publication lock. Independent files have
 independent locks. Lock-admission retry limits are configurable, including open;
 mutations are never automatically replayed after an uncertain commit.
+
+Snapshot-local page caching now reuses validated pages during repeated reads
+and catalog write validation/planning, bounded to 64 pages / 256 KiB of decoded
+storage (plus bookkeeping overhead). New-file-only `create_packed` opts into v3
+leaves that omit unused value padding, without compression. Default creation
+and existing v2 files keep their format. Neither change removes durability
+syncs or qualifies NFS or production operation.
 
 This is a Unix-only local prototype, not a claim of fast EFS/NFS operation or
 full backend compatibility. It uses an original versioned file plus a retained
 `.writer.lock` sidecar. Snapshot/publication locks cover the actual data file;
-the sidecar serializes writer preparation. Do not unlink/replace either while
+the sidecar is a compatibility/maintenance fence, shared by ordinary writers.
+The separate `.keylocks` file provides 64 deterministic key stripes.
+Do not unlink/replace these files while
 handles are live.
 
+The low-level API now includes a native-only catalog with stable identity,
+versioned declarations, typed rows, and physically maintained primary and
+secondary indexes for its supported scalar types. CRUD and index entries
+publish atomically; exact lookups and bounded composite-index ranges are
+available. Explicit bulk CRUD coalesces multiple rows/indexes into one durable
+publication. Updates validate but do not rewrite unchanged index entries.
+The benchmark separately compares 36 individual commits against one bulk
+commit, without claiming automatic group commit or faster isolated writes.
+This is a partial #540 slice, not a native application-data `BriskDb` backend:
+native SQL/document execution and secured-root integration remain unsupported.
+The hybrid metadata selector described above is a separate, narrower boundary.
+
 Per-handle diagnostics expose logical file open/close/stat and root/page
-operations, sync calls, lock requests/retries, and admission wait time. The
-ignored #536 comparison
-harness measures retained/open-existing paths, point and 36-row range reads,
-chunk writes/deletes, conflicts, and four same-file disjoint writers against
-BriskDB SQLite and a non-transactional fixed-file control. These logical
-counters are not NFS RPC measurements, and local macOS/Linux results are not
-EFS qualification. #536 remains open: the baseline still needs distinct
-result-conversion/serialization timing, automatic CI artifact retention, and
-agreed prospective gates before it can be considered complete. ISAM's
-root/page I/O, sync, publication and lock-admission timings are diagnostic and
-overlap as documented.
-Old pages accumulate; space reclamation, bounded snapshots, crash/power-loss
-qualification, mount/cache-coherence behavior, and sustained contention/fairness
-remain open. Local model/corruption/process tests do not prove those guarantees.
+operations, sync calls, aggregate lock requests/retries, and admission wait
+time. Striped write-lock stats additionally report deduplicated acquisitions
+per stable stripe ID and separate local-mutex from OS byte-range-lock retries
+and wait. The ignored #536 comparison harness measures retained/open-existing
+paths, point and 36-row range reads, chunk writes/deletes, conflicts, and four
+same-file disjoint writers against BriskDB SQLite and a non-transactional
+fixed-file control; matched JSON row serialization and an opt-in CI artifact
+workflow are included. These logical counters are not NFS RPC measurements,
+and local macOS/Linux results are not EFS qualification. #536 remains open
+until prospective latency, throughput, metadata, and correctness gates are
+agreed for the intended storage. ISAM's root/page I/O, sync, publication and
+lock-admission timings are diagnostic and overlap as documented.
+Format v2 refuses experimental v1 files and fails closed on ambiguous root
+damage instead of silently exposing an older root. This conservative local
+behavior is not durable-recovery proof: power-loss qualification, stale-writer
+fencing, lock-loss handling, mount/cache-coherence behavior, and independent-host
+EFS/NFS validation remain open. Old pages accumulate; space reclamation, bounded
+snapshots, and sustained contention/fairness also remain open. Local
+model/corruption/process tests do not prove those guarantees.
 
 Implementation queue:
 

@@ -14,11 +14,26 @@ use super::journal::JournalPolicy;
 pub(super) struct StorageRoot {
     path: PathBuf,
     journal: JournalPolicy,
+    metadata_backend: crate::MetadataBackend,
 }
 
 impl StorageRoot {
     pub(super) fn new(path: PathBuf, journal: JournalPolicy) -> Self {
-        Self { path, journal }
+        Self {
+            path,
+            journal,
+            metadata_backend: crate::MetadataBackend::Sqlite,
+        }
+    }
+
+    #[cfg(all(unix, feature = "experimental-isam"))]
+    pub(super) fn with_native_metadata(mut self) -> Self {
+        self.metadata_backend = crate::MetadataBackend::Isam;
+        self
+    }
+
+    pub(super) const fn metadata_backend(&self) -> crate::MetadataBackend {
+        self.metadata_backend
     }
 
     pub(super) const fn journal(&self) -> JournalPolicy {
@@ -46,6 +61,9 @@ impl AsRef<Path> for StorageRoot {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix, feature = "experimental-isam", feature = "embedded"))]
+mod chapter_qualification;
 
 #[cfg(all(test, unix, feature = "documents"))]
 mod efs_qualification;

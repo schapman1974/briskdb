@@ -40,7 +40,6 @@ from ._briskdb import (
     UniqueViolationError,
     UnsupportedError,
     __version__,
-    open,
 )
 from .api import (
     AsyncCursor,
@@ -49,6 +48,7 @@ from .api import (
     AsyncSession,
     AsyncTransaction,
     connect,
+    connect as open,
     connect_async,
     open_async,
 )

@@ -280,6 +280,7 @@ class ContentionPolicy:
 class Config:
     contention_policy: Optional[ContentionPolicy]
     storage_profile: Literal["local", "nfs"]
+    metadata_backend: Literal["sqlite", "isam"]
     shards: Optional[int]
     documents: bool
     uuid_representation: UuidRepresentation
@@ -297,6 +298,7 @@ class Config:
         *,
         contention_policy: Optional[ContentionPolicy] = ...,
         storage_profile: Literal["local", "nfs"] = ...,
+        metadata_backend: Literal["sqlite", "isam"] = ...,
         shards: Optional[int] = ...,
         documents: bool = ...,
         uuid_representation: UuidRepresentation = ...,

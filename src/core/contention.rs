@@ -1,5 +1,7 @@
 //! Bounded lock-acquisition backoff. This never replays application work.
 
+#[cfg(feature = "contention-logging")]
+mod logging;
 mod statistics;
 
 pub use statistics::ContentionStatistics;
@@ -132,6 +134,8 @@ pub(crate) struct ContentionBudget {
     retries: u32,
     metrics: Arc<ContentionMetrics>,
     exhaustion_recorded: bool,
+    #[cfg(feature = "contention-logging")]
+    log: logging::ContentionLog,
 }
 
 impl ContentionBudget {
@@ -148,13 +152,15 @@ impl ContentionBudget {
             retries: 0,
             metrics,
             exhaustion_recorded: false,
+            #[cfg(feature = "contention-logging")]
+            log: logging::ContentionLog::new(),
         }
     }
 
     pub(crate) fn next_delay(&mut self, now: Instant, random: u64) -> Option<Duration> {
         let started = *self.started.get_or_insert(now);
         if self.retries >= self.policy.max_retries {
-            self.record_exhaustion();
+            self.record_exhaustion(now);
             return None;
         }
         let remaining = self
@@ -170,11 +176,14 @@ impl ContentionBudget {
         };
         // No shortened final sleep followed by an attempt at/after expiry.
         if delay >= remaining {
-            self.record_exhaustion();
+            self.record_exhaustion(now);
             return None;
         }
         self.retries += 1;
         self.metrics.scheduled();
+        #[cfg(feature = "contention-logging")]
+        self.log
+            .retry(self.retries, now.duration_since(started), remaining, delay);
         self.next_delay = self
             .next_delay
             .saturating_mul(self.policy.multiplier)
@@ -187,15 +196,22 @@ impl ContentionBudget {
             .started
             .is_some_and(|started| now.duration_since(started) >= self.policy.max_elapsed);
         if expired {
-            self.record_exhaustion();
+            self.record_exhaustion(now);
         }
         expired
     }
 
-    fn record_exhaustion(&mut self) {
+    fn record_exhaustion(&mut self, _now: Instant) {
         if !self.exhaustion_recorded {
             self.exhaustion_recorded = true;
             self.metrics.exhausted();
+            #[cfg(feature = "contention-logging")]
+            self.log.exhausted(
+                self.retries,
+                self.started
+                    .map_or(Duration::ZERO, |start| _now.duration_since(start)),
+                self.policy.max_elapsed,
+            );
         }
     }
 

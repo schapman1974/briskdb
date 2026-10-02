@@ -11,8 +11,12 @@ pub mod server;
 pub mod sql;
 pub mod storage;
 
-/// Original experimental record store, separate from the SQLite engine.
-/// Not yet connected to SQL, documents, or the Python/wire interfaces.
+/// Opt-in SQL database: ISAM catalog, immutable SQLite bases, S3 Parquet changes.
+#[cfg(all(unix, feature = "experimental-s3-overlay"))]
+pub mod s3_overlay;
+
+/// Original experimental record store. The hybrid metadata adapter also uses
+/// these primitives; native application-data SQL/document execution is separate.
 #[cfg(all(unix, feature = "experimental-isam"))]
 pub use storage::isam;
 
@@ -48,7 +52,7 @@ pub use core::{
     IdempotencyKey, IdempotencyStatus, IdempotentWriteResult, IndexKeyCollation, IndexKeyOrder,
     IndexKeyPart, IndexKeyValue, IndexKeyValueRef, IndexNullOrder,
     MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS, MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD,
-    MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD, MAX_IDEMPOTENCY_RECEIPTS_PER_SHARD,
+    MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD, MAX_IDEMPOTENCY_RECEIPTS_PER_SHARD, MetadataBackend,
     ParseDecimalError, ParseIdempotencyKeyError, PortalId, PrepareRequest, PreparedExecution,
     PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits, RequestContext,
     ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId, SessionState,

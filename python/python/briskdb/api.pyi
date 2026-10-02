@@ -1,5 +1,5 @@
 from os import PathLike
-from typing import AsyncIterator, List, Optional, Sequence, Union
+from typing import AsyncIterator, List, Optional, Sequence, Union, Literal, overload
 from uuid import UUID
 
 from ._briskdb import (
@@ -40,6 +40,9 @@ from ._briskdb import (
     WriteResult,
 )
 
+from .s3_overlay import OpenOptions, Database as OverlayDatabase
+
+@overload
 def connect(
     path: Union[str, PathLike[str]],
     *,
@@ -47,7 +50,17 @@ def connect(
     documents: bool = False,
     uuid_representation: Optional[UuidRepresentation] = None,
     config: Optional[Config] = None,
+    storage_mode: Literal["sqlite"] = "sqlite",
+    overlay_options: None = None,
 ) -> Database: ...
+
+@overload
+def connect(
+    path: Union[str, PathLike[str]],
+    *,
+    storage_mode: Literal["s3-overlay"],
+    overlay_options: Optional[OpenOptions] = None,
+) -> OverlayDatabase: ...
 
 class AsyncCursor(AsyncIterator[SqlRow]):
     @property

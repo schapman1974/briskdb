@@ -1,4 +1,76 @@
-# Warm-handler quickstart
+# Serverless patterns
+
+## Optional S3/Parquet overlay: fresh database per request
+
+An experimental Unix source build with `s3-overlay` provides a
+separate mode with ISAM metadata, immutable SQLite bases on shared storage,
+and pending Parquet changes in S3. It does not switch normal BriskDB databases
+to object storage. Use the [main README example](../README.md#optional-s3parquet-write-overlay-experimental-source-builds)
+and [Lambda handler](examples/s3_overlay_lambda.py). The handler closes its
+database before responding, and writes are acknowledged only after durable
+S3 publication. It never depends on Lambda continuing after its response.
+
+Provision the overlay once, then configure these **trusted deployment settings**:
+
+```text
+BRISKDB_STORAGE_MODE=s3-overlay
+BRISKDB_OVERLAY_ROOT=/mnt/shared/my-overlay
+BRISKDB_OVERLAY_PARQUET_PRUNING=true
+BRISKDB_OVERLAY_READ_ONLY=false
+```
+
+The last two flags are optional (defaults shown), accept only exact `true` /
+`false`, and are read by `Database.from_env()`, not by ordinary database opens.
+Use `true` for read-only deployments; that rejects mutation/compaction in the
+native layer, but does not replace scoped AWS permissions. S3 location/schema
+come from the persisted catalog; no bucket/prefix override is accepted on reopen.
+
+```python
+from briskdb.s3_overlay import Database
+
+def handler(event, _context):
+    with Database.from_env() as db:
+        rows = db.query("SELECT * FROM events WHERE id = ?", [event["id"]]).rows
+        return {"rows": rows}
+```
+
+Keep bucket, root, SQL structure and flags out of untrusted request parameters.
+No database handle is retained after the response. Creation-only shard,
+partition, compaction and publication-retry flags are listed in the
+[configuration reference](../README.md#selecting-and-configuring-this-mode).
+
+The SQLite reader uses advisory per-partition ISAM min/max/Bloom summaries to
+skip pending files for compatible primary-key equality filters. `db.read_stats()`
+reports actual files read/skipped and Parquet bytes read. Disable with
+`db.set_parquet_pruning(False)` for a controlled comparison. Each request still
+opens its own ISAM snapshot; no warm database handle is required. Missing or
+busy summaries safely fall back to payload reads. This is separate from the
+optional DuckDB reader and does not accelerate a partition with no pending files.
+
+For scheduled compaction, invoke one table/partition per event and cover all
+partitions. The same operation can be called from cron or an administrative
+request. A repeated compaction is safe; uncertain user writes must not be
+blindly retried. Configure caller/runtime deadlines, logging and alarms around
+these jobs. No recurring AWS schedule is enabled automatically by installing
+the wheel or creating an overlay database.
+
+The mode retains old SQLite bases and S3 objects for active-reader safety;
+automatic reclamation is not yet supported. Queries can span partitions but
+writes cannot, and neither global transactions nor Mongo adapters are enabled.
+See the README for the exact limits. The older ordinary-engine examples below
+are distinct from this mode and do not acquire its storage behavior.
+
+To experiment with DuckDB reads, build with `duckdb-reader` and
+provision the pinned native library/SQLite extension described in the
+[README](../README.md#optional-duckdb-reader-experimental). The example handler
+opts in only with `BRISKDB_OVERLAY_READER=duckdb`, trusted absolute
+`BRISKDB_DUCKDB_LIBRARY` and `BRISKDB_DUCKDB_SQLITE_EXTENSION` paths, and optional
+`BRISKDB_DUCKDB_THREADS`. Its default is twice the visible CPU count (maximum
+16), which is not a claim of twice Lambda's actual CPU capacity. DuckDB opens
+and closes inside each read request. Writes/compaction are unchanged; this
+reader is partition-scoped, not a replacement for arbitrary cross-table SQL.
+
+## Ordinary-engine warm-handler quickstart
 
 BriskDB can run inside one long-lived function/container process because the
 Python package starts no listener or subprocess. Keep one database handle warm

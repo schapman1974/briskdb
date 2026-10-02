@@ -19,7 +19,12 @@ mod journal;
 mod manifest;
 #[cfg(feature = "documents")]
 mod manifest_readers;
+pub(crate) mod metadata;
 mod migration;
+#[cfg(all(unix, feature = "experimental-isam"))]
+mod native_manifest;
+#[cfg(all(unix, feature = "experimental-isam"))]
+mod native_metadata;
 mod process_lock;
 mod schema_gate;
 #[cfg(feature = "auth-scram")]
@@ -580,6 +585,8 @@ fn validate_schema_migration_checksum_prefix(
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: profile::StorageRoot,
+    #[cfg(all(unix, feature = "experimental-isam"))]
+    native_manifest: Option<Arc<Mutex<native_manifest::NativeManifest>>>,
     catalog: Arc<CatalogSnapshot>,
     shard_layout: shard::ShardLayout,
     // Drop private idle readers before releasing this root's process lease.
@@ -615,6 +622,34 @@ fn schema_migration_status(migration: &manifest::SchemaMigration) -> SchemaMigra
 }
 
 impl Storage {
+    pub(crate) fn metadata_backend(&self) -> crate::MetadataBackend {
+        self.root.metadata_backend()
+    }
+
+    pub(crate) fn open_with_metadata_control(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        security_store_id: Option<[u8; 16]>,
+        control: Option<&Arc<OperationControl>>,
+        profile: crate::StorageProfile,
+        backend: crate::MetadataBackend,
+    ) -> EngineResult<Self> {
+        metadata::validate_selection(root.as_ref(), backend)?;
+        if backend == crate::MetadataBackend::Isam {
+            #[cfg(all(unix, feature = "experimental-isam"))]
+            return contention::with_control(control.cloned(), || {
+                Self::open_native_metadata(
+                    root.as_ref(),
+                    requested_shards,
+                    security_store_id,
+                    control,
+                    profile,
+                )
+            });
+        }
+        Self::open_with_profile_control(root, requested_shards, security_store_id, control, profile)
+    }
+
     fn configure_manifest_connection(&self, connection: &Connection) -> EngineResult<()> {
         configure_manifest_connection_with_policy(connection, self.root.journal())?;
         self.root.journal().configure_existing_mode(
@@ -684,6 +719,7 @@ impl Storage {
         control: Option<&Arc<OperationControl>>,
         profile: crate::core::StorageProfile,
     ) -> EngineResult<Self> {
+        metadata::validate_selection(root.as_ref(), crate::MetadataBackend::Sqlite)?;
         contention::with_control(control.cloned(), || {
             Self::open_with_startup_control_inner(
                 root,
@@ -726,6 +762,9 @@ impl Storage {
             CONNECTION_BUSY_TIMEOUT,
             control,
         )?;
+        // A concurrent native initializer may have won after the initial
+        // preflight. Never establish a second metadata authority in that root.
+        metadata::validate_selection(&root, crate::MetadataBackend::Sqlite)?;
         let schema_coordination = root_schema_coordination(&root)?;
         let mut startup = begin_startup_coordination(&schema_coordination, control)?;
         match control {
@@ -930,6 +969,8 @@ impl Storage {
 
         let mut storage = Self {
             root,
+            #[cfg(all(unix, feature = "experimental-isam"))]
+            native_manifest: None,
             catalog,
             shard_layout: ready_layout,
             #[cfg(feature = "documents")]
@@ -1161,6 +1202,10 @@ impl Storage {
     pub(crate) fn checkpoint_auxiliary_databases(
         &self,
     ) -> EngineResult<Vec<CheckpointDatabaseReport>> {
+        if self.metadata_backend() == crate::MetadataBackend::Isam {
+            // Native metadata commits sync before acknowledgement; there is no WAL.
+            return Ok(Vec::new());
+        }
         self.require_wal_checkpoint()?;
         let result = (|| {
             let manifest = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
@@ -1450,6 +1495,10 @@ impl Storage {
 
     fn register_tables_inner(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
         self.validate_table_declaration_request(&declarations)?;
+        #[cfg(all(unix, feature = "experimental-isam"))]
+        if self.native_manifest.is_some() {
+            return self.register_native_metadata(declarations);
+        }
         let catalog_is_empty = self.catalog.logical().tables().is_empty();
         if !catalog_is_empty && !declarations_match_catalog(self.catalog.logical(), &declarations) {
             let _operation = self.enter_schema_operation()?;
@@ -3007,6 +3056,17 @@ impl Storage {
     /// Fail closed immediately and make one zero-busy-wait best-effort attempt
     /// to persist terminal `Degraded` state in an already-trusted manifest.
     pub(crate) fn record_schema_degraded(&self) {
+        #[cfg(all(unix, feature = "experimental-isam"))]
+        if let Some(native) = &self.native_manifest {
+            self.mark_schema_degraded();
+            if let Ok(mut native) = native.lock() {
+                if let Ok((version, mut root)) = native.root() {
+                    root.degraded = true;
+                    let _ = native.publish(version, &root, Vec::new());
+                }
+            }
+            return;
+        }
         self.mark_schema_degraded();
         if let Ok(mut manifest_connection) =
             open_existing_manifest(&self.root.join("manifest.sqlite"))
@@ -3066,6 +3126,11 @@ impl Storage {
         &self,
         control: Arc<OperationControl>,
     ) -> EngineResult<SchemaMigrationSummary> {
+        #[cfg(all(unix, feature = "experimental-isam"))]
+        if let Some(native) = &self.native_manifest {
+            check_startup_control(Some(&control))?;
+            return contention::lock(native, "native metadata")?.summary();
+        }
         const MAX_GENERATION_RETRIES: usize = 8;
         let mut committed_handoff = None;
         for _ in 0..MAX_GENERATION_RETRIES {
@@ -3142,6 +3207,11 @@ impl Storage {
         target_generation: u64,
         control: Arc<OperationControl>,
     ) -> EngineResult<Option<SchemaMigrationStatus>> {
+        #[cfg(all(unix, feature = "experimental-isam"))]
+        if let Some(native) = &self.native_manifest {
+            check_startup_control(Some(&control))?;
+            return contention::lock(native, "native metadata")?.status(target_generation);
+        }
         const MAX_GENERATION_RETRIES: usize = 8;
         let mut committed_handoff = None;
         for _ in 0..MAX_GENERATION_RETRIES {
@@ -3209,6 +3279,11 @@ impl Storage {
         guard: &mut SchemaMigrationGuard,
         control: Option<Arc<crate::core::OperationControl>>,
     ) -> EngineResult<Vec<u16>> {
+        #[cfg(all(unix, feature = "experimental-isam"))]
+        if self.native_manifest.is_some() {
+            let result = self.migrate_native_metadata(sql, guard, control);
+            return self.fail_closed_on_corruption(result);
+        }
         if !self.catalog.logical().global_indexes().is_empty() {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
@@ -4259,7 +4334,20 @@ fn startup_storage_profile(
 }
 
 pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {
-    validate_existing_manifest_file(path)?;
+    if let Err(error) = validate_existing_manifest_file(path) {
+        // Error-only probe: no added filesystem work on ordinary SQLite reads.
+        if path
+            .file_name()
+            .is_some_and(|name| name == "manifest.sqlite")
+            && metadata::present(&path.with_file_name("manifest.isam"))?
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "this metadata operation is not implemented for ISAM; SQLite fallback is disabled",
+            ));
+        }
+        return Err(error);
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW

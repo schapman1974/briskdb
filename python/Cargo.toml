@@ -17,6 +17,14 @@ briskdb = { path = "..", default-features = false, features = ["documents", "lis
 pyo3 = { version = "=0.29.2", features = ["abi3-py39"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
 libsqlite3-sys = "0.37.0"
+serde_json = { version = "1", optional = true }
+
+[features]
+experimental-isam = ["briskdb/experimental-isam"]
+experimental-s3-overlay = ["briskdb/experimental-s3-overlay", "dep:serde_json"]
+experimental-duckdb-reader = ["experimental-s3-overlay", "briskdb/experimental-duckdb-reader"]
+s3-overlay = ["experimental-s3-overlay"]
+duckdb-reader = ["experimental-duckdb-reader"]
 
 [build-dependencies]
 cc = "1.4.1"

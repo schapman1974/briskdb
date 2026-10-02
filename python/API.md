@@ -8,7 +8,7 @@ files; the signatures below are the compact API map.
 
 For networked use of Python's real `sqlite3`, see [remote SQLite](#remote-sqlite-addon).
 
-- `open(path, *, shards=None, documents=False, uuid_representation=None, config=None) -> Database`
+- `open(path, *, shards=None, documents=False, uuid_representation=None, config=None, storage_mode="sqlite", overlay_options=None) -> Database`
 - `connect(...) -> Database` is the synchronous ergonomic alias.
 - `await open_async(...) -> AsyncDatabase` and `connect_async(...)` open
   without blocking the event loop.
@@ -36,6 +36,40 @@ See [bounds, coverage and examples](../docs/REQUEST_CONTROLS.md#opt-in-storage-c
 omitted count is read from the validated manifest; an explicit mismatch raises
 `FailedPreconditionError`. `Database.shard_count` and `Database.config.shards`
 always report the resolved count.
+
+### Optional overlay API (source feature `s3-overlay`)
+
+`open(path, storage_mode="s3-overlay", overlay_options=None)` and the same
+`connect(...)` return **`briskdb.s3_overlay.Database`**, not an ordinary session
+database. They open an existing overlay only; ordinary `Config`, explicit
+`shards`, document and UUID options are rejected. No environment setting changes
+the default `storage_mode="sqlite"`. Missing native feature support raises
+`UnsupportedError` before storage opens. This selection is synchronous-only.
+
+- `s3_overlay.OpenOptions(parquet_pruning=True, read_only=False)` is immutable
+  and accepts booleans only. Flags are per handle, not persisted.
+- `s3_overlay.Database(path, *, options=None)` is the equivalent direct open.
+- `Database.from_env(environ=None)` requires `BRISKDB_STORAGE_MODE=s3-overlay`
+  and `BRISKDB_OVERLAY_ROOT`. `OpenOptions.from_env(environ=None)` reads optional
+  `BRISKDB_OVERLAY_PARQUET_PRUNING` / `BRISKDB_OVERLAY_READ_ONLY` (`true` / `false`
+  only). These environment helpers are explicit, not part of ordinary opens.
+- `Database.create(root, *, bucket, region, prefix, tables, seed=None, shards=4,
+  partitions=64, compact_after_files=32, max_pending_files=64,
+  write_retry_ms=60000, options=None)` provisions a new root and S3 namespace.
+  Creation refuses read-only options. Schema and creation settings are immutable.
+- `query(sql, params=()) -> QueryResult` has `.columns` and `.rows`.
+  `execute(sql, params=()) -> dict` returns affected rows and commit identity.
+- `compact(table=None, partition=None)` compacts all partitions or exactly one
+  when both selectors are supplied. Read-only handles reject execute/compaction
+  natively. Read-only is an operation guard, not an AWS authorization policy.
+- `settings() -> dict` reports mode, backends, persisted config and effective
+  flags, never credentials. `set_parquet_pruning(bool)` changes pruning and
+  summary publication for this handle; `read_stats()` reports the last SQL scan.
+- `close()` and `with Database(...)` release the handle before returning.
+
+Writes are single-table/partition statements, not global transactions. Query
+results merge pending changes with immutable SQLite bases. No automatic DDL,
+migration or Mongo/Postgres routing is provided. See [full example and bounds](../README.md#optional-s3parquet-write-overlay-experimental-source-builds).
 
 ## Database and session
 
