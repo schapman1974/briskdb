@@ -1,21 +1,143 @@
 # Experimental original ISAM record-store format
 
 The Unix-only `experimental-isam` feature exposes an unreleased, opt-in record
-store. It is an original BriskDB format, not VBISAM, and is not selected by
-`BriskDb`, SQL, document, Python, or wire APIs. SQLite remains the supported
-default. There is no format conversion, catalog, secondary index, compaction,
-or NFS/EFS qualification.
+store. It is an original BriskDB format, not VBISAM. The experimental hybrid
+SQL metadata option uses this store; application data remains in SQLite shards.
+SQLite remains the supported default. A separate native-only catalog supports typed rows and secondary indexes, but
+there is no format conversion, compaction, or NFS/EFS qualification.
+
+## Hybrid SQL metadata manifest (experimental)
+
+Explicit `MetadataBackend::Isam` uses `manifest.isam`: packed v3 tree pages,
+17-byte keys, and values of at most 1024 bytes. This is a distinct format from
+the low-level `NativeCatalog`. Its root record carries the marker
+`briskdb.hybrid-metadata.v1`, random 16-byte shard-layout identity, fixed shard
+count and routing algorithm versions, schema generation, trusted schema
+digest, readiness/degradation state, table count, and pending migration state.
+Unknown versions/fields, mismatched metadata selection, missing manifests beside
+existing shards, and symlinked manifests fail closed. There is no automatic
+conversion or hidden `manifest.sqlite`.
+
+The optional `rollback_journal` root flag defaults to false (local/WAL). Only
+the internal disposable-data benchmark creates true/PERSIST-EXTRA roots. Their
+shard journal policy survives migrations and reopening, and public local opens
+reject them without conversion. This test-only path does not enable public NFS
+support or establish EFS qualification.
+
+Keys are a one-byte record kind plus two big-endian u64 values: kind 0 is the
+singleton root, kind 1 SQL table identity, kind 2 migration target generation,
+and kind 3 migration generation/chunk number. Kind 4 stores a completed SQL
+receipt under a 128-bit hash prefix, always checked against the full 256-bit
+hash and exact SQL bytes; collisions are errors, not receipt matches. Table
+declarations are sorted by name with stable positive IDs. The initial atomic
+registration limit is 4095 tables plus the root. Migration SQL is chunked and
+checksummed with a 65536-byte bound, never truncated to a single ISAM value.
+All metadata publication uses generation-checked atomic native batches.
+
+Application shards retain their existing SQLite identity, WAL, transactions,
+schema validation, and checksums. Schema changes retain root/schema ownership,
+preflight every shard, durably publish native intent, commit each
+shard and its progress, and publish the completed native generation. Reopen
+validates the entire source/target prefix before resuming. Immediate process
+exit tests cover intent, first-shard commit, progress, and final-publication
+boundaries; these are not power-loss or EFS qualification. Ordinary SQL data
+requests use the existing admitted catalog and do not reopen/scan the ISAM
+manifest per row.
+
+Document/global-index/generated-ID/security metadata is not yet implemented in
+this adapter. Metadata backend choice is independent of any future native
+application-data backend; this hybrid mode does not promise SQLite-free data
+storage or permit public NFS mode. Old tree pages accumulate until reclamation
+is implemented.
+
+## Separate optional S3/Parquet overlay format
+
+The `experimental-s3-overlay` feature does not change either normal manifest
+format. It uses a distinct new root marked by `overlay.mode` and `overlay.isam`.
+Normal BriskDB opens reject these markers, including interrupted creation.
+The ISAM catalog uses packed records with 8-byte big-endian keys and 1024-byte
+values: key zero stores config length/hash; remaining keys hold JSON chunks.
+The catalog is published after bases and heads are durable, then opened with
+shared read locks only. It contains no AWS credentials.
+
+S3 paths are scoped by configured prefix and random database ID, then table
+number and partition. Each `head.json` names an immutable SQLite base, a
+contiguous ordered delta list, base-through/sequence/revision counters and the
+last 256 commit IDs. ETag conditional replacement is the publication point.
+Parquet payloads are uploaded before heads can name them, with length and
+BLAKE3 checksums verified on read. Typed columns preserve INTEGER/REAL/TEXT/BLOB
+and NULL; explicit primary keys and tombstone flags encode replacement/deletion.
+There is no SQL/WAL file upload, object listing per query, or whole-database copy.
+
+Each partition may also have a packed-v3 `parquet-index.isam` sidecar, with
+32-byte ASCII delta-ID keys and at most 1024-byte JSON summaries. Its records
+contain format version 1, the payload checksum, and primary-key column min/max
+bounds plus 256-bit Bloom filters (three BLAKE3-derived probes). Routing columns
+take priority when all columns cannot fit. Wide keys retain their Bloom filter
+without truncated bounds. Tombstones and both sides of a primary-key change
+are indexed using their explicit keys, not nullable payload values.
+
+A writer uploads the immutable Parquet object, attempts durable ISAM index
+publication, then includes an optional `index_hash` in the same conditional
+S3-head commit. Index failure omits that field and does not lose the write.
+Readers take one short shared ISAM snapshot per partition and verify both the
+summary checksum and its payload binding before skipping files. Missing,
+stale, busy, malformed or mismatched records force normal payload reads.
+Unpublished/orphan summaries have no authority. No global mutable index is
+introduced. Old readers reject heads with the new field; deploy compatible
+overlay clients together. Old heads without the field remain readable.
+
+Pruning currently applies only to SQLite BINARY equality predicates on typed
+primary-key columns. Non-key filters cannot safely exclude a delta that might
+supersede an older matching row. Coercions and unsupported predicates retain
+the full read path. Query heads remain pinned across repeated join probes;
+partially pruned row sets are never cached as complete partition snapshots.
+Compaction always reads every pending file. No index backfill or index garbage
+collection is implemented.
+
+SQLite bases live under `shards/SHARD/TABLE/PARTITION/base-ID.sqlite`; partition
+modulo shard count chooses the directory. The routing hash uses BriskDB's
+canonical key encoding. Published bases are never mutated, so read-only
+`immutable=1` opens do not need SQLite journal/writer locks. This flag must not
+be used for the ordinary mutable SQLite shards. Compaction writes/fsyncs a
+private replacement and conditionally changes base plus pending membership in
+one head publication, retaining concurrently appended deltas. A losing
+compactor's candidate remains an orphan, not authoritative data.
+
+No automatic deletion/expiration of bases, deltas, receipts or object versions
+is permitted by this implementation. Existing readers may still reference old
+heads; age-only cleanup could corrupt them. Offline reclamation, backup/restore
+and full host/network-failure qualification are not claimed. Runtime S3 access
+needs only scoped GetObject/PutObject, with conditional writes and HTTPS.
 
 ## Logical operation diagnostics
+
+Each immutable read batch now owns a bounded cache of validated, decoded tree
+pages. Repeated point reads, overlapping ranges, and write validation/planning
+within the same snapshot reuse those pages. The cache is discarded on a new
+batch or write rebase; it is never shared across files or generations. FIFO
+eviction limits it to 64 pages and 256 KiB of decoded node/vector storage
+(allocator and map overhead are additional). Reads in progress may retain an
+evicted page until traversal completes. This is not a database-sized cache or
+a change to the durable format. Parent/child fences are checked even on hits;
+failed page reads are not cached. `verify()` bypasses the cache to check the
+physical pages, including corruption introduced after a page was cached.
 
 Each `Store` exposes a snapshot of its per-handle logical operation counters;
 an `OperationStatsHandle` can retain access to final close counts after the
 store is dropped. Counters include data/sidecar opens and closes, explicit
-file-metadata calls, root and tree-page reads/writes, sync calls, lock
-requests/retries, and accumulated lock-admission wait time. Timings cover
+file-metadata calls, root and tree-page reads/writes, sync calls, aggregate
+lock requests/retries, and accumulated lock-admission wait time. Separate
+write-lock counters report batch/key counts, deduplicated stripe acquisitions,
+and local-mutex versus OS byte-range-lock retries and wait. Per-stripe
+acquisition/retry/wait arrays expose stable hash stripe IDs, not record keys.
+Timings cover
 explicit root/page I/O and sync calls plus the root-publication critical
-section; the publication duration includes lock admission, root write, and
-final sync, so those values overlap and must not be summed. Timings exclude
+section; in v2/v3 publication duration includes lock admission, root write, and
+final sync, so those values overlap and must not be summed. In v4 the final
+sync is outside publication ownership and is counted only in sync time.
+Root I/O counters include v4 working-state reads/writes, not just reader-visible
+publications. Timings exclude
 result serialization and are diagnostic, not a replacement for end-to-end
 latency. The counters count application-level calls, not kernel syscall totals
 or NFS RPCs. The metadata counter excludes implicit kernel work performed by
@@ -29,8 +151,8 @@ truncates an existing path. A store at `name.isam` has a separate
 `name.isam.writer.lock` sidecar. Both must be regular files with one hard link
 and owner-only permissions; final path components are opened without following
 symlinks. The identity currently consists of these retained file descriptors
-and their inode identities, the `BRISAM02` format marker/version, and the
-selected root tuple `(layout, generation, root offset, committed end)`. The
+and their inode identities, the `BRISAM02`, `BRISAM03`, or `BRISAM04` format marker/version,
+and the selected root tuple `(version, layout, generation, root offset, committed end)`. The
 format does not yet contain a persistent database UUID or detect replacement
 of a path while a handle is live. Do not rename, unlink, replace, or recreate
 either file while any process may hold it; external replacement is unsupported.
@@ -43,8 +165,11 @@ stripes, using one-byte POSIX range locks at fixed offsets. Writers acquire
 deduplicated stripe IDs in ascending order. A stripe collision conservatively
 serializes unrelated keys; it cannot grant access to conflicting keys. The
 mapping, stripe count, and lock-file version are format-stable and must not be
-changed in place. Batches can hold at most 64 range locks per store and no
-whole-file fallback is allowed on exhaustion. The key-lock descriptor is
+changed in place. Batches can hold at most 64 key-range locks plus one commit
+gate per store; no whole-file fallback is allowed on exhaustion. The gate uses
+byte offset 4160, immediately after the key stripes, on the same retained
+descriptor, with its own process-local mutex. It does not change the persisted
+data/header format or the key-stripe mapping. The key-lock descriptor is
 process-shared among local handles so closing another descriptor cannot drop
 the process's POSIX locks. Legacy writers' exclusive `.writer.lock` lock
 excludes new writers holding the shared compatibility lock.
@@ -57,15 +182,27 @@ while same-key mutations serialize. Callers must not treat a prior read or a
 range scan as a lock-protected read-modify-write transaction; phantom
 protection and serializable multi-key transactions are not provided.
 
-For a write, the shared legacy fence and sorted key stripes remain held while
-the writer captures a root, prepares immutable pages, reserves a non-overlapping
-append range under a brief exclusive data-file lock, writes and syncs those
-pages, then acquires exclusive publication admission. It publishes only if the
-captured root is still current; otherwise it replans against the new root and
-leaves the unreferenced pages as orphans. Readers hold shared publication
+For a v2/v3 write, the shared legacy fence and sorted key stripes remain held while
+the writer captures a root and prepares an in-memory immutable-page plan.
+Disjoint writers can prepare concurrently. Before allocating or writing pages,
+the writer acquires the commit gate and rechecks its root under the brief
+exclusive allocation lock. A stale plan is rebuilt while retaining the gate,
+without reserving space, writing pages, or flushing the discarded plan. This
+serializes the durable write stage, not snapshot reads or the first preparation.
+The writer then reserves a non-overlapping append range, writes and syncs pages,
+and acquires exclusive publication admission. Both existing syncs remain.
+It still publishes only if the captured root is current: older writers do not
+honor the new performance gate, so this last recheck cannot be removed. Such a
+mixed-version conflict still replans and leaves orphan pages. The lock order is
+legacy fence, ascending key stripes, commit gate, data-file locks. Readers never
+take the commit gate. Readers hold shared publication
 admission only while capturing a root. Lock waits consume one finite
 operation-wide admission deadline and return `Busy` when it expires. Synchronous
 filesystem I/O itself is not cancellable or deadline-bounded by this policy.
+The gate does not provide FIFO fairness or automatic group commit; those remain
+separate performance/qualification work. `preflight_rebases` counts discarded
+unflushed plans; `publication_retries` counts post-sync conflicts, and
+`commit_lock_wait_ns` is included in aggregate lock wait time.
 
 These primitives are a local locking design only. POSIX locks are process-wide
 and descriptor close behavior is subtle; independent-host EFS/NFS visibility,
@@ -115,25 +252,164 @@ Ambiguous root damage fails closed and requires operator recovery; automatic
 fallback can silently discard acknowledged data. A process-exit test is not a
 power-loss test. Do not infer power-loss guarantees from local tests.
 
+## Opt-in version 3: packed values, no compression
+
+`Store::create_packed(path, layout)` and `NativeCatalog::create_packed(path)`
+create new v3 files. Normal `create` still creates v2; `open` recognizes either
+version and subsequent writes preserve it. There is no automatic conversion,
+and older v2-only readers reject v3 rather than misreading it. Root slots use
+`BRISAM03` / version `3`, must agree on format version as well as layout, and
+retain the same bounds, checksum, generation, and fail-closed recovery rules.
+Live handles reject an unexpected format change.
+
+V3 pages use `BRIPAGE2`. Branch records retain fixed-width keys and 8-byte child
+offsets. Leaf records contain the full fixed-width key, a 2-byte little-endian
+value length, and exactly that many value bytes. Entries are contiguous; only
+the unused page tail is zero padded. Splits are sized by actual encoded bytes,
+including when updates grow values. For the native catalog's 128-byte keys and
+1024-byte value limit, a page can hold 15 entries with 128-byte values instead
+of v2's 3 fixed slots. Maximum-sized values still fit 3 per leaf.
+
+No compression codec, packed-decimal conversion, or key-prefix encoding is
+used. Numeric encodings and logical limits are unchanged. The decoder validates
+each entry boundary, value length, key order and zero tail before caching a
+page. Checksums, parent/child fences, key locks, the commit gate, and both syncs
+remain in force. This improves space utilization, not reclamation: old versions
+still accumulate, and adjacent underfull leaves are not yet consolidated.
+
+## Opt-in version 4: pipelined durable prefixes
+
+`Store::create_pipelined(path, layout)` and
+`NativeCatalog::create_pipelined(path)` create new v4 files. Normal creation,
+existing v2/v3 files, SQLite defaults, and public SQL/Mongo/Python routing are
+unchanged. This is an experimental local-Unix path, **not NFS/EFS-qualified**.
+It does not implement independently committed index partitions or remove all
+shared coordination. It moves explicit durability flushes outside the shared
+staging and publication gates; conflicting keys still serialize on the same
+64 stripes. NFS may itself flush cached writes when acquiring/releasing a
+data-file lock, so this does not promise flush-free NFS lock handoffs.
+
+V4 retains v3 packed tree pages, record limits, checksum validation, and
+append-only copy-on-write snapshots. The data file begins with two published
+4096-byte root slots and a third 4096-byte speculative working-state page;
+tree pages begin at byte 12288. Root magic/version are `BRISAM04` / `4`.
+Bytes 40–47 contain a publication sequence, distinct from the tree generation.
+Publication parity selects the slot, and valid published slots must have
+consecutive publication sequences with nondecreasing generation/end. Repeated
+publication of a generation must preserve exactly the same root and end.
+Generation can jump when a later completed writer publishes a whole prefix.
+Only the initial generation/publication 1 can have an unused alternate slot.
+Published-root damage still fails closed; no older-root fallback is permitted.
+
+The working page uses the same root fields, followed by a durable-generation
+watermark (bytes 48–55), a 64-bit completion window (56–63), and a failed flag
+encoded as 0 or 1 (64–71). The remaining payload is zero, followed by the usual
+BLAKE3 checksum. The window covers at most 64 staged generations beyond the
+watermark; bit `generation % 64` means that writer completed its first sync.
+Bits outside the window are invalid. This is coordination state, **never a
+reader-visible root or recovery authority**.
+
+The write sequence is:
+
+1. Hold the shared writer fence and sorted key stripes. Under the short
+   byte-range staging gate and shared data-file fence, validate against the
+   working root, construct/write immutable pages, reserve append space, and
+   install a new working root. The data-file fence is required for NFS cache
+   coherence: locking only the sidecar does not refresh cached database bytes.
+   The staging gate excludes other working-state writers; the shared data
+   fence lets both new and retained immutable snapshots read throughout staging.
+2. Release both gates, then sync this writer's data. Under the staging gate
+   and data-file fence, set its completion bit and advance the contiguous
+   durable watermark. The failure flag uses the same two locks.
+   Wait with the operation's bounded admission policy until every earlier
+   staged generation is durable. One client's sync never substitutes for
+   another client's completion. A full completion window returns `Busy`
+   before staging new work.
+3. Briefly acquire exclusive publication admission. Publish this writer's
+   durable prefix, or retain a newer prefix if another writer finished first.
+   Always write a root with the next publication sequence on this descriptor.
+   Do not roll the reader root back on out-of-order completion.
+4. Release publication admission **before** the second sync. Return success
+   only after that sync succeeds. The writer/key locks remain held until then.
+
+Both durability barriers remain. Handles in the **same process** coalesce
+overlapping sync requests: each registers a ticket after its writes complete,
+and a physical sync covers only tickets captured before that sync began.
+Requests arriving during a sync require a subsequent sync. A shared sync
+failure wakes all covered waiters with errors; no caller is acknowledged early.
+`sync_requests` counts logical durability barriers and `syncs` counts successful
+physical flushes. This optimization does **not** combine requests from separate
+processes or Lambda instances; multi-host performance cannot be inferred from
+a threaded benchmark. Independent processes can still overlap their flushes
+because neither shared gate spans them. A later
+writer may publish earlier staged transactions before their callers return,
+but only after those originating writers reported data durability. Readers
+capture only the published immutable snapshot, never working state. Record
+and secondary-index mutations remain atomic within each batch. A stalled
+earlier writer can still hold back the publishable prefix; byte locks do not
+eliminate that dependency or storage-device contention.
+
+Once working-root installation is attempted, an error is `CommitUnknown`:
+another writer might already include the transaction. Missing completion bits
+prevent unsafe publication after a failed first sync. A best-effort failed flag
+stops further speculation; errors must be reconciled, never blindly retried.
+A crashed writer can leave a durability hole. Quiesce writers and reopen to
+recover, rather than skipping that hole. A validation conflict against
+unpublished state returns `Busy` before staging, so catalog retries cannot loop
+forever rereading the same published row. Duplicate checks distinguish a real
+published conflict from one present only in abandoned speculation. Writable open takes the exclusive
+writer fence and the exclusive data-file fence, rereads the published authority,
+and resets working state to it.
+Unpublished work is discarded without reusing its pages; acknowledged data
+and old reader snapshots remain intact. Read-only open never resets state.
+Opening another writable handle can therefore return `Busy` while writers are
+active; `Store::open_with_policy` provides bounded waiting.
+
+Tests cover out-of-order publication, overlapping writers, atomic reader
+snapshots, unique-index conflicts, window wrapping, corruption, and injected
+errors/process exits. They are not power-cut, independent-host cache-coherence,
+lease-recovery, or stale-client fencing qualification. Never deploy this
+experimental format as authoritative NFS/EFS storage based on local timings.
+
 ## Native schema catalog
 
-`NativeCatalog` stores only native metadata records in a separate ISAM file;
-it does not create or open `manifest.sqlite`. Its root record (`BRICAT01`)
+`NativeCatalog` stores native metadata, rows, and secondary-index entries in a
+separate ISAM file; it does not create or open `manifest.sqlite`. Its root record (`BRICAT01`)
 identifies the ISAM format version, catalog-record version, and a random
-16-byte catalog identity. Table declarations (`BRITBL01`) persist a schema
+16-byte catalog identity. Table declarations (`BRITBL02`) persist a schema
 version, bounded column definitions, and bounded index declarations. Names are
 case-sensitive ASCII identifiers of at most 63 bytes; each table declaration
 must fit in one 1024-byte value. The catalog supports at most 64 columns, 32
-index declarations, and 8 columns per declared index, subject to that encoded
-record size limit.
+index declarations, and 8 columns per primary or secondary key, subject to
+that encoded record size limit. Version-1 (`BRITBL01`) declarations remain
+readable as metadata but have no primary key and cannot use typed row
+operations.
 
-Catalog declarations are metadata only: index declarations do not create
-physical indexes or enforce uniqueness, and table declarations are not yet
-connected to SQL/document execution or backend selection. Catalog DDL records
-and the root identity are committed together. The catalog's table listing is
-bounded to 4096 declarations and returns an error if more are present. Old pages
-accumulate. Snapshot bounds, reclamation, native query/API integration, and
-NFS/EFS qualification are separate work.
+Rows (`BRIROW01`) use a versioned typed encoding for Boolean, signed/unsigned
+64-bit integer, 64-bit float, text, binary, and nullable values; each encoded
+row is limited to 1024 bytes. Primary-key values cannot be NULL. Inserts,
+updates, deletes, and all affected secondary-index entries publish in one
+atomic ISAM batch. The bulk `insert_rows`, `update_rows`, and `delete_rows`
+operations let callers combine up to 4096 physical row/index mutations in one
+durable publication; a false update/delete result means at least one requested
+old key was absent and no part of the batch was committed. Index entries
+whose encoded key and owner are unchanged are validated but not deleted and
+reinserted on updates. Key movement still replaces the affected owners, and
+unique-key swaps within an atomic bulk update remain supported. This reduces
+index mutations and stripe admission work; it does not eliminate either
+durable sync or automatically combine independent clients' transactions.
+Unique indexes enforce uniqueness, with SQL-style distinct NULL values; non-unique indexes
+retain NULL values. Exact lookups and ordered composite-index ranges return at
+most 4096 rows; range bounds are inclusive at the start and exclusive at the
+end. Oversized or unsupported encodings reject before publication.
+
+Catalog DDL records and the root identity are committed together. Table drops
+refuse nonempty data/index namespaces and exclude concurrent row writes during
+the emptiness check. The catalog's table listing is bounded to 4096 declarations
+and returns an error if more are present. Neither the catalog nor its physical
+indexes are connected to SQL/document execution or backend selection. Old
+pages accumulate. Snapshot bounds, reclamation, native query/API integration,
+and NFS/EFS qualification are separate work.
 
 # Manifest storage format and migrations
 

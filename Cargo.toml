@@ -23,6 +23,7 @@ default = ["server-cli", "sqlite-import-cli"]
 embedded = ["experimental-vtab"]
 # Network adapters can be selected independently by downstream applications.
 http = [
+    "contention-logging",
     "dep:axum",
     "dep:base64",
     "dep:futures",
@@ -95,6 +96,7 @@ documents = [
 ]
 # Opt-in Mongo transport foundation. No listener is enabled by default.
 mongo = [
+    "contention-logging",
     "documents",
     "dep:base64",
     "dep:bytes",
@@ -110,12 +112,27 @@ mongo-tls = ["mongo", "transport-tls"]
 # This reserved name establishes the intended package boundary without
 # claiming that the listener is implemented.
 mysql = []
+# Host-controlled, data-free lock/backoff diagnostics; no subscriber is installed.
+contention-logging = ["dep:tracing"]
 # Statically compile rusqlite's virtual-table API for the no-fork sharded-table
 # prototype. This does not enable SQLite's runtime extension loader.
 experimental-vtab = ["rusqlite/vtab"]
-# Original, experimental indexed-record storage primitives (Unix only).
-# This is not yet a SQL/document backend and never changes SQLite defaults.
-experimental-isam = []
+# Original indexed-record primitives and experimental hybrid SQL metadata (Unix only).
+# Application data shards remain SQLite; neither backend default changes.
+experimental-isam = ["dep:serde", "dep:serde_json"]
+# Separate, explicitly opened immutable-SQLite/S3-Parquet SQL mode. Never
+# selected by ordinary Engine/BriskDb opens or by the default feature set.
+experimental-s3-overlay = [
+    "experimental-isam", "experimental-vtab", "dep:object_store", "dep:parquet",
+    "dep:bytes", "dep:futures", "dep:async-trait", "tokio/net", "tokio/time", "tokio/rt-multi-thread",
+]
+# Optional dynamic DuckDB reader; the caller supplies trusted pinned binaries.
+experimental-duckdb-reader = ["experimental-s3-overlay", "dep:libloading"]
+# User-facing opt-in feature names. The experimental aliases remain supported;
+# enabling a feature never changes the storage mode selected at runtime.
+s3-overlay = ["experimental-s3-overlay"]
+s3-overlay-cli = ["s3-overlay", "dep:clap"]
+duckdb-reader = ["experimental-duckdb-reader"]
 # Opt-in matched ISAM/SQLite benchmark harness with JSON row-serialization timing.
 isam-benchmark = [
     "embedded",
@@ -141,7 +158,10 @@ fancy-regex = { version = "=0.19.0", optional = true }
 hyper = { version = "1.11", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"], optional = true }
 libc = "0.2"
+libloading = { version = "=0.8.9", optional = true }
 num-bigint = { version = "=0.4.8", optional = true }
+object_store = { version = "=0.12.4", default-features = false, features = ["aws", "tls-webpki-roots"], optional = true }
+parquet = { version = "=56.2.0", default-features = false, optional = true }
 # bson 3.1 permits newer `time` releases whose MSRV has moved past BriskDB's
 # Rust 1.85 floor. Constrain that transitive edge for downstream consumers,
 # whose lockfiles do not inherit this repository's compatible resolution.
@@ -189,6 +209,11 @@ tokio-postgres = "=0.7.18"
 [[bench]]
 name = "storage"
 harness = false
+
+[[bin]]
+name = "briskdb-s3-overlay"
+path = "src/bin/briskdb-s3-overlay.rs"
+required-features = ["experimental-s3-overlay"]
 
 [[bin]]
 name = "briskdb"

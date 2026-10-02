@@ -12,7 +12,10 @@ use std::{
 
 use briskdb::{
     core::Value,
-    isam::{Layout, LockPolicy, Mutation, OperationStats, Record, Store},
+    isam::{
+        ColumnDefinition, ColumnType, IndexDefinition, Layout, LockPolicy, Mutation, NativeCatalog,
+        NativeValue, OperationStats, Record, Store, TableDefinition,
+    },
     storage::Database,
 };
 use serde::Serialize;
@@ -22,6 +25,9 @@ const SEED_CHAPTERS: u32 = 10;
 const SEED_FIRST_CHAPTER: u32 = 100;
 const SEED_REFRESH_CHAPTER: u32 = 103;
 const SQLITE_CREATE: &str = "CREATE TABLE isam_bench (id TEXT PRIMARY KEY, body TEXT NOT NULL)";
+const SQLITE_CATALOG_CREATE: &str =
+    "CREATE TABLE isam_catalog_bench (id TEXT PRIMARY KEY, body TEXT NOT NULL)";
+const SQLITE_CATALOG_INDEX: &str = "CREATE INDEX isam_catalog_body ON isam_catalog_bench (body)";
 const SQLITE_READ: &str = "SELECT id, body FROM isam_bench WHERE id = ?1";
 const SQLITE_RANGE: &str =
     "SELECT id, body FROM isam_bench WHERE id >= ?1 AND id < ?2 ORDER BY id LIMIT 36";
@@ -29,6 +35,88 @@ const SQLITE_UPSERT: &str = "INSERT INTO isam_bench (id, body) VALUES __VALUES__
 const FLAT_KEY_BYTES: usize = 11;
 const FLAT_VALUE_BYTES: usize = 128;
 const FLAT_RECORD_BYTES: usize = FLAT_KEY_BYTES + FLAT_VALUE_BYTES;
+const CATALOG_TABLE: &str = "bench_rows";
+const CATALOG_ID_INDEX: &str = "by_id";
+const CATALOG_BODY_INDEX: &str = "by_body";
+
+fn catalog_schema() -> TableDefinition {
+    TableDefinition {
+        name: CATALOG_TABLE.to_owned(),
+        schema_version: 1,
+        columns: vec![
+            ColumnDefinition {
+                name: "id".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDefinition {
+                name: "body".to_owned(),
+                column_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".to_owned()],
+        indexes: vec![
+            IndexDefinition {
+                name: CATALOG_ID_INDEX.to_owned(),
+                columns: vec!["id".to_owned()],
+                unique: true,
+            },
+            IndexDefinition {
+                name: CATALOG_BODY_INDEX.to_owned(),
+                columns: vec!["body".to_owned()],
+                unique: false,
+            },
+        ],
+    }
+}
+
+fn catalog_values(id: String, body: String) -> Vec<NativeValue> {
+    vec![NativeValue::Text(id), NativeValue::Text(body)]
+}
+
+fn catalog_id(sample: usize) -> String {
+    format!("typed-{sample:06}")
+}
+
+fn catalog_key(id: &str) -> [NativeValue; 1] {
+    [NativeValue::Text(id.to_owned())]
+}
+
+fn catalog_seed_rows() -> Vec<(String, String)> {
+    (0..4_000)
+        .map(|sample| (catalog_id(sample), format!("seed-body-{sample}")))
+        .collect()
+}
+
+fn catalog_sql_upsert(rows: &[(String, String)]) -> SqlWrite {
+    let mut values = Vec::with_capacity(rows.len());
+    let mut params = Vec::with_capacity(rows.len() * 2);
+    for (index, (id, body)) in rows.iter().enumerate() {
+        let position = index * 2;
+        values.push(format!("(?{}, ?{})", position + 1, position + 2));
+        params.push(Value::from(id.clone()));
+        params.push(Value::from(body.clone()));
+    }
+    SqlWrite {
+        sql: format!(
+            "INSERT INTO isam_catalog_bench (id, body) VALUES {} ON CONFLICT(id) DO UPDATE SET body=excluded.body",
+            values.join(", ")
+        ),
+        params,
+    }
+}
+
+fn catalog_sql_delete(ids: &[String]) -> SqlWrite {
+    let placeholders = (1..=ids.len())
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    SqlWrite {
+        sql: format!("DELETE FROM isam_catalog_bench WHERE id IN ({placeholders})"),
+        params: ids.iter().cloned().map(Value::from).collect(),
+    }
+}
 
 #[derive(Debug)]
 struct Measurement {
@@ -38,7 +126,6 @@ struct Measurement {
     operations: Option<OperationStats>,
 }
 
-#[derive(Default)]
 struct OperationTotal {
     file_opens: u128,
     file_closes: u128,
@@ -52,11 +139,69 @@ struct OperationTotal {
     page_read_ns: u128,
     page_write_ns: u128,
     syncs: u128,
+    sync_requests: u128,
     sync_ns: u128,
     publication_ns: u128,
+    preflight_rebases: u128,
+    publication_retries: u128,
+    commit_lock_wait_ns: u128,
     lock_requests: u128,
     lock_retries: u128,
     lock_wait_ns: u128,
+    write_lock_batches: u128,
+    write_lock_keys: u128,
+    write_lock_requests: u128,
+    write_lock_retries: u128,
+    write_lock_wait_ns: u128,
+    write_lock_local_retries: u128,
+    write_lock_local_wait_ns: u128,
+    write_lock_range_retries: u128,
+    write_lock_range_wait_ns: u128,
+    write_lock_stripes_acquired: u128,
+    write_lock_stripe_acquisitions: [u128; briskdb::isam::KEY_LOCK_STRIPES],
+    write_lock_stripe_retries: [u128; briskdb::isam::KEY_LOCK_STRIPES],
+    write_lock_stripe_wait_ns: [u128; briskdb::isam::KEY_LOCK_STRIPES],
+}
+
+impl Default for OperationTotal {
+    fn default() -> Self {
+        Self {
+            file_opens: 0,
+            file_closes: 0,
+            file_stats: 0,
+            root_reads: 0,
+            root_writes: 0,
+            page_reads: 0,
+            page_writes: 0,
+            root_read_ns: 0,
+            root_write_ns: 0,
+            page_read_ns: 0,
+            page_write_ns: 0,
+            syncs: 0,
+            sync_requests: 0,
+            sync_ns: 0,
+            publication_ns: 0,
+            preflight_rebases: 0,
+            publication_retries: 0,
+            commit_lock_wait_ns: 0,
+            lock_requests: 0,
+            lock_retries: 0,
+            lock_wait_ns: 0,
+            write_lock_batches: 0,
+            write_lock_keys: 0,
+            write_lock_requests: 0,
+            write_lock_retries: 0,
+            write_lock_wait_ns: 0,
+            write_lock_local_retries: 0,
+            write_lock_local_wait_ns: 0,
+            write_lock_range_retries: 0,
+            write_lock_range_wait_ns: 0,
+            write_lock_stripes_acquired: 0,
+            write_lock_stripe_acquisitions: [0; briskdb::isam::KEY_LOCK_STRIPES],
+            write_lock_stripe_retries: [0; briskdb::isam::KEY_LOCK_STRIPES],
+            write_lock_stripe_wait_ns: [0; briskdb::isam::KEY_LOCK_STRIPES],
+        }
+    }
 }
 
 impl OperationTotal {
@@ -73,19 +218,40 @@ impl OperationTotal {
         self.page_read_ns += u128::from(stats.page_read_ns);
         self.page_write_ns += u128::from(stats.page_write_ns);
         self.syncs += u128::from(stats.syncs);
+        self.sync_requests += u128::from(stats.sync_requests);
         self.sync_ns += u128::from(stats.sync_ns);
         self.publication_ns += u128::from(stats.publication_ns);
+        self.preflight_rebases += u128::from(stats.preflight_rebases);
+        self.publication_retries += u128::from(stats.publication_retries);
+        self.commit_lock_wait_ns += u128::from(stats.commit_lock_wait_ns);
         self.lock_requests += u128::from(stats.lock_requests);
         self.lock_retries += u128::from(stats.lock_retries);
         self.lock_wait_ns += u128::from(stats.lock_wait_ns);
+        self.write_lock_batches += u128::from(stats.write_lock_batches);
+        self.write_lock_keys += u128::from(stats.write_lock_keys);
+        self.write_lock_requests += u128::from(stats.write_lock_requests);
+        self.write_lock_retries += u128::from(stats.write_lock_retries);
+        self.write_lock_wait_ns += u128::from(stats.write_lock_wait_ns);
+        self.write_lock_local_retries += u128::from(stats.write_lock_local_retries);
+        self.write_lock_local_wait_ns += u128::from(stats.write_lock_local_wait_ns);
+        self.write_lock_range_retries += u128::from(stats.write_lock_range_retries);
+        self.write_lock_range_wait_ns += u128::from(stats.write_lock_range_wait_ns);
+        self.write_lock_stripes_acquired += u128::from(stats.write_lock_stripes_acquired);
+        for stripe in 0..briskdb::isam::KEY_LOCK_STRIPES {
+            self.write_lock_stripe_acquisitions[stripe] +=
+                u128::from(stats.write_lock_stripe_acquisitions[stripe]);
+            self.write_lock_stripe_retries[stripe] +=
+                u128::from(stats.write_lock_stripe_retries[stripe]);
+            self.write_lock_stripe_wait_ns[stripe] +=
+                u128::from(stats.write_lock_stripe_wait_ns[stripe]);
+        }
     }
 
     fn average(&self, samples: usize) -> String {
         if samples == 0 {
             return String::new();
         }
-        format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        [
             self.file_opens / samples as u128,
             self.file_closes / samples as u128,
             self.file_stats / samples as u128,
@@ -100,10 +266,25 @@ impl OperationTotal {
             self.syncs / samples as u128,
             self.sync_ns / samples as u128,
             self.publication_ns / samples as u128,
+            self.preflight_rebases / samples as u128,
+            self.publication_retries / samples as u128,
+            self.commit_lock_wait_ns / samples as u128,
             self.lock_requests / samples as u128,
             self.lock_retries / samples as u128,
             self.lock_wait_ns / samples as u128,
-        )
+            self.write_lock_batches / samples as u128,
+            self.write_lock_keys / samples as u128,
+            self.write_lock_requests / samples as u128,
+            self.write_lock_retries / samples as u128,
+            self.write_lock_wait_ns / samples as u128,
+            self.write_lock_local_retries / samples as u128,
+            self.write_lock_local_wait_ns / samples as u128,
+            self.write_lock_range_retries / samples as u128,
+            self.write_lock_range_wait_ns / samples as u128,
+            self.write_lock_stripes_acquired / samples as u128,
+        ]
+        .map(|value| value.to_string())
+        .join("\t")
     }
 }
 
@@ -113,12 +294,24 @@ struct IsamFixture {
     store: Store,
 }
 
+fn packed_pages() -> bool {
+    std::env::var("BRISKDB_ISAM_PACKED").is_ok_and(|value| value == "1")
+}
+
+fn create_store(path: &std::path::Path) -> briskdb::isam::Result<Store> {
+    let layout = Layout::new(11, 128)?;
+    if packed_pages() {
+        Store::create_packed(path, layout)
+    } else {
+        Store::create(path, layout)
+    }
+}
+
 impl IsamFixture {
     fn seeded() -> Self {
         let directory = tempfile::tempdir().expect("create ISAM benchmark directory");
         let path = directory.path().join("bench.isam");
-        let mut store = Store::create(&path, Layout::new(11, 128).unwrap())
-            .expect("create ISAM benchmark store");
+        let mut store = create_store(&path).expect("create ISAM benchmark store");
         store
             .write_batch(&seed_mutations(SEED_FIRST_CHAPTER, SEED_CHAPTERS, "seed"))
             .expect("seed ISAM benchmark store");
@@ -132,12 +325,47 @@ impl IsamFixture {
     fn new_empty() -> Self {
         let directory = tempfile::tempdir().expect("create ISAM benchmark directory");
         let path = directory.path().join("bench.isam");
-        let store = Store::create(&path, Layout::new(11, 128).unwrap())
-            .expect("create ISAM benchmark store");
+        let store = create_store(&path).expect("create ISAM benchmark store");
         Self {
             _directory: directory,
             path,
             store,
+        }
+    }
+}
+
+struct NativeCatalogFixture {
+    _directory: tempfile::TempDir,
+    catalog: NativeCatalog,
+}
+
+impl NativeCatalogFixture {
+    fn seeded() -> Self {
+        let directory = tempfile::tempdir().expect("create native catalog benchmark directory");
+        let path = directory.path().join("catalog.isam");
+        let mut catalog = if packed_pages() {
+            NativeCatalog::create_packed(&path)
+        } else {
+            NativeCatalog::create(&path)
+        }
+        .expect("create native catalog fixture");
+        catalog
+            .create_table(&catalog_schema())
+            .expect("create native catalog benchmark schema");
+        let rows = catalog_seed_rows();
+        for chunk in rows.chunks(1_000) {
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|(id, body)| catalog_values(id.clone(), body.clone()))
+                .collect();
+            catalog
+                .insert_rows(CATALOG_TABLE, &values)
+                .expect("seed native catalog benchmark");
+        }
+        catalog.reset_operation_stats();
+        Self {
+            _directory: directory,
+            catalog,
         }
     }
 }
@@ -174,6 +402,32 @@ impl SqliteFixture {
             .expect("create SQLite benchmark schema");
         Self {
             root: directory.path().to_path_buf(),
+            _directory: directory,
+            database,
+        }
+    }
+}
+
+struct SqliteCatalogFixture {
+    _directory: tempfile::TempDir,
+    database: Database,
+}
+
+impl SqliteCatalogFixture {
+    fn seeded() -> Self {
+        let directory = tempfile::tempdir().expect("create SQLite catalog benchmark directory");
+        let database = Database::open(directory.path(), 2).expect("open SQLite catalog benchmark");
+        database
+            .broadcast(SQLITE_CATALOG_CREATE)
+            .expect("create SQLite catalog benchmark schema");
+        database
+            .broadcast(SQLITE_CATALOG_INDEX)
+            .expect("create SQLite catalog benchmark index");
+        let seed = catalog_sql_upsert(&catalog_seed_rows());
+        database
+            .execute("benchmark", &seed.sql, &seed.params)
+            .expect("seed SQLite catalog benchmark");
+        Self {
             _directory: directory,
             database,
         }
@@ -334,11 +588,36 @@ fn stats_delta(before: OperationStats, after: OperationStats) -> OperationStats 
         page_read_ns: after.page_read_ns - before.page_read_ns,
         page_write_ns: after.page_write_ns - before.page_write_ns,
         syncs: after.syncs - before.syncs,
+        sync_requests: after.sync_requests - before.sync_requests,
         sync_ns: after.sync_ns - before.sync_ns,
         publication_ns: after.publication_ns - before.publication_ns,
+        preflight_rebases: after.preflight_rebases - before.preflight_rebases,
+        publication_retries: after.publication_retries - before.publication_retries,
+        commit_lock_wait_ns: after.commit_lock_wait_ns - before.commit_lock_wait_ns,
         lock_requests: after.lock_requests - before.lock_requests,
         lock_retries: after.lock_retries - before.lock_retries,
         lock_wait_ns: after.lock_wait_ns - before.lock_wait_ns,
+        write_lock_batches: after.write_lock_batches - before.write_lock_batches,
+        write_lock_keys: after.write_lock_keys - before.write_lock_keys,
+        write_lock_requests: after.write_lock_requests - before.write_lock_requests,
+        write_lock_retries: after.write_lock_retries - before.write_lock_retries,
+        write_lock_wait_ns: after.write_lock_wait_ns - before.write_lock_wait_ns,
+        write_lock_local_retries: after.write_lock_local_retries - before.write_lock_local_retries,
+        write_lock_local_wait_ns: after.write_lock_local_wait_ns - before.write_lock_local_wait_ns,
+        write_lock_range_retries: after.write_lock_range_retries - before.write_lock_range_retries,
+        write_lock_range_wait_ns: after.write_lock_range_wait_ns - before.write_lock_range_wait_ns,
+        write_lock_stripes_acquired: after.write_lock_stripes_acquired
+            - before.write_lock_stripes_acquired,
+        write_lock_stripe_acquisitions: std::array::from_fn(|stripe| {
+            after.write_lock_stripe_acquisitions[stripe]
+                - before.write_lock_stripe_acquisitions[stripe]
+        }),
+        write_lock_stripe_retries: std::array::from_fn(|stripe| {
+            after.write_lock_stripe_retries[stripe] - before.write_lock_stripe_retries[stripe]
+        }),
+        write_lock_stripe_wait_ns: std::array::from_fn(|stripe| {
+            after.write_lock_stripe_wait_ns[stripe] - before.write_lock_stripe_wait_ns[stripe]
+        }),
     }
 }
 
@@ -371,12 +650,210 @@ fn measure_isam(
             page_read_ns: total.page_read_ns.min(u64::MAX as u128) as u64,
             page_write_ns: total.page_write_ns.min(u64::MAX as u128) as u64,
             syncs: total.syncs.min(u64::MAX as u128) as u64,
+            sync_requests: total.sync_requests.min(u64::MAX as u128) as u64,
             sync_ns: total.sync_ns.min(u64::MAX as u128) as u64,
             publication_ns: total.publication_ns.min(u64::MAX as u128) as u64,
+            preflight_rebases: total.preflight_rebases.min(u64::MAX as u128) as u64,
+            publication_retries: total.publication_retries.min(u64::MAX as u128) as u64,
+            commit_lock_wait_ns: total.commit_lock_wait_ns.min(u64::MAX as u128) as u64,
             lock_requests: total.lock_requests.min(u64::MAX as u128) as u64,
             lock_retries: total.lock_retries.min(u64::MAX as u128) as u64,
             lock_wait_ns: total.lock_wait_ns.min(u64::MAX as u128) as u64,
+            write_lock_batches: total.write_lock_batches.min(u64::MAX as u128) as u64,
+            write_lock_keys: total.write_lock_keys.min(u64::MAX as u128) as u64,
+            write_lock_requests: total.write_lock_requests.min(u64::MAX as u128) as u64,
+            write_lock_retries: total.write_lock_retries.min(u64::MAX as u128) as u64,
+            write_lock_wait_ns: total.write_lock_wait_ns.min(u64::MAX as u128) as u64,
+            write_lock_local_retries: total.write_lock_local_retries.min(u64::MAX as u128) as u64,
+            write_lock_local_wait_ns: total.write_lock_local_wait_ns.min(u64::MAX as u128) as u64,
+            write_lock_range_retries: total.write_lock_range_retries.min(u64::MAX as u128) as u64,
+            write_lock_range_wait_ns: total.write_lock_range_wait_ns.min(u64::MAX as u128) as u64,
+            write_lock_stripes_acquired: total.write_lock_stripes_acquired.min(u64::MAX as u128)
+                as u64,
+            write_lock_stripe_acquisitions: std::array::from_fn(|stripe| {
+                total.write_lock_stripe_acquisitions[stripe].min(u64::MAX as u128) as u64
+            }),
+            write_lock_stripe_retries: std::array::from_fn(|stripe| {
+                total.write_lock_stripe_retries[stripe].min(u64::MAX as u128) as u64
+            }),
+            write_lock_stripe_wait_ns: std::array::from_fn(|stripe| {
+                total.write_lock_stripe_wait_ns[stripe].min(u64::MAX as u128) as u64
+            }),
         }),
+    }
+}
+
+fn measure_catalog(
+    workload: &'static str,
+    catalog: &mut NativeCatalog,
+    samples: usize,
+    mut operation: impl FnMut(&mut NativeCatalog, usize) -> Duration,
+) -> Measurement {
+    let mut durations = Vec::with_capacity(samples);
+    let mut total = OperationTotal::default();
+    for sample in 0..samples {
+        let before = catalog.operation_stats();
+        durations.push(operation(catalog, sample).as_nanos());
+        total.add(stats_delta(before, catalog.operation_stats()));
+    }
+    Measurement {
+        backend: "isam_catalog",
+        workload,
+        durations,
+        operations: Some(stats_from_total(total)),
+    }
+}
+
+// Same rows, schema, values and starting state. The individual path deliberately
+// has 36 transaction boundaries; the bulk path has one. This measures explicit
+// batching, not automatic group commit or independent-client throughput.
+fn measure_catalog_batching(samples: usize, measurements: &mut Vec<Measurement>) {
+    let mut individual = NativeCatalogFixture::seeded();
+    let mut bulk = NativeCatalogFixture::seeded();
+    let sqlite = SqliteCatalogFixture::seeded();
+    let mut results: Vec<_> = ["group_insert_36", "group_update_36", "group_delete_36"]
+        .into_iter()
+        .flat_map(|workload| {
+            ["isam_individual", "isam_bulk", "sqlite"].map(|backend| Measurement {
+                backend,
+                workload,
+                durations: Vec::with_capacity(samples),
+                operations: (backend != "sqlite").then(OperationStats::default),
+            })
+        })
+        .collect();
+    let mut totals: Vec<_> = (0..9).map(|_| OperationTotal::default()).collect();
+    for sample in 0..samples {
+        let initial: Vec<_> = (0..CHAPTER_ROWS)
+            .map(|offset| {
+                (
+                    catalog_id(100_000 + sample * CHAPTER_ROWS + offset),
+                    format!("batch-insert-{sample}-{offset}"),
+                )
+            })
+            .collect();
+        let changed: Vec<_> = initial
+            .iter()
+            .enumerate()
+            .map(|(offset, (id, _))| (id.clone(), format!("batch-update-{sample}-{offset}")))
+            .collect();
+        let keys: Vec<_> = initial
+            .iter()
+            .map(|(id, _)| catalog_key(id).to_vec())
+            .collect();
+        for operation in 0..3 {
+            let rows = if operation == 0 { &initial } else { &changed };
+            let values: Vec<_> = rows
+                .iter()
+                .map(|(id, body)| catalog_values(id.clone(), body.clone()))
+                .collect();
+            let updates: Vec<_> = keys.iter().cloned().zip(values.iter().cloned()).collect();
+            let sql = if operation == 2 {
+                catalog_sql_delete(&rows.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+            } else {
+                catalog_sql_upsert(rows)
+            };
+            for backend in if sample % 2 == 0 {
+                [0, 1, 2]
+            } else {
+                [2, 1, 0]
+            } {
+                let index = operation * 3 + backend;
+                if backend == 2 {
+                    let start = Instant::now();
+                    assert_eq!(
+                        sqlite
+                            .database
+                            .execute("benchmark", &sql.sql, &sql.params)
+                            .unwrap(),
+                        CHAPTER_ROWS
+                    );
+                    results[index].durations.push(start.elapsed().as_nanos());
+                    for (id, body) in rows {
+                        let found = sqlite
+                            .database
+                            .query(
+                                "benchmark",
+                                "SELECT id, body FROM isam_catalog_bench WHERE id = ?1",
+                                &[Value::from(id.clone())],
+                            )
+                            .unwrap();
+                        assert_eq!(record_count(&found), usize::from(operation != 2));
+                        if operation != 2 {
+                            let actual = json_rows_from_result(&found);
+                            assert_eq!(
+                                (actual[0].id, actual[0].body),
+                                (id.as_str(), body.as_str())
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let catalog = if backend == 0 {
+                    &mut individual.catalog
+                } else {
+                    &mut bulk.catalog
+                };
+                let before = catalog.operation_stats();
+                let start = Instant::now();
+                if backend == 0 {
+                    for row in 0..CHAPTER_ROWS {
+                        match operation {
+                            0 => catalog.insert_row(CATALOG_TABLE, &values[row]).unwrap(),
+                            1 => assert!(
+                                catalog
+                                    .update_row(CATALOG_TABLE, &keys[row], &values[row])
+                                    .unwrap()
+                            ),
+                            2 => assert!(catalog.delete_row(CATALOG_TABLE, &keys[row]).unwrap()),
+                            _ => unreachable!(),
+                        }
+                    }
+                } else {
+                    match operation {
+                        0 => catalog.insert_rows(CATALOG_TABLE, &values).unwrap(),
+                        1 => assert!(catalog.update_rows(CATALOG_TABLE, &updates).unwrap()),
+                        2 => assert!(catalog.delete_rows(CATALOG_TABLE, &keys).unwrap()),
+                        _ => unreachable!(),
+                    }
+                }
+                results[index].durations.push(start.elapsed().as_nanos());
+                let stats = stats_delta(before, catalog.operation_stats());
+                assert_eq!(stats.root_writes, if backend == 0 { 36 } else { 1 });
+                assert_eq!(stats.syncs, if backend == 0 { 72 } else { 2 });
+                totals[index].add(stats);
+                // Validate results outside the timed interval, including the
+                // maintained index. A fast but partial commit must fail the run.
+                for (row, (id, body)) in rows.iter().enumerate() {
+                    let expected = if operation == 2 {
+                        None
+                    } else {
+                        Some(values[row].clone())
+                    };
+                    assert_eq!(
+                        catalog.get_row(CATALOG_TABLE, &catalog_key(id)).unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        catalog
+                            .lookup_index(
+                                CATALOG_TABLE,
+                                CATALOG_BODY_INDEX,
+                                &[NativeValue::Text(body.clone())],
+                                2
+                            )
+                            .unwrap(),
+                        expected.into_iter().collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+    for (mut result, total) in results.into_iter().zip(totals) {
+        if result.operations.is_some() {
+            result.operations = Some(stats_from_total(total));
+        }
+        measurements.push(result);
     }
 }
 
@@ -433,11 +910,34 @@ fn stats_from_total(total: OperationTotal) -> OperationStats {
         page_read_ns: total.page_read_ns.min(u64::MAX as u128) as u64,
         page_write_ns: total.page_write_ns.min(u64::MAX as u128) as u64,
         syncs: total.syncs.min(u64::MAX as u128) as u64,
+        sync_requests: total.sync_requests.min(u64::MAX as u128) as u64,
         sync_ns: total.sync_ns.min(u64::MAX as u128) as u64,
         publication_ns: total.publication_ns.min(u64::MAX as u128) as u64,
+        preflight_rebases: total.preflight_rebases.min(u64::MAX as u128) as u64,
+        publication_retries: total.publication_retries.min(u64::MAX as u128) as u64,
+        commit_lock_wait_ns: total.commit_lock_wait_ns.min(u64::MAX as u128) as u64,
         lock_requests: total.lock_requests.min(u64::MAX as u128) as u64,
         lock_retries: total.lock_retries.min(u64::MAX as u128) as u64,
         lock_wait_ns: total.lock_wait_ns.min(u64::MAX as u128) as u64,
+        write_lock_batches: total.write_lock_batches.min(u64::MAX as u128) as u64,
+        write_lock_keys: total.write_lock_keys.min(u64::MAX as u128) as u64,
+        write_lock_requests: total.write_lock_requests.min(u64::MAX as u128) as u64,
+        write_lock_retries: total.write_lock_retries.min(u64::MAX as u128) as u64,
+        write_lock_wait_ns: total.write_lock_wait_ns.min(u64::MAX as u128) as u64,
+        write_lock_local_retries: total.write_lock_local_retries.min(u64::MAX as u128) as u64,
+        write_lock_local_wait_ns: total.write_lock_local_wait_ns.min(u64::MAX as u128) as u64,
+        write_lock_range_retries: total.write_lock_range_retries.min(u64::MAX as u128) as u64,
+        write_lock_range_wait_ns: total.write_lock_range_wait_ns.min(u64::MAX as u128) as u64,
+        write_lock_stripes_acquired: total.write_lock_stripes_acquired.min(u64::MAX as u128) as u64,
+        write_lock_stripe_acquisitions: std::array::from_fn(|stripe| {
+            total.write_lock_stripe_acquisitions[stripe].min(u64::MAX as u128) as u64
+        }),
+        write_lock_stripe_retries: std::array::from_fn(|stripe| {
+            total.write_lock_stripe_retries[stripe].min(u64::MAX as u128) as u64
+        }),
+        write_lock_stripe_wait_ns: std::array::from_fn(|stripe| {
+            total.write_lock_stripe_wait_ns[stripe].min(u64::MAX as u128) as u64
+        }),
     }
 }
 
@@ -451,28 +951,11 @@ fn measurement_line(measurement: &Measurement) -> String {
     let ops = measurement
         .operations
         .map(|stats| {
-            OperationTotal {
-                file_opens: u128::from(stats.file_opens),
-                file_closes: u128::from(stats.file_closes),
-                file_stats: u128::from(stats.file_stats),
-                root_reads: u128::from(stats.root_reads),
-                root_writes: u128::from(stats.root_writes),
-                page_reads: u128::from(stats.page_reads),
-                page_writes: u128::from(stats.page_writes),
-                root_read_ns: u128::from(stats.root_read_ns),
-                root_write_ns: u128::from(stats.root_write_ns),
-                page_read_ns: u128::from(stats.page_read_ns),
-                page_write_ns: u128::from(stats.page_write_ns),
-                syncs: u128::from(stats.syncs),
-                sync_ns: u128::from(stats.sync_ns),
-                publication_ns: u128::from(stats.publication_ns),
-                lock_requests: u128::from(stats.lock_requests),
-                lock_retries: u128::from(stats.lock_retries),
-                lock_wait_ns: u128::from(stats.lock_wait_ns),
-            }
-            .average(count)
+            let mut total = OperationTotal::default();
+            total.add(stats);
+            total.average(count)
         })
-        .unwrap_or_else(|| vec!["NA"; 17].join("\t"));
+        .unwrap_or_else(|| vec!["NA"; 30].join("\t"));
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         measurement.backend,
@@ -534,21 +1017,60 @@ fn directory_file_bytes(directory: &std::path::Path) -> u64 {
 fn save_report(
     measurements: &[Measurement],
     peak_rss_bytes: u64,
-    disk_growth_bytes: [i128; 3],
+    disk_growth_bytes: [i128; 5],
     path: &std::path::Path,
 ) {
     let mut report = format!(
-        "# schema=isam-benchmark-v5\trun_revision={}\thost={}-{}\tpeak_rss_bytes={}\n",
+        "# schema=isam-benchmark-v7\trun_revision={}\thost={}-{}\tpeak_rss_bytes={}\n",
         std::env::var("BRISKDB_ISAM_REVISION").unwrap_or_else(|_| "unspecified".into()),
         std::env::consts::OS,
         std::env::consts::ARCH,
         peak_rss_bytes
     );
     report.push_str(&format!(
-        "# disk_growth_bytes\tisam={}\tsqlite={}\tflat_file={}\n",
-        disk_growth_bytes[0], disk_growth_bytes[1], disk_growth_bytes[2]
+        "# native_format\tversion={}\tcompression=none\n",
+        if packed_pages() { 3 } else { 2 }
     ));
-    report.push_str("backend\tworkload\tsamples\tmean_ns\tlow_ns\thigh_ns\tp50_ns\tp95_ns\tp99_ns\tthroughput_ops_s\tavg_file_opens\tavg_file_closes\tavg_file_stats\tavg_root_reads\tavg_root_writes\tavg_page_reads\tavg_page_writes\tavg_root_read_ns\tavg_root_write_ns\tavg_page_read_ns\tavg_page_write_ns\tavg_syncs\tavg_sync_ns\tavg_publication_ns\tavg_lock_requests\tavg_lock_retries\tavg_lock_wait_ns\n");
+    report.push_str(&format!(
+        "# disk_growth_bytes\tisam={}\tsqlite={}\tflat_file={}\tisam_catalog={}\tsqlite_catalog={}\n",
+        disk_growth_bytes[0],
+        disk_growth_bytes[1],
+        disk_growth_bytes[2],
+        disk_growth_bytes[3],
+        disk_growth_bytes[4]
+    ));
+    report.push_str("# write_lock_stats\trequests count OS byte-range attempts; local_* measures process-local mutex contention; range_* measures byte-range-lock contention; stripe IDs are stable hash buckets\n");
+    report.push_str("# durability\tISAM retains two File::sync_all calls per commit; SQLite retains BriskDB WAL/FULL defaults; macOS flush primitives differ, so these are default-policy comparisons, not identical power-loss guarantees\n");
+    report.push_str("# group_workloads\t36 separate native commits vs one explicit native bulk commit vs one SQLite statement; not automatic group commit; verification excluded from timings; per-workload phase counters overlap; disk_growth_bytes excludes these separate group fixtures\n");
+    let mut lock_totals = OperationTotal::default();
+    for measurement in measurements {
+        if let Some(stats) = measurement.operations {
+            lock_totals.add(stats);
+        }
+    }
+    for (label, values) in [
+        (
+            "write_lock_stripe_acquisitions",
+            &lock_totals.write_lock_stripe_acquisitions,
+        ),
+        (
+            "write_lock_stripe_retries",
+            &lock_totals.write_lock_stripe_retries,
+        ),
+        (
+            "write_lock_stripe_wait_ns",
+            &lock_totals.write_lock_stripe_wait_ns,
+        ),
+    ] {
+        let histogram = values
+            .iter()
+            .enumerate()
+            .map(|(stripe, value)| format!("stripe_{stripe:02}={value}"))
+            .collect::<Vec<_>>()
+            .join("\t");
+        report.push_str(&format!("# {label}\t{histogram}\n"));
+    }
+    report.push_str("backend\tworkload\tsamples\tmean_ns\tlow_ns\thigh_ns\tp50_ns\tp95_ns\tp99_ns\tthroughput_ops_s\tavg_file_opens\tavg_file_closes\tavg_file_stats\tavg_root_reads\tavg_root_writes\tavg_page_reads\tavg_page_writes\tavg_root_read_ns\tavg_root_write_ns\tavg_page_read_ns\tavg_page_write_ns\tavg_syncs\tavg_sync_ns\tavg_publication_ns\tavg_preflight_rebases\tavg_publication_retries\tavg_commit_lock_wait_ns\tavg_lock_requests\tavg_lock_retries\tavg_lock_wait_ns\tavg_write_lock_batches\tavg_write_lock_keys\tavg_write_lock_requests\tavg_write_lock_retries\tavg_write_lock_wait_ns\tavg_write_lock_local_retries\tavg_write_lock_local_wait_ns\tavg_write_lock_range_retries\tavg_write_lock_range_wait_ns\tavg_write_lock_stripes_acquired\n");
     for measurement in measurements {
         report.push_str(&measurement_line(measurement));
         report.push('\n');
@@ -634,13 +1156,21 @@ fn bounded_comparison_smoke() {
     let report_path = directory.path().join("isam-benchmark.tsv");
     run_comparison(2, &report_path);
     let report = fs::read_to_string(report_path).unwrap();
-    assert!(report.starts_with("# schema=isam-benchmark-v5\t"));
+    assert!(report.starts_with("# schema=isam-benchmark-v7\t"));
     assert!(report.contains("isam\trange_36\t"));
     assert!(report.contains("isam\tresult_json_serialization_36\t"));
     assert!(report.contains("sqlite\tresult_json_serialization_36\t"));
     assert!(report.contains("sqlite\tchunk_delete_36\t"));
+    assert!(report.contains("isam_catalog\tcatalog_insert_1\t"));
+    assert!(report.contains("sqlite\tcatalog_update_1\t"));
+    assert!(report.contains("isam_catalog\tcatalog_delete_1\t"));
+    assert!(report.contains("isam_catalog\tcatalog_update_36\t"));
+    assert!(report.contains("isam_individual\tgroup_insert_36\t"));
+    assert!(report.contains("isam_bulk\tgroup_update_36\t"));
+    assert!(report.contains("sqlite\tgroup_delete_36\t"));
     assert!(report.contains("isam_writer_3\tdisjoint_writer_latency\t"));
     assert!(report.contains("# disk_growth_bytes\tisam="));
+    assert!(report.contains("# write_lock_stripe_acquisitions\tstripe_00="));
     let mut lines = report.lines().filter(|line| !line.starts_with('#'));
     let column_count = lines.next().unwrap().split('\t').count();
     for line in lines {
@@ -655,17 +1185,24 @@ fn release_isam_sqlite_comparison() {
 }
 
 fn run_comparison(samples: usize, report_path: &std::path::Path) {
-    assert!(samples >= 2, "at least two samples are required");
+    assert!(
+        (2..=100).contains(&samples),
+        "fixed fixtures support 2..=100 samples"
+    );
     let peak_rss_start = peak_rss_bytes();
     let mut isam = IsamFixture::seeded();
     let sqlite = SqliteFixture::seeded();
     let mut isam_empty = IsamFixture::new_empty();
     let sqlite_empty = SqliteFixture::new_empty();
+    let mut isam_catalog = NativeCatalogFixture::seeded();
+    let sqlite_catalog = SqliteCatalogFixture::seeded();
     let flat = FlatFileFixture::seeded();
     let isam_bytes_before = directory_file_bytes(isam._directory.path())
         + directory_file_bytes(isam_empty._directory.path());
     let sqlite_bytes_before = directory_file_bytes(sqlite._directory.path())
         + directory_file_bytes(sqlite_empty._directory.path());
+    let native_catalog_bytes_before = directory_file_bytes(isam_catalog._directory.path());
+    let sqlite_catalog_bytes_before = directory_file_bytes(sqlite_catalog._directory.path());
     let flat_bytes_before = directory_file_bytes(flat._directory.path());
     let mut measurements = Vec::new();
 
@@ -921,6 +1458,229 @@ fn run_comparison(samples: usize, report_path: &std::path::Path) {
     });
     measurements.extend([isam_delete, sqlite_delete]);
 
+    let isam_catalog_insert = measure_catalog(
+        "catalog_insert_1",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let id = catalog_id(10_000 + sample);
+            let values = catalog_values(id, "inserted".to_owned());
+            let start = Instant::now();
+            catalog
+                .insert_row(CATALOG_TABLE, &values)
+                .expect("insert native catalog benchmark row");
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_insert = measure_sqlite("catalog_insert_1", samples, |sample| {
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute(
+                "benchmark",
+                "INSERT INTO isam_catalog_bench (id, body) VALUES (?1, ?2)",
+                &[
+                    Value::from(catalog_id(10_000 + sample)),
+                    Value::from("inserted"),
+                ],
+            )
+            .expect("insert SQLite catalog benchmark row");
+        assert_eq!(result, 1);
+        start.elapsed()
+    });
+    let isam_catalog_update = measure_catalog(
+        "catalog_update_1",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let id = catalog_id(sample % 100);
+            let values = catalog_values(id.clone(), format!("updated-{sample}"));
+            let key = catalog_key(&id);
+            let start = Instant::now();
+            assert!(
+                catalog
+                    .update_row(CATALOG_TABLE, &key, &values)
+                    .expect("update native catalog benchmark row")
+            );
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_update = measure_sqlite("catalog_update_1", samples, |sample| {
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute(
+                "benchmark",
+                "UPDATE isam_catalog_bench SET body = ?2 WHERE id = ?1",
+                &[
+                    Value::from(catalog_id(sample % 100)),
+                    Value::from(format!("updated-{sample}")),
+                ],
+            )
+            .expect("update SQLite catalog benchmark row");
+        assert_eq!(result, 1);
+        start.elapsed()
+    });
+    let isam_catalog_delete = measure_catalog(
+        "catalog_delete_1",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let id = catalog_id(sample % 100);
+            let key = catalog_key(&id);
+            let start = Instant::now();
+            assert!(
+                catalog
+                    .delete_row(CATALOG_TABLE, &key)
+                    .expect("delete native catalog benchmark row")
+            );
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_delete = measure_sqlite("catalog_delete_1", samples, |sample| {
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute(
+                "benchmark",
+                "DELETE FROM isam_catalog_bench WHERE id = ?1",
+                &[Value::from(catalog_id(sample % 100))],
+            )
+            .expect("delete SQLite catalog benchmark row");
+        assert_eq!(result, 1);
+        start.elapsed()
+    });
+    measurements.extend([
+        isam_catalog_insert,
+        sqlite_catalog_insert,
+        isam_catalog_update,
+        sqlite_catalog_update,
+        isam_catalog_delete,
+        sqlite_catalog_delete,
+    ]);
+
+    let isam_catalog_batch_insert = measure_catalog(
+        "catalog_insert_36",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let rows: Vec<_> = (0..CHAPTER_ROWS)
+                .map(|offset| {
+                    catalog_values(
+                        catalog_id(100_000 + sample * CHAPTER_ROWS + offset),
+                        format!("batch-insert-{sample}-{offset}"),
+                    )
+                })
+                .collect();
+            let start = Instant::now();
+            catalog
+                .insert_rows(CATALOG_TABLE, &rows)
+                .expect("insert native catalog batch");
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_batch_insert = measure_sqlite("catalog_insert_36", samples, |sample| {
+        let rows: Vec<_> = (0..CHAPTER_ROWS)
+            .map(|offset| {
+                (
+                    catalog_id(100_000 + sample * CHAPTER_ROWS + offset),
+                    format!("batch-insert-{sample}-{offset}"),
+                )
+            })
+            .collect();
+        let write = catalog_sql_upsert(&rows);
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute("benchmark", &write.sql, &write.params)
+            .expect("insert SQLite catalog batch");
+        assert_eq!(result, CHAPTER_ROWS);
+        start.elapsed()
+    });
+    let isam_catalog_batch_update = measure_catalog(
+        "catalog_update_36",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let start_index = 100 + sample * CHAPTER_ROWS;
+            let updates: Vec<_> = (0..CHAPTER_ROWS)
+                .map(|offset| {
+                    let id = catalog_id(start_index + offset);
+                    (
+                        catalog_key(&id).to_vec(),
+                        catalog_values(id, format!("batch-updated-{sample}-{offset}")),
+                    )
+                })
+                .collect();
+            let start = Instant::now();
+            assert!(
+                catalog
+                    .update_rows(CATALOG_TABLE, &updates)
+                    .expect("update native catalog batch")
+            );
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_batch_update = measure_sqlite("catalog_update_36", samples, |sample| {
+        let start_index = 100 + sample * CHAPTER_ROWS;
+        let rows: Vec<_> = (0..CHAPTER_ROWS)
+            .map(|offset| {
+                (
+                    catalog_id(start_index + offset),
+                    format!("batch-updated-{sample}-{offset}"),
+                )
+            })
+            .collect();
+        let write = catalog_sql_upsert(&rows);
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute("benchmark", &write.sql, &write.params)
+            .expect("update SQLite catalog batch");
+        assert_eq!(result, CHAPTER_ROWS);
+        start.elapsed()
+    });
+    let isam_catalog_batch_delete = measure_catalog(
+        "catalog_delete_36",
+        &mut isam_catalog.catalog,
+        samples,
+        |catalog, sample| {
+            let start_index = 100 + sample * CHAPTER_ROWS;
+            let keys: Vec<_> = (0..CHAPTER_ROWS)
+                .map(|offset| catalog_key(&catalog_id(start_index + offset)).to_vec())
+                .collect();
+            let start = Instant::now();
+            assert!(
+                catalog
+                    .delete_rows(CATALOG_TABLE, &keys)
+                    .expect("delete native catalog batch")
+            );
+            start.elapsed()
+        },
+    );
+    let sqlite_catalog_batch_delete = measure_sqlite("catalog_delete_36", samples, |sample| {
+        let start_index = 100 + sample * CHAPTER_ROWS;
+        let ids: Vec<_> = (0..CHAPTER_ROWS)
+            .map(|offset| catalog_id(start_index + offset))
+            .collect();
+        let write = catalog_sql_delete(&ids);
+        let start = Instant::now();
+        let result = sqlite_catalog
+            .database
+            .execute("benchmark", &write.sql, &write.params)
+            .expect("delete SQLite catalog batch");
+        assert_eq!(result, CHAPTER_ROWS);
+        start.elapsed()
+    });
+    measurements.extend([
+        isam_catalog_batch_insert,
+        sqlite_catalog_batch_insert,
+        isam_catalog_batch_update,
+        sqlite_catalog_batch_update,
+        isam_catalog_batch_delete,
+        sqlite_catalog_batch_delete,
+    ]);
+
     let conflict_key = main_key(SEED_FIRST_CHAPTER, 0);
     let isam_conflict = measure_isam("same_key_conflict", samples, |_| {
         let before = isam.store.operation_stats();
@@ -1075,6 +1835,16 @@ fn run_comparison(samples: usize, report_path: &std::path::Path) {
                 + directory_file_bytes(sqlite_empty._directory.path()),
         ) - i128::from(sqlite_bytes_before),
         i128::from(directory_file_bytes(flat._directory.path())) - i128::from(flat_bytes_before),
+        i128::from(directory_file_bytes(isam_catalog._directory.path()))
+            - i128::from(native_catalog_bytes_before),
+        i128::from(directory_file_bytes(sqlite_catalog._directory.path()))
+            - i128::from(sqlite_catalog_bytes_before),
     ];
-    save_report(&measurements, rss, disk_growth, report_path);
+    measure_catalog_batching(samples, &mut measurements);
+    save_report(
+        &measurements,
+        rss.max(peak_rss_bytes()),
+        disk_growth,
+        report_path,
+    );
 }

@@ -618,6 +618,7 @@ impl Engine {
         startup: StartupOperation,
     ) -> EngineResult<Self> {
         options.storage_profile().require_available()?;
+        options.metadata_backend().require_available()?;
         crate::storage::validate_shard_count(requested_shards)?;
         let root = PathBuf::from(root.as_ref());
         let worker_limit = options.worker_limit(requested_shards)?;
@@ -626,12 +627,13 @@ impl Engine {
         let database = workers
             .run(move || {
                 Ok(Database {
-                    storage: crate::storage::Storage::open_with_profile_control(
+                    storage: crate::storage::Storage::open_with_metadata_control(
                         root,
                         requested_shards,
                         None,
                         control.as_ref(),
                         options.storage_profile(),
+                        options.metadata_backend(),
                     )?,
                     global_index_worker_id: super::random_global_index_worker_id()?,
                 })
@@ -650,15 +652,17 @@ impl Engine {
         options: EngineOptions,
     ) -> EngineResult<Self> {
         options.storage_profile().require_available()?;
+        options.metadata_backend().require_available()?;
         let root = PathBuf::from(root.as_ref());
         let detect_root = root.clone();
         let startup = StartupOperation::new(options.contention_policy());
         let control = startup.control.clone();
         let requested_shards = tokio::task::spawn_blocking(move || {
             crate::storage::contention::with_control(control, || {
-                crate::storage::detect_shard_count_with_profile(
-                    detect_root,
+                crate::storage::metadata::detect_shards(
+                    &detect_root,
                     options.storage_profile(),
+                    options.metadata_backend(),
                 )
             })
         })
@@ -675,7 +679,8 @@ impl Engine {
 
     /// Wrap the synchronous compatibility API in the shared async boundary.
     pub fn from_database(database: Arc<Database>) -> Self {
-        Self::from_database_with_options(database, EngineOptions::default())
+        let options = EngineOptions::default().with_metadata_backend(database.metadata_backend());
+        Self::from_database_with_options(database, options)
             .expect("default engine options are valid for every supported database")
     }
 
@@ -700,6 +705,13 @@ impl Engine {
         workers: BlockingPool,
         contention_metrics: Arc<ContentionMetrics>,
     ) -> EngineResult<Self> {
+        options.metadata_backend().require_available()?;
+        if options.metadata_backend() != database.storage.metadata_backend() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "engine metadata selection does not match the opened database",
+            ));
+        }
         let connections = ConnectionPools::new(
             database.storage.clone(),
             options.connections_per_shard(),

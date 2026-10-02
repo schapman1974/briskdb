@@ -145,6 +145,12 @@ impl Engine {
         request: DocumentRequest,
         _authorization: Option<&DocumentCommand>,
     ) -> EngineResult<DocumentExecution> {
+        if self.inner.database.metadata_backend() == crate::MetadataBackend::Isam {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "document metadata is not yet supported by the experimental ISAM metadata adapter",
+            ));
+        }
         let (request_id, context, command) = request.into_parts();
         let mut operation = self.operation_lifecycle(context)?;
         if session.owner != self.inner.id {

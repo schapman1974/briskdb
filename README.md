@@ -98,6 +98,234 @@ The protocol adapters do not own database semantics. Routing, limits,
 cancellation, values, sessions, and execution live in the shared Rust engine,
 leaving room for more protocols and storage adapters later.
 
+## Experimental ISAM metadata (source builds)
+
+Metadata and application data are separate choices. The Unix-only
+`experimental-isam` feature adds an opt-in **native ISAM manifest with ordinary
+SQLite data shards**. SQLite metadata remains the default. This is not the
+future all-ISAM data backend, and it does not enable NFS/EFS support.
+
+In a Python wheel built with `experimental-isam`:
+
+```python
+import briskdb
+
+config = briskdb.Config(shards=4, metadata_backend="isam")
+with briskdb.open("./hybrid-data", config=config) as db:
+    with db.session(routing_key="example") as session:
+        session.migrate("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+        session.execute("INSERT INTO notes VALUES (?, ?)", [1, "hello"])
+        print(session.query("SELECT * FROM notes")["rows"])
+```
+
+Rust builders accept `.with_metadata_backend(briskdb::MetadataBackend::Isam)`;
+the daemon accepts `--metadata-backend isam` in a feature-enabled build.
+Reopen using the same selection. Existing SQLite roots are never converted.
+
+**Current scope is SQL-only:** routing, table declarations, durable schema
+migration history, and recovery use `manifest.isam`, not a hidden SQLite
+manifest. Mongo/document metadata, global-index metadata, generated-ID metadata,
+and secured roots remain unfinished and are not supported by this option.
+The format is experimental; compaction, conversion, and shared-filesystem
+qualification are still pending. This source change is not a PyPI release.
+
+## Optional S3/Parquet write overlay (experimental source builds)
+
+This is a **separate, explicit mode**, not a change to ordinary opens or an
+automatic conversion of existing databases. It combines an immutable native
+ISAM catalog, indexed SQLite base snapshots on shared storage, and durable
+Parquet changes in S3. SQL reads combine the base and pending changes; inserts,
+updates and deletes become visible without waiting for a nightly merge.
+
+Build a Unix Python wheel with `maturin build --manifest-path python/Cargo.toml
+--features s3-overlay` (install that local wheel), then:
+
+```python
+import briskdb
+from briskdb.s3_overlay import Database, OpenOptions
+
+# Run once; the database root must not already exist.
+with Database.create(
+    "/mnt/shared/my-overlay", bucket="my-private-bucket", region="us-east-1",
+    prefix="briskdb", tables=[{
+        "name": "events",
+        "columns": [
+            {"name": "id", "kind": "Text", "nullable": False},
+            {"name": "message", "kind": "Text", "nullable": False},
+        ],
+        "primary_key": ["id"], "shard_key": "id", "indexes": [],
+    }],
+) as db:
+    db.execute("INSERT INTO events VALUES (?, ?)", ("event-1", "Hello"))
+
+# Fresh connection per Lambda request; no background work after the response.
+with briskdb.open(
+    "/mnt/shared/my-overlay", storage_mode="s3-overlay",
+    overlay_options=OpenOptions(parquet_pruning=True),
+) as db:
+    print(db.query("SELECT * FROM events WHERE id = ?", ("event-1",)).rows)
+
+# Cron/scheduled worker; choose one partition per invocation for bounded work.
+with Database("/mnt/shared/my-overlay") as db:
+    db.compact("events", 0)  # schedule every partition, 0..63 by default
+```
+
+Credentials come from the AWS environment/role, never the catalog. The runtime
+needs scoped S3 `GetObject`/`PutObject` permissions; no bucket listing is needed
+for normal queries or compaction. Keep the bucket private and use HTTPS. For a
+private Lambda VPC, provide an S3 gateway endpoint and HTTPS security-group
+egress. The native API is `briskdb::s3_overlay::Database`; the optional
+`briskdb-s3-overlay` binary accepts one JSON command per process.
+
+### Selecting and configuring this mode
+
+`briskdb.open()` / `briskdb.connect()` default to `storage_mode="sqlite"`.
+Only `storage_mode="s3-overlay"` selects this separate **synchronous SQL API**;
+it opens an existing overlay and never creates or converts a root implicitly.
+The result uses `query()` / `execute()`, not ordinary `session()` / Mongo APIs.
+Ordinary `Config`, `shards`, document and UUID options are rejected in this
+mode. A wheel without the optional native feature raises `UnsupportedError`;
+it never silently falls back to ordinary storage. Async and network connector
+APIs do not select this mode.
+
+`OpenOptions(parquet_pruning=True, read_only=False)` controls each open.
+`read_only=True` rejects SQL mutations and all compaction, including native
+calls; it is not a substitute for read-only AWS credentials/filesystem policy.
+`db.settings()` reports the selected mode, stored layout and effective flags
+without credentials. Neither flag rewrites the stored configuration.
+
+For Lambda, explicitly set `BRISKDB_STORAGE_MODE=s3-overlay` and
+`BRISKDB_OVERLAY_ROOT=/mnt/shared/my-overlay`, then use
+`with Database.from_env() as db:` inside the handler. The optional
+`BRISKDB_OVERLAY_PARQUET_PRUNING=true` and `BRISKDB_OVERLAY_READ_ONLY=false`
+flags accept only the exact strings `true` / `false`. Ordinary opens do not
+read these environment variables. See [serverless setup](python/SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
+
+The creation settings below are persisted and reused on reopen. They cannot
+be overridden per request; choose the S3 namespace and schema when creating.
+
+| Python creation argument | CLI creation flag | Default |
+| --- | --- | --- |
+| `bucket`, `region`, `prefix`, `tables` | `--bucket`, `--region`, `--prefix`, `--schema-file` | Required |
+| `shards` | `--shards` | `4` |
+| `partitions` | `--partitions` | `64` |
+| `compact_after_files` | `--compact-after-files` | `32` |
+| `max_pending_files` | `--max-pending-files` | `64` |
+| `write_retry_ms` | `--write-retry-ms` | `60000` |
+
+Shards must be 2–64, partitions 2–256 and divisible by the shard count;
+pending files must be 2–128, the compaction threshold 1 through that limit,
+and the publication-retry budget 1–120000 ms. Invalid values are rejected before
+creation, not clamped or silently ignored.
+
+The retry budget covers head-publication conflicts, **not replaying user SQL**
+or an overall request timeout. Configure the surrounding Lambda deadline too.
+For CLI creation, each setting except `--schema-file` also accepts
+`BRISKDB_OVERLAY_` plus its uppercase underscore name (for example,
+`BRISKDB_OVERLAY_COMPACT_AFTER_FILES`). Explicit flags override environment
+values. Python creation takes explicit arguments, not these CLI defaults.
+
+Build flag-based tools with `cargo build --features s3-overlay-cli`:
+
+```bash
+# schema.json is the same JSON table list shown above; provision once.
+briskdb overlay --root /mnt/shared/my-overlay create \
+  --bucket my-private-bucket --region us-east-1 --prefix briskdb \
+  --schema-file schema.json --shards 4 --partitions 64
+
+briskdb overlay --root /mnt/shared/my-overlay --read-only query \
+  --sql 'SELECT * FROM events WHERE id = ?' \
+  --params-json '[{"Text":"event-1"}]'
+
+briskdb overlay --root /mnt/shared/my-overlay compact --table events --partition 0
+briskdb overlay --root /mnt/shared/my-overlay --parquet-pruning false settings
+```
+
+The same flags work with `briskdb-s3-overlay` (omit the `overlay` subcommand).
+Both commands open, work, close and exit without listeners. Without arguments,
+the standalone tool keeps its original JSON-stdin protocol. Main daemon flags
+cannot be mixed with `overlay`; its ordinary listener configuration is separate.
+Feature aliases `s3-overlay` and `duckdb-reader` retain the older
+`experimental-s3-overlay` / `experimental-duckdb-reader` names for compatibility.
+None is enabled by default, and no PyPI publication is implied by this change.
+
+The SQLite reader now uses **per-partition ISAM file summaries** to skip
+irrelevant pending Parquet files before downloading them. Min/max key bounds
+and compact Bloom filters cover typed primary-key equality predicates, including
+deleted and changed keys. Missing/stale/busy index records fall back to reading
+the file; they cannot hide rows. Ordinary BriskDB behavior is unchanged.
+
+```python
+with Database("/mnt/shared/my-overlay") as db:
+    rows = db.query("SELECT * FROM events WHERE id=?", ["event-42"])
+    print(db.read_stats())  # actual Parquet files read/skipped and bytes read
+    db.set_parquet_pruning(False)  # optional before/after comparison
+```
+
+This first pruning implementation covers BINARY equality on INTEGER/TEXT/BLOB
+primary-key columns, not arbitrary non-key predicates, SQL range expressions,
+or the DuckDB reader. Existing unindexed deltas remain readable but are not
+retroactively indexed. Deploy matching new binaries to all overlay clients:
+older experimental builds reject the new optional `index_hash` head field.
+
+Important experimental boundaries:
+
+- Each modifying statement is atomic within **one table/key partition**. A
+  statement spanning partitions fails without committing partial rows. Queries
+  can join tables, but there is no global multi-partition transaction snapshot.
+- IDs are supplied by the caller. Online DDL, foreign keys, global unique
+  indexes, SQL transactions, Mongo/PostgreSQL adapters and automatic migration
+  of existing roots are not provided for this separate mode.
+- Default routing uses four shard directories and 64 key partitions. The
+  routing key must be part of the primary key. Small independent inserts spread
+  naturally; updates cannot move between partitions.
+- Compaction publishes a new base and the remaining pending set atomically.
+  Writes also trigger compaction at a configurable pending-file threshold
+  (32 by default). SQL is never silently replayed after an uncertain response.
+- Published base files are immutable. Old bases, ISAM file-index records, merged Parquet objects and S3
+  object versions are retained for reader safety; automatic garbage collection
+  is not implemented. Do not add age-only expiry rules or edit base files.
+- Queries/partition compactions are bounded to 100,000 rows and 64 MiB of row
+  data; a Parquet batch is limited to 10,000 changes and 16 MiB. This is an
+  experimental opt-in path, not a general production EFS-support guarantee.
+
+### Optional DuckDB reader (experimental)
+
+For this overlay only, build with `--features duckdb-reader` to
+experiment with DuckDB SQL execution over **one routed table partition**. The
+normal SQLite reader and all writes are unchanged. This does not make a Python
+`sqlite3` connection multithreaded or replace BriskDB's normal SQL/Mongo engine.
+
+Provision the official DuckDB **1.5.6** shared library and matching signed
+`sqlite_scanner` extension for your OS/architecture in the deployment image;
+these are **not bundled in the wheel**. Pass trusted absolute paths, never paths
+from an untrusted request. Runtime extension downloads are disabled.
+
+```python
+with Database("/mnt/shared/my-overlay") as db:
+    rows = db.query_partition_duckdb(
+        "events", "event-1",  # choose the partition containing this routing key
+        "SELECT id, message FROM events WHERE id = ?", ("event-1",),
+        library="/opt/duckdb/libduckdb.so",
+        sqlite_extension="/opt/duckdb/sqlite_scanner.duckdb_extension",
+        threads=4, memory_mb=256,
+    ).rows
+```
+
+DuckDB scans the immutable SQLite base directly, without copying the database
+to Lambda disk. BriskDB still fetches/verifies pending Parquet changes and
+supplies them to DuckDB's merged view. This is **not** direct DuckDB S3/Parquet
+scanning. Other partitions/tables are outside this API's scope; keep the routing
+predicate in your SQL. It accepts read-only SQL supported by both the SQLite
+preflight and DuckDB, with DuckDB expression semantics. Results support null,
+signed integers, finite floats, text and blobs; cast other DuckDB types explicitly.
+Errors never silently fall back to SQLite. Each call opens/closes its DuckDB
+instance, with a 120-second interrupt watchdog and no disk spill.
+
+More threads do not guarantee more chapter pulls: these bases use `WITHOUT
+ROWID`, for which DuckDB's SQLite scanner uses one scan thread. See the
+[measured Lambda comparison](docs/BENCHMARKS.md#optional-duckdb-reader-lambdaefs-2026-10-02).
+
 ## Use Python sqlite3 with BriskDB
 
 Use a real `sqlite3.Connection` and ordinary SQL to read tables on a BriskDB
