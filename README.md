@@ -177,6 +177,80 @@ private Lambda VPC, provide an S3 gateway endpoint and HTTPS security-group
 egress. The native API is `briskdb::s3_overlay::Database`; the optional
 `briskdb-s3-overlay` binary accepts one JSON command per process.
 
+### Safe updates and optional durable queue handoff
+
+For a single-record edit, use `update()` with the complete primary key and an
+operation ID retained by the caller. Unlike arbitrary SQL, this explicit API
+can safely retry a definite conflict, and reconcile a lost response without
+applying an increment twice:
+
+```python
+from briskdb.s3_overlay import Database, RetryOptions, UpdateRequest
+
+# Generate once (or supply your saved 32-character lowercase hex ID).
+# Reuse this SAME request and ID when retrying after a lost response.
+edit = UpdateRequest("events", {"id": "event-1"},
+                     set={"message": "Updated"}, expected={"message": "Hello"})
+with Database("/mnt/shared/my-overlay") as db:
+    result = db.update(edit, retry=RetryOptions(timeout_ms=1000, max_retries=2))
+    print(result["status"])  # committed OR condition_not_met
+```
+
+Retries keep the original expected value/version. Unrelated-row changes can
+reuse the prepared update; changes to the target row require a fresh attempt.
+Default statement retry delays use jitter (up to 20 then 40 ms). The 1-second budget covers
+the update's storage calls/retries, **not** opening the database or an
+uninterruptible shared-filesystem call. Foreground updates do not compact;
+schedule compaction, or explicitly enable `allow_compaction=True` for a worker.
+Normal `execute()` does not automatically replay SQL or weaken write concern.
+
+For an existing **FIFO SQS queue with a FIFO dead-letter queue**, install the
+`s3-queue` extra alongside your source-built wheel and explicitly opt in:
+
+```python
+from briskdb.s3_overlay_queue import QueuedUpdates, SqsUpdateQueue
+
+queue = SqsUpdateQueue(  # reuse the client; open the DB inside each handler
+    "https://sqs.us-east-1.amazonaws.com/123456789012/briskdb-updates.fifo",
+    region="us-east-1",
+)
+with Database("/mnt/shared/my-overlay") as db:
+    result = QueuedUpdates(db, queue).submit(edit, mode="quick")
+    # committed / condition_not_met / queued. "queued" is NOT "saved".
+```
+
+`quick` reserves 250 ms of the default budget for queue submission, with no
+hidden SDK retries; network/credential setup can exceed that target. `queued`
+skips the foreground write; `committed` never queues. A queue failure is raised,
+never acknowledged as success. No work is left running after a Lambda response.
+The [worker example](python/examples/s3_overlay_writer_lambda.py) describes
+required event-source, permissions, visibility-timeout and alarm settings;
+nothing creates AWS resources implicitly. Queue replacements require expected
+old values for every replaced field, or a configured version column that every
+writer maintains. The worker enforces the same guard and uses native operation
+IDs for duplicate safety, not SQS's limited deduplication window.
+
+`db.update_status(edit.operation_id)` returns a confirmed result, or `None`
+(unconfirmed, **not** proof of failure). A queued write may later fail its
+condition or reach the DLQ; applications must expose pending/conflict states,
+check completion, and alert on DLQ depth/queue age. FIFO groups serialize one
+table partition but do not order direct writes outside that queue.
+
+**Format boundary:** the first safe update upgrades that partition's head to
+format 2; older overlay binaries reject it. Upgrade all readers/writers before
+using this API; it is not a downgrade-compatible format. Operation claims and
+results must not be expired/deleted while an operation can be retried or
+redelivered. Receipts are archived before leaving the recent-head window and
+survive compaction/reopening. These extra objects add storage/request cost.
+This remains an experimental source-only feature, not a PyPI release.
+
+Safe updates/status checks also need `s3:ListBucket` permission on their bucket
+so S3 can distinguish a missing receipt from denied access (although BriskDB
+does not issue listing requests). A 403 is never treated as "not committed."
+Keep object access scoped to the database prefix; use a dedicated private
+bucket where bucket-list visibility is inappropriate. See [S3's documented
+missing-object permission behavior](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
+
 ### Selecting and configuring this mode
 
 `briskdb.open()` / `briskdb.connect()` default to `storage_mode="sqlite"`.

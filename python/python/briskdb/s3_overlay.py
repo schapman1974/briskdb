@@ -2,7 +2,8 @@
 
 Requires a native build with ``s3-overlay``. This separate mode
 does not alter ordinary opens or existing databases. Every modifying statement
-must target one table/key partition. No implicit retries of user SQL.
+must target one table/key partition. No implicit retries of user SQL; the explicit
+``update`` API safely retries deterministic primary-key updates.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import json
 import math
 import os
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -55,6 +56,79 @@ def _params(values):
 class QueryResult:
     columns: tuple[str, ...]
     rows: list[tuple[Any, ...]]
+
+
+@dataclass(frozen=True)
+class RetryOptions:
+    """One native operation budget, including cloud I/O and retry pauses.
+
+    Does not include opening the database or bound uninterruptible filesystem
+    calls. A publication timeout can have an unknown outcome: reuse the same
+    UpdateRequest/operation_id, never create a new ID to retry an increment.
+    """
+    timeout_ms: int = 1_000
+    max_retries: int = 2
+    backoff_ms: int = 20
+    max_backoff_ms: int = 100
+    rebase_disjoint: bool = True
+    allow_compaction: bool = False
+
+    def __post_init__(self):
+        for name in ("timeout_ms", "max_retries", "backoff_ms", "max_backoff_ms"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"{name} must be an int")
+        if not 1 <= self.timeout_ms <= 120_000 or not 0 <= self.max_retries <= 32:
+            raise ValueError("invalid update timeout or retry count")
+        if not 0 <= self.backoff_ms <= self.max_backoff_ms <= 5_000:
+            raise ValueError("invalid update backoff")
+        for name in ("rebase_disjoint", "allow_compaction"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a bool")
+
+
+@dataclass(frozen=True)
+class UpdateRequest:
+    """Single-record update; persist/reuse operation_id across retries.
+
+    `key` must contain the complete primary key. `set` replaces fields;
+    `increment` performs numeric addition. `expected` preserves version/old-value
+    conditions on every retry. A failed condition returns condition_not_met.
+    Inputs are serialized at submission, so do not mutate their mappings while
+    a request is in flight. The same ID with different contents is rejected.
+    """
+    table: str
+    key: Mapping[str, Any]
+    set: Mapping[str, Any] = field(default_factory=dict)
+    increment: Mapping[str, Any] = field(default_factory=dict)
+    expected: Mapping[str, Any] = field(default_factory=dict)
+    operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+def _request_json(request: UpdateRequest) -> str:
+    if not isinstance(request, UpdateRequest):
+        raise TypeError("request must be briskdb.s3_overlay.UpdateRequest")
+    if not isinstance(request.table, str) or not request.table:
+        raise ValueError("table must be a nonempty string")
+    identifier = request.operation_id
+    if not isinstance(identifier, str) or len(identifier) != 32 or any(c not in "0123456789abcdef" for c in identifier):
+        raise ValueError("operation_id must be 32 lowercase hexadecimal characters")
+    data = {"operation_id": identifier, "table": request.table}
+    for name in ("key", "set", "increment", "expected"):
+        values = getattr(request, name)
+        if not isinstance(values, Mapping) or any(not isinstance(k, str) for k in values):
+            raise TypeError(f"{name} must map column names to values")
+        data[name] = {key: _cell(value) for key, value in values.items()}
+    encoded = json.dumps(data, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        raise ValueError("update request exceeds 256 KiB")
+    return encoded
+
+
+def _retry_json(options: RetryOptions | None) -> str:
+    options = RetryOptions() if options is None else options
+    if not isinstance(options, RetryOptions):
+        raise TypeError("retry must be briskdb.s3_overlay.RetryOptions")
+    return json.dumps(asdict(options))
 
 
 @dataclass(frozen=True)
@@ -148,6 +222,27 @@ class Database:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any]:
         """Commit one modifying SQL statement; return affected_rows and commit_id."""
         return json.loads(self._db.execute(sql, _params(params)))
+
+    def update(self, request: UpdateRequest, *, retry: RetryOptions | None = None) -> dict[str, Any]:
+        """Safely commit a deterministic point update, preserving its operation ID.
+
+        Opt-in receipt format: touched partitions require a version of BriskDB
+        supporting safe updates. Does not silently queue or weaken durability.
+        """
+        return self._update_serialized(_request_json(request), retry)
+
+    def _update_serialized(self, request_json: str, retry: RetryOptions | None = None):
+        return json.loads(self._db.update(request_json, _retry_json(retry)))
+
+    def update_target(self, request: UpdateRequest) -> dict[str, Any]:
+        """Validate a point update and resolve its queue group without writing."""
+        return json.loads(self._db.update_target(_request_json(request)))
+
+    def update_status(self, operation_id: str, *, timeout_ms: int = 1_000) -> dict[str, Any] | None:
+        """Confirmed result, or None (not confirmed, NOT proof of a failed write)."""
+        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 120_000:
+            raise ValueError("timeout_ms must be an integer in 1..120000")
+        return json.loads(self._db.update_status(operation_id, timeout_ms))
 
     def set_parquet_pruning(self, enabled: bool):
         """Enable/disable advisory ISAM primary-key file pruning (default on).

@@ -70,6 +70,11 @@ incompatible flags fail explicitly. See [configuration and limits](../README.md#
 and [fresh-per-request Lambda setup](SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
 The feature is experimental and is not automatically available in published wheels.
 
+For bounded, duplicate-safe point edits use `db.update(UpdateRequest(...))`;
+optional `QueuedUpdates(...).submit(..., mode="quick")` hands a slow write to
+an existing durable SQS FIFO queue. It reports **queued**, not committed, until
+the worker completes. See the [short examples and compatibility/retention rules](../README.md#safe-updates-and-optional-durable-queue-handoff).
+
 ## Patch PyMongo for local testing
 
 The beta wheel includes `briskdb.patch()`, a TinyMongo-style
