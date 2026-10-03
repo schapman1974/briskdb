@@ -1,7 +1,7 @@
 //! One-shot JSON adapter for the opt-in overlay library. Useful for Lambda and
 //! scheduled compaction; it never keeps a warmed database alive after a reply.
 #[cfg(unix)]
-use briskdb::s3_overlay::{Cell, Config, Database, Row};
+use briskdb::s3_overlay::{Cell, Config, Database, RetryOptions, Row, UpdateRequest};
 #[cfg(unix)]
 use serde::Deserialize;
 #[cfg(unix)]
@@ -50,6 +50,18 @@ enum Request {
         #[serde(default = "pruning_default")]
         parquet_pruning: bool,
     },
+    Update {
+        root: PathBuf,
+        request: UpdateRequest,
+        #[serde(default)]
+        retry: RetryOptions,
+    },
+    UpdateStatus {
+        root: PathBuf,
+        operation_id: String,
+        #[serde(default = "status_timeout_default")]
+        timeout_ms: u64,
+    },
     Compact {
         root: PathBuf,
         table: Option<String>,
@@ -63,12 +75,19 @@ fn pruning_default() -> bool {
 }
 
 #[cfg(unix)]
+fn status_timeout_default() -> u64 {
+    1000
+}
+
+#[cfg(unix)]
 fn run(request: Request) -> briskdb::EngineResult<Value> {
     let started = Instant::now();
     let root = match &request {
         Request::Create { root, .. }
         | Request::Query { root, .. }
         | Request::Execute { root, .. }
+        | Request::Update { root, .. }
+        | Request::UpdateStatus { root, .. }
         | Request::Compact { root, .. } => root,
         #[cfg(feature = "experimental-duckdb-reader")]
         Request::QueryDuckdb { root, .. } => root,
@@ -119,6 +138,12 @@ fn run(request: Request) -> briskdb::EngineResult<Value> {
             partition: Some(partition),
             ..
         } => json!(database.compact(&table, partition)?),
+        Request::Update { request, retry, .. } => json!(database.update(&request, retry)?),
+        Request::UpdateStatus {
+            operation_id,
+            timeout_ms,
+            ..
+        } => json!(database.update_status(&operation_id, timeout_ms)?),
         Request::Compact {
             table: None,
             partition: None,

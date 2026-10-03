@@ -28,12 +28,16 @@ mod registry;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod update;
+#[cfg(test)]
+mod update_tests;
 mod vtab;
 
 pub use cloud::s3_store;
 pub use object_store::ObjectStore;
 pub use registry::{CompactionResult, ReadStats, WriteResult};
 pub use schema::{Cell, Column, ColumnType, Row, Table};
+pub use update::{RetryOptions, UpdateRequest, UpdateResult, UpdateTarget};
 
 use crate::{EngineError, EngineErrorKind};
 use bytes::Bytes;
@@ -65,6 +69,19 @@ pub(crate) fn limit(message: impl Into<String>) -> EngineError {
     EngineError::new(EngineErrorKind::LimitExceeded, message)
 }
 pub(crate) fn storage_error(error: impl std::error::Error + Send + Sync + 'static) -> EngineError {
+    if matches!(
+        (&error as &dyn std::any::Any).downcast_ref::<object_store::Error>(),
+        Some(
+            object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }
+        )
+    ) {
+        return EngineError::from_source(
+            EngineErrorKind::PermissionDenied,
+            error.to_string(),
+            error,
+        );
+    }
     let kind = match (&error as &dyn std::any::Any).downcast_ref::<rusqlite::Error>() {
         Some(rusqlite::Error::SqliteFailure(code, _)) => match code.extended_code {
             rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
