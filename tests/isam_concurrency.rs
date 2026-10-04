@@ -19,6 +19,7 @@ fn writer_process() {
         LockPolicy::new(Duration::from_secs(10), Duration::from_millis(1)).unwrap(),
     )
     .unwrap();
+    store.reset_operation_stats();
     for batch in 0..12_u8 {
         let operations: Vec<_> = (0..8_u8)
             .map(|i| {
@@ -28,13 +29,40 @@ fn writer_process() {
             .collect();
         store.write_batch(&operations).unwrap();
     }
+    let stats = store.operation_stats();
+    let roots_per_write = if store.format_version() == 4 { 3 } else { 1 };
+    assert_eq!(
+        (stats.syncs, stats.root_writes, stats.publication_retries),
+        (24, 12 * roots_per_write, 0)
+    );
 }
 
 #[test]
 fn independent_writers_make_progress_while_old_and_fresh_readers_coexist() {
+    independent_writer_snapshots(2);
+}
+
+#[test]
+fn packed_independent_writers_preserve_old_and_fresh_snapshots() {
+    independent_writer_snapshots(3);
+}
+
+#[test]
+fn pipelined_independent_process_writers_preserve_atomic_snapshots() {
+    independent_writer_snapshots(4);
+}
+
+fn independent_writer_snapshots(version: u16) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("concurrent.isam");
-    let mut creator = Store::create(&path, Layout::new(2, 8).unwrap()).unwrap();
+    let layout = Layout::new(2, 8).unwrap();
+    let mut creator = match version {
+        2 => Store::create(&path, layout),
+        3 => Store::create_packed(&path, layout),
+        4 => Store::create_pipelined(&path, layout),
+        _ => unreachable!(),
+    }
+    .unwrap();
     creator
         .write_batch(&[Mutation::insert([0, 0], b"initial")])
         .unwrap();

@@ -98,6 +98,149 @@ The protocol adapters do not own database semantics. Routing, limits,
 cancellation, values, sessions, and execution live in the shared Rust engine,
 leaving room for more protocols and storage adapters later.
 
+## Experimental ISAM metadata (source builds)
+
+Metadata and application data are separate choices. The Unix-only
+`experimental-isam` feature adds an opt-in **native ISAM manifest with ordinary
+SQLite data shards**. SQLite metadata remains the default. This is not the
+future all-ISAM data backend, and it does not enable NFS/EFS support.
+
+In a Python wheel built with `experimental-isam`:
+
+```python
+import briskdb
+
+config = briskdb.Config(shards=4, metadata_backend="isam")
+with briskdb.open("./hybrid-data", config=config) as db:
+    with db.session(routing_key="example") as session:
+        session.migrate("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+        session.execute("INSERT INTO notes VALUES (?, ?)", [1, "hello"])
+        print(session.query("SELECT * FROM notes")["rows"])
+```
+
+Rust builders accept `.with_metadata_backend(briskdb::MetadataBackend::Isam)`;
+the daemon accepts `--metadata-backend isam` in a feature-enabled build.
+Reopen using the same selection. Existing SQLite roots are never converted.
+
+**Current scope is SQL-only:** routing, table declarations, durable schema
+migration history, and recovery use `manifest.isam`, not a hidden SQLite
+manifest. Mongo/document metadata, global-index metadata, generated-ID metadata,
+and secured roots remain unfinished and are not supported by this option.
+The format is experimental; compaction, conversion, and shared-filesystem
+qualification are still pending. This source change is not a PyPI release.
+
+## Optional S3/Parquet write overlay (experimental source builds)
+
+This is a **separate, explicit mode**, not a change to ordinary opens or an
+automatic conversion of existing databases. It combines an immutable native
+ISAM catalog, indexed SQLite base snapshots on shared storage, and durable
+Parquet changes in S3. SQL reads combine the base and pending changes; inserts,
+updates and deletes become visible without waiting for a nightly merge.
+
+### Example: a serverless app
+
+A product catalog or knowledge portal could use this flow:
+
+```mermaid
+flowchart TD
+    App["Your app"] -->|"1. Send a request"| Gateway["API Gateway"]
+    Gateway --> API["Lambda runs your API · FastAPI + Mangum"]
+    API -->|"2. Read or save data"| DB["BriskDB · S3 overlay mode"]
+    DB --> EFS["EFS: catalog + database snapshots"]
+    DB --> S3["S3: saved changes"]
+    API -->|"3. Return the result"| App
+```
+
+Lambda runs the application on demand. BriskDB reads the snapshots and newer
+S3 changes together, so writes are visible before compaction. A separate
+on-demand maintenance function can merge changes into the snapshots. There is
+no always-running database server; EFS and S3 retain the data between requests
+and still incur storage and request charges.
+
+These are example applications, not bundled apps. This diagram describes the
+experimental S3-overlay mode, not ordinary SQLite WAL databases on EFS.
+
+### Build and use the overlay
+
+Build a Unix Python wheel with `maturin build --manifest-path python/Cargo.toml
+--features s3-overlay` (install that local wheel), then:
+
+```python
+import briskdb
+from briskdb.s3_overlay import Database, OpenOptions
+
+# Run once; the database root must not already exist.
+with Database.create(
+    "/mnt/shared/my-overlay", bucket="my-private-bucket", region="us-east-1",
+    prefix="briskdb", tables=[{
+        "name": "events",
+        "columns": [
+            {"name": "id", "kind": "Text", "nullable": False},
+            {"name": "message", "kind": "Text", "nullable": False},
+        ],
+        "primary_key": ["id"], "shard_key": "id", "indexes": [],
+    }],
+) as db:
+    db.execute("INSERT INTO events VALUES (?, ?)", ("event-1", "Hello"))
+
+# Fresh connection per Lambda request; no background work after the response.
+with briskdb.open(
+    "/mnt/shared/my-overlay", storage_mode="s3-overlay",
+    overlay_options=OpenOptions(parquet_pruning=True),
+) as db:
+    print(db.query("SELECT * FROM events WHERE id = ?", ("event-1",)).rows)
+
+# Cron/scheduled worker; choose one partition per invocation for bounded work.
+with Database("/mnt/shared/my-overlay") as db:
+    db.compact("events", 0)  # schedule every partition, 0..63 by default
+```
+
+Credentials come from the AWS role/environment, not the catalog. Start with
+the [serverless guide](python/SERVERLESS.md) for Lambda lifecycle, permissions,
+configuration, compaction and deployment limits. No AWS resources are created
+automatically.
+
+### Safe updates and optional durable queue handoff
+
+Use the explicit point-update API when an edit needs bounded, duplicate-safe
+retries. Save the request and its operation ID, and reuse both after a lost
+response:
+
+```python
+from briskdb.s3_overlay import Database, RetryOptions, UpdateRequest
+
+edit = UpdateRequest("events", {"id": "event-1"},
+                     set={"message": "Updated"}, expected={"message": "Hello"})
+with Database("/mnt/shared/my-overlay") as db:
+    result = db.update(edit, retry=RetryOptions(timeout_ms=1000, max_retries=2))
+    print(result["status"])  # committed OR condition_not_met
+```
+
+A timeout can leave an unknown outcome; ordinary SQL is not automatically
+replayed. An optional SQS FIFO adapter can hand off an update durably, but
+**queued is not committed**. See [safe updates and queue setup](python/SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff)
+for status checks, expected-value guards, permissions and format compatibility.
+
+### Selecting and configuring this mode
+
+Normal opens still use SQLite. `storage_mode="s3-overlay"` selects a separate
+synchronous SQL API, not ordinary sessions, Mongo adapters or network listeners.
+Writes are atomic within one table/key partition; cross-partition transactions,
+online DDL and automatic migration are not supported. Old snapshots and objects
+are retained; do not add age-only deletion rules.
+
+See [configuration and CLI flags](python/SERVERLESS.md#selecting-and-configuring-this-mode)
+and [current limits](python/SERVERLESS.md#compaction-and-current-limits).
+These features require an opt-in source build, not an ordinary published wheel.
+
+### Optional DuckDB reader (experimental)
+
+An additional `duckdb-reader` build can query one routed overlay partition.
+It does not replace the default SQLite reader or change writes. Native DuckDB
+dependencies are supplied separately, and more threads do not guarantee faster
+reads. See [setup and scope](python/SERVERLESS.md#optional-duckdb-reader-experimental)
+and the [measured comparison](docs/BENCHMARKS.md#optional-duckdb-reader-lambdaefs-2026-10-02).
+
 ## Use Python sqlite3 with BriskDB
 
 Use a real `sqlite3.Connection` and ordinary SQL to read tables on a BriskDB

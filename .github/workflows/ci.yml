@@ -19,6 +19,11 @@ on:
         type: boolean
         required: false
         default: false
+      isam_benchmark:
+        description: Run the opt-in local ISAM/SQLite comparison and retain its report
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +37,53 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  isam-benchmark:
+    name: ISAM comparative benchmark (opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.isam_benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BRISKDB_ISAM_BENCH_SAMPLES: "100"
+      BRISKDB_ISAM_REVISION: ${{ github.sha }}
+      BRISKDB_ISAM_BENCH_OUTPUT: target/isam-benchmark.tsv
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: isam-benchmark-stable
+
+      - name: Run release comparison and retain log
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          cargo test --release --locked --no-default-features \
+            --features isam-benchmark \
+            --test isam_benchmark release_isam_sqlite_comparison -- \
+            --ignored --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/isam-benchmark.log"
+
+      - name: Retain benchmark report and run log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: isam-benchmark-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/isam-benchmark.tsv
+            ${{ runner.temp }}/isam-benchmark.log
+          if-no-files-found: warn
+          retention-days: 90
+
   # TEMPORARY Relay-Then-Verify gate; remove for final ISAM CI verification.
   mongo-soak:
     name: Mongo mixed CRUD and restart soak (opt-in)

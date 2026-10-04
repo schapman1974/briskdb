@@ -44,6 +44,37 @@ session.close()
 db.close()
 ```
 
+## Optional S3/Parquet storage mode
+
+An opt-in Unix source build can combine ISAM metadata/file pruning, immutable
+SQLite base shards and S3 Parquet writes. Normal SQLite remains the default.
+Build a local wheel with `maturin build --manifest-path python/Cargo.toml
+--features s3-overlay` from the repository root, then install that wheel.
+Provision a **new** overlay with the [creation example](../README.md#optional-s3parquet-write-overlay-experimental-source-builds).
+
+```python
+import briskdb
+from briskdb.s3_overlay import OpenOptions
+
+with briskdb.open(
+    "/mnt/shared/my-overlay", storage_mode="s3-overlay",
+    overlay_options=OpenOptions(parquet_pruning=True, read_only=True),
+) as db:
+    print(db.query("SELECT * FROM events WHERE id = ?", ["event-1"]).rows)
+    print(db.settings())
+```
+
+This uses a separate synchronous SQL API, not the ordinary sessions,
+transactions, Mongo adapters or network listeners. Missing build support and
+incompatible flags fail explicitly. See [configuration and limits](SERVERLESS.md#selecting-and-configuring-this-mode)
+and [fresh-per-request Lambda setup](SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
+The feature is experimental and is not automatically available in published wheels.
+
+For bounded, duplicate-safe point edits use `db.update(UpdateRequest(...))`;
+optional `QueuedUpdates(...).submit(..., mode="quick")` hands a slow write to
+an existing durable SQS FIFO queue. It reports **queued**, not committed, until
+the worker completes. See the [examples and compatibility/retention rules](SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff).
+
 ## Patch PyMongo for local testing
 
 The beta wheel includes `briskdb.patch()`, a TinyMongo-style
@@ -562,7 +593,7 @@ See [sync and asyncio usage](ASYNC_API.md) for transactions, streaming cursors,
 deadlines, cancellation, thread/task safety, and the intentionally unclaimed
 DB-API compatibility surface.
 The [API reference](API.md), [platform matrix](COMPATIBILITY.md), and
-[serverless-shaped warm-handler example](SERVERLESS.md) define the supported
+[serverless guide](SERVERLESS.md) define the supported
 package surface and its current boundaries.
 
 This is a pre-1.0 API. SQL supports `None`, `bool`, bounded integers, `float`,

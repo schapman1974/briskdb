@@ -4,6 +4,8 @@ mod document_api;
 mod error;
 mod mongo_client;
 mod remote_sqlite;
+#[cfg(all(unix, feature = "experimental-s3-overlay"))]
+mod s3_overlay;
 mod server_reload;
 mod value;
 
@@ -151,6 +153,7 @@ impl Drop for DatabaseShared {
 struct Config {
     contention_policy: Option<ContentionPolicy>,
     storage_profile: String,
+    metadata_backend: String,
     shards: Option<u16>,
     documents: bool,
     uuid_representation: String,
@@ -170,6 +173,7 @@ impl Default for Config {
         Self {
             contention_policy: None,
             storage_profile: "local".to_owned(),
+            metadata_backend: "sqlite".to_owned(),
             shards: None,
             documents: false,
             uuid_representation: "standard".to_owned(),
@@ -200,6 +204,7 @@ impl Config {
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
                 .with_storage_profile(self.storage_profile.parse()?)
+                .with_metadata_backend(self.metadata_backend.parse()?)
                 .with_contention_policy(
                     self.contention_policy
                         .as_ref()
@@ -221,6 +226,7 @@ impl Config {
         *,
         contention_policy = None,
         storage_profile = "local",
+        metadata_backend = "sqlite",
         shards = None,
         documents = false,
         uuid_representation = "standard",
@@ -238,6 +244,7 @@ impl Config {
     fn new(
         contention_policy: Option<PyRef<'_, ContentionPolicy>>,
         storage_profile: &str,
+        metadata_backend: &str,
         shards: Option<u16>,
         documents: bool,
         uuid_representation: &str,
@@ -254,6 +261,7 @@ impl Config {
         let config = Self {
             contention_policy: contention_policy.map(|policy| policy.clone()),
             storage_profile: storage_profile.to_owned(),
+            metadata_backend: metadata_backend.to_owned(),
             shards,
             documents,
             uuid_representation: uuid_representation.to_owned(),
@@ -281,12 +289,13 @@ impl Config {
             .as_ref()
             .map_or_else(|| "None".to_owned(), ContentionPolicy::representation);
         format!(
-            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={}, storage_profile={:?}, contention_policy={contention})",
+            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={}, storage_profile={:?}, metadata_backend={:?}, contention_policy={contention})",
             self.documents,
             self.uuid_representation,
             self.connections_per_shard,
             self.queue_capacity_per_shard,
-            self.storage_profile
+            self.storage_profile,
+            self.metadata_backend
         )
     }
 }
@@ -3175,6 +3184,8 @@ fn python_distribution_version(version: &str) -> String {
 #[pymodule]
 fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(module)?;
+    #[cfg(all(unix, feature = "experimental-s3-overlay"))]
+    module.add_class::<s3_overlay::S3OverlayDatabase>()?;
     module.add_class::<CancellationToken>()?;
     module.add_class::<Config>()?;
     module.add_class::<ContentionPolicy>()?;

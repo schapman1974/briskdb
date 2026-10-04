@@ -4,15 +4,21 @@
 //! an append-only, copy-on-write B+ tree. Shared read batches and exclusive write
 //! batches retain descriptors. Readers briefly share the publication lock to
 //! capture a root, then traverse immutable pages concurrently with a writer.
-//! Writers serialize on a retained sidecar and exclusively lock the data file
-//! only while publishing/synchronizing the new root. A read batch reloads the root;
+//! In v2/v3 disjoint writers prepare in parallel, then retain a commit gate
+//! through writing/syncing. Opt-in v4 pipelines durable prefixes: the staging
+//! and publication gates are released before either explicit sync, while
+//! conflicting key locks remain held. Working-state handoffs also take a shared
+//! data-file lock for NFS cache coherence (the kernel may flush on handoff).
+//! A read batch reloads the published root;
 //! it never caches the entire database in memory.
 //!
-//! SQLite remains BriskDB's normal backend. These primitives are not yet wired
-//! into SQL, documents, catalogs, or the Python/wire interfaces. The format is
-//! experimental; there is no migration, compaction, secondary index, or EFS/NFS
-//! qualification. Do not use for authoritative data. Never unlink/replace a live
-//! file, bypass its locks, or reuse a handle inherited across `fork`.
+//! SQLite remains BriskDB's normal backend. An opt-in hybrid metadata adapter
+//! uses this store while retaining SQLite application shards. `NativeCatalog`
+//! separately provides typed rows and physical secondary indexes; those native
+//! application-data operations are not wired into SQL/documents. The format is
+//! experimental; there is no migration, compaction, or EFS/NFS qualification.
+//! Do not use for authoritative data. Never unlink or replace a live file,
+//! bypass its locks, or reuse a handle inherited across `fork`.
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +35,7 @@
 
 #![cfg(unix)]
 
+mod catalog;
 mod format;
 mod locking;
 mod tree;
@@ -45,14 +52,18 @@ use std::{
     },
 };
 
-use format::{HEADER_BYTES, Snapshot, read_snapshot, write_snapshot};
+pub use catalog::{
+    CatalogIdentity, ColumnDefinition, ColumnType, IndexDefinition, NativeCatalog, NativeValue,
+    TableDefinition,
+};
+use format::{Snapshot, read_snapshot, write_snapshot};
 use locking::{Guard, KeyLockFile};
 pub use locking::{KEY_LOCK_STRIPES, LockPolicy};
 
 /// Maximum mutations in a transaction or records returned by one range call.
 pub const MAX_BATCH_RECORDS: usize = 4096;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OperationCounters {
     file_opens: AtomicU64,
     file_closes: AtomicU64,
@@ -66,18 +77,78 @@ struct OperationCounters {
     page_read_ns: AtomicU64,
     page_write_ns: AtomicU64,
     syncs: AtomicU64,
+    sync_requests: AtomicU64,
     sync_ns: AtomicU64,
     publication_ns: AtomicU64,
+    preflight_rebases: AtomicU64,
+    publication_retries: AtomicU64,
+    commit_lock_wait_ns: AtomicU64,
     lock_requests: AtomicU64,
     lock_retries: AtomicU64,
     lock_wait_ns: AtomicU64,
+    write_lock_batches: AtomicU64,
+    write_lock_keys: AtomicU64,
+    write_lock_requests: AtomicU64,
+    write_lock_retries: AtomicU64,
+    write_lock_wait_ns: AtomicU64,
+    write_lock_local_retries: AtomicU64,
+    write_lock_local_wait_ns: AtomicU64,
+    write_lock_range_retries: AtomicU64,
+    write_lock_range_wait_ns: AtomicU64,
+    write_lock_stripes_acquired: AtomicU64,
+    write_lock_stripe_acquisitions: [AtomicU64; locking::KEY_LOCK_STRIPES],
+    write_lock_stripe_retries: [AtomicU64; locking::KEY_LOCK_STRIPES],
+    write_lock_stripe_wait_ns: [AtomicU64; locking::KEY_LOCK_STRIPES],
+}
+
+impl Default for OperationCounters {
+    fn default() -> Self {
+        Self {
+            file_opens: AtomicU64::new(0),
+            file_closes: AtomicU64::new(0),
+            file_stats: AtomicU64::new(0),
+            root_reads: AtomicU64::new(0),
+            root_writes: AtomicU64::new(0),
+            page_reads: AtomicU64::new(0),
+            page_writes: AtomicU64::new(0),
+            root_read_ns: AtomicU64::new(0),
+            root_write_ns: AtomicU64::new(0),
+            page_read_ns: AtomicU64::new(0),
+            page_write_ns: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
+            sync_requests: AtomicU64::new(0),
+            sync_ns: AtomicU64::new(0),
+            publication_ns: AtomicU64::new(0),
+            preflight_rebases: AtomicU64::new(0),
+            publication_retries: AtomicU64::new(0),
+            commit_lock_wait_ns: AtomicU64::new(0),
+            lock_requests: AtomicU64::new(0),
+            lock_retries: AtomicU64::new(0),
+            lock_wait_ns: AtomicU64::new(0),
+            write_lock_batches: AtomicU64::new(0),
+            write_lock_keys: AtomicU64::new(0),
+            write_lock_requests: AtomicU64::new(0),
+            write_lock_retries: AtomicU64::new(0),
+            write_lock_wait_ns: AtomicU64::new(0),
+            write_lock_local_retries: AtomicU64::new(0),
+            write_lock_local_wait_ns: AtomicU64::new(0),
+            write_lock_range_retries: AtomicU64::new(0),
+            write_lock_range_wait_ns: AtomicU64::new(0),
+            write_lock_stripes_acquired: AtomicU64::new(0),
+            write_lock_stripe_acquisitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            write_lock_stripe_retries: std::array::from_fn(|_| AtomicU64::new(0)),
+            write_lock_stripe_wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 /// Logical operation counts and selected phase timings from this store handle.
 ///
 /// These measure application-level calls and durations, not operating-system
-/// syscall totals or NFS RPCs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// syscall totals or NFS RPCs. Write-lock fields separate striped key-lock
+/// activity from the aggregate file-lock counters; per-stripe arrays report
+/// stable stripe IDs, never record keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationStats {
     pub file_opens: u64,
     pub file_closes: u64,
@@ -91,11 +162,76 @@ pub struct OperationStats {
     pub page_read_ns: u64,
     pub page_write_ns: u64,
     pub syncs: u64,
+    /// Durability barriers requested. V4 may share a physical sync among
+    /// waiting handles in the same process; this is not cross-host coalescing.
+    pub sync_requests: u64,
     pub sync_ns: u64,
     pub publication_ns: u64,
+    /// Plans discarded before allocating, writing or syncing pages.
+    pub preflight_rebases: u64,
+    /// Post-sync root conflicts (possible when interoperating with old writers).
+    pub publication_retries: u64,
+    /// Commit-gate admission; also included in aggregate lock_wait_ns.
+    pub commit_lock_wait_ns: u64,
     pub lock_requests: u64,
     pub lock_retries: u64,
     pub lock_wait_ns: u64,
+    /// Write-lock stripe admission counts. Stripe IDs are stable hash stripes,
+    /// not record keys; collisions intentionally serialize writes.
+    pub write_lock_batches: u64,
+    pub write_lock_keys: u64,
+    pub write_lock_requests: u64,
+    pub write_lock_retries: u64,
+    pub write_lock_wait_ns: u64,
+    pub write_lock_local_retries: u64,
+    pub write_lock_local_wait_ns: u64,
+    pub write_lock_range_retries: u64,
+    pub write_lock_range_wait_ns: u64,
+    pub write_lock_stripes_acquired: u64,
+    pub write_lock_stripe_acquisitions: [u64; locking::KEY_LOCK_STRIPES],
+    pub write_lock_stripe_retries: [u64; locking::KEY_LOCK_STRIPES],
+    pub write_lock_stripe_wait_ns: [u64; locking::KEY_LOCK_STRIPES],
+}
+
+impl Default for OperationStats {
+    fn default() -> Self {
+        Self {
+            file_opens: 0,
+            file_closes: 0,
+            file_stats: 0,
+            root_reads: 0,
+            root_writes: 0,
+            page_reads: 0,
+            page_writes: 0,
+            root_read_ns: 0,
+            root_write_ns: 0,
+            page_read_ns: 0,
+            page_write_ns: 0,
+            syncs: 0,
+            sync_requests: 0,
+            sync_ns: 0,
+            publication_ns: 0,
+            preflight_rebases: 0,
+            publication_retries: 0,
+            commit_lock_wait_ns: 0,
+            lock_requests: 0,
+            lock_retries: 0,
+            lock_wait_ns: 0,
+            write_lock_batches: 0,
+            write_lock_keys: 0,
+            write_lock_requests: 0,
+            write_lock_retries: 0,
+            write_lock_wait_ns: 0,
+            write_lock_local_retries: 0,
+            write_lock_local_wait_ns: 0,
+            write_lock_range_retries: 0,
+            write_lock_range_wait_ns: 0,
+            write_lock_stripes_acquired: 0,
+            write_lock_stripe_acquisitions: [0; locking::KEY_LOCK_STRIPES],
+            write_lock_stripe_retries: [0; locking::KEY_LOCK_STRIPES],
+            write_lock_stripe_wait_ns: [0; locking::KEY_LOCK_STRIPES],
+        }
+    }
 }
 
 impl OperationCounters {
@@ -114,11 +250,34 @@ impl OperationCounters {
             page_read_ns: load(&self.page_read_ns),
             page_write_ns: load(&self.page_write_ns),
             syncs: load(&self.syncs),
+            sync_requests: load(&self.sync_requests),
             sync_ns: load(&self.sync_ns),
             publication_ns: load(&self.publication_ns),
+            preflight_rebases: load(&self.preflight_rebases),
+            publication_retries: load(&self.publication_retries),
+            commit_lock_wait_ns: load(&self.commit_lock_wait_ns),
             lock_requests: load(&self.lock_requests),
             lock_retries: load(&self.lock_retries),
             lock_wait_ns: load(&self.lock_wait_ns),
+            write_lock_batches: load(&self.write_lock_batches),
+            write_lock_keys: load(&self.write_lock_keys),
+            write_lock_requests: load(&self.write_lock_requests),
+            write_lock_retries: load(&self.write_lock_retries),
+            write_lock_wait_ns: load(&self.write_lock_wait_ns),
+            write_lock_local_retries: load(&self.write_lock_local_retries),
+            write_lock_local_wait_ns: load(&self.write_lock_local_wait_ns),
+            write_lock_range_retries: load(&self.write_lock_range_retries),
+            write_lock_range_wait_ns: load(&self.write_lock_range_wait_ns),
+            write_lock_stripes_acquired: load(&self.write_lock_stripes_acquired),
+            write_lock_stripe_acquisitions: std::array::from_fn(|stripe| {
+                load(&self.write_lock_stripe_acquisitions[stripe])
+            }),
+            write_lock_stripe_retries: std::array::from_fn(|stripe| {
+                load(&self.write_lock_stripe_retries[stripe])
+            }),
+            write_lock_stripe_wait_ns: std::array::from_fn(|stripe| {
+                load(&self.write_lock_stripe_wait_ns[stripe])
+            }),
         }
     }
 
@@ -136,13 +295,32 @@ impl OperationCounters {
             &self.page_read_ns,
             &self.page_write_ns,
             &self.syncs,
+            &self.sync_requests,
             &self.sync_ns,
             &self.publication_ns,
+            &self.preflight_rebases,
+            &self.publication_retries,
+            &self.commit_lock_wait_ns,
             &self.lock_requests,
             &self.lock_retries,
             &self.lock_wait_ns,
+            &self.write_lock_batches,
+            &self.write_lock_keys,
+            &self.write_lock_requests,
+            &self.write_lock_retries,
+            &self.write_lock_wait_ns,
+            &self.write_lock_local_retries,
+            &self.write_lock_local_wait_ns,
+            &self.write_lock_range_retries,
+            &self.write_lock_range_wait_ns,
+            &self.write_lock_stripes_acquired,
         ] {
             counter.store(0, Ordering::Relaxed);
+        }
+        for stripe in 0..locking::KEY_LOCK_STRIPES {
+            self.write_lock_stripe_acquisitions[stripe].store(0, Ordering::Relaxed);
+            self.write_lock_stripe_retries[stripe].store(0, Ordering::Relaxed);
+            self.write_lock_stripe_wait_ns[stripe].store(0, Ordering::Relaxed);
         }
     }
 }
@@ -167,7 +345,8 @@ pub enum Error {
     ReadOnly,
     WrongProcess,
     LockRegistryPoisoned,
-    /// Root publication was attempted, but its durable outcome is unknown.
+    /// Root publication (or v4 speculative staging) was attempted, but the
+    /// durable outcome is unknown; a later writer may publish the staged prefix.
     /// Reopen/reconcile by key; do not blindly retry non-idempotent work.
     CommitUnknown(io::Error),
 }
@@ -290,6 +469,7 @@ pub struct Store {
     writer_lock: File,
     key_locks: Option<Arc<KeyLockFile>>,
     layout: Layout,
+    format_version: u16,
     policy: LockPolicy,
     writable: bool,
     owner_pid: u32,
@@ -300,7 +480,23 @@ impl Store {
     /// Create a new file; never adopt, truncate, or convert an existing file.
     /// A failed creation may leave an incomplete file; it is not auto-repaired.
     pub fn create(path: impl AsRef<Path>, layout: Layout) -> Result<Self> {
-        let path = path.as_ref();
+        Self::create_inner(path.as_ref(), layout, format::FORMAT_VERSION)
+    }
+
+    /// Create an opt-in v3 file with variable-length leaf values (no compression).
+    /// Existing v2 files remain unchanged; there is no in-place conversion.
+    pub fn create_packed(path: impl AsRef<Path>, layout: Layout) -> Result<Self> {
+        Self::create_inner(path.as_ref(), layout, format::PACKED_FORMAT_VERSION)
+    }
+
+    /// Create an opt-in v4 packed file with pipelined durable commits. The
+    /// staging gate does not span either explicit sync; key locks protect conflicts.
+    /// Existing files are never converted. Not yet qualified on NFS/EFS.
+    pub fn create_pipelined(path: impl AsRef<Path>, layout: Layout) -> Result<Self> {
+        Self::create_inner(path.as_ref(), layout, format::PIPELINED_FORMAT_VERSION)
+    }
+
+    fn create_inner(path: &Path, layout: Layout, format_version: u16) -> Result<Self> {
         let counters = Arc::new(OperationCounters::default());
         let file = options(true).create_new(true).open(path)?;
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
@@ -310,14 +506,19 @@ impl Store {
             .open(writer_lock_path(path)?)?;
         counters.file_opens.fetch_add(1, Ordering::Relaxed);
         let key_locks = KeyLockFile::create(&key_lock_path(path)?, Arc::clone(&counters))?;
-        file.set_len(HEADER_BYTES)?;
+        file.set_len(format::data_start(format_version))?;
         let initial = Snapshot {
+            format_version,
             layout,
             generation: 1,
+            publication: 1,
             root: 0,
-            end: HEADER_BYTES,
+            end: format::data_start(format_version),
         };
         write_snapshot(&file, initial, &counters)?;
+        if format_version == format::PIPELINED_FORMAT_VERSION {
+            format::write_working_snapshot(&file, initial, &counters)?;
+        }
         sync_file(&file, &counters)?;
         sync_file(&writer_lock, &counters)?;
         let parent = path
@@ -330,7 +531,7 @@ impl Store {
             file,
             writer_lock,
             Some(key_locks),
-            layout,
+            initial,
             true,
             counters,
         ))
@@ -365,7 +566,7 @@ impl Store {
             return Err(Error::Corrupt("invalid writer lock file"));
         }
         let guard = Guard::acquire_until(&file, false, deadline, policy.interval(), &counters)?;
-        let snapshot = read_snapshot(&file, Some(&counters))?;
+        let mut snapshot = read_snapshot(&file, Some(&counters))?;
         if snapshot.root != 0 {
             tree::read_node(&file, snapshot, snapshot.root, &counters)?;
         }
@@ -381,14 +582,22 @@ impl Store {
         } else {
             None
         };
-        let mut store = Self::from_file(
-            file,
-            writer_lock,
-            key_locks,
-            snapshot.layout,
-            writable,
-            counters,
-        );
+        if writable && snapshot.format_version == format::PIPELINED_FORMAT_VERSION {
+            // No active writer may lose its speculative base. This is an
+            // exclusive *open/recovery* fence, never the normal commit gate.
+            // An unpublished working root is not durable authority, even if
+            // it happens to have a valid checksum after a crash.
+            let _recovery =
+                Guard::acquire_until(&writer_lock, true, deadline, policy.interval(), &counters)?;
+            // A sidecar lock does not refresh this inode's NFS cache. Recovery
+            // must read the published root and reset working state under the
+            // data-file fence, just like normal working-state handoffs.
+            let _data = Guard::acquire_until(&file, true, deadline, policy.interval(), &counters)?;
+            snapshot = read_snapshot(&file, Some(&counters))?;
+            format::write_working_snapshot(&file, snapshot, &counters)?;
+            key_locks.as_ref().unwrap().reset_durability()?;
+        }
+        let mut store = Self::from_file(file, writer_lock, key_locks, snapshot, writable, counters);
         store.policy = policy;
         Ok(store)
     }
@@ -397,7 +606,7 @@ impl Store {
         file: File,
         writer_lock: File,
         key_locks: Option<Arc<KeyLockFile>>,
-        layout: Layout,
+        snapshot: Snapshot,
         writable: bool,
         counters: Arc<OperationCounters>,
     ) -> Self {
@@ -405,7 +614,8 @@ impl Store {
             file,
             writer_lock,
             key_locks,
-            layout,
+            layout: snapshot.layout,
+            format_version: snapshot.format_version,
             writable,
             policy: LockPolicy::default(),
             owner_pid: std::process::id(),
@@ -415,6 +625,11 @@ impl Store {
 
     pub const fn layout(&self) -> Layout {
         self.layout
+    }
+
+    /// Persisted format: 2 fixed slots, 3 packed, 4 packed/pipelined commits.
+    pub const fn format_version(&self) -> u16 {
+        self.format_version
     }
 
     /// Return application-level counts since the last reset.
@@ -455,13 +670,14 @@ impl Store {
             snapshot,
             owner_pid: self.owner_pid,
             counters: Arc::clone(&self.counters),
+            cache: tree::PageCache::default(),
         })
     }
 
     fn snapshot(&self) -> Result<Snapshot> {
         let snapshot = read_snapshot(&self.file, Some(&self.counters))?;
-        if snapshot.layout != self.layout {
-            return Err(Error::Corrupt("record layout changed"));
+        if snapshot.layout != self.layout || snapshot.format_version != self.format_version {
+            return Err(Error::Corrupt("record layout or format changed"));
         }
         Ok(snapshot)
     }
@@ -472,11 +688,50 @@ impl Store {
         self.write_with_hook(mutations, |_| Ok(()))
     }
 
+    /// Internal metadata compare-and-publish. Validation is repeated after
+    /// rebasing under commit admission; a stale caller never overwrites authority.
+    pub(crate) fn write_batch_at_generation(
+        &mut self,
+        mutations: &[Mutation],
+        generation: u64,
+    ) -> Result<bool> {
+        self.write_batch_checked(mutations, &[], |read| Ok(read.generation() == generation))
+    }
+
     fn write_with_hook(
         &mut self,
         mutations: &[Mutation],
         mut hook: impl FnMut(CommitPoint) -> io::Result<()>,
     ) -> Result<()> {
+        self.write_with_validator(mutations, &[], false, |_| Ok(true), &mut hook)
+            .map(|_| ())
+    }
+
+    fn write_batch_checked(
+        &mut self,
+        mutations: &[Mutation],
+        lock_keys: &[Vec<u8>],
+        mut validate: impl FnMut(&ReadBatch<'_>) -> Result<bool>,
+    ) -> Result<bool> {
+        self.write_with_validator(mutations, lock_keys, false, &mut validate, |_| Ok(()))
+    }
+
+    fn write_batch_checked_exclusive_legacy(
+        &mut self,
+        mutations: &[Mutation],
+        mut validate: impl FnMut(&ReadBatch<'_>) -> Result<bool>,
+    ) -> Result<bool> {
+        self.write_with_validator(mutations, &[], true, &mut validate, |_| Ok(()))
+    }
+
+    fn write_with_validator(
+        &mut self,
+        mutations: &[Mutation],
+        lock_keys: &[Vec<u8>],
+        exclusive_legacy: bool,
+        mut validate: impl FnMut(&ReadBatch<'_>) -> Result<bool>,
+        mut hook: impl FnMut(CommitPoint) -> io::Result<()>,
+    ) -> Result<bool> {
         self.check_process()?;
         if !self.writable {
             return Err(Error::ReadOnly);
@@ -492,24 +747,42 @@ impl Store {
                 }
             }
         }
+        for key in lock_keys {
+            self.layout.check_key(key)?;
+        }
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let deadline = self.policy.deadline();
         let _legacy_compatibility = Guard::acquire_until(
             &self.writer_lock,
-            false,
+            exclusive_legacy,
             deadline,
             self.policy.interval(),
             &self.counters,
         )?;
-        let keys: Vec<_> = mutations.iter().map(Mutation::key).collect();
+        let mut keys: Vec<_> = mutations
+            .iter()
+            .map(|mutation| mutation.key().to_vec())
+            .collect();
+        keys.extend(lock_keys.iter().cloned());
+        let key_refs: Vec<_> = keys.iter().map(Vec::as_slice).collect();
         let key_locks = self
             .key_locks
             .as_ref()
             .ok_or(Error::Corrupt("writable store has no key-lock table"))?;
-        let _key_stripes =
-            key_locks.acquire_stripes(&keys, deadline, self.policy.interval(), &self.counters)?;
+        let _key_stripes = key_locks.acquire_stripes(
+            &key_refs,
+            deadline,
+            self.policy.interval(),
+            &self.counters,
+        )?;
+        if self.format_version == format::PIPELINED_FORMAT_VERSION {
+            return self.write_pipelined(mutations, deadline, &mut validate, &mut hook);
+        }
+        // Keep admission across a preflight rebase, so a waiting writer does
+        // not repeatedly lose its turn. The first plan is still concurrent.
+        let mut commit_guard = None;
         loop {
             let root_guard = Guard::acquire_until(
                 &self.file,
@@ -520,13 +793,46 @@ impl Store {
             )?;
             let base = self.snapshot()?;
             drop(root_guard);
+            let read = ReadBatch {
+                file: &self.file,
+                snapshot: base,
+                owner_pid: self.owner_pid,
+                counters: Arc::clone(&self.counters),
+                cache: tree::PageCache::default(),
+            };
+            if !validate(&read)? {
+                return Ok(false);
+            }
             let mut next = base;
             next.generation = next
                 .generation
                 .checked_add(1)
                 .ok_or(Error::Invalid("generation exhausted"))?;
-            let plan = tree::prepare_batch(&self.file, base, mutations, &self.counters)?;
-            let start = self.reserve_page_range(base, plan.page_count(), deadline)?;
+            next.publication = next.generation;
+            let plan = tree::prepare_batch(
+                &self.file,
+                base,
+                mutations,
+                &self.counters,
+                Some(&read.cache),
+            )?;
+            drop(read);
+            hook(CommitPoint::PlanPrepared)?;
+            if commit_guard.is_none() {
+                commit_guard = Some(key_locks.acquire_commit(
+                    deadline,
+                    self.policy.interval(),
+                    &self.counters,
+                )?);
+            }
+            // Recheck under the allocation lock we already need, avoiding a
+            // separate lock round trip and any allocation for a stale plan.
+            let Some(start) = self.reserve_page_range(base, plan.page_count(), deadline)? else {
+                self.counters
+                    .preflight_rebases
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             next = tree::write_plan(&self.file, base, next, start, &plan, &self.counters)?;
             hook(CommitPoint::PagesWritten)?;
             sync_file(&self.file, &self.counters)?;
@@ -543,6 +849,9 @@ impl Store {
                 )?;
                 let latest = self.snapshot()?;
                 if latest != base {
+                    self.counters
+                        .publication_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(false);
                 }
                 write_snapshot(&self.file, next, &self.counters).map_err(|e| match e {
@@ -558,8 +867,239 @@ impl Store {
                 Ordering::Relaxed,
             );
             if publication_result? {
-                return Ok(());
+                return Ok(true);
             }
+        }
+    }
+
+    fn write_pipelined(
+        &self,
+        mutations: &[Mutation],
+        deadline: locking::LockDeadline,
+        mut validate: impl FnMut(&ReadBatch<'_>) -> Result<bool>,
+        mut hook: impl FnMut(CommitPoint) -> io::Result<()>,
+    ) -> Result<bool> {
+        let staged = {
+            let _stage = self.key_locks.as_ref().unwrap().acquire_commit(
+                deadline,
+                self.policy.interval(),
+                &self.counters,
+            )?;
+            // Lock the inode whose cached bytes we exchange, not just its
+            // sidecar. NFS lock acquisition refreshes its cached state; unlock
+            // hands off the new working root and appended pages to peers.
+            // Shared is enough: the staging gate excludes other working-state
+            // writers, and published pages are immutable. Snapshot capture can
+            // coexist; only root publication needs exclusive data ownership.
+            let _data = Guard::acquire_until(
+                &self.file,
+                false,
+                deadline,
+                self.policy.interval(),
+                &self.counters,
+            )?;
+            let mut state = format::read_working_state(&self.file, &self.counters)?;
+            let base = state.snapshot;
+            if state.failed {
+                return Err(Error::Corrupt(
+                    "pipeline failed; quiesce writers and reopen",
+                ));
+            }
+            if base.generation - state.durable_generation == 64 {
+                return Err(Error::Busy);
+            }
+            if base.layout != self.layout || base.format_version != self.format_version {
+                return Err(Error::Corrupt("working root layout or format changed"));
+            }
+            let read = ReadBatch {
+                file: &self.file,
+                snapshot: base,
+                owner_pid: self.owner_pid,
+                counters: Arc::clone(&self.counters),
+                cache: tree::PageCache::default(),
+            };
+            if !validate(&read)? {
+                // A dead writer can leave a speculative row different from
+                // the published row. Returning false here would make catalog
+                // optimistic retries reread that same old row forever. Do not
+                // spin or silently discard a durability hole.
+                if self.snapshot()?.generation < base.generation {
+                    return Err(Error::Busy);
+                }
+                return Ok(false);
+            }
+            let mut next = base;
+            next.generation = base
+                .generation
+                .checked_add(1)
+                .ok_or(Error::Invalid("generation exhausted"))?;
+            let plan = match tree::prepare_batch(
+                &self.file,
+                base,
+                mutations,
+                &self.counters,
+                Some(&read.cache),
+            ) {
+                Ok(plan) => plan,
+                Err(Error::Duplicate) => {
+                    // Do not report a durable uniqueness conflict solely from
+                    // an abandoned, unpublished transaction. A conflict that
+                    // also exists in the published tree is a real Duplicate.
+                    let published = self.snapshot()?;
+                    if published.generation == base.generation {
+                        return Err(Error::Duplicate);
+                    }
+                    match tree::prepare_batch(
+                        &self.file,
+                        published,
+                        mutations,
+                        &self.counters,
+                        None,
+                    ) {
+                        Ok(_) => return Err(Error::Busy),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            hook(CommitPoint::PlanPrepared)?;
+            // The staging gate owns append allocation. The data fence makes
+            // both the physical length and speculative base fresh on NFS.
+            let start = self.reserve_physical_pages(base, plan.page_count())?;
+            next = tree::write_plan(&self.file, base, next, start, &plan, &self.counters)?;
+            hook(CommitPoint::PagesWritten)?;
+            // From this point a later writer can include this transaction in
+            // its durable prefix, so failures are uncertain, never safe retries.
+            state.snapshot = next;
+            format::write_working_state(&self.file, state, &self.counters)
+                .map_err(uncertain_commit)?;
+            next
+        }; // Crucially: release the staging gate BEFORE either durable sync.
+
+        let finish = (|| -> Result<()> {
+            hook(CommitPoint::WorkingRootWritten)?;
+            // Flush this writer's pages, then wait for the earlier writers'
+            // explicit completion flags. This does NOT assume fsync on one
+            // client flushes another client's dirty cache.
+            self.key_locks
+                .as_ref()
+                .unwrap()
+                .synchronize(&self.file, &self.counters)?;
+            self.complete_pipeline_data(staged.generation, deadline)?;
+            hook(CommitPoint::PagesSynced)?;
+            let started = std::time::Instant::now();
+            {
+                let _publication = Guard::acquire_until(
+                    &self.file,
+                    true,
+                    deadline,
+                    self.policy.interval(),
+                    &self.counters,
+                )?;
+                let latest = self.snapshot()?;
+                let mut published = if latest.generation < staged.generation {
+                    staged
+                } else {
+                    latest
+                };
+                published.publication = latest
+                    .publication
+                    .checked_add(1)
+                    .ok_or(Error::Invalid("publication sequence exhausted"))?;
+                // Write a root on THIS descriptor even if a later writer has
+                // already published our prefix; the following fsync must not
+                // depend on flushing another client's dirty root header.
+                write_snapshot(&self.file, published, &self.counters)?;
+                // A newer published prefix already contains this transaction.
+                // Never overwrite it with an out-of-order older completion.
+            }
+            self.counters
+                .publication_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            hook(CommitPoint::RootWritten)?;
+            // Publication ownership is also released before this sync. No
+            // acknowledgement is returned until the root/prefix is durable.
+            self.key_locks
+                .as_ref()
+                .unwrap()
+                .synchronize(&self.file, &self.counters)?;
+            Ok(())
+        })();
+        if let Err(error) = finish {
+            // Best effort: prevent new speculation after a failed sync/timeout.
+            // A missing completion bit independently prevents unsafe promotion.
+            if let Ok(_stage) = self.key_locks.as_ref().unwrap().acquire_commit(
+                LockPolicy::default().deadline(),
+                self.policy.interval(),
+                &self.counters,
+            ) {
+                if let Ok(_data) = Guard::acquire_until(
+                    &self.file,
+                    false,
+                    LockPolicy::default().deadline(),
+                    self.policy.interval(),
+                    &self.counters,
+                ) {
+                    if let Ok(mut state) = format::read_working_state(&self.file, &self.counters) {
+                        state.failed = true;
+                        let _ = format::write_working_state(&self.file, state, &self.counters);
+                    }
+                }
+            }
+            return Err(uncertain_commit(error));
+        }
+        Ok(true)
+    }
+
+    fn complete_pipeline_data(
+        &self,
+        generation: u64,
+        deadline: locking::LockDeadline,
+    ) -> Result<()> {
+        let mut marked = false;
+        loop {
+            {
+                let _stage = self.key_locks.as_ref().unwrap().acquire_commit(
+                    deadline,
+                    self.policy.interval(),
+                    &self.counters,
+                )?;
+                let _data = Guard::acquire_until(
+                    &self.file,
+                    false,
+                    deadline,
+                    self.policy.interval(),
+                    &self.counters,
+                )?;
+                let mut state = format::read_working_state(&self.file, &self.counters)?;
+                if state.failed {
+                    return Err(Error::Corrupt(
+                        "pipeline failed; quiesce writers and reopen",
+                    ));
+                }
+                if generation > state.snapshot.generation {
+                    return Err(Error::Corrupt("pipeline lost staged generation"));
+                }
+                if !marked {
+                    if generation > state.durable_generation {
+                        state.ready |= 1 << (generation % 64);
+                        while state.durable_generation < state.snapshot.generation {
+                            let bit = 1 << ((state.durable_generation + 1) % 64);
+                            if state.ready & bit == 0 {
+                                break;
+                            }
+                            state.ready &= !bit;
+                            state.durable_generation += 1;
+                        }
+                    }
+                    format::write_working_state(&self.file, state, &self.counters)?;
+                    marked = true;
+                }
+                if state.durable_generation >= generation {
+                    return Ok(());
+                }
+            }
+            deadline.wait(self.policy.interval())?;
         }
     }
 
@@ -568,10 +1108,7 @@ impl Store {
         base: Snapshot,
         pages: usize,
         deadline: locking::LockDeadline,
-    ) -> Result<u64> {
-        if pages == 0 {
-            return Ok(base.end);
-        }
+    ) -> Result<Option<u64>> {
         let _allocation = Guard::acquire_until(
             &self.file,
             true,
@@ -579,6 +1116,16 @@ impl Store {
             self.policy.interval(),
             &self.counters,
         )?;
+        if self.snapshot()? != base {
+            return Ok(None);
+        }
+        self.reserve_physical_pages(base, pages).map(Some)
+    }
+
+    fn reserve_physical_pages(&self, base: Snapshot, pages: usize) -> Result<u64> {
+        if pages == 0 {
+            return Ok(base.end);
+        }
         self.counters.file_stats.fetch_add(1, Ordering::Relaxed);
         let physical_end = self.file.metadata()?.len();
         let start = physical_end.max(base.end);
@@ -597,7 +1144,20 @@ impl Store {
     }
 }
 
+fn uncertain_commit(error: Error) -> Error {
+    match error {
+        Error::CommitUnknown(_) => error,
+        Error::Io(error) => Error::CommitUnknown(error),
+        other => Error::CommitUnknown(io::Error::other(other)),
+    }
+}
+
 fn sync_file(file: &File, counters: &OperationCounters) -> io::Result<()> {
+    counters.sync_requests.fetch_add(1, Ordering::Relaxed);
+    sync_file_physical(file, counters)
+}
+
+fn sync_file_physical(file: &File, counters: &OperationCounters) -> io::Result<()> {
     let started = std::time::Instant::now();
     let result = file.sync_all();
     counters
@@ -659,7 +1219,9 @@ fn options(writable: bool) -> OpenOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitPoint {
+    PlanPrepared,
     PagesWritten,
+    WorkingRootWritten,
     PagesSynced,
     RootWritten,
 }
@@ -672,6 +1234,7 @@ pub struct ReadBatch<'a> {
     snapshot: Snapshot,
     owner_pid: u32,
     counters: Arc<OperationCounters>,
+    cache: tree::PageCache,
 }
 
 impl ReadBatch<'_> {
@@ -682,7 +1245,7 @@ impl ReadBatch<'_> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_process()?;
         self.snapshot.layout.check_key(key)?;
-        tree::get(self.file, self.snapshot, key, &self.counters)
+        tree::get(self.file, self.snapshot, key, &self.counters, &self.cache)
     }
 
     /// Ordered half-open range `[start, end)`, with a hard record limit.
@@ -699,7 +1262,15 @@ impl ReadBatch<'_> {
         if limit > MAX_BATCH_RECORDS {
             return Err(Error::Invalid("read limit exceeds record limit"));
         }
-        tree::range(self.file, self.snapshot, start, end, limit, &self.counters)
+        tree::range(
+            self.file,
+            self.snapshot,
+            start,
+            end,
+            limit,
+            &self.counters,
+            &self.cache,
+        )
     }
 
     /// Traverse the live tree and check every parent/child ordering boundary.
@@ -717,5 +1288,7 @@ impl ReadBatch<'_> {
     }
 }
 
+#[cfg(test)]
+mod pipelined_tests;
 #[cfg(test)]
 mod tests;

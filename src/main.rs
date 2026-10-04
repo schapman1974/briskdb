@@ -58,8 +58,11 @@ impl FromStr for ListenerSetting {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[cfg(all(unix, feature = "s3-overlay-cli"))]
+    #[command(subcommand)]
+    command: Option<Command>,
     #[command(flatten)]
     contention: cli_contention::ContentionArgs,
     /// Loopback data-plane HTTP listener address.
@@ -219,6 +222,10 @@ struct Args {
     #[arg(long, env = "BRISKDB_STORAGE_PROFILE", default_value = "local")]
     storage_profile: briskdb::StorageProfile,
 
+    /// Catalog persistence; ISAM is experimental and does not change data shards.
+    #[arg(long, env = "BRISKDB_METADATA_BACKEND", default_value = "sqlite")]
+    metadata_backend: briskdb::MetadataBackend,
+
     /// Graceful-shutdown drain period in milliseconds.
     #[arg(
         long,
@@ -235,6 +242,13 @@ struct Args {
         default_value_t = false
     )]
     experimental_vtab_writes: bool,
+}
+
+#[cfg(all(unix, feature = "s3-overlay-cli"))]
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Explicit ISAM metadata / SQLite base / S3-Parquet storage mode. No listeners.
+    Overlay(briskdb::s3_overlay::cli::OverlayArgs),
 }
 
 impl Args {
@@ -293,6 +307,7 @@ impl Args {
         let contention_policy = self.contention.policy()?;
         EngineOptions::default()
             .with_storage_profile(self.storage_profile)
+            .with_metadata_backend(self.metadata_backend)
             .validate_for_shards(self.shards)?;
         self.validate_mongo_tls()?;
         self.validate_http_tls()?;
@@ -359,6 +374,7 @@ impl Args {
         let options =
             EngineOptions::new(self.connections_per_shard, self.queue_capacity_per_shard)?
                 .with_storage_profile(self.storage_profile)
+                .with_metadata_backend(self.metadata_backend)
                 .with_contention_policy(contention_policy)
                 .with_result_limits(result_limits)
                 .with_prepared_statement_limits(prepared_statement_limits)
@@ -378,15 +394,37 @@ impl Args {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    #[allow(unused_mut)]
+    let mut args = Args::parse();
+    #[cfg(all(unix, feature = "s3-overlay-cli"))]
+    if let Some(Command::Overlay(options)) = args.command.take() {
+        // Keep machine-readable command output separate from diagnostics.
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("briskdb=info")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+        // The overlay owns a synchronous, request-scoped runtime. Dispatch it
+        // before entering the daemon runtime, including its blocking pool.
+        let output = options.run()?;
+        println!("{output}");
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("briskdb=info")),
         )
         .init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon(args))
+}
 
-    let args = Args::parse();
+async fn run_daemon(args: Args) -> anyhow::Result<()> {
     // Validate pairs/feature support before moving fields or starting any I/O.
     args.validate_mongo_tls()?;
     args.validate_http_tls()?;
@@ -425,6 +463,73 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "s3-overlay-cli"))]
+    #[test]
+    fn overlay_command_is_explicit_and_cannot_mix_daemon_flags() {
+        use clap::{CommandFactory, Parser};
+        super::Args::command().debug_assert();
+        let args = super::Args::try_parse_from([
+            "briskdb",
+            "overlay",
+            "--root",
+            "/not/opened",
+            "--read-only",
+            "settings",
+        ])
+        .unwrap();
+        let Some(super::Command::Overlay(options)) = args.command else {
+            panic!("overlay subcommand must select the separate mode")
+        };
+        assert!(options.read_only);
+        assert!(options.parquet_pruning);
+        assert!(
+            super::Args::try_parse_from(["briskdb"])
+                .unwrap()
+                .command
+                .is_none()
+        );
+        assert!(
+            super::Args::try_parse_from([
+                "briskdb",
+                "--listen",
+                "127.0.0.1:8888",
+                "overlay",
+                "--root",
+                "/not/opened",
+                "settings",
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Args::try_parse_from([
+                "briskdb",
+                "overlay",
+                "--root",
+                "/not/opened",
+                "--mongo-listen",
+                "127.0.0.1:27017",
+                "settings",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(not(all(unix, feature = "s3-overlay-cli")))]
+    #[test]
+    fn overlay_command_fails_explicitly_without_the_feature() {
+        use clap::Parser;
+        assert!(
+            super::Args::try_parse_from([
+                "briskdb",
+                "overlay",
+                "--root",
+                "/not/opened",
+                "settings",
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn storage_profile_cli_is_explicit_and_rejects_nfs_without_creating_storage() {
         use clap::Parser;

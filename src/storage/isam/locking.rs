@@ -8,12 +8,15 @@ use std::{
         unix::fs::{FileExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, atomic::Ordering},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, atomic::Ordering},
     time::{Duration, Instant},
 };
 
 /// Fixed, versioned key-lock stripes. Hash collisions only serialize writers.
 pub const KEY_LOCK_STRIPES: usize = 64;
+// Reserved byte immediately after the key stripes. The root recheck remains
+// mandatory: older writers do not participate in this performance-only gate.
+const COMMIT_LOCK_SLOT: usize = KEY_LOCK_STRIPES;
 const LOCK_TABLE_OFFSET: i64 = 4096;
 const LOCK_HEADER_BYTES: usize = 4096;
 const LOCK_MAGIC: &[u8; 8] = b"BRILOCK1";
@@ -61,7 +64,7 @@ impl LockDeadline {
         self.0.checked_duration_since(Instant::now())
     }
 
-    fn wait(self, interval: Duration) -> Result<()> {
+    pub(super) fn wait(self, interval: Duration) -> Result<()> {
         let Some(remaining) = self.remaining() else {
             return Err(Error::Busy);
         };
@@ -183,6 +186,8 @@ pub(super) struct KeyLockFile {
     identity: LockIdentity,
     owner_pid: u32,
     local: [Mutex<()>; KEY_LOCK_STRIPES],
+    commit: Mutex<()>,
+    durability: DurabilityBarrier,
     open_counters: Arc<OperationCounters>,
 }
 
@@ -218,11 +223,12 @@ impl KeyLockFile {
         let registry = LOCK_FILES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry = registry.lock().map_err(|_| Error::LockRegistryPoisoned)?;
         prune_registry(&mut registry);
-        if let Some(existing) = registry.get(&path).and_then(Weak::upgrade)
-            && existing.owner_pid == std::process::id()
-        {
-            existing.validate_path()?;
-            return Ok(existing);
+        match registry.get(&path).and_then(Weak::upgrade) {
+            Some(existing) if existing.owner_pid == std::process::id() => {
+                existing.validate_path()?;
+                return Ok(existing);
+            }
+            _ => {}
         }
 
         let file = options(true).open(&path)?;
@@ -273,6 +279,7 @@ impl KeyLockFile {
         header[12..16].copy_from_slice(&1_u32.to_le_bytes());
         file.set_len(LOCK_HEADER_BYTES as u64)?;
         file.write_all_at(&header, 0)?;
+        counters.sync_requests.fetch_add(1, Ordering::Relaxed);
         file.sync_all()?;
         counters.syncs.fetch_add(1, Ordering::Relaxed);
         drop(_guard);
@@ -282,6 +289,8 @@ impl KeyLockFile {
             identity,
             owner_pid: std::process::id(),
             local: std::array::from_fn(|_| Mutex::new(())),
+            commit: Mutex::new(()),
+            durability: DurabilityBarrier::default(),
             open_counters: counters,
         })
     }
@@ -311,6 +320,9 @@ impl KeyLockFile {
             header[12..16].copy_from_slice(&1_u32.to_le_bytes());
             file.set_len(LOCK_HEADER_BYTES as u64)?;
             file.write_all_at(&header, 0)?;
+            operation_counters
+                .sync_requests
+                .fetch_add(1, Ordering::Relaxed);
             file.sync_all()?;
             operation_counters.syncs.fetch_add(1, Ordering::Relaxed);
         }
@@ -333,6 +345,8 @@ impl KeyLockFile {
             identity,
             owner_pid: std::process::id(),
             local: std::array::from_fn(|_| Mutex::new(())),
+            commit: Mutex::new(()),
+            durability: DurabilityBarrier::default(),
             open_counters: counters,
         })
     }
@@ -353,6 +367,81 @@ impl KeyLockFile {
         Ok(())
     }
 
+    /// Coalesce fsync only among descriptors in THIS process, on the same
+    /// inode. A ticket is registered after its data/root write completes;
+    /// fsync covers only tickets captured before that particular sync began.
+    /// This is not a cross-host flush service or an acknowledgement shortcut.
+    pub(super) fn synchronize(&self, file: &File, counters: &OperationCounters) -> io::Result<()> {
+        counters.sync_requests.fetch_add(1, Ordering::Relaxed);
+        self.durability
+            .run(|| super::sync_file_physical(file, counters))
+    }
+
+    /// Called under the exclusive writer/recovery fence, with no active writes.
+    pub(super) fn reset_durability(&self) -> io::Result<()> {
+        let mut state = self
+            .durability
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("poisoned durability barrier"))?;
+        if state.flushing {
+            return Err(io::Error::other("durability barrier still active"));
+        }
+        *state = FlushState::default();
+        Ok(())
+    }
+
+    /// Coordinate durable publication without excluding snapshot readers or
+    /// taking another file descriptor (closing one could release POSIX locks).
+    pub(super) fn acquire_commit(
+        &self,
+        deadline: LockDeadline,
+        interval: Duration,
+        counters: &OperationCounters,
+    ) -> Result<KeyStripeGuard<'_>> {
+        if self.owner_pid != std::process::id() {
+            return Err(Error::WrongProcess);
+        }
+        let started = Instant::now();
+        let result = (|| {
+            let local = loop {
+                match self.commit.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(Error::LockRegistryPoisoned);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        counters.lock_retries.fetch_add(1, Ordering::Relaxed);
+                        deadline.wait(interval)?;
+                    }
+                }
+            };
+            loop {
+                counters.lock_requests.fetch_add(1, Ordering::Relaxed);
+                match set_range_lock(&self.file, COMMIT_LOCK_SLOT, true) {
+                    Ok(()) => break,
+                    Err(error) if lock_contended(&error) => {
+                        counters.lock_retries.fetch_add(1, Ordering::Relaxed);
+                        deadline.wait(interval)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(KeyStripeGuard {
+                file: &self.file,
+                stripes: vec![COMMIT_LOCK_SLOT],
+                _local_guards: vec![local],
+                owner_pid: std::process::id(),
+            })
+        })();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        counters.lock_wait_ns.fetch_add(elapsed, Ordering::Relaxed);
+        counters
+            .commit_lock_wait_ns
+            .fetch_add(elapsed, Ordering::Relaxed);
+        result
+    }
+
     pub(super) fn acquire_stripes<'a>(
         &'a self,
         keys: &[&[u8]],
@@ -368,12 +457,23 @@ impl KeyLockFile {
         stripes.dedup();
 
         let started = Instant::now();
+        counters.write_lock_batches.fetch_add(1, Ordering::Relaxed);
+        counters
+            .write_lock_keys
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
         let mut local_guards = Vec::with_capacity(stripes.len());
+        let mut local_wait_ns = Vec::with_capacity(stripes.len());
         for stripe in &stripes {
+            let stripe_started = Instant::now();
             loop {
                 match self.local[*stripe].try_lock() {
                     Ok(guard) => {
+                        let waited = stripe_started.elapsed().as_nanos() as u64;
                         local_guards.push(guard);
+                        local_wait_ns.push(waited);
+                        counters
+                            .write_lock_local_wait_ns
+                            .fetch_add(waited, Ordering::Relaxed);
                         break;
                     }
                     Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -381,10 +481,24 @@ impl KeyLockFile {
                     }
                     Err(std::sync::TryLockError::WouldBlock) => {
                         counters.lock_retries.fetch_add(1, Ordering::Relaxed);
+                        counters.write_lock_retries.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .write_lock_local_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        counters.write_lock_stripe_retries[*stripe].fetch_add(1, Ordering::Relaxed);
                         if let Err(error) = deadline.wait(interval) {
+                            let waited = stripe_started.elapsed().as_nanos() as u64;
                             counters
                                 .lock_wait_ns
                                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            counters
+                                .write_lock_wait_ns
+                                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            counters
+                                .write_lock_local_wait_ns
+                                .fetch_add(waited, Ordering::Relaxed);
+                            counters.write_lock_stripe_wait_ns[*stripe]
+                                .fetch_add(waited, Ordering::Relaxed);
                             return Err(error);
                         }
                     }
@@ -393,11 +507,26 @@ impl KeyLockFile {
         }
 
         let mut held = Vec::with_capacity(stripes.len());
-        for stripe in &stripes {
+        for (index, stripe) in stripes.iter().enumerate() {
+            let range_started = Instant::now();
             loop {
                 counters.lock_requests.fetch_add(1, Ordering::Relaxed);
+                counters.write_lock_requests.fetch_add(1, Ordering::Relaxed);
                 if set_range_lock(&self.file, *stripe, true).is_ok() {
+                    let range_waited = range_started.elapsed().as_nanos() as u64;
                     held.push(*stripe);
+                    counters
+                        .write_lock_stripes_acquired
+                        .fetch_add(1, Ordering::Relaxed);
+                    counters.write_lock_stripe_acquisitions[*stripe]
+                        .fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .write_lock_range_wait_ns
+                        .fetch_add(range_waited, Ordering::Relaxed);
+                    counters.write_lock_stripe_wait_ns[*stripe].fetch_add(
+                        local_wait_ns[index].saturating_add(range_waited),
+                        Ordering::Relaxed,
+                    );
                     break;
                 }
                 let error = io::Error::last_os_error();
@@ -406,24 +535,99 @@ impl KeyLockFile {
                     return Err(error.into());
                 }
                 counters.lock_retries.fetch_add(1, Ordering::Relaxed);
+                counters.write_lock_retries.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .write_lock_range_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                counters.write_lock_stripe_retries[*stripe].fetch_add(1, Ordering::Relaxed);
                 if let Err(wait_error) = deadline.wait(interval) {
                     unlock_ranges(&self.file, &held);
+                    let waited = started.elapsed().as_nanos() as u64;
+                    let range_waited = range_started.elapsed().as_nanos() as u64;
+                    counters.lock_wait_ns.fetch_add(waited, Ordering::Relaxed);
                     counters
-                        .lock_wait_ns
-                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        .write_lock_wait_ns
+                        .fetch_add(waited, Ordering::Relaxed);
+                    counters
+                        .write_lock_range_wait_ns
+                        .fetch_add(range_waited, Ordering::Relaxed);
+                    counters.write_lock_stripe_wait_ns[*stripe].fetch_add(
+                        local_wait_ns[index].saturating_add(range_waited),
+                        Ordering::Relaxed,
+                    );
                     return Err(wait_error);
                 }
             }
         }
+        let waited = started.elapsed().as_nanos() as u64;
+        counters.lock_wait_ns.fetch_add(waited, Ordering::Relaxed);
         counters
-            .lock_wait_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .write_lock_wait_ns
+            .fetch_add(waited, Ordering::Relaxed);
         Ok(KeyStripeGuard {
             file: &self.file,
             stripes: held,
             _local_guards: local_guards,
             owner_pid: std::process::id(),
         })
+    }
+}
+
+#[derive(Debug, Default)]
+struct FlushState {
+    requested: u64,
+    completed: u64,
+    flushing: bool,
+    failed: Option<(io::ErrorKind, String)>,
+}
+
+#[derive(Debug, Default)]
+struct DurabilityBarrier {
+    state: Mutex<FlushState>,
+    changed: Condvar,
+}
+
+impl DurabilityBarrier {
+    fn run(&self, flush: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("poisoned durability barrier"))?;
+        state.requested = state
+            .requested
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("durability ticket exhausted"))?;
+        let ticket = state.requested;
+        loop {
+            if let Some((kind, message)) = &state.failed {
+                return Err(io::Error::new(*kind, message.clone()));
+            }
+            if state.completed >= ticket {
+                return Ok(());
+            }
+            if state.flushing {
+                state = self
+                    .changed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("poisoned durability barrier"))?;
+                continue;
+            }
+            let through = state.requested;
+            state.flushing = true;
+            drop(state);
+            let result = flush();
+            state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("poisoned durability barrier"))?;
+            state.flushing = false;
+            match &result {
+                Ok(()) => state.completed = through,
+                Err(error) => state.failed = Some((error.kind(), error.to_string())),
+            }
+            self.changed.notify_all();
+            return result;
+        }
     }
 }
 
@@ -525,4 +729,95 @@ fn normalize_path(path: &Path) -> Result<PathBuf> {
 
 fn prune_registry(registry: &mut HashMap<PathBuf, Weak<KeyLockFile>>) {
     registry.retain(|_, entry| entry.strong_count() > 0);
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use std::{
+        sync::{atomic::AtomicUsize, mpsc},
+        thread,
+    };
+
+    fn wait_for_tickets(barrier: &DurabilityBarrier, count: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while barrier.state.lock().unwrap().requested != count {
+            assert!(Instant::now() < deadline, "flush waiters did not register");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn coalescing_never_acks_tickets_registered_after_a_flush_started() {
+        let barrier = DurabilityBarrier::default();
+        let calls = AtomicUsize::new(0);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let barrier_ref = &barrier;
+            let calls_ref = &calls;
+            let leader = scope.spawn(move || {
+                barrier_ref.run(|| {
+                    calls_ref.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let followers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.run(|| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(barrier.state.lock().unwrap().completed, 1);
+                            Ok(())
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            wait_for_tickets(&barrier, 9);
+            assert_eq!(barrier.state.lock().unwrap().completed, 0);
+            resume_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            for follower in followers {
+                follower.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(barrier.state.lock().unwrap().completed, 9);
+    }
+
+    #[test]
+    fn shared_flush_failure_wakes_every_waiter_without_acknowledging_any() {
+        let barrier = DurabilityBarrier::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let barrier_ref = &barrier;
+            let leader = scope.spawn(move || {
+                barrier_ref.run(|| {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Err(io::Error::other("injected sync failure"))
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let followers = (0..8)
+                .map(|_| scope.spawn(|| barrier.run(|| panic!("must not flush after failure"))))
+                .collect::<Vec<_>>();
+            wait_for_tickets(&barrier, 9);
+            resume_tx.send(()).unwrap();
+            assert!(leader.join().unwrap().is_err());
+            for follower in followers {
+                assert!(follower.join().unwrap().is_err());
+            }
+        });
+        assert_eq!(barrier.state.lock().unwrap().completed, 0);
+        assert!(
+            barrier
+                .run(|| panic!("must stay failed until exclusive recovery"))
+                .is_err()
+        );
+    }
 }

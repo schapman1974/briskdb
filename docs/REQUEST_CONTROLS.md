@@ -174,6 +174,18 @@ resource acquisition or block the async runtime. Exhaustion drops the pending
 future and releases its queue reservation. The engine/request deadline still
 bounds the complete request.
 
+For critical writes that should wait beyond the legacy five-second SQLite lock
+limit, use a larger **finite** budget (for example 60 seconds): initial delay
+10 ms, maximum delay 250 ms, multiplier 2, full jitter, 100,000 retries, and
+`max_elapsed` 60 seconds. Also raise the engine request timeout (for example to
+90 seconds); its default 30 seconds would otherwise cut the wait short. In
+Python these are `max_elapsed_ms=60_000` and `Config(request_timeout_ms=90_000)`.
+This waits inside the existing operation; it does not retry the complete SQL
+statement or guarantee that a write will eventually succeed. Cancellation,
+SQLite deadlock avoidance, and non-lock errors can still end the request early.
+Callers must handle returned failures; uncertain outcomes require an idempotent
+write or reconciliation, never blind replay.
+
 On unreleased main, Python sync/async opens accept the same validated policy:
 
 ```python
@@ -282,6 +294,17 @@ cannot bound an operating-system call stalled in filesystem I/O, and cancelling
 a request does not establish the outcome of an unacknowledged remote write.
 
 ### Contention diagnostics
+
+The `contention-logging` Cargo feature (included by HTTP/Mongo and the default
+daemon build) emits structured `tracing` events under `briskdb::contention`.
+Embedded Rust hosts can enable it separately and install their own subscriber;
+the library never installs a global logger. The first retry is DEBUG, prolonged
+waiting is WARN at most once every five seconds per shared budget, and exhaustion
+is WARN once. Events contain a process-local budget ID, attempt count, elapsed
+time, remaining budget and delay where applicable, never SQL or parameter values.
+Exhaustion is a wait diagnostic, not a claim that a write failed or committed;
+the returned operation result remains authoritative. Legacy/unconfigured waits
+do not emit these events.
 
 On unreleased main, `Engine::contention_statistics()` reads three engine-lifetime
 counters without storage I/O. The same snapshot is included in Rust
