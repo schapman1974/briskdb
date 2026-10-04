@@ -92,7 +92,7 @@ Point updates opt into the receipt-aware head format (older binaries reject it):
   version_column=None, retry=None, remaining_time_ms=None)` implements the
   FIFO worker with partial-batch failure reporting. No resources are provisioned.
 
-See [safe-update usage, retention and deployment requirements](../README.md#safe-updates-and-optional-durable-queue-handoff).
+See [safe-update usage, retention and deployment requirements](SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff).
 
 Writes are single-table/partition statements, not global transactions. Query
 results merge pending changes with immutable SQLite bases. No automatic DDL,

@@ -66,14 +66,14 @@ with briskdb.open(
 
 This uses a separate synchronous SQL API, not the ordinary sessions,
 transactions, Mongo adapters or network listeners. Missing build support and
-incompatible flags fail explicitly. See [configuration and limits](../README.md#selecting-and-configuring-this-mode)
+incompatible flags fail explicitly. See [configuration and limits](SERVERLESS.md#selecting-and-configuring-this-mode)
 and [fresh-per-request Lambda setup](SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
 The feature is experimental and is not automatically available in published wheels.
 
 For bounded, duplicate-safe point edits use `db.update(UpdateRequest(...))`;
 optional `QueuedUpdates(...).submit(..., mode="quick")` hands a slow write to
 an existing durable SQS FIFO queue. It reports **queued**, not committed, until
-the worker completes. See the [short examples and compatibility/retention rules](../README.md#safe-updates-and-optional-durable-queue-handoff).
+the worker completes. See the [examples and compatibility/retention rules](SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff).
 
 ## Patch PyMongo for local testing
 
@@ -593,7 +593,7 @@ See [sync and asyncio usage](ASYNC_API.md) for transactions, streaming cursors,
 deadlines, cancellation, thread/task safety, and the intentionally unclaimed
 DB-API compatibility surface.
 The [API reference](API.md), [platform matrix](COMPATIBILITY.md), and
-[serverless-shaped warm-handler example](SERVERLESS.md) define the supported
+[serverless guide](SERVERLESS.md) define the supported
 package surface and its current boundaries.
 
 This is a pre-1.0 API. SQL supports `None`, `bool`, bounded integers, `float`,

@@ -137,6 +137,31 @@ ISAM catalog, indexed SQLite base snapshots on shared storage, and durable
 Parquet changes in S3. SQL reads combine the base and pending changes; inserts,
 updates and deletes become visible without waiting for a nightly merge.
 
+### Example: a serverless app
+
+A product catalog or knowledge portal could use this flow:
+
+```mermaid
+flowchart TD
+    App["Your app"] -->|"1. Send a request"| Gateway["API Gateway"]
+    Gateway --> API["Lambda runs your API · FastAPI + Mangum"]
+    API -->|"2. Read or save data"| DB["BriskDB · S3 overlay mode"]
+    DB --> EFS["EFS: catalog + database snapshots"]
+    DB --> S3["S3: saved changes"]
+    API -->|"3. Return the result"| App
+```
+
+Lambda runs the application on demand. BriskDB reads the snapshots and newer
+S3 changes together, so writes are visible before compaction. A separate
+on-demand maintenance function can merge changes into the snapshots. There is
+no always-running database server; EFS and S3 retain the data between requests
+and still incur storage and request charges.
+
+These are example applications, not bundled apps. This diagram describes the
+experimental S3-overlay mode, not ordinary SQLite WAL databases on EFS.
+
+### Build and use the overlay
+
 Build a Unix Python wheel with `maturin build --manifest-path python/Cargo.toml
 --features s3-overlay` (install that local wheel), then:
 
@@ -170,25 +195,20 @@ with Database("/mnt/shared/my-overlay") as db:
     db.compact("events", 0)  # schedule every partition, 0..63 by default
 ```
 
-Credentials come from the AWS environment/role, never the catalog. The runtime
-needs scoped S3 `GetObject`/`PutObject` permissions; no bucket listing is needed
-for normal queries or compaction. Keep the bucket private and use HTTPS. For a
-private Lambda VPC, provide an S3 gateway endpoint and HTTPS security-group
-egress. The native API is `briskdb::s3_overlay::Database`; the optional
-`briskdb-s3-overlay` binary accepts one JSON command per process.
+Credentials come from the AWS role/environment, not the catalog. Start with
+the [serverless guide](python/SERVERLESS.md) for Lambda lifecycle, permissions,
+configuration, compaction and deployment limits. No AWS resources are created
+automatically.
 
 ### Safe updates and optional durable queue handoff
 
-For a single-record edit, use `update()` with the complete primary key and an
-operation ID retained by the caller. Unlike arbitrary SQL, this explicit API
-can safely retry a definite conflict, and reconcile a lost response without
-applying an increment twice:
+Use the explicit point-update API when an edit needs bounded, duplicate-safe
+retries. Save the request and its operation ID, and reuse both after a lost
+response:
 
 ```python
 from briskdb.s3_overlay import Database, RetryOptions, UpdateRequest
 
-# Generate once (or supply your saved 32-character lowercase hex ID).
-# Reuse this SAME request and ID when retrying after a lost response.
 edit = UpdateRequest("events", {"id": "event-1"},
                      set={"message": "Updated"}, expected={"message": "Hello"})
 with Database("/mnt/shared/my-overlay") as db:
@@ -196,209 +216,30 @@ with Database("/mnt/shared/my-overlay") as db:
     print(result["status"])  # committed OR condition_not_met
 ```
 
-Retries keep the original expected value/version. Unrelated-row changes can
-reuse the prepared update; changes to the target row require a fresh attempt.
-Default statement retry delays use jitter (up to 20 then 40 ms). The 1-second budget covers
-the update's storage calls/retries, **not** opening the database or an
-uninterruptible shared-filesystem call. Foreground updates do not compact;
-schedule compaction, or explicitly enable `allow_compaction=True` for a worker.
-Normal `execute()` does not automatically replay SQL or weaken write concern.
-
-For an existing **FIFO SQS queue with a FIFO dead-letter queue**, install the
-`s3-queue` extra alongside your source-built wheel and explicitly opt in:
-
-```python
-from briskdb.s3_overlay_queue import QueuedUpdates, SqsUpdateQueue
-
-queue = SqsUpdateQueue(  # reuse the client; open the DB inside each handler
-    "https://sqs.us-east-1.amazonaws.com/123456789012/briskdb-updates.fifo",
-    region="us-east-1",
-)
-with Database("/mnt/shared/my-overlay") as db:
-    result = QueuedUpdates(db, queue).submit(edit, mode="quick")
-    # committed / condition_not_met / queued. "queued" is NOT "saved".
-```
-
-`quick` reserves 250 ms of the default budget for queue submission, with no
-hidden SDK retries; network/credential setup can exceed that target. `queued`
-skips the foreground write; `committed` never queues. A queue failure is raised,
-never acknowledged as success. No work is left running after a Lambda response.
-The [worker example](python/examples/s3_overlay_writer_lambda.py) describes
-required event-source, permissions, visibility-timeout and alarm settings;
-nothing creates AWS resources implicitly. Queue replacements require expected
-old values for every replaced field, or a configured version column that every
-writer maintains. The worker enforces the same guard and uses native operation
-IDs for duplicate safety, not SQS's limited deduplication window.
-
-`db.update_status(edit.operation_id)` returns a confirmed result, or `None`
-(unconfirmed, **not** proof of failure). A queued write may later fail its
-condition or reach the DLQ; applications must expose pending/conflict states,
-check completion, and alert on DLQ depth/queue age. FIFO groups serialize one
-table partition but do not order direct writes outside that queue.
-
-**Format boundary:** the first safe update upgrades that partition's head to
-format 2; older overlay binaries reject it. Upgrade all readers/writers before
-using this API; it is not a downgrade-compatible format. Operation claims and
-results must not be expired/deleted while an operation can be retried or
-redelivered. Receipts are archived before leaving the recent-head window and
-survive compaction/reopening. These extra objects add storage/request cost.
-This remains an experimental source-only feature, not a PyPI release.
-
-Safe updates/status checks also need `s3:ListBucket` permission on their bucket
-so S3 can distinguish a missing receipt from denied access (although BriskDB
-does not issue listing requests). A 403 is never treated as "not committed."
-Keep object access scoped to the database prefix; use a dedicated private
-bucket where bucket-list visibility is inappropriate. See [S3's documented
-missing-object permission behavior](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
+A timeout can leave an unknown outcome; ordinary SQL is not automatically
+replayed. An optional SQS FIFO adapter can hand off an update durably, but
+**queued is not committed**. See [safe updates and queue setup](python/SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff)
+for status checks, expected-value guards, permissions and format compatibility.
 
 ### Selecting and configuring this mode
 
-`briskdb.open()` / `briskdb.connect()` default to `storage_mode="sqlite"`.
-Only `storage_mode="s3-overlay"` selects this separate **synchronous SQL API**;
-it opens an existing overlay and never creates or converts a root implicitly.
-The result uses `query()` / `execute()`, not ordinary `session()` / Mongo APIs.
-Ordinary `Config`, `shards`, document and UUID options are rejected in this
-mode. A wheel without the optional native feature raises `UnsupportedError`;
-it never silently falls back to ordinary storage. Async and network connector
-APIs do not select this mode.
+Normal opens still use SQLite. `storage_mode="s3-overlay"` selects a separate
+synchronous SQL API, not ordinary sessions, Mongo adapters or network listeners.
+Writes are atomic within one table/key partition; cross-partition transactions,
+online DDL and automatic migration are not supported. Old snapshots and objects
+are retained; do not add age-only deletion rules.
 
-`OpenOptions(parquet_pruning=True, read_only=False)` controls each open.
-`read_only=True` rejects SQL mutations and all compaction, including native
-calls; it is not a substitute for read-only AWS credentials/filesystem policy.
-`db.settings()` reports the selected mode, stored layout and effective flags
-without credentials. Neither flag rewrites the stored configuration.
-
-For Lambda, explicitly set `BRISKDB_STORAGE_MODE=s3-overlay` and
-`BRISKDB_OVERLAY_ROOT=/mnt/shared/my-overlay`, then use
-`with Database.from_env() as db:` inside the handler. The optional
-`BRISKDB_OVERLAY_PARQUET_PRUNING=true` and `BRISKDB_OVERLAY_READ_ONLY=false`
-flags accept only the exact strings `true` / `false`. Ordinary opens do not
-read these environment variables. See [serverless setup](python/SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
-
-The creation settings below are persisted and reused on reopen. They cannot
-be overridden per request; choose the S3 namespace and schema when creating.
-
-| Python creation argument | CLI creation flag | Default |
-| --- | --- | --- |
-| `bucket`, `region`, `prefix`, `tables` | `--bucket`, `--region`, `--prefix`, `--schema-file` | Required |
-| `shards` | `--shards` | `4` |
-| `partitions` | `--partitions` | `64` |
-| `compact_after_files` | `--compact-after-files` | `32` |
-| `max_pending_files` | `--max-pending-files` | `64` |
-| `write_retry_ms` | `--write-retry-ms` | `60000` |
-
-Shards must be 2–64, partitions 2–256 and divisible by the shard count;
-pending files must be 2–128, the compaction threshold 1 through that limit,
-and the publication-retry budget 1–120000 ms. Invalid values are rejected before
-creation, not clamped or silently ignored.
-
-The retry budget covers head-publication conflicts, **not replaying user SQL**
-or an overall request timeout. Configure the surrounding Lambda deadline too.
-For CLI creation, each setting except `--schema-file` also accepts
-`BRISKDB_OVERLAY_` plus its uppercase underscore name (for example,
-`BRISKDB_OVERLAY_COMPACT_AFTER_FILES`). Explicit flags override environment
-values. Python creation takes explicit arguments, not these CLI defaults.
-
-Build flag-based tools with `cargo build --features s3-overlay-cli`:
-
-```bash
-# schema.json is the same JSON table list shown above; provision once.
-briskdb overlay --root /mnt/shared/my-overlay create \
-  --bucket my-private-bucket --region us-east-1 --prefix briskdb \
-  --schema-file schema.json --shards 4 --partitions 64
-
-briskdb overlay --root /mnt/shared/my-overlay --read-only query \
-  --sql 'SELECT * FROM events WHERE id = ?' \
-  --params-json '[{"Text":"event-1"}]'
-
-briskdb overlay --root /mnt/shared/my-overlay compact --table events --partition 0
-briskdb overlay --root /mnt/shared/my-overlay --parquet-pruning false settings
-```
-
-The same flags work with `briskdb-s3-overlay` (omit the `overlay` subcommand).
-Both commands open, work, close and exit without listeners. Without arguments,
-the standalone tool keeps its original JSON-stdin protocol. Main daemon flags
-cannot be mixed with `overlay`; its ordinary listener configuration is separate.
-Feature aliases `s3-overlay` and `duckdb-reader` retain the older
-`experimental-s3-overlay` / `experimental-duckdb-reader` names for compatibility.
-None is enabled by default, and no PyPI publication is implied by this change.
-
-The SQLite reader now uses **per-partition ISAM file summaries** to skip
-irrelevant pending Parquet files before downloading them. Min/max key bounds
-and compact Bloom filters cover typed primary-key equality predicates, including
-deleted and changed keys. Missing/stale/busy index records fall back to reading
-the file; they cannot hide rows. Ordinary BriskDB behavior is unchanged.
-
-```python
-with Database("/mnt/shared/my-overlay") as db:
-    rows = db.query("SELECT * FROM events WHERE id=?", ["event-42"])
-    print(db.read_stats())  # actual Parquet files read/skipped and bytes read
-    db.set_parquet_pruning(False)  # optional before/after comparison
-```
-
-This first pruning implementation covers BINARY equality on INTEGER/TEXT/BLOB
-primary-key columns, not arbitrary non-key predicates, SQL range expressions,
-or the DuckDB reader. Existing unindexed deltas remain readable but are not
-retroactively indexed. Deploy matching new binaries to all overlay clients:
-older experimental builds reject the new optional `index_hash` head field.
-
-Important experimental boundaries:
-
-- Each modifying statement is atomic within **one table/key partition**. A
-  statement spanning partitions fails without committing partial rows. Queries
-  can join tables, but there is no global multi-partition transaction snapshot.
-- IDs are supplied by the caller. Online DDL, foreign keys, global unique
-  indexes, SQL transactions, Mongo/PostgreSQL adapters and automatic migration
-  of existing roots are not provided for this separate mode.
-- Default routing uses four shard directories and 64 key partitions. The
-  routing key must be part of the primary key. Small independent inserts spread
-  naturally; updates cannot move between partitions.
-- Compaction publishes a new base and the remaining pending set atomically.
-  Writes also trigger compaction at a configurable pending-file threshold
-  (32 by default). SQL is never silently replayed after an uncertain response.
-- Published base files are immutable. Old bases, ISAM file-index records, merged Parquet objects and S3
-  object versions are retained for reader safety; automatic garbage collection
-  is not implemented. Do not add age-only expiry rules or edit base files.
-- Queries/partition compactions are bounded to 100,000 rows and 64 MiB of row
-  data; a Parquet batch is limited to 10,000 changes and 16 MiB. This is an
-  experimental opt-in path, not a general production EFS-support guarantee.
+See [configuration and CLI flags](python/SERVERLESS.md#selecting-and-configuring-this-mode)
+and [current limits](python/SERVERLESS.md#compaction-and-current-limits).
+These features require an opt-in source build, not an ordinary published wheel.
 
 ### Optional DuckDB reader (experimental)
 
-For this overlay only, build with `--features duckdb-reader` to
-experiment with DuckDB SQL execution over **one routed table partition**. The
-normal SQLite reader and all writes are unchanged. This does not make a Python
-`sqlite3` connection multithreaded or replace BriskDB's normal SQL/Mongo engine.
-
-Provision the official DuckDB **1.5.6** shared library and matching signed
-`sqlite_scanner` extension for your OS/architecture in the deployment image;
-these are **not bundled in the wheel**. Pass trusted absolute paths, never paths
-from an untrusted request. Runtime extension downloads are disabled.
-
-```python
-with Database("/mnt/shared/my-overlay") as db:
-    rows = db.query_partition_duckdb(
-        "events", "event-1",  # choose the partition containing this routing key
-        "SELECT id, message FROM events WHERE id = ?", ("event-1",),
-        library="/opt/duckdb/libduckdb.so",
-        sqlite_extension="/opt/duckdb/sqlite_scanner.duckdb_extension",
-        threads=4, memory_mb=256,
-    ).rows
-```
-
-DuckDB scans the immutable SQLite base directly, without copying the database
-to Lambda disk. BriskDB still fetches/verifies pending Parquet changes and
-supplies them to DuckDB's merged view. This is **not** direct DuckDB S3/Parquet
-scanning. Other partitions/tables are outside this API's scope; keep the routing
-predicate in your SQL. It accepts read-only SQL supported by both the SQLite
-preflight and DuckDB, with DuckDB expression semantics. Results support null,
-signed integers, finite floats, text and blobs; cast other DuckDB types explicitly.
-Errors never silently fall back to SQLite. Each call opens/closes its DuckDB
-instance, with a 120-second interrupt watchdog and no disk spill.
-
-More threads do not guarantee more chapter pulls: these bases use `WITHOUT
-ROWID`, for which DuckDB's SQLite scanner uses one scan thread. See the
-[measured Lambda comparison](docs/BENCHMARKS.md#optional-duckdb-reader-lambdaefs-2026-10-02).
+An additional `duckdb-reader` build can query one routed overlay partition.
+It does not replace the default SQLite reader or change writes. Native DuckDB
+dependencies are supplied separately, and more threads do not guarantee faster
+reads. See [setup and scope](python/SERVERLESS.md#optional-duckdb-reader-experimental)
+and the [measured comparison](docs/BENCHMARKS.md#optional-duckdb-reader-lambdaefs-2026-10-02).
 
 ## Use Python sqlite3 with BriskDB
 

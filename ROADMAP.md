@@ -52,116 +52,55 @@ states the current bounds and unsupported behavior.
 
 ### Optional S3/Parquet SQL overlay (unreleased source build)
 
-The separate `experimental-s3-overlay` mode now has an ISAM catalog, immutable
-indexed SQLite base snapshots, typed Parquet inserts/updates/tombstones in S3,
-conditional publication with lost-ack reconciliation, pending-aware SQL reads
-and joins, and concurrent-safe compaction. It exposes Rust, an explicit Python
-`briskdb.s3_overlay.Database`, and a one-shot native command adapter. Default
-BriskDB and its protocol adapters are unchanged. See the
-[usage and boundaries](README.md#optional-s3parquet-write-overlay-experimental-source-builds).
+The opt-in `s3-overlay` mode combines an ISAM catalog, immutable indexed
+SQLite bases and S3 Parquet changes. Rust, Python and one-shot CLI APIs support
+pending-aware SQL reads/joins, partition-local writes, compaction and explicit
+receipt-backed point updates. Optional SQS FIFO handoff reports queued work
+separately from committed work. Ordinary BriskDB/protocol behavior is unchanged.
 
-Atomic modifying statements are deliberately partition-local. This is not
-Mongo/PostgreSQL overlay support or a transparent migration of existing roots.
-Automatic old-object/base reclamation, global transactions, online schema
-changes and production failure/restore qualification remain future work.
-No PyPI release is authorized by the experimental implementation or benchmark.
+Remaining work includes safe old-object/base reclamation, production
+failure/restore qualification and broader query/transaction capabilities.
+This mode has no Mongo/PostgreSQL adapters, online schema changes, automatic
+root conversion or global transactions. See the
+[serverless guide](python/SERVERLESS.md) for current usage and limits.
+Source experiments do not authorize a PyPI release.
 
 ### Original ISAM backend experiment (unreleased)
 
-Tracked by [#534](https://github.com/schapman1974/briskdb/issues/534). This replaces
-the unfinished SQLite/EFS direction in #509 and #512–#516, closed as superseded,
-not completed. The native path will use no SQLite for records, indexes, catalog,
-receipts, transactions or query execution; the existing SQLite mode stays intact.
+The original BriskDB ISAM work is tracked by
+[#534](https://github.com/schapman1974/briskdb/issues/534). It is optional,
+Unix-only and uses no VBISAM dependency, source port or compatible file format.
+SQLite remains the supported default; the future all-native data backend is
+separate from today's hybrid metadata option.
 
-SQLite remains the supported default. An independent, opt-in `experimental-isam`
-Rust feature exposes `briskdb::isam` record primitives. A separate **hybrid
-metadata integration** now exposes `MetadataBackend::Isam` for SQL roots while
-keeping application data in SQLite shards. It is not the all-native data backend
-described by #534. Python source builds expose `Config(metadata_backend="isam")`;
-the CLI accepts `--metadata-backend isam`. Defaults stay SQLite. This original
-implementation has no VBISAM dependency, source port, or file-format compatibility.
-It stays in this repository under the existing license; no licensing change or
-release is part of the experiment.
+Implemented building blocks:
 
-The hybrid slice persists routing identity, SQL table declarations, schema
-generation/checksums, and resumable schema-migration journals as native records
-in `manifest.isam`. Reopen/backend mismatch checks and durable-boundary process
-exit tests accompany the integration. It does not wrap SQLite pages or keep a
-hidden SQLite manifest. Metadata selection is independent of a future
-application-data storage plugin and does not lift the NFS gate.
+- Checksummed copy-on-write records, indexed point/range reads and atomic
+  batches; shared snapshot reads, striped key locks and coordinated publication.
+- Bounded snapshot page caching, opt-in packed values without compression,
+  and an experimental pipelined format.
+- A native typed catalog with primary/secondary indexes and explicit bulk CRUD.
+- SQL-only `MetadataBackend::Isam` / `Config(metadata_backend="isam")`:
+  routing, table declarations and schema-migration recovery in `manifest.isam`,
+  with ordinary SQLite application-data shards. Reopens require the same
+  backend selection; existing SQLite roots are not converted.
 
-Still required before calling the hybrid metadata option complete: native
-document/collection/index metadata and lifecycle recovery; SQL global-index and
-generated-ID metadata; secured-root integration; complete compatibility,
-contention/cancellation, failure, and installed-wheel qualification. Those paths
-are deliberately unavailable, not redirected to SQLite metadata. Existing
-native-backend epic issues are not closed by this SQL-only slice.
+Still needed: document/collection/index metadata, global-index and generated-ID
+metadata, secured-root integration, native SQL/document execution, and full
+compatibility/installed-wheel qualification. Unsupported hybrid paths fail
+explicitly rather than silently using SQLite metadata.
 
-The first local slice provides fixed-width byte keys, bounded values, indexed
-point/range reads, and atomic insert/put/delete batches in a checksummed,
-copy-on-write B+ tree. Retained file handles avoid per-row open/close/catalog
-work. Batch writes coalesce changes to touched pages. Readers briefly share a
-publication lock, capture a root, and scan immutable pages concurrently with
-writer preparation and later commits. Writers hold sorted, deduplicated key
-stripes, so disjoint writers can prepare concurrently in one file. A separate
-commit gate revalidates the plan before allocating/flushing pages, avoiding
-wasted durable work when another writer commits first. Both durability syncs
-and the final root recheck remain; publishing the root takes an exclusive
-publication lock. Independent files have
-independent locks. Lock-admission retry limits are configurable, including open;
-mutations are never automatically replayed after an uncertain commit.
+Shared-filesystem acceptance also requires independent-host correctness and
+performance evidence, power-loss/lock-loss recovery, stale-writer safety,
+bounded snapshots, reclamation and backup/restore. Local process tests and
+fast reads do not establish these guarantees. Ordinary public NFS opens remain
+disabled. See the [format contract](docs/STORAGE_FORMAT.md) for locking and
+durability details, and [benchmark guide](docs/BENCHMARKS.md#experimental-isam-and-sqlite-comparison)
+for matched controls.
 
-Snapshot-local page caching now reuses validated pages during repeated reads
-and catalog write validation/planning, bounded to 64 pages / 256 KiB of decoded
-storage (plus bookkeeping overhead). New-file-only `create_packed` opts into v3
-leaves that omit unused value padding, without compression. Default creation
-and existing v2 files keep their format. Neither change removes durability
-syncs or qualifies NFS or production operation.
+Implementation queue (issue acceptance criteria remain authoritative):
 
-This is a Unix-only local prototype, not a claim of fast EFS/NFS operation or
-full backend compatibility. It uses an original versioned file plus a retained
-`.writer.lock` sidecar. Snapshot/publication locks cover the actual data file;
-the sidecar is a compatibility/maintenance fence, shared by ordinary writers.
-The separate `.keylocks` file provides 64 deterministic key stripes.
-Do not unlink/replace these files while
-handles are live.
-
-The low-level API now includes a native-only catalog with stable identity,
-versioned declarations, typed rows, and physically maintained primary and
-secondary indexes for its supported scalar types. CRUD and index entries
-publish atomically; exact lookups and bounded composite-index ranges are
-available. Explicit bulk CRUD coalesces multiple rows/indexes into one durable
-publication. Updates validate but do not rewrite unchanged index entries.
-The benchmark separately compares 36 individual commits against one bulk
-commit, without claiming automatic group commit or faster isolated writes.
-This is a partial #540 slice, not a native application-data `BriskDb` backend:
-native SQL/document execution and secured-root integration remain unsupported.
-The hybrid metadata selector described above is a separate, narrower boundary.
-
-Per-handle diagnostics expose logical file open/close/stat and root/page
-operations, sync calls, aggregate lock requests/retries, and admission wait
-time. Striped write-lock stats additionally report deduplicated acquisitions
-per stable stripe ID and separate local-mutex from OS byte-range-lock retries
-and wait. The ignored #536 comparison harness measures retained/open-existing
-paths, point and 36-row range reads, chunk writes/deletes, conflicts, and four
-same-file disjoint writers against BriskDB SQLite and a non-transactional
-fixed-file control; matched JSON row serialization and an opt-in CI artifact
-workflow are included. These logical counters are not NFS RPC measurements,
-and local macOS/Linux results are not EFS qualification. #536 remains open
-until prospective latency, throughput, metadata, and correctness gates are
-agreed for the intended storage. ISAM's root/page I/O, sync, publication and
-lock-admission timings are diagnostic and overlap as documented.
-Format v2 refuses experimental v1 files and fails closed on ambiguous root
-damage instead of silently exposing an older root. This conservative local
-behavior is not durable-recovery proof: power-loss qualification, stale-writer
-fencing, lock-loss handling, mount/cache-coherence behavior, and independent-host
-EFS/NFS validation remain open. Old pages accumulate; space reclamation, bounded
-snapshots, and sustained contention/fairness also remain open. Local
-model/corruption/process tests do not prove those guarantees.
-
-Implementation queue:
-
-- [x] [#535](https://github.com/schapman1974/briskdb/issues/535) — land/harden the original record core and format contract (merged in #583)
+- [x] [#535](https://github.com/schapman1974/briskdb/issues/535) — original record core and format contract
 - [ ] [#536](https://github.com/schapman1974/briskdb/issues/536) — mixed-workload benchmarks and I/O budgets
 - [ ] [#537](https://github.com/schapman1974/briskdb/issues/537) — record/key locks and concurrent same-file writers
 - [ ] [#538](https://github.com/schapman1974/briskdb/issues/538) — durable recovery, lock loss and stale-writer safety
@@ -171,17 +110,12 @@ Implementation queue:
 - [ ] [#542](https://github.com/schapman1974/briskdb/issues/542) — native SQL/document execution with explicit capability limits
 - [ ] [#543](https://github.com/schapman1974/briskdb/issues/543) — backend selection, Python/client integration and invocation lifecycle
 - [ ] [#544](https://github.com/schapman1974/briskdb/issues/544) — snapshot bounds, space reclamation and backup/restore
-- [ ] [#545](https://github.com/schapman1974/briskdb/issues/545) — staged independent-host EFS correctness/performance qualification
+- [ ] [#545](https://github.com/schapman1974/briskdb/issues/545) — independent-host EFS correctness/performance qualification
 - [ ] [#546](https://github.com/schapman1974/briskdb/issues/546) — later opt-in insert-only available-shard placement
 
-The #535 foundation is merged. Proceed with #536/#537. The native catalog
-(#539) can proceed after the foundation without blocking storage-core
-measurements. #545 separates an early
-isolated, disposable-data EFS probe from final release qualification; the early
-probe need not wait for full query/client compatibility. Optional alternate-shard
-placement is not an initial one-shard test gate. Issue dependencies and acceptance
-criteria are authoritative. Preserve SQLite and its existing APIs throughout;
-do not resume the earlier SQLite/NFS work or enable its public gate as a shortcut.
+Partial building blocks do not close the full-backend issues. Preserve SQLite
+and its existing APIs throughout; the superseded SQLite/NFS experiment is not
+a shortcut to enabling production shared-storage support.
 
 ### What compatibility means
 
@@ -772,29 +706,15 @@ requires an earlier dependency:
 8. [ ] **Complete security, backup, observability, and production hardening.**
    Add identity and authorization, TLS, resource governance, metrics and
    tracing, online backup and restore, fault testing, and compatibility gates.
-9. [ ] **Complete serverless support.** Define atomic snapshot storage,
-   ephemeral-runtime lifecycle adapters, warm reuse, and fenced writer
-   guarantees. The separate direct-EFS [native ISAM track (#534)](https://github.com/schapman1974/briskdb/issues/534)
-   uses no SQLite storage or execution and does not require snapshot restore into
-   Lambda. Its same-file concurrent writer protocol (#537), recovery/fencing
-   (#538), native catalog (#539), write identity (#541), invocation integration
-   (#543) and independent-host qualification (#545) precede support claims.
-   Configurable contention budgets (#510) now cover configured Engine admission,
-   startup, SQLite/Brisk waits, maintenance and virtual-table paths, with the
-   same policy exposed through Rust/Python, managed Mongo and daemon settings.
-   Native paths must reuse this budget; it cannot bound stalled kernel I/O.
-   Optional insert-only placement (#546) follows safe fixed routing and is not
-   required for the early one-shard experiment. Measurements (#536/#545) must
-   include cold/warm catalog and lock traffic, same-file independent-writer
-   progress, retained-handle freshness and actual NFS RPC counts; do not omit
-   coherence or durability checks to improve results.
-   The old SQLite/NFS epic #509 and its unfinished children #512–#516 are closed
-   as superseded, not completed. Completed #510/#511 and the test-only SQLite
-   [source runner](python/SERVERLESS.md#isolated-efs-source-test-runner-not-public-nfs-support)
-   remain historical groundwork; no merged code is removed. Existing local
-   SQLite roots/behavior remain unchanged, and public SQLite/NFS opens remain
-   disabled. #194/#196 and #195's original snapshot-provider lifecycle remain
-   separate; #195's direct-EFS addendum now points to #543/#545.
+9. [ ] **Complete serverless support.** The [S3 overlay](#optional-s3parquet-sql-overlay-unreleased-source-build)
+   is the current opt-in SQL path for short-lived shared-storage processes;
+   the [native ISAM backend](#original-isam-backend-experiment-unreleased)
+   is separate work. Both require their documented recovery, lifecycle and
+   independent-host qualification before production support claims.
+   Configurable contention budgets (#510) are available but cannot interrupt
+   stalled kernel I/O. Ordinary SQLite/NFS opens remain disabled; the
+   [test-only runner](python/SERVERLESS.md#isolated-efs-source-test-runner-not-public-nfs-support)
+   is not a deployment path. Snapshot-provider work (#194–#196) remains separate.
 10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential
