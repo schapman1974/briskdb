@@ -553,6 +553,15 @@ impl Store {
     }
 
     fn open_inner(path: &Path, writable: bool, policy: LockPolicy) -> Result<Self> {
+        Self::open_inner_with_snapshot(path, writable, policy, None).map(|(store, _)| store)
+    }
+
+    fn open_inner_with_snapshot(
+        path: &Path,
+        writable: bool,
+        policy: LockPolicy,
+        cache: Option<&tree::PageCache>,
+    ) -> Result<(Self, Snapshot)> {
         let deadline = policy.deadline();
         let file = options(writable).open(path)?;
         let counters = Arc::new(OperationCounters::default());
@@ -568,7 +577,7 @@ impl Store {
         let guard = Guard::acquire_until(&file, false, deadline, policy.interval(), &counters)?;
         let mut snapshot = read_snapshot(&file, Some(&counters))?;
         if snapshot.root != 0 {
-            tree::read_node(&file, snapshot, snapshot.root, &counters)?;
+            tree::validate_root(&file, snapshot, &counters, cache)?;
         }
         drop(guard);
         let key_locks = if writable {
@@ -599,7 +608,36 @@ impl Store {
         }
         let mut store = Self::from_file(file, writer_lock, key_locks, snapshot, writable, counters);
         store.policy = policy;
-        Ok(store)
+        Ok((store, snapshot))
+    }
+
+    /// Consume the snapshot validated during a read-only open, including its
+    /// decoded root page. The callback cannot retain a batch past the file's
+    /// lifetime. Ordinary `read_batch` still acquires a fresh published root.
+    #[cfg(any(feature = "experimental-s3-overlay", test))]
+    pub(crate) fn with_open_read_only_snapshot<T>(
+        path: impl AsRef<Path>,
+        use_snapshot: impl FnOnce(Layout, &ReadBatch<'_>) -> T,
+    ) -> Result<(T, OperationStats)> {
+        let cache = tree::PageCache::default();
+        let (store, snapshot) = Self::open_inner_with_snapshot(
+            path.as_ref(),
+            false,
+            LockPolicy::default(),
+            Some(&cache),
+        )?;
+        let stats = store.operation_stats_handle();
+        let read = ReadBatch {
+            file: &store.file,
+            snapshot,
+            owner_pid: store.owner_pid,
+            counters: Arc::clone(&store.counters),
+            cache,
+        };
+        let result = use_snapshot(store.layout, &read);
+        drop(read);
+        drop(store);
+        Ok((result, stats.snapshot()))
     }
 
     fn from_file(

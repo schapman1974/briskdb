@@ -144,6 +144,29 @@ all publication, retry or compaction I/O. Pruning does not cover arbitrary
 non-key/range predicates or the DuckDB reader. Deploy matching binaries:
 older experimental builds reject the optional `index_hash` head field.
 
+### Open and immutable-base reuse
+
+Opening reads one shared-lock ISAM catalog snapshot and reuses its validated
+root page while loading the catalog. It does not preload SQLite shards or S3
+payloads. `db.open_stats()` reports `total_ms`, `root_path_ms`, `catalog_ms`,
+`store_client_ms`, `runtime_ms`, and `connection_ms`, plus logical catalog
+file-open/root-read/page-read/lock-request counts (not physical NFS RPC counts).
+It returns `None` on a handle returned by `Database.create()`.
+
+Each open handle retains at most eight immutable SQLite base connections in
+least-recently-used order, keyed by table, partition, and published base ID.
+Repeated queries can reuse SQLite's page and prepared-statement caches. Every
+new statement still fetches fresh S3 heads; updates and deletes remain visible,
+and compaction's new base ID selects a new connection. Closing the handle
+releases all retained connections. This works within one Lambda invocation;
+it does not depend on keeping Lambda warm or copying EFS data to `/tmp`.
+
+`db.read_stats()` adds `sqlite_base_opens` (successful opens),
+`sqlite_base_cache_hits`, and `sqlite_base_cache_evictions` for the last SQL scan.
+The CLI includes the same counters and an `open_stats` breakdown alongside
+its existing end-to-end `open_ms`. These optimizations apply only to the
+opt-in S3-overlay SQLite reader, not normal BriskDB or the DuckDB reader.
+
 ## Safe updates and optional durable queue handoff
 
 For a bounded point edit, supply the complete primary key and preserve the

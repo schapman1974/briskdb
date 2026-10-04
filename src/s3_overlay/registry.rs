@@ -1,6 +1,7 @@
 use super::{
-    Cell, Config, MAX_BYTES, MAX_ROWS, Result, Row, cloud, corrupt, create_base, file_index,
-    invalid, is_nonce, limit, nonce, open_base,
+    Cell, Config, MAX_BYTES, MAX_ROWS, Result, Row,
+    base_cache::BaseCache,
+    cloud, corrupt, create_base, file_index, invalid, is_nonce, limit, nonce, open_base,
     parquet::{self, Changes},
     schema::quote,
     storage_error,
@@ -142,6 +143,12 @@ pub struct ReadStats {
     pub parquet_bytes_read: u64,
     pub index_files_opened: u64,
     pub index_fallback_files: u64,
+    #[serde(default)]
+    pub sqlite_base_opens: u64,
+    #[serde(default)]
+    pub sqlite_base_cache_hits: u64,
+    #[serde(default)]
+    pub sqlite_base_cache_evictions: u64,
 }
 
 #[derive(Clone)]
@@ -207,6 +214,7 @@ pub(crate) struct Registry {
     pub config: Config,
     pub cloud: Arc<cloud::Cloud>,
     pub state: Mutex<State>,
+    pub bases: Mutex<BaseCache>,
     pub pruning: AtomicBool,
 }
 
@@ -568,7 +576,14 @@ impl Registry {
         let mut rows = Vec::new();
         let mut bytes = 0;
         if let Some(base) = snapshot.head.base {
-            let connection = open_base(&self.root, &self.config, table, partition, &base)?;
+            let mut bases = self
+                .bases
+                .lock()
+                .map_err(|_| corrupt("overlay base cache poisoned"))?;
+            let connection =
+                bases.get_or_open(table, partition, &base, &mut state.stats, || {
+                    open_base(&self.root, &self.config, table, partition, &base)
+                })?;
             let mut sql = format!(
                 "SELECT {} FROM {}",
                 schema.select_columns(),
@@ -584,7 +599,7 @@ impl Registry {
                         .join(" AND "),
                 );
             }
-            let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+            let mut statement = connection.prepare_cached(&sql).map_err(storage_error)?;
             let mut cursor = statement
                 .query(rusqlite::params_from_iter(
                     predicates.iter().map(|(_, v)| v),

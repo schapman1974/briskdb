@@ -117,6 +117,14 @@ impl S3OverlayDatabase {
         })
     }
 
+    fn open_stats(&self, py: Python<'_>) -> PyResult<String> {
+        run_native(py, || {
+            let guard = self.inner.lock()?;
+            let db = guard.as_ref().ok_or(NativeError::Closed("S3 overlay"))?;
+            serde_json::to_string(&db.open_stats()).map_err(json_error)
+        })
+    }
+
     fn settings(&self, py: Python<'_>) -> PyResult<String> {
         run_native(py, || {
             let guard = self.inner.lock()?;

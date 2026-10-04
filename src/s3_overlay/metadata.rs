@@ -1,5 +1,5 @@
 use super::{Config, Result, corrupt, storage_error};
-use crate::isam::{Layout, Mutation, Store};
+use crate::isam::{Layout, Mutation, OperationStats, ReadBatch, Store};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::Path};
 
@@ -42,12 +42,16 @@ pub(crate) fn create(root: &Path, config: &Config) -> Result<()> {
 }
 
 /// Shared read locks only. No SQLite manifest, recovery, or root startup fence.
-pub(crate) fn open(root: &Path) -> Result<Config> {
-    let mut store = Store::open_read_only(root.join(FILE)).map_err(storage_error)?;
-    if store.layout() != Layout::new(8, CHUNK as u16).map_err(storage_error)? {
+pub(crate) fn open(root: &Path) -> Result<(Config, OperationStats)> {
+    let (config, stats) =
+        Store::with_open_read_only_snapshot(root.join(FILE), decode).map_err(storage_error)?;
+    Ok((config?, stats))
+}
+
+fn decode(layout: Layout, read: &ReadBatch<'_>) -> Result<Config> {
+    if layout != Layout::new(8, CHUNK as u16).map_err(storage_error)? {
         return Err(corrupt("overlay ISAM catalog layout mismatch"));
     }
-    let read = store.read_batch().map_err(storage_error)?;
     let header: Header = serde_json::from_slice(
         &read
             .get(&0u64.to_be_bytes())

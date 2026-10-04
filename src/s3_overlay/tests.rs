@@ -58,6 +58,126 @@ fn all(database: &mut Database) -> Vec<Row> {
 }
 
 #[test]
+fn open_stats_report_one_catalog_snapshot_and_no_base_warmup() {
+    let (root, store, database) = fixture();
+    assert!(database.open_stats().is_none());
+    drop(database);
+    let mut database = Database::open(root.path().join("db"), store).unwrap();
+    let stats = database.open_stats().unwrap().clone();
+    assert_eq!(stats.catalog_file_opens, 2);
+    assert_eq!(stats.catalog_root_reads, 1);
+    assert_eq!(stats.catalog_lock_requests, 1);
+    assert!(stats.catalog_page_reads >= 1);
+    assert_eq!(stats.store_client_ms, 0.0);
+    let stages = stats.root_path_ms
+        + stats.catalog_ms
+        + stats.store_client_ms
+        + stats.runtime_ms
+        + stats.connection_ms;
+    assert!(stats.total_ms >= stages);
+    assert_eq!(database.read_stats().sqlite_base_opens, 0);
+    database
+        .query("SELECT value FROM items WHERE id='a'", &[])
+        .unwrap();
+    assert_eq!(database.read_stats().sqlite_base_opens, 1);
+    assert_eq!(database.open_stats().unwrap().total_ms, stats.total_ms);
+}
+
+#[test]
+fn cached_bases_reuse_connections_but_refresh_heads_after_remote_writes_and_compaction() {
+    let (root, store, mut writer) = fixture();
+    let mut reader = Database::open(root.path().join("db"), store.clone()).unwrap();
+    let query = "SELECT value FROM items WHERE id='a'";
+    assert_eq!(
+        reader.query(query, &[]).unwrap().rows,
+        vec![vec![Cell::Text("original".into())]]
+    );
+    assert_eq!(
+        (
+            reader.read_stats().sqlite_base_opens,
+            reader.read_stats().sqlite_base_cache_hits
+        ),
+        (1, 0)
+    );
+    reader.query(query, &[]).unwrap();
+    assert_eq!(
+        (
+            reader.read_stats().sqlite_base_opens,
+            reader.read_stats().sqlite_base_cache_hits
+        ),
+        (0, 1)
+    );
+    assert_eq!(reader.read_stats().heads_read, 1);
+
+    // A different handle publishes deltas; the reader retains its connection.
+    writer
+        .execute("UPDATE items SET value='changed' WHERE id='a'", &[])
+        .unwrap();
+    assert_eq!(
+        reader.query(query, &[]).unwrap().rows,
+        vec![vec![Cell::Text("changed".into())]]
+    );
+    assert_eq!(reader.read_stats().heads_read, 1);
+    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 1);
+    let partition = writer.config().partition(&Cell::Text("a".into())).unwrap();
+    writer.compact("items", partition).unwrap();
+    assert_eq!(
+        reader.query(query, &[]).unwrap().rows,
+        vec![vec![Cell::Text("changed".into())]]
+    );
+    assert_eq!(
+        (
+            reader.read_stats().sqlite_base_opens,
+            reader.read_stats().sqlite_base_cache_hits
+        ),
+        (1, 0)
+    );
+    assert_eq!(reader.read_stats().heads_read, 1);
+    writer
+        .execute("DELETE FROM items WHERE id='a'", &[])
+        .unwrap();
+    assert!(reader.query(query, &[]).unwrap().rows.is_empty());
+    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 1);
+    assert_eq!(reader.read_stats().heads_read, 1);
+
+    let released = Arc::downgrade(&reader.registry);
+    drop(reader);
+    assert!(
+        released.upgrade().is_none(),
+        "closing releases registry and its base cache"
+    );
+    let mut reopened = Database::open(root.path().join("db"), store).unwrap();
+    assert!(reopened.query(query, &[]).unwrap().rows.is_empty());
+    assert_eq!(
+        (
+            reopened.read_stats().sqlite_base_opens,
+            reopened.read_stats().sqlite_base_cache_hits
+        ),
+        (1, 0)
+    );
+}
+
+#[test]
+fn base_cache_reuses_probes_within_one_statement_without_mixing_tables() {
+    let (_root, _store, mut database) = fixture();
+    let result = database.query(
+        "SELECT value FROM items WHERE id='a' UNION ALL SELECT value FROM items WHERE id='a' UNION ALL SELECT value FROM labels WHERE id='a'",
+        &[],
+    ).unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Cell::Text("original".into())],
+            vec![Cell::Text("original".into())],
+            vec![Cell::Text("label-a".into())],
+        ]
+    );
+    assert_eq!(database.read_stats().sqlite_base_opens, 2);
+    assert_eq!(database.read_stats().sqlite_base_cache_hits, 1);
+    assert_eq!(database.read_stats().heads_read, 2);
+}
+
+#[test]
 fn explicit_open_flags_are_per_handle_and_read_only_blocks_all_writes() {
     let (root, store, database) = fixture();
     assert_eq!(database.options(), OpenOptions::default());
