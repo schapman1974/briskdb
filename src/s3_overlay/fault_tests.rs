@@ -15,6 +15,7 @@ struct FaultStore {
     fault: AtomicU8,
     gets: AtomicUsize,
     lists: AtomicUsize,
+    head_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl std::fmt::Display for FaultStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,6 +39,33 @@ impl ObjectStore for FaultStore {
     ) -> object_store::Result<PutResult> {
         let fault = self.fault.load(Ordering::SeqCst);
         let updating = matches!(options.mode, PutMode::Update(_));
+        let gate = if updating {
+            self.head_gate.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = gate {
+            entered.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        if updating && fault == 8 {
+            self.fault.store(0, Ordering::SeqCst);
+            let result = self.inner.put_opts(path, payload, options).await?;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            return Ok(result);
+        }
+        if updating && fault == 9 {
+            return Err(object_store::Error::PermissionDenied {
+                path: path.to_string(),
+                source: "injected denied head publication".into(),
+            });
+        }
+        if fault == 7 && path.as_ref().ends_with("/result.json") {
+            self.fault.store(0, Ordering::SeqCst);
+            return Err(failure());
+        }
         if updating && fault == 6 {
             self.fault.store(0, Ordering::SeqCst);
             self.inner.put_opts(path, payload, options).await?;
@@ -135,6 +163,183 @@ fn fixture() -> (tempfile::TempDir, Arc<FaultStore>, Database) {
     )
     .unwrap();
     (root, store, database)
+}
+
+fn point_request(value: &str) -> UpdateRequest {
+    UpdateRequest {
+        operation_id: nonce().unwrap(),
+        table: "items".into(),
+        key: BTreeMap::from([("id".into(), Cell::Text("a".into()))]),
+        set: BTreeMap::from([("value".into(), Cell::Text(value.into()))]),
+        increment: BTreeMap::new(),
+        expected: BTreeMap::new(),
+    }
+}
+
+fn update_race(disjoint: bool, rebase: bool, expected: bool) -> UpdateResult {
+    let (root, store, mut other) = fixture();
+    other
+        .execute("INSERT INTO items VALUES ('a','original')", &[])
+        .unwrap();
+    let partition = other.config().partition(&Cell::Text("a".into())).unwrap();
+    let other_id = (0..100)
+        .map(|n| format!("other-{n}"))
+        .find(|id| other.config().partition(&Cell::Text(id.clone())).unwrap() == partition)
+        .unwrap();
+    other
+        .execute(
+            "INSERT INTO items VALUES (?, 'unrelated')",
+            &[Cell::Text(other_id.clone())],
+        )
+        .unwrap();
+    let mut update = point_request("new");
+    if expected {
+        update
+            .expected
+            .insert("value".into(), Cell::Text("original".into()));
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *store.head_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    let path = root.path().join("db");
+    let worker = std::thread::spawn(move || {
+        let mut db = Database::open(path, store).unwrap();
+        db.update(
+            &update,
+            RetryOptions {
+                timeout_ms: 10_000,
+                rebase_disjoint: rebase,
+                allow_compaction: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    });
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let target = if disjoint { other_id } else { "a".into() };
+    other
+        .execute(
+            "UPDATE items SET value='competing' WHERE id=?",
+            &[Cell::Text(target)],
+        )
+        .unwrap();
+    release_tx.send(()).unwrap();
+    worker.join().unwrap()
+}
+
+#[test]
+fn conflicting_point_update_replays_only_after_definite_no_commit() {
+    let result = update_race(false, true, false);
+    assert_eq!(result.statement_retries, 1);
+    assert_eq!(result.status, "committed");
+    assert_eq!(result.affected_rows, 1);
+}
+
+#[test]
+fn stale_editor_condition_is_not_removed_by_retry() {
+    let result = update_race(false, true, true);
+    assert_eq!(result.statement_retries, 1);
+    assert_eq!(result.status, "condition_not_met");
+    assert_eq!(result.affected_rows, 0);
+}
+
+#[test]
+fn disjoint_record_update_rebases_without_reexecuting_the_statement() {
+    let result = update_race(true, true, false);
+    assert_eq!(result.statement_retries, 0);
+    assert_eq!(result.publication_retries, 1);
+    assert_eq!(result.status, "committed");
+    let conservative = update_race(true, false, false);
+    assert_eq!(conservative.statement_retries, 1);
+}
+
+#[test]
+fn update_deadline_after_publication_is_reconciled_by_operation_id() {
+    let (_root, store, mut db) = fixture();
+    db.execute("INSERT INTO items VALUES ('a','original')", &[])
+        .unwrap();
+    let update = point_request("new");
+    store.fault.store(8, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let error = db
+        .update(
+            &update,
+            RetryOptions {
+                timeout_ms: 150,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+    assert!(started.elapsed() < std::time::Duration::from_millis(900));
+    let result = db
+        .update_status(&update.operation_id, 1000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, "committed");
+    assert_eq!(
+        db.update(&update, RetryOptions::default())
+            .unwrap()
+            .commit_id,
+        result.commit_id
+    );
+}
+
+#[test]
+fn denied_head_publication_is_a_permission_failure_not_a_transient_queue_trigger() {
+    let (_root, store, mut db) = fixture();
+    db.execute("INSERT INTO items VALUES ('a','original')", &[])
+        .unwrap();
+    let update = point_request("not-authorized");
+    store.fault.store(9, Ordering::SeqCst);
+    assert_eq!(
+        db.update(&update, RetryOptions::default())
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::PermissionDenied
+    );
+    assert!(
+        db.update_status(&update.operation_id, 1000)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.query("SELECT value FROM items WHERE id='a'", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Cell::Text("original".into())]]
+    );
+}
+
+#[test]
+fn receipt_archive_failure_never_forgets_a_committed_operation() {
+    let (_root, store, mut db) = fixture();
+    // No matching row: cheap metadata-only commits also need durable dedup.
+    let first_request = point_request("first");
+    let first = db.update(&first_request, RetryOptions::default()).unwrap();
+    for _ in 0..255 {
+        db.update(&point_request("unused"), RetryOptions::default())
+            .unwrap();
+    }
+    store.fault.store(7, Ordering::SeqCst);
+    let last = point_request("last");
+    assert!(db.update(&last, RetryOptions::default()).is_err());
+    assert_eq!(
+        db.update_status(&first_request.operation_id, 1000)
+            .unwrap()
+            .unwrap()
+            .commit_id,
+        first.commit_id
+    );
+    db.update(&last, RetryOptions::default()).unwrap();
+    assert_eq!(
+        db.update(&first_request, RetryOptions::default())
+            .unwrap()
+            .commit_id,
+        first.commit_id
+    );
 }
 
 #[test]

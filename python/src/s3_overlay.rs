@@ -1,6 +1,6 @@
 //! Private JSON transport; public Python API lives in briskdb.s3_overlay.
 use crate::error::{NativeError, run_native};
-use briskdb::s3_overlay::{Cell, Config, Database, OpenOptions, Row};
+use briskdb::s3_overlay::{Cell, Config, Database, OpenOptions, RetryOptions, Row, UpdateRequest};
 use pyo3::prelude::*;
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -63,6 +63,40 @@ impl S3OverlayDatabase {
             let mut guard = self.inner.lock()?;
             let db = guard.as_mut().ok_or(NativeError::Closed("S3 overlay"))?;
             serde_json::to_string(&db.execute(&sql, &params)?).map_err(json_error)
+        })
+    }
+
+    #[pyo3(signature = (request_json, retry_json="{}"))]
+    fn update(&self, py: Python<'_>, request_json: String, retry_json: &str) -> PyResult<String> {
+        let request: UpdateRequest = serde_json::from_str(&request_json).map_err(json_error)?;
+        let options: RetryOptions = serde_json::from_str(retry_json).map_err(json_error)?;
+        run_native(py, || {
+            let mut guard = self.inner.lock()?;
+            let db = guard.as_mut().ok_or(NativeError::Closed("S3 overlay"))?;
+            serde_json::to_string(&db.update(&request, options)?).map_err(json_error)
+        })
+    }
+
+    fn update_target(&self, py: Python<'_>, request_json: String) -> PyResult<String> {
+        let request: UpdateRequest = serde_json::from_str(&request_json).map_err(json_error)?;
+        run_native(py, || {
+            let guard = self.inner.lock()?;
+            let db = guard.as_ref().ok_or(NativeError::Closed("S3 overlay"))?;
+            serde_json::to_string(&db.update_target(&request)?).map_err(json_error)
+        })
+    }
+
+    #[pyo3(signature = (operation_id, timeout_ms=1000))]
+    fn update_status(
+        &self,
+        py: Python<'_>,
+        operation_id: String,
+        timeout_ms: u64,
+    ) -> PyResult<String> {
+        run_native(py, || {
+            let guard = self.inner.lock()?;
+            let db = guard.as_ref().ok_or(NativeError::Closed("S3 overlay"))?;
+            serde_json::to_string(&db.update_status(&operation_id, timeout_ms)?).map_err(json_error)
         })
     }
 

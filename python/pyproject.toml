@@ -33,6 +33,7 @@ Issues = "https://github.com/schapman1974/briskdb/issues"
 
 [project.optional-dependencies]
 pymongo = ["pymongo==4.17.0"]
+s3-queue = ["boto3>=1.35,<2"]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"

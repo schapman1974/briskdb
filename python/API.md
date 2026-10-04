@@ -67,6 +67,33 @@ the default `storage_mode="sqlite"`. Missing native feature support raises
   summary publication for this handle; `read_stats()` reports the last SQL scan.
 - `close()` and `with Database(...)` release the handle before returning.
 
+Point updates opt into the receipt-aware head format (older binaries reject it):
+
+- `UpdateRequest(table, key, set={}, increment={}, expected={}, operation_id=...)`
+  requires the complete primary key and a deterministic change. IDs are 32
+  lowercase hexadecimal characters; the default generates a new ID. Retain and
+  reuse it **with identical intent** across client retries and queue redelivery.
+- `RetryOptions(timeout_ms=1000, max_retries=2, backoff_ms=20,
+  max_backoff_ms=100, rebase_disjoint=True, allow_compaction=False)` bounds native
+  storage/retry work, not database opening or uninterruptible filesystem calls.
+- `update(request, *, retry=None)` returns `status` (`committed` or
+  `condition_not_met`), `operation_id`, `affected_rows`, `commit_id`, `partition`,
+  `shard`, `statement_retries`, `publication_retries` and `deduplicated`.
+- `update_status(operation_id, *, timeout_ms=1000)` returns a confirmed result
+  or `None`. `None` does not prove failure; a timed-out submission may commit.
+- `update_target(request)` validates and resolves the FIFO group without writes.
+- Optional `s3_overlay_queue.QueuedUpdates(db, queue, version_column=None)`
+  exposes `submit(request, mode="quick", retry=None)`. Modes are `committed`
+  (never queue), `quick` (bounded attempt then durable handoff), and `queued`.
+  Queue acknowledgements have `status="queued"`, `committed=False`, operation
+  ID and message ID; do not interpret them as committed database writes.
+- `SqsUpdateQueue(queue_url, *, region, send_timeout_ms=250, client=None)` uses
+  an existing FIFO queue; `process_batch(db, event, *, queue_arn,
+  version_column=None, retry=None, remaining_time_ms=None)` implements the
+  FIFO worker with partial-batch failure reporting. No resources are provisioned.
+
+See [safe-update usage, retention and deployment requirements](SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff).
+
 Writes are single-table/partition statements, not global transactions. Query
 results merge pending changes with immutable SQLite bases. No automatic DDL,
 migration or Mongo/Postgres routing is provided. See [full example and bounds](../README.md#optional-s3parquet-write-overlay-experimental-source-builds).
