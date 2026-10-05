@@ -233,7 +233,7 @@ impl NativeManifest {
             tables: 0,
             active: None,
         };
-        let mut store = Store::create_packed(
+        let mut store = Store::create_pipelined(
             path,
             Layout::new(KEY_BYTES, VALUE_BYTES as u16).map_err(map_error)?,
         )
@@ -256,7 +256,7 @@ impl NativeManifest {
         }
         .map_err(map_error)?;
         if store.layout() != Layout::new(KEY_BYTES, VALUE_BYTES as u16).map_err(map_error)?
-            || store.format_version() != 3
+            || !matches!(store.format_version(), 3 | 4)
         {
             return Err(corrupt(
                 "ISAM file is not a supported hybrid metadata manifest",
@@ -632,6 +632,81 @@ impl TableRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_metadata_defaults_to_v4_and_reopens_read_only_and_writable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(FILE_NAME);
+        let mut native = NativeManifest::create(&path, 2).unwrap();
+        assert_eq!(native.store.format_version(), 4);
+        let identity = native.root().unwrap().1.layout_id;
+        drop(native);
+        let before = fs::read(&path).unwrap();
+        let mut reader = NativeManifest::open(&path, true).unwrap();
+        assert_eq!(reader.store.format_version(), 4);
+        assert_eq!(reader.root().unwrap().1.layout_id, identity);
+        drop(reader);
+        assert_eq!(before, fs::read(&path).unwrap());
+        let mut writer = NativeManifest::open(&path, false).unwrap();
+        let (version, mut root) = writer.root().unwrap();
+        root.degraded = true;
+        writer.publish(version, &root, vec![]).unwrap();
+        drop(writer);
+        let mut reopened = NativeManifest::open(&path, true).unwrap();
+        assert_eq!(reopened.store.format_version(), 4);
+        assert!(reopened.root().unwrap().1.degraded);
+    }
+
+    #[test]
+    fn legacy_v3_metadata_remains_readable_and_writable_without_conversion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = NativeManifest::create(&directory.path().join("source.isam"), 2).unwrap();
+        let root = source.root().unwrap().1;
+        let path = directory.path().join(FILE_NAME);
+        let mut legacy =
+            Store::create_packed(&path, Layout::new(KEY_BYTES, VALUE_BYTES as u16).unwrap())
+                .unwrap();
+        legacy
+            .write_batch(&[Mutation::insert(key(0, 0, 0), encode(&root).unwrap())])
+            .unwrap();
+        drop(legacy);
+        let before = fs::read(&path).unwrap();
+        let mut reader = NativeManifest::open(&path, true).unwrap();
+        assert_eq!(reader.root().unwrap().1.layout_id, root.layout_id);
+        assert_eq!(reader.store.format_version(), 3);
+        drop(reader);
+        assert_eq!(before, fs::read(&path).unwrap());
+        let mut writer = NativeManifest::open(&path, false).unwrap();
+        let (version, mut updated) = writer.root().unwrap();
+        updated.degraded = true;
+        writer.publish(version, &updated, vec![]).unwrap();
+        drop(writer);
+        let mut reopened = NativeManifest::open(&path, true).unwrap();
+        assert_eq!(reopened.store.format_version(), 3);
+        assert!(reopened.root().unwrap().1.degraded);
+    }
+
+    #[test]
+    fn v2_tree_with_valid_metadata_records_is_still_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = NativeManifest::create(&directory.path().join("source.isam"), 2).unwrap();
+        let root = source.root().unwrap().1;
+        let path = directory.path().join(FILE_NAME);
+        let mut unsupported =
+            Store::create(&path, Layout::new(KEY_BYTES, VALUE_BYTES as u16).unwrap()).unwrap();
+        unsupported
+            .write_batch(&[Mutation::insert(key(0, 0, 0), encode(&root).unwrap())])
+            .unwrap();
+        drop(unsupported);
+        let before = fs::read(&path).unwrap();
+        for read_only in [true, false] {
+            assert_eq!(
+                NativeManifest::open(&path, read_only).unwrap_err().kind(),
+                EngineErrorKind::DataCorruption
+            );
+            assert_eq!(before, fs::read(&path).unwrap());
+        }
+    }
 
     #[test]
     fn worst_case_root_and_migration_fit_the_persisted_record_bound() {

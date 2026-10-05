@@ -1,7 +1,7 @@
 # Serverless and S3/Parquet guide
 
 BriskDB's optional S3 overlay is an experimental SQL mode for short-lived
-processes. The beta.2 Linux/macOS wheels include its native engine; ordinary
+processes. The beta.3 Linux/macOS wheels include its native engine; ordinary
 SQLite storage remains the default.
 
 | Mode | Metadata and data | Scope |
@@ -16,7 +16,7 @@ BriskDB does not deploy an API or provision AWS resources for you.
 
 ## Optional S3/Parquet overlay: fresh database per request
 
-Install `briskdb==0.1.0b2` and provision a **new** root once using the
+Install `briskdb==0.1.0b3` and provision a **new** root once using the
 [creation example](../README.md#build-and-use-the-overlay). For Lambda, package
 the wheel for the deployed Linux architecture, not your development Mac.
 The Rust `s3-overlay` feature remains opt-in; Python packaging enables the
@@ -146,6 +146,15 @@ all publication, retry or compaction I/O. Pruning does not cover arbitrary
 non-key/range predicates or the DuckDB reader. Deploy matching binaries:
 older experimental builds reject the optional `index_hash` head field.
 
+Complete, exactly typed BINARY primary-key equality probes search pending files
+newest first. The first matching row or tombstone is authoritative: older files
+and the SQLite base are not read for that key. Missing keys still fall through
+to the pinned base; partial keys, coercions, and other collations retain the
+general scan path. This optimization also works with advisory pruning disabled.
+`parquet_files_skipped` includes superseded files as well as index exclusions.
+Each statement still fetches a fresh head, and a point probe never makes a
+partial result into a complete snapshot for other probes, joins, or scans.
+
 ### Open and immutable-base reuse
 
 Opening reads one shared-lock ISAM catalog snapshot and reuses its validated
@@ -155,13 +164,20 @@ payloads. `db.open_stats()` reports `total_ms`, `root_path_ms`, `catalog_ms`,
 file-open/root-read/page-read/lock-request counts (not physical NFS RPC counts).
 It returns `None` on a handle returned by `Database.create()`.
 
-Each open handle retains at most eight immutable SQLite base connections in
+Each open handle retains at most 64 immutable SQLite base connections in
 least-recently-used order, keyed by table, partition, and published base ID.
 Repeated queries can reuse SQLite's page and prepared-statement caches. Every
 new statement still fetches fresh S3 heads; updates and deletes remain visible,
 and compaction's new base ID selects a new connection. Closing the handle
 releases all retained connections. This works within one Lambda invocation;
 it does not depend on keeping Lambda warm or copying EFS data to `/tmp`.
+
+Connections are opened lazily. The 64-entry limit accommodates a 64-partition
+working set without cycling through an eight-entry cache. The limit is shared
+across tables and base versions within that database handle; larger working sets
+still evict the least-recently-used connection before opening a replacement.
+Retaining more connections can increase file-descriptor and SQLite page-cache
+memory use, so size the host for the number of simultaneously open handles.
 
 `db.read_stats()` adds `sqlite_base_opens` (successful opens),
 `sqlite_base_cache_hits`, and `sqlite_base_cache_evictions` for the last SQL scan.
@@ -191,6 +207,12 @@ characters. Reusing the ID with different contents is rejected. Retries keep
 the original guards; unrelated-row changes may reuse prepared work, while a
 target-row change requires a fresh attempt.
 
+Within each attempt, receipt resolution and SQL use the same pinned head.
+With disjoint-row rebasing enabled, the exact primary-key scan also reuses the
+target row already read for conflict detection. Expected-value guards still
+run in SQLite; receipt archive checks and conditional publication remain in
+place. Cached rows and heads are cleared before each retry or subsequent operation.
+
 Default retries use jitter up to 20 then 40 ms within a 1-second update budget.
 That budget includes storage calls and retry pauses, not database opening or
 an uninterruptible filesystem call. It can still expire under contention.
@@ -205,7 +227,7 @@ explicitly allow it in a worker with `RetryOptions(allow_compaction=True)`.
 ### Optional SQS handoff
 
 Provision a FIFO SQS queue and FIFO dead-letter queue explicitly, install the
-`s3-queue` extra (`pip install 'briskdb[s3-queue]==0.1.0b2'`), and opt in:
+`s3-queue` extra (`pip install 'briskdb[s3-queue]==0.1.0b3'`), and opt in:
 
 ```python
 from briskdb.s3_overlay_queue import QueuedUpdates, SqsUpdateQueue

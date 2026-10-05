@@ -19,7 +19,7 @@ This roadmap is ordered by dependency and risk rather than by calendar date.
 
 ### Local/developer beta release
 
-The `0.1.0-beta.2` / Python `0.1.0b2` release retains the local embedded
+The `0.1.0-beta.3` / Python `0.1.0b3` release retains the local embedded
 and PyMongo subset and bundles the opt-in S3/EFS SQL preview described below.
 Freeze feature additions while the restored full CI,
 compatibility/recovery/fuzz/soak, native packaging and installed-wheel/sdist gates

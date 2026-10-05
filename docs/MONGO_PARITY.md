@@ -2,7 +2,7 @@
 
 ## Local/developer beta scope
 
-`0.1.0-beta.2` (`0.1.0b2` on PyPI) targets local development and application
+`0.1.0-beta.3` (`0.1.0b3` on PyPI) targets local development and application
 testing with embedded document APIs, sync/async PyMongo clients and
 `briskdb.patch()`. The detailed supported query, CRUD/update, aggregation, index
 and lifecycle contracts below remain authoritative. Beta is not a claim of full

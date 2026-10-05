@@ -14,7 +14,10 @@ struct FaultStore {
     // 6: ambiguous SDK retry after the receipt retention window advances.
     fault: AtomicU8,
     gets: AtomicUsize,
+    head_gets: AtomicUsize,
+    parquet_gets: AtomicUsize,
     lists: AtomicUsize,
+    archive_on_head_read: Mutex<Option<ObjectPath>>,
     head_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl std::fmt::Display for FaultStore {
@@ -111,6 +114,28 @@ impl ObjectStore for FaultStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        if path.as_ref().ends_with("/head.json") {
+            self.head_gets.fetch_add(1, Ordering::SeqCst);
+            let archive = self.archive_on_head_read.lock().unwrap().take();
+            if let Some(archive) = archive {
+                let bytes = self.inner.get(path).await?.bytes().await?;
+                let mut head: registry::Head = serde_json::from_slice(&bytes).unwrap();
+                let receipt = head.operations.remove(0);
+                self.inner
+                    .put(
+                        &archive,
+                        Bytes::from(serde_json::to_vec(&receipt).unwrap()).into(),
+                    )
+                    .await?;
+                head.revision += 1;
+                self.inner
+                    .put(path, Bytes::from(serde_json::to_vec(&head).unwrap()).into())
+                    .await?;
+            }
+        }
+        if path.as_ref().ends_with(".parquet") {
+            self.parquet_gets.fetch_add(1, Ordering::SeqCst);
+        }
         if self.fault.load(Ordering::SeqCst) == 5 && path.as_ref().ends_with(".parquet") {
             return Err(failure());
         }
@@ -174,6 +199,140 @@ fn point_request(value: &str) -> UpdateRequest {
         increment: BTreeMap::new(),
         expected: BTreeMap::new(),
     }
+}
+
+#[test]
+fn safe_update_reads_one_head_and_scans_the_target_once() {
+    for rebase_disjoint in [false, true] {
+        for pruning in [false, true] {
+            for pending in [false, true] {
+                for target in ["a", "missing"] {
+                    for matches_expected in [false, true] {
+                        let root = tempfile::tempdir().unwrap();
+                        let store = Arc::new(FaultStore::default());
+                        let config = tests::config();
+                        let partition = config.partition(&Cell::Text("a".into())).unwrap();
+                        let same_partition = |prefix: &str| {
+                            (0..100)
+                                .map(|number| format!("{prefix}-{number}"))
+                                .find(|key| {
+                                    config.partition(&Cell::Text(key.clone())).unwrap() == partition
+                                })
+                                .unwrap()
+                        };
+                        let other_key = same_partition("z");
+                        let missing_key = same_partition("missing");
+                        let mut db = Database::create(
+                            root.path().join("db"),
+                            config,
+                            store.clone(),
+                            BTreeMap::from([(
+                                "items".into(),
+                                vec![tests::row("a", "original"), tests::row(&other_key, "other")],
+                            )]),
+                        )
+                        .unwrap();
+                        db.set_parquet_pruning(pruning);
+                        if pending {
+                            db.execute("UPDATE items SET value='original' WHERE id='a'", &[])
+                                .unwrap();
+                            db.execute(
+                                "UPDATE items SET value='later' WHERE id=?",
+                                &[Cell::Text(other_key.clone())],
+                            )
+                            .unwrap();
+                        }
+                        let mut request = point_request("new");
+                        request.key.insert(
+                            "id".into(),
+                            Cell::Text(if target == "a" {
+                                "a".into()
+                            } else {
+                                missing_key
+                            }),
+                        );
+                        request.expected.insert(
+                            "value".into(),
+                            Cell::Text(
+                                if matches_expected {
+                                    "original"
+                                } else {
+                                    "stale"
+                                }
+                                .into(),
+                            ),
+                        );
+                        let heads = store.head_gets.load(Ordering::SeqCst);
+                        let parquet = store.parquet_gets.load(Ordering::SeqCst);
+                        let result = db
+                            .update(
+                                &request,
+                                RetryOptions {
+                                    timeout_ms: 10_000,
+                                    rebase_disjoint,
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            result.affected_rows,
+                            u64::from(target == "a" && matches_expected)
+                        );
+                        assert_eq!(store.head_gets.load(Ordering::SeqCst) - heads, 1);
+                        let expected_parquet = if !pending {
+                            0
+                        } else if !pruning {
+                            2
+                        } else {
+                            usize::from(target == "a")
+                        };
+                        assert_eq!(
+                            store.parquet_gets.load(Ordering::SeqCst) - parquet,
+                            expected_parquet
+                        );
+                        let stats = db.read_stats();
+                        assert_eq!(stats.heads_read, 1);
+                        assert_eq!(
+                            stats.sqlite_base_opens + stats.sqlite_base_cache_hits,
+                            u64::from(!pending || target != "a")
+                        );
+                        assert_eq!(stats.parquet_files_read, expected_parquet as u64);
+                        assert_eq!(
+                            db.query(
+                                "SELECT value FROM items WHERE id=?",
+                                &[Cell::Text(other_key)]
+                            )
+                            .unwrap()
+                            .rows,
+                            vec![vec![Cell::Text(
+                                if pending { "later" } else { "other" }.into()
+                            )]]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn safe_update_recovers_a_receipt_archived_during_its_head_read() {
+    let (_root, store, mut db) = fixture();
+    db.execute("INSERT INTO items VALUES ('a','original')", &[])
+        .unwrap();
+    let request = point_request("new");
+    let first = db.update(&request, RetryOptions::default()).unwrap();
+    *store.archive_on_head_read.lock().unwrap() = Some(ObjectPath::from(update::operation_key(
+        db.config(),
+        &request.operation_id,
+        "result",
+    )));
+    let parquet = store.parquet_gets.load(Ordering::SeqCst);
+    let repeated = db.update(&request, RetryOptions::default()).unwrap();
+    assert!(repeated.deduplicated);
+    assert_eq!(repeated.commit_id, first.commit_id);
+    assert_eq!(store.parquet_gets.load(Ordering::SeqCst), parquet);
+    assert!(store.archive_on_head_read.lock().unwrap().is_none());
 }
 
 fn update_race(disjoint: bool, rebase: bool, expected: bool) -> UpdateResult {

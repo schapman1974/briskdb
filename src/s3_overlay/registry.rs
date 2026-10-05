@@ -344,7 +344,10 @@ impl Registry {
         prepared: &Prepared,
         rebase_disjoint: bool,
         allow_compaction: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<Receipt>> {
+        if let Some(receipt) = self.archived_receipt(&prepared.claim)? {
+            return Ok(Some(receipt));
+        }
         let mut state = self
             .state
             .lock()
@@ -352,7 +355,11 @@ impl Registry {
         state.owner = Some((prepared.claim.table, prepared.claim.partition));
         // Pin the head even if SQLite finds no matching row: a no-op result is
         // also recorded atomically, so a delayed retry cannot later change data.
-        self.head_snapshot(&mut state, prepared.claim.table, prepared.claim.partition)?;
+        let snapshot =
+            self.head_snapshot(&mut state, prepared.claim.table, prepared.claim.partition)?;
+        if let Some(receipt) = self.receipt_in_head(&snapshot.head, &prepared.claim)? {
+            return Ok(Some(receipt));
+        }
         if rebase_disjoint {
             let original = self.point_rows(
                 &mut state,
@@ -367,7 +374,7 @@ impl Registry {
         }
         state.operation = Some(prepared.claim.clone());
         state.allow_compaction = allow_compaction;
-        Ok(())
+        Ok(None)
     }
 
     #[cfg(feature = "experimental-duckdb-reader")]
@@ -433,24 +440,26 @@ impl Registry {
         if snapshot.complete {
             return Ok(snapshot);
         }
-        if !self.pruning.load(Ordering::Relaxed)
-            || !file_index::applicable(&self.config.tables[table], predicates)
-        {
+        let point_key = self.config.tables[table].point_key(predicates);
+        let pruning = self.pruning.load(Ordering::Relaxed)
+            && file_index::applicable(&self.config.tables[table], predicates);
+        if !pruning && point_key.is_none() {
             return self.snapshot(state, table, partition);
         }
         if snapshot.summaries.is_none() {
-            let summaries = if snapshot.head.deltas.iter().any(|d| d.index_hash.is_some()) {
-                state.stats.index_files_opened += 1;
-                file_index::load(
-                    &self.root,
-                    &self.config,
-                    table,
-                    partition,
-                    &snapshot.head.deltas,
-                )
-            } else {
-                None
-            };
+            let summaries =
+                if pruning && snapshot.head.deltas.iter().any(|d| d.index_hash.is_some()) {
+                    state.stats.index_files_opened += 1;
+                    file_index::load(
+                        &self.root,
+                        &self.config,
+                        table,
+                        partition,
+                        &snapshot.head.deltas,
+                    )
+                } else {
+                    None
+                };
             snapshot.summaries = Some(Arc::new(
                 summaries.unwrap_or_else(|| vec![None; snapshot.head.deltas.len()]),
             ));
@@ -461,18 +470,47 @@ impl Registry {
                 .summaries = snapshot.summaries.clone();
         }
         let summaries = snapshot.summaries.as_ref().unwrap();
+        if let Some(key) = point_key {
+            snapshot.latest = Changes::new();
+            for (position, (delta, summary)) in snapshot
+                .head
+                .deltas
+                .iter()
+                .zip(summaries.iter())
+                .enumerate()
+                .rev()
+            {
+                if pruning
+                    && summary.as_ref().is_some_and(|summary| {
+                        summary.excludes(&self.config.tables[table], predicates)
+                    })
+                {
+                    state.stats.parquet_files_skipped += 1;
+                    continue;
+                }
+                state.stats.index_fallback_files += u64::from(pruning && summary.is_none());
+                let mut changes =
+                    self.load_deltas(state, table, partition, std::slice::from_ref(delta))?;
+                if let Some(row) = changes.remove(&key) {
+                    snapshot.latest.insert(key, row);
+                    state.stats.parquet_files_skipped += position as u64;
+                    break;
+                }
+            }
+            return Ok(snapshot);
+        }
         let selected = snapshot
             .head
             .deltas
             .iter()
             .zip(summaries.iter())
             .filter_map(|(delta, summary)| match summary {
-                Some(s) if s.excludes(&self.config.tables[table], predicates) => {
+                Some(s) if pruning && s.excludes(&self.config.tables[table], predicates) => {
                     state.stats.parquet_files_skipped += 1;
                     None
                 }
                 None => {
-                    state.stats.index_fallback_files += 1;
+                    state.stats.index_fallback_files += u64::from(pruning);
                     Some(delta.clone())
                 }
                 _ => Some(delta.clone()),
@@ -567,11 +605,28 @@ impl Registry {
         if state.started.elapsed() > Duration::from_secs(120) {
             return Err(limit("overlay request exceeded 120-second deadline"));
         }
+        if let Some(guard) = state.point_guard.as_ref().filter(|guard| {
+            state.owner == Some((table, partition))
+                && state.changes.is_empty()
+                && predicates.len() == guard.predicates.len()
+                && guard
+                    .predicates
+                    .iter()
+                    .all(|predicate| predicates.contains(predicate))
+        }) {
+            return Ok(guard.original.clone());
+        }
         let schema = &self.config.tables[table];
         let snapshot = self.read_snapshot(state, table, partition, predicates)?;
         let mut latest = snapshot.latest;
         if state.owner == Some((table, partition)) {
             latest.extend(state.changes.clone());
+        }
+        if let Some(row) = schema
+            .point_key(predicates)
+            .and_then(|key| latest.remove(&key))
+        {
+            return Ok(row.into_iter().collect());
         }
         let mut rows = Vec::new();
         let mut bytes = 0;

@@ -1,5 +1,27 @@
 # Python changelog
 
+## 0.1.0-beta.3 — overlay read efficiency and pipelined metadata
+
+Python distribution version: `0.1.0b3`. Publication requires the matching tag
+and the full CI and installed-artifact gates; this checkout is release preparation.
+
+- Exact, fully typed BINARY primary-key probes search pending Parquet files
+  newest first, stopping at the authoritative row or tombstone and avoiding
+  superseded files and unnecessary SQLite-base reads. Other queries retain
+  the general scan path; every statement still reads fresh S3 heads.
+- Guarded updates share one pinned head for receipt resolution and SQL within
+  an attempt, and reuse the conflict-check row for eligible exact-key scans.
+  Expected-value guards, archived receipts, conditional publication, and
+  retry-state clearing are preserved.
+- New roots selected with `metadata_backend="isam"` use V4 pipelined durable
+  metadata commits. Existing V3 roots are not converted; SQLite data-shard
+  commits and the S3-overlay format are unchanged. Older V3-only binaries
+  cannot open newly created V4 metadata manifests.
+- Increase the per-handle immutable SQLite-base cache bound from eight to 64
+  connections to reduce churn across larger partition working sets. Connections
+  remain lazy and LRU-bounded; every statement still reads current S3 heads.
+  Retaining more connections can increase memory and file-descriptor use.
+
 ## 0.1.0-beta.2 — optional serverless engine and storage efficiency
 
 Python distribution version: `0.1.0b2`. The version is published only after

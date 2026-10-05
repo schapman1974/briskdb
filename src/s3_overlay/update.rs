@@ -328,17 +328,16 @@ impl Database {
         self.registry.claim_update(&prepared.claim)?;
         for attempt in 0..=options.max_retries {
             self.registry.cloud.check_deadline()?;
-            if let Some(receipt) = self.registry.update_receipt(&prepared.claim)? {
+            self.registry.reset(false)?;
+            if let Some(receipt) = self.registry.begin_update(
+                prepared,
+                options.rebase_disjoint,
+                options.allow_compaction,
+            )? {
                 let mut result = receipt.result(self.config(), true);
                 result.statement_retries = attempt;
                 return Ok(result);
             }
-            self.registry.reset(false)?;
-            self.registry.begin_update(
-                prepared,
-                options.rebase_disjoint,
-                options.allow_compaction,
-            )?;
             let result = (|| {
                 let affected = self
                     .connection

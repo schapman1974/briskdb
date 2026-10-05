@@ -118,7 +118,7 @@ fn cached_bases_reuse_connections_but_refresh_heads_after_remote_writes_and_comp
         vec![vec![Cell::Text("changed".into())]]
     );
     assert_eq!(reader.read_stats().heads_read, 1);
-    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 1);
+    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 0);
     let partition = writer.config().partition(&Cell::Text("a".into())).unwrap();
     writer.compact("items", partition).unwrap();
     assert_eq!(
@@ -137,7 +137,7 @@ fn cached_bases_reuse_connections_but_refresh_heads_after_remote_writes_and_comp
         .execute("DELETE FROM items WHERE id='a'", &[])
         .unwrap();
     assert!(reader.query(query, &[]).unwrap().rows.is_empty());
-    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 1);
+    assert_eq!(reader.read_stats().sqlite_base_cache_hits, 0);
     assert_eq!(reader.read_stats().heads_read, 1);
 
     let released = Arc::downgrade(&reader.registry);
@@ -153,8 +153,54 @@ fn cached_bases_reuse_connections_but_refresh_heads_after_remote_writes_and_comp
             reopened.read_stats().sqlite_base_opens,
             reopened.read_stats().sqlite_base_cache_hits
         ),
-        (1, 0)
+        (0, 0)
     );
+}
+
+#[test]
+fn warm_base_cache_reads_across_64_partitions_do_not_reopen_bases() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config.partitions = 64;
+    let mut keys = BTreeMap::new();
+    for number in 0..10_000 {
+        let key = Cell::Text(format!("key-{number}"));
+        keys.entry(config.partition(&key).unwrap()).or_insert(key);
+        if keys.len() == 64 {
+            break;
+        }
+    }
+    assert_eq!(keys.len(), 64);
+    let seed = keys
+        .values()
+        .map(|key| vec![key.clone(), Cell::Text("base".into())])
+        .collect();
+    let mut database = Database::create(
+        root.path().join("db"),
+        config,
+        Arc::new(InMemory::new()),
+        BTreeMap::from([("items".into(), seed)]),
+    )
+    .unwrap();
+    for pass in 0..3 {
+        for key in keys.values() {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT value FROM items WHERE id=?",
+                        std::slice::from_ref(key)
+                    )
+                    .unwrap()
+                    .rows,
+                vec![vec![Cell::Text("base".into())]]
+            );
+            let stats = database.read_stats();
+            assert_eq!(stats.heads_read, 1);
+            assert_eq!(stats.sqlite_base_opens, u64::from(pass == 0));
+            assert_eq!(stats.sqlite_base_cache_hits, u64::from(pass != 0));
+            assert_eq!(stats.sqlite_base_cache_evictions, 0);
+        }
+    }
 }
 
 #[test]
