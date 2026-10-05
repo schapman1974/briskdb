@@ -1,7 +1,8 @@
 # Serverless and S3/Parquet guide
 
-BriskDB's optional S3 overlay is an experimental, source-built SQL mode for
-short-lived processes. Ordinary SQLite storage remains the default.
+BriskDB's optional S3 overlay is an experimental SQL mode for short-lived
+processes. The beta.2 Linux/macOS wheels include its native engine; ordinary
+SQLite storage remains the default.
 
 | Mode | Metadata and data | Scope |
 | --- | --- | --- |
@@ -15,10 +16,11 @@ BriskDB does not deploy an API or provision AWS resources for you.
 
 ## Optional S3/Parquet overlay: fresh database per request
 
-Build a Unix wheel with the `s3-overlay` feature and provision a **new** root
-once using the [creation example](../README.md#build-and-use-the-overlay).
-For Lambda, build for the deployed Linux architecture, not your development
-Mac. An ordinary published wheel does not automatically include this feature.
+Install `briskdb==0.1.0b2` and provision a **new** root once using the
+[creation example](../README.md#build-and-use-the-overlay). For Lambda, package
+the wheel for the deployed Linux architecture, not your development Mac.
+The Rust `s3-overlay` feature remains opt-in; Python packaging enables the
+capability without changing the default storage mode. DuckDB is not bundled.
 
 Configure these trusted deployment settings:
 
@@ -203,7 +205,7 @@ explicitly allow it in a worker with `RetryOptions(allow_compaction=True)`.
 ### Optional SQS handoff
 
 Provision a FIFO SQS queue and FIFO dead-letter queue explicitly, install the
-`s3-queue` extra alongside the source-built wheel, and opt in:
+`s3-queue` extra (`pip install 'briskdb[s3-queue]==0.1.0b2'`), and opt in:
 
 ```python
 from briskdb.s3_overlay_queue import QueuedUpdates, SqsUpdateQueue

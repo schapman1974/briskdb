@@ -39,7 +39,7 @@ s3-queue = ["boto3>=1.35,<2"]
 manifest-path = "Cargo.toml"
 python-source = "python"
 module-name = "briskdb._briskdb"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "s3-overlay"]
 strip = true
 include = [
     { path = "API.md", format = "sdist" },

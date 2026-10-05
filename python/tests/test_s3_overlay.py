@@ -191,6 +191,8 @@ def test_native_options_validate_before_touching_storage(tmp_path):
     from briskdb import _briskdb
     native = getattr(_briskdb, "S3OverlayDatabase", None)
     if native is None:
+        if os.environ.get("BRISKDB_REQUIRE_S3_OVERLAY") == "1":
+            pytest.fail("release wheel is missing its native S3/EFS engine")
         pytest.skip("requires a source wheel built with s3-overlay")
     root = tmp_path / "never-created"
     for options in ('{"unknown":true}', '{"read_only":"false"}', '{"parquet_pruning":0}'):

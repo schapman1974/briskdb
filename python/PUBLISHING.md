@@ -40,7 +40,7 @@ Verify a downloaded artifact with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify briskdb-0.1.0b1-*.whl --repo schapman1974/briskdb
+gh attestation verify briskdb-0.1.0b2-*.whl --repo schapman1974/briskdb
 ```
 
 Do not reuse or move a release tag. Update both Cargo package versions and the
@@ -48,6 +48,13 @@ release notes, commit, pass CI, and then create the matching `v<crate-version>`
 tag. Pushing that tag is the single trigger for both the GitHub prerelease and
 PyPI publication; an ordinary version-changing branch or main-branch push
 cannot publish.
+
+Beta.2 Python builds enable `s3-overlay` in Maturin's feature list. This bundles
+the native ISAM/EFS/S3 implementation without selecting it for ordinary opens.
+All installed-artifact jobs require `BRISKDB_REQUIRE_S3_OVERLAY=1`, check the
+native class and unchanged SQLite default, and run the overlay/queue pytest
+contracts as well as the full unittest suite. Python's AWS SDK remains optional
+for applications; the `s3-queue` extra is needed only for the SQS helper.
 
 For the local/developer beta, first restore the CI and Python distribution
 workflows and the original stable/MSRV required checks. Run CI with the opt-in

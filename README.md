@@ -37,7 +37,7 @@ tables through a local or remote server, using the same Python wheel.
 > [Boundaries are explicit](#honest-beta-boundaries); secure remote Mongo hosting
 > remains experimental.
 
-Release version: **0.1.0-beta.1** (Python: `0.1.0b1`). A version in this checkout
+Release version: **0.1.0-beta.2** (Python: `0.1.0b2`). A version in this checkout
 does not itself mean publication: use the matching
 [GitHub prerelease](https://github.com/schapman1974/briskdb/releases) and
 [PyPI artifacts](https://pypi.org/project/briskdb/) after the release gates pass.
@@ -98,14 +98,16 @@ The protocol adapters do not own database semantics. Routing, limits,
 cancellation, values, sessions, and execution live in the shared Rust engine,
 leaving room for more protocols and storage adapters later.
 
-## Experimental ISAM metadata (source builds)
+<a id="experimental-isam-metadata-source-builds"></a>
+
+## Experimental ISAM metadata
 
 Metadata and application data are separate choices. The Unix-only
 `experimental-isam` feature adds an opt-in **native ISAM manifest with ordinary
 SQLite data shards**. SQLite metadata remains the default. This is not the
 future all-ISAM data backend, and it does not enable NFS/EFS support.
 
-In a Python wheel built with `experimental-isam`:
+The beta.2 Python wheels include this capability; select it explicitly:
 
 ```python
 import briskdb
@@ -127,9 +129,11 @@ migration history, and recovery use `manifest.isam`, not a hidden SQLite
 manifest. Mongo/document metadata, global-index metadata, generated-ID metadata,
 and secured roots remain unfinished and are not supported by this option.
 The format is experimental; compaction, conversion, and shared-filesystem
-qualification are still pending. This source change is not a PyPI release.
+qualification are still pending. Use the separate S3-overlay mode below for EFS.
 
-## Optional S3/Parquet write overlay (experimental source builds)
+<a id="optional-s3parquet-write-overlay-experimental-source-builds"></a>
+
+## Optional S3/Parquet write overlay (experimental)
 
 This is a **separate, explicit mode**, not a change to ordinary opens or an
 automatic conversion of existing databases. It combines an immutable native
@@ -162,8 +166,9 @@ experimental S3-overlay mode, not ordinary SQLite WAL databases on EFS.
 
 ### Build and use the overlay
 
-Build a Unix Python wheel with `maturin build --manifest-path python/Cargo.toml
---features s3-overlay` (install that local wheel), then:
+Install the beta.2 wheel with `python -m pip install --only-binary=:all:
+'briskdb==0.1.0b2'`. Supported Linux/macOS wheels include the native overlay;
+ordinary SQLite remains the default. Then provision a new overlay explicitly:
 
 ```python
 import briskdb
@@ -231,7 +236,8 @@ are retained; do not add age-only deletion rules.
 
 See [configuration and CLI flags](python/SERVERLESS.md#selecting-and-configuring-this-mode)
 and [current limits](python/SERVERLESS.md#compaction-and-current-limits).
-These features require an opt-in source build, not an ordinary published wheel.
+The beta.2 wheels include these features, but using them is always opt-in.
+Rust source builds select `s3-overlay`; CLI builds select `s3-overlay-cli`.
 
 ### Optional DuckDB reader (experimental)
 
@@ -251,7 +257,7 @@ server's database files. SQLite runs joins, filters, and aggregates locally.
 This addon remains a **read-only experimental preview** included in the wheel:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb==0.1.0b1'
+python -m pip install --only-binary=:all: 'briskdb==0.1.0b2'
 ```
 
 To build a checkout instead, use `python -m pip install ./python` with
@@ -546,7 +552,7 @@ The beta wheel supports TinyMongo-style usage without a separate database
 process. Install the wheel and its optional pinned PyMongo companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b2'
 ```
 
 For a source build, run `python -m pip install './python[pymongo]'` from the

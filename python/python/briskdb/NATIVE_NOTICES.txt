@@ -12,13 +12,14 @@ supported wheels are designed to depend only on operating-system libraries;
 they do not load a separately installed SQLite library.
 
 
-Optional S3/Parquet source builds
-================================
+Optional S3/Parquet mode
+=======================
 
-Wheels built with experimental-s3-overlay additionally link Apache Arrow
+Beta.2 wheels, and source wheels built with s3-overlay, link Apache Arrow
 Parquet 56.2.0 and Apache Arrow Object Store 0.12.4, both under Apache-2.0.
-Their upstream notices and license are reproduced below. Ordinary wheels do
-not enable these optional libraries. No upstream source files were modified.
+Their upstream notices and license are reproduced below. Linking these
+libraries does not enable the S3 storage mode by default. No upstream source
+files were modified.
 
 Parquet upstream NOTICE.txt
 --------------------------

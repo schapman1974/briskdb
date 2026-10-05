@@ -21,14 +21,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   MACOSX_DEPLOYMENT_TARGET: "11.0"
+  BRISKDB_REQUIRE_S3_OVERLAY: "1"
 
 jobs:
-  # TEMPORARY Relay-Then-Verify gate; remove for final ISAM CI verification.
   sdist:
     name: Python sdist, metadata, and typing
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -119,6 +118,7 @@ jobs:
           PY
           "$RUNNER_TEMP/briskdb-sdist/bin/python" -m pip install -r python/test-requirements.txt
           "$RUNNER_TEMP/briskdb-sdist/bin/python" -m unittest discover -s python/tests -v
+          "$RUNNER_TEMP/briskdb-sdist/bin/python" -m pytest -q python/tests/test_s3_overlay.py python/tests/test_s3_overlay_queue.py
 
       - name: Upload source distribution
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -130,12 +130,10 @@ jobs:
 
   wheels:
     name: Python wheel (${{ matrix.platform }})
-    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     # Run 36444474832 needed ~25 minutes for the Intel build and ~16 for
-    # its first Python suite, exhausting 45 minutes during the second suite.
-    # Keep both suites and native addon/TLS checks, with bounded headroom on
-    # Intel only; the other platform budgets stay unchanged.
+    # its first Python suite. Beta.2 adds Arrow/Parquet and S3 compilation;
+    # retain both suites and allow bounded build headroom on every platform.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -145,22 +143,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: manylinux_2_28_x86_64
             manylinux: "2_28"
-            timeout_minutes: 45
+            timeout_minutes: 60
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: manylinux_2_28_aarch64
             manylinux: "2_28"
-            timeout_minutes: 45
+            timeout_minutes: 60
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: macosx_11_0_x86_64
             manylinux: auto
-            timeout_minutes: 75
+            timeout_minutes: 105
           - runner: macos-15
             target: aarch64-apple-darwin
             platform: macosx_11_0_arm64
             manylinux: auto
-            timeout_minutes: 45
+            timeout_minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -252,6 +250,7 @@ jobs:
           PY
           python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
+          python -m pytest -q python/tests/test_s3_overlay.py python/tests/test_s3_overlay_queue.py
 
       - name: Install and test wheel on CPython 3.14
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -287,6 +286,7 @@ jobs:
           PY
           python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
+          python -m pytest -q python/tests/test_s3_overlay.py python/tests/test_s3_overlay_queue.py
           python -m pip install mypy==1.19.1
           python -m mypy --strict --python-version 3.9 python/tests/typing_contract.py
 

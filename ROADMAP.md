@@ -19,8 +19,9 @@ This roadmap is ordered by dependency and risk rather than by calendar date.
 
 ### Local/developer beta release
 
-The `0.1.0-beta.1` / Python `0.1.0b1` release targets the existing local embedded
-and PyMongo subset. Freeze feature additions while the restored full CI,
+The `0.1.0-beta.2` / Python `0.1.0b2` release retains the local embedded
+and PyMongo subset and bundles the opt-in S3/EFS SQL preview described below.
+Freeze feature additions while the restored full CI,
 compatibility/recovery/fuzz/soak, native packaging and installed-wheel/sdist gates
 run; fix release blockers before tagging. The version in source is a candidate
 until the release workflow publishes verified artifacts.
@@ -50,13 +51,14 @@ unknown-commit-outcome tests. No write capability will be enabled solely because
 SQLite exposes an `xUpdate` callback. The [Python API](python/API.md#remote-sqlite-addon)
 states the current bounds and unsupported behavior.
 
-### Optional S3/Parquet SQL overlay (unreleased source build)
+### Optional S3/Parquet SQL overlay (beta.2 preview)
 
 The opt-in `s3-overlay` mode combines an ISAM catalog, immutable indexed
 SQLite bases and S3 Parquet changes. Rust, Python and one-shot CLI APIs support
 pending-aware SQL reads/joins, partition-local writes, compaction and explicit
 receipt-backed point updates. Optional SQS FIFO handoff reports queued work
 separately from committed work. Ordinary BriskDB/protocol behavior is unchanged.
+The Python wheels include this engine; ordinary SQLite remains the default.
 
 Remaining work includes safe old-object/base reclamation, production
 failure/restore qualification and broader query/transaction capabilities.
