@@ -1657,8 +1657,8 @@ fn write_lock_stats_count_deduplicated_stripes_by_id() {
     store
         .write_batch(&[
             Mutation::insert(first, b"one"),
-            Mutation::insert(&same_stripe, b"two"),
-            Mutation::insert(&other_stripe, b"three"),
+            Mutation::insert(same_stripe, b"two"),
+            Mutation::insert(other_stripe, b"three"),
         ])
         .unwrap();
 

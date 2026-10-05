@@ -493,10 +493,10 @@ fn save_for(
             let refreshed = surface.reference(python, case)?;
             Ok((surface.expected(&refreshed)?, candidate(&refreshed)) == signature)
         })
-        .map_err(&failure)?;
+        .map_err(failure)?;
     let refreshed = surface
         .reference(python, &reduction.case)
-        .map_err(&failure)?;
+        .map_err(failure)?;
     if (surface.expected(&refreshed)?, candidate(&refreshed)) != signature {
         return Err(failure(
             "reduced mismatch did not reproduce on final verification".into(),

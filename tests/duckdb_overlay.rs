@@ -1,7 +1,7 @@
 #![cfg(all(unix, feature = "experimental-duckdb-reader"))]
 use briskdb::s3_overlay::{Cell, Column, ColumnType, Config, Database, DuckDbReadOptions};
 use object_store::memory::InMemory;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, slice::from_ref, sync::Arc};
 
 fn row(id: &str, text: &str) -> Vec<Cell> {
     vec![Cell::Text(id.into()), Cell::Text(text.into())]
@@ -151,7 +151,7 @@ fn duckdb_preserves_scalar_types_empty_partitions_and_errors() {
     let sql = "SELECT * FROM typed WHERE id=?";
     let opt = options(4);
     assert!(
-        db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &opt)
+        db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &opt)
             .unwrap()
             .rows
             .is_empty()
@@ -170,23 +170,23 @@ fn duckdb_preserves_scalar_types_empty_partitions_and_errors() {
             db.compact_all().unwrap();
         }
         assert_eq!(
-            db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &opt)
+            db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &opt)
                 .unwrap()
                 .rows,
             vec![values.clone()]
         );
         assert_eq!(
-            db.query(sql, &[key.clone()]).unwrap().rows,
+            db.query(sql, from_ref(&key)).unwrap().rows,
             vec![values.clone()]
         );
     }
     db.execute(
         "UPDATE typed SET n=NULL,r=NULL,text=NULL,bytes=NULL WHERE id=?",
-        &[key.clone()],
+        from_ref(&key),
     )
     .unwrap();
     assert_eq!(
-        db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &opt)
+        db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &opt)
             .unwrap()
             .rows,
         vec![vec![
@@ -202,7 +202,7 @@ fn duckdb_preserves_scalar_types_empty_partitions_and_errors() {
             .is_err()
     );
     assert!(
-        db.query_partition_duckdb("typed", &Cell::Text("12".into()), sql, &[key.clone()], &opt)
+        db.query_partition_duckdb("typed", &Cell::Text("12".into()), sql, from_ref(&key), &opt)
             .is_err()
     );
     assert!(
@@ -216,23 +216,23 @@ fn duckdb_preserves_scalar_types_empty_partitions_and_errors() {
     let mut bad = opt.clone();
     bad.threads = 0;
     assert!(
-        db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &bad)
+        db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &bad)
             .is_err()
     );
     bad = opt.clone();
     bad.memory_mb = 1;
     assert!(
-        db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &bad)
+        db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &bad)
             .is_err()
     );
     bad = opt.clone();
     bad.library = directory.path().join("missing-library");
     assert!(
-        db.query_partition_duckdb("typed", &key, sql, &[key.clone()], &bad)
+        db.query_partition_duckdb("typed", &key, sql, from_ref(&key), &bad)
             .is_err()
     );
     assert_eq!(
-        db.query("SELECT id FROM typed WHERE id=?", &[key.clone()])
+        db.query("SELECT id FROM typed WHERE id=?", from_ref(&key))
             .unwrap()
             .rows,
         vec![vec![key]]

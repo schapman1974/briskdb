@@ -2583,6 +2583,8 @@ fn next_server_timestamp() -> EngineResult<BsonTimestamp> {
     advance_server_timestamp(&SERVER_TIMESTAMP, seconds)
 }
 
+// The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+#[allow(deprecated)]
 fn advance_server_timestamp(clock: &AtomicU64, seconds: u32) -> EngineResult<BsonTimestamp> {
     let mut next = 0;
     clock
