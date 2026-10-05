@@ -1,6 +1,6 @@
 #[test]
 fn beta_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-beta.1");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-beta.2");
     assert!(include_str!("../fuzz/Cargo.lock").contains(&format!(
         "name = \"briskdb\"\nversion = {:?}",
         env!("CARGO_PKG_VERSION")
@@ -17,6 +17,8 @@ fn beta_release_contract_covers_every_native_archive_and_safety_boundary() {
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
         "cargo build --release --locked --bins",
+        "--features s3-overlay-cli",
+        "/release/briskdb-s3-overlay",
         "Smoke-test native server",
         "--admin-listen 127.0.0.1:17655",
         "http://127.0.0.1:17654/v1",
@@ -69,7 +71,9 @@ fn beta_release_contract_covers_every_native_archive_and_safety_boundary() {
         "Cross-platform artifact tests and native dependency audits are required before publishing",
         "complete data-directory copy",
         "There is no stable pre-1.0 on-disk compatibility promise",
-        "manifest version 22",
+        "manifest version 24",
+        "S3/EFS support is included in the Python wheels",
+        "ordinary SQLite remains the default",
         "In-place downgrade is unsupported",
     ] {
         assert!(
@@ -119,6 +123,7 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
         "Typing :: Typed",
         "license-files = [\"BRISKDB_LICENSE.txt\"]",
         "maturin==1.14.1",
+        "features = [\"pyo3/extension-module\", \"s3-overlay\"]",
     ] {
         assert!(
             metadata.contains(required),
@@ -152,6 +157,8 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
         "maturin sdist",
         "check_dist.py",
         "mypy --strict --python-version 3.9",
+        "BRISKDB_REQUIRE_S3_OVERLAY: \"1\"",
+        "python/tests/test_s3_overlay.py python/tests/test_s3_overlay_queue.py",
     ] {
         assert!(
             workflow.contains(required),
@@ -185,4 +192,16 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
     assert!(!include_str!("../python/python/briskdb/__init__.pyi").is_empty());
     assert!(!include_str!("../python/python/briskdb/_briskdb.pyi").is_empty());
     assert!(!include_str!("../python/python/briskdb/api.pyi").is_empty());
+}
+
+#[test]
+fn release_restores_real_pull_request_ci_gates() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    assert!(ci.contains("name: Format and Clippy (stable)"));
+    assert!(ci.contains("name: Tests (${{ matrix.rust }})"));
+    assert!(!ci.contains("deferred-quality:"));
+    assert!(!ci.contains("deferred-tests-"));
+    assert!(!ci.contains("if: github.event_name == 'workflow_dispatch'\n"));
+    let wheels = include_str!("../.github/workflows/python-wheels.yml");
+    assert!(!wheels.contains("if: github.event_name != 'pull_request'"));
 }

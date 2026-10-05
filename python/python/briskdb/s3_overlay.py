@@ -255,11 +255,19 @@ class Database:
         self._db.set_parquet_pruning(enabled)
 
     def read_stats(self) -> dict[str, int]:
-        """Last SQL scan's file reads/skips and transferred Parquet bytes.
+        """Last SQL scan's file I/O, Parquet bytes, and SQLite base cache counters.
 
         Internal publication/rebase checks and automatic compaction are excluded.
         """
         return json.loads(self._db.read_stats())
+
+    def open_stats(self) -> dict[str, Any] | None:
+        """Open-stage milliseconds and logical catalog I/O; None after create.
+
+        Includes canonicalization, ISAM catalog, S3 client, runtime and SQLite
+        setup. This is not a count of physical EFS/NFS requests.
+        """
+        return json.loads(self._db.open_stats())
 
     def settings(self) -> dict[str, Any]:
         """Effective mode, persisted S3/schema config, and current open flags.

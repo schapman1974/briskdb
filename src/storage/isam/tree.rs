@@ -32,6 +32,22 @@ struct CachedPages {
     bytes: usize,
 }
 
+/// Validate at open under the shared root fence. A supplied cache belongs only
+/// to this snapshot and lets its first lookup reuse the validated root page.
+pub(super) fn validate_root(
+    file: &File,
+    snapshot: Snapshot,
+    counters: &OperationCounters,
+    cache: Option<&PageCache>,
+) -> Result<()> {
+    if cache.is_some() {
+        cached_node(file, snapshot, snapshot.root, counters, cache)?;
+    } else {
+        read_node(file, snapshot, snapshot.root, counters)?;
+    }
+    Ok(())
+}
+
 impl Node {
     fn cache_bytes(&self) -> usize {
         std::mem::size_of::<Self>()

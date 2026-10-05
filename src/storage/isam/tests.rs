@@ -1049,6 +1049,86 @@ fn snapshots_do_not_block_writes_and_reused_handles_refresh() {
 }
 
 #[test]
+fn open_snapshot_reuses_validated_root_without_changing_later_read_batches() {
+    for packed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.isam");
+        let layout = Layout::new(2, 32).unwrap();
+        let mut writer = if packed {
+            Store::create_packed(&path, layout)
+        } else {
+            Store::create(&path, layout)
+        }
+        .unwrap();
+        writer.write_batch(&[Mutation::put(b"aa", b"old")]).unwrap();
+
+        let mut ordinary = Store::open_read_only(&path).unwrap();
+        assert_eq!(
+            ordinary.read_batch().unwrap().get(b"aa").unwrap(),
+            Some(b"old".to_vec())
+        );
+        let before = ordinary.operation_stats();
+        assert_eq!(
+            (before.root_reads, before.page_reads, before.lock_requests),
+            (2, 2, 2)
+        );
+
+        let (_, after) = Store::with_open_read_only_snapshot(&path, |actual_layout, read| {
+            assert_eq!(actual_layout, layout);
+            writer.write_batch(&[Mutation::put(b"aa", b"new")]).unwrap();
+            for _ in 0..3 {
+                assert_eq!(read.get(b"aa").unwrap(), Some(b"old".to_vec()));
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            (after.root_reads, after.page_reads, after.lock_requests),
+            (1, 1, 1)
+        );
+        assert_eq!((after.file_opens, after.file_closes), (2, 2));
+        assert_eq!(
+            ordinary.read_batch().unwrap().get(b"aa").unwrap(),
+            Some(b"new".to_vec())
+        );
+        let (latest, _) =
+            Store::with_open_read_only_snapshot(&path, |_, read| read.get(b"aa")).unwrap();
+        assert_eq!(latest.unwrap(), Some(b"new".to_vec()));
+    }
+}
+
+#[test]
+fn open_snapshot_validates_corruption_before_invoking_callback() {
+    for damage in ["root", "page", "truncate"] {
+        let (directory, mut store) = open_fixture(2, 32);
+        store.write_batch(&[Mutation::put(b"aa", b"old")]).unwrap();
+        let snapshot = read_snapshot(&store.file, None).unwrap();
+        match damage {
+            "root" => store
+                .file
+                .write_all_at(
+                    &[0xff],
+                    snapshot.generation % 2 * format::PAGE_BYTES as u64 + 48,
+                )
+                .unwrap(),
+            "page" => store
+                .file
+                .write_all_at(&[0xff], snapshot.root + 40)
+                .unwrap(),
+            "truncate" => store.file.set_len(snapshot.root + 40).unwrap(),
+            _ => unreachable!(),
+        }
+        let result =
+            Store::with_open_read_only_snapshot(directory.path().join("records.isam"), |_, _| {
+                panic!("corrupt snapshot must not reach callback")
+            });
+        assert!(
+            matches!(result, Err(Error::Corrupt(_))),
+            "{damage}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn writable_open_migrates_a_missing_key_lock_sidecar_after_read_only_open() {
     let (directory, store) = open_fixture(2, 4);
     let path = directory.path().join("records.isam");
@@ -1577,8 +1657,8 @@ fn write_lock_stats_count_deduplicated_stripes_by_id() {
     store
         .write_batch(&[
             Mutation::insert(first, b"one"),
-            Mutation::insert(&same_stripe, b"two"),
-            Mutation::insert(&other_stripe, b"three"),
+            Mutation::insert(same_stripe, b"two"),
+            Mutation::insert(other_stripe, b"three"),
         ])
         .unwrap();
 

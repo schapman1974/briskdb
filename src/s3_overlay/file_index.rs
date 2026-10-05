@@ -304,7 +304,7 @@ mod tests {
             };
             let changes = values
                 .iter()
-                .map(|v| (table.key(&[v.clone()]), None))
+                .map(|v| (table.key(std::slice::from_ref(v)), None))
                 .collect();
             let bytes = Summary::build(&table, &changes, &"a".repeat(64)).unwrap();
             assert!(bytes.len() <= MAX_RECORD);

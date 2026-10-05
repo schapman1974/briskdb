@@ -84,6 +84,12 @@ fn flag_smoke(program: &str, prefix: &[&str], root: &Path) {
         json!({"parquet_pruning":false,"read_only":true})
     );
     assert_eq!(value["closed"], true);
+    assert_eq!(value["open_stats"]["catalog_root_reads"], 1);
+    assert_eq!(value["open_stats"]["catalog_lock_requests"], 1);
+    assert!(
+        value["open_ms"].as_f64().unwrap() >= value["open_stats"]["total_ms"].as_f64().unwrap()
+    );
+    assert_eq!(value["read_stats"]["sqlite_base_opens"], 0);
 
     let output = command(program)
         .args(prefix)
@@ -163,6 +169,9 @@ fn standalone_flags_and_legacy_json_use_the_same_library() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["result"]["rows"], json!([[{"Integer":7}]]));
     assert_eq!(value["closed"], true);
+    assert_eq!(value["open_stats"]["catalog_root_reads"], 1);
+    assert_eq!(value["open_stats"]["catalog_lock_requests"], 1);
+    assert_eq!(value["read_stats"]["sqlite_base_opens"], 0);
 }
 
 #[cfg(feature = "server-cli")]

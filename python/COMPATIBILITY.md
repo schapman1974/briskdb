@@ -13,6 +13,14 @@ One `cp39-abi3` wheel per platform supports the stated CPython range. A local
 Rust compiler is not used when installing those wheels. The sdist is tested
 separately and requires Rust 1.85 or newer.
 
+Beta.2 wheels and Python source installs include the experimental S3/EFS
+engine. Ordinary SQLite is still the default; only an explicit
+`storage_mode="s3-overlay"` open selects the shared-storage mode. That mode's
+ISAM catalog, immutable SQLite bases, and S3 Parquet deltas have a separate
+format and SQL API; see [the serverless guide](SERVERLESS.md). It does not make
+ordinary SQLite WAL roots safe on NFS/EFS. DuckDB remains a separate source
+feature with caller-supplied native libraries.
+
 ## Remote SQLite host requirements
 
 `attach_remote` additionally requires the Python interpreter's own SQLite
@@ -58,7 +66,7 @@ versions rather than advertising an untested lifecycle compatibility range.
 
 The `briskdb-python` crate version must exactly equal the root `briskdb` Rust
 crate version. Python metadata and `briskdb.__version__` use the equivalent PEP
-440 spelling (`0.1.0-beta.1` becomes `0.1.0b1`). Release automation rejects a
+440 spelling (`0.1.0-beta.2` becomes `0.1.0b2`). Release automation rejects a
 tag or artifact when those versions are not equivalent. A Python prerelease package
 supports only its exact bundled Rust engine; mixing an extension and core from
 different releases is unsupported.

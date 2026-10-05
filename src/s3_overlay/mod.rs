@@ -10,6 +10,7 @@
 //! committed. Online DDL, cross-partition transactions, generated IDs, foreign
 //! keys and global unique indexes are deliberately not advertised.
 
+mod base_cache;
 #[cfg(feature = "s3-overlay-cli")]
 pub mod cli;
 mod cloud;
@@ -53,6 +54,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 pub type Result<T> = crate::EngineResult<T>;
@@ -231,12 +233,31 @@ impl Default for OpenOptions {
     }
 }
 
-/// A distinct SQL connection. All request-scoped snapshots and pending-file
-/// caches are discarded between statements; reopening does not warm the root.
+/// Timings for an existing database open; creation does not produce these.
+/// These are client-side elapsed times and logical ISAM operations, not NFS RPC
+/// counters. A caller-supplied object store's construction is outside this API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenStats {
+    pub total_ms: f64,
+    pub root_path_ms: f64,
+    pub catalog_ms: f64,
+    pub store_client_ms: f64,
+    pub runtime_ms: f64,
+    pub connection_ms: f64,
+    pub catalog_file_opens: u64,
+    pub catalog_root_reads: u64,
+    pub catalog_page_reads: u64,
+    pub catalog_lock_requests: u64,
+}
+
+/// A distinct SQL connection. Request-scoped snapshots and pending-file caches
+/// are discarded between statements. Only immutable base connections are
+/// retained, bounded to eight and keyed by table/partition/published base ID.
 pub struct Database {
     connection: Connection,
     registry: Arc<registry::Registry>,
     last_read_stats: ReadStats,
+    open_stats: Option<OpenStats>,
     options: OpenOptions,
 }
 
@@ -327,9 +348,7 @@ impl Database {
     }
 
     pub fn open(root: impl AsRef<Path>, store: Arc<dyn ObjectStore>) -> Result<Self> {
-        let root = fs::canonicalize(root).map_err(storage_error)?;
-        let config = metadata::open(&root)?;
-        Self::connect(root, config, Arc::new(cloud::Cloud::new(store)?))
+        Self::open_inner(root.as_ref(), Some(store))
     }
 
     pub fn open_s3(root: impl AsRef<Path>) -> Result<Self> {
@@ -337,14 +356,42 @@ impl Database {
     }
 
     pub fn open_s3_with_options(root: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let root = fs::canonicalize(root).map_err(storage_error)?;
-        let config = metadata::open(&root)?;
-        let cloud = Arc::new(cloud::Cloud::new(s3_store(
-            &config.bucket,
-            &config.region,
-        )?)?);
-        let mut database = Self::connect(root, config, cloud)?;
+        let mut database = Self::open_inner(root.as_ref(), None)?;
         database.apply_options(options);
+        Ok(database)
+    }
+
+    fn open_inner(root: &Path, store: Option<Arc<dyn ObjectStore>>) -> Result<Self> {
+        let started = Instant::now();
+        let root = fs::canonicalize(root).map_err(storage_error)?;
+        let mut stats = OpenStats {
+            root_path_ms: started.elapsed().as_secs_f64() * 1000.0,
+            ..OpenStats::default()
+        };
+        let stage = Instant::now();
+        let (config, catalog) = metadata::open(&root)?;
+        stats.catalog_ms = stage.elapsed().as_secs_f64() * 1000.0;
+        stats.catalog_file_opens = catalog.file_opens;
+        stats.catalog_root_reads = catalog.root_reads;
+        stats.catalog_page_reads = catalog.page_reads;
+        stats.catalog_lock_requests = catalog.lock_requests;
+        let store = match store {
+            Some(store) => store,
+            None => {
+                let stage = Instant::now();
+                let store = s3_store(&config.bucket, &config.region)?;
+                stats.store_client_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                store
+            }
+        };
+        let stage = Instant::now();
+        let cloud = Arc::new(cloud::Cloud::new(store)?);
+        stats.runtime_ms = stage.elapsed().as_secs_f64() * 1000.0;
+        let stage = Instant::now();
+        let mut database = Self::connect(root, config, cloud)?;
+        stats.connection_ms = stage.elapsed().as_secs_f64() * 1000.0;
+        stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        database.open_stats = Some(stats);
         Ok(database)
     }
 
@@ -393,6 +440,7 @@ impl Database {
             config,
             cloud,
             state: Mutex::new(Default::default()),
+            bases: Mutex::new(Default::default()),
             pruning: std::sync::atomic::AtomicBool::new(true),
         });
         let connection = Connection::open_in_memory().map_err(storage_error)?;
@@ -456,6 +504,7 @@ impl Database {
             connection,
             registry,
             last_read_stats: ReadStats::default(),
+            open_stats: None,
             options: OpenOptions::default(),
         })
     }
@@ -494,6 +543,10 @@ impl Database {
 
     pub fn read_stats(&self) -> &ReadStats {
         &self.last_read_stats
+    }
+
+    pub fn open_stats(&self) -> Option<&OpenStats> {
+        self.open_stats.as_ref()
     }
 
     fn finish_statement(&mut self) -> Result<()> {

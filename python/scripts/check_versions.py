@@ -61,6 +61,8 @@ def main() -> None:
     pyproject = (ROOT / "python" / "pyproject.toml").read_text(encoding="utf-8")
     if 'maturin==1.14.1' not in pyproject:
         raise SystemExit("the Python build frontend must remain pinned to maturin 1.14.1")
+    if 'features = ["pyo3/extension-module", "s3-overlay"]' not in pyproject:
+        raise SystemExit("published Python builds must include the opt-in S3 overlay engine")
     python_manifest = (ROOT / "python" / "Cargo.toml").read_text(encoding="utf-8")
     if 'features = ["abi3-py39"]' not in python_manifest:
         raise SystemExit("the supported wheel ABI must remain explicitly abi3-py39")

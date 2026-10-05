@@ -1,7 +1,8 @@
 # Serverless and S3/Parquet guide
 
-BriskDB's optional S3 overlay is an experimental, source-built SQL mode for
-short-lived processes. Ordinary SQLite storage remains the default.
+BriskDB's optional S3 overlay is an experimental SQL mode for short-lived
+processes. The beta.2 Linux/macOS wheels include its native engine; ordinary
+SQLite storage remains the default.
 
 | Mode | Metadata and data | Scope |
 | --- | --- | --- |
@@ -15,10 +16,11 @@ BriskDB does not deploy an API or provision AWS resources for you.
 
 ## Optional S3/Parquet overlay: fresh database per request
 
-Build a Unix wheel with the `s3-overlay` feature and provision a **new** root
-once using the [creation example](../README.md#build-and-use-the-overlay).
-For Lambda, build for the deployed Linux architecture, not your development
-Mac. An ordinary published wheel does not automatically include this feature.
+Install `briskdb==0.1.0b2` and provision a **new** root once using the
+[creation example](../README.md#build-and-use-the-overlay). For Lambda, package
+the wheel for the deployed Linux architecture, not your development Mac.
+The Rust `s3-overlay` feature remains opt-in; Python packaging enables the
+capability without changing the default storage mode. DuckDB is not bundled.
 
 Configure these trusted deployment settings:
 
@@ -144,6 +146,29 @@ all publication, retry or compaction I/O. Pruning does not cover arbitrary
 non-key/range predicates or the DuckDB reader. Deploy matching binaries:
 older experimental builds reject the optional `index_hash` head field.
 
+### Open and immutable-base reuse
+
+Opening reads one shared-lock ISAM catalog snapshot and reuses its validated
+root page while loading the catalog. It does not preload SQLite shards or S3
+payloads. `db.open_stats()` reports `total_ms`, `root_path_ms`, `catalog_ms`,
+`store_client_ms`, `runtime_ms`, and `connection_ms`, plus logical catalog
+file-open/root-read/page-read/lock-request counts (not physical NFS RPC counts).
+It returns `None` on a handle returned by `Database.create()`.
+
+Each open handle retains at most eight immutable SQLite base connections in
+least-recently-used order, keyed by table, partition, and published base ID.
+Repeated queries can reuse SQLite's page and prepared-statement caches. Every
+new statement still fetches fresh S3 heads; updates and deletes remain visible,
+and compaction's new base ID selects a new connection. Closing the handle
+releases all retained connections. This works within one Lambda invocation;
+it does not depend on keeping Lambda warm or copying EFS data to `/tmp`.
+
+`db.read_stats()` adds `sqlite_base_opens` (successful opens),
+`sqlite_base_cache_hits`, and `sqlite_base_cache_evictions` for the last SQL scan.
+The CLI includes the same counters and an `open_stats` breakdown alongside
+its existing end-to-end `open_ms`. These optimizations apply only to the
+opt-in S3-overlay SQLite reader, not normal BriskDB or the DuckDB reader.
+
 ## Safe updates and optional durable queue handoff
 
 For a bounded point edit, supply the complete primary key and preserve the
@@ -180,7 +205,7 @@ explicitly allow it in a worker with `RetryOptions(allow_compaction=True)`.
 ### Optional SQS handoff
 
 Provision a FIFO SQS queue and FIFO dead-letter queue explicitly, install the
-`s3-queue` extra alongside the source-built wheel, and opt in:
+`s3-queue` extra (`pip install 'briskdb[s3-queue]==0.1.0b2'`), and opt in:
 
 ```python
 from briskdb.s3_overlay_queue import QueuedUpdates, SqsUpdateQueue

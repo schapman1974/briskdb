@@ -20,7 +20,8 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    # Beta.2 also compiles the native Arrow/Parquet and S3 client dependencies.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -65,7 +66,7 @@ jobs:
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Build locked release binaries
-        run: cargo build --release --locked --bins --target "${{ matrix.target }}"
+        run: cargo build --release --locked --bins --features s3-overlay-cli --target "${{ matrix.target }}"
 
       - name: Smoke-test native server
         shell: bash
@@ -73,6 +74,8 @@ jobs:
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/briskdb"
           "$binary" --version | grep -F "briskdb $VERSION"
+          "$binary" overlay --help
+          "target/${{ matrix.target }}/release/briskdb-s3-overlay" --help
           data_dir="$(mktemp -d)"
           "$binary" \
             --listen 127.0.0.1:17654 \
@@ -147,6 +150,7 @@ jobs:
           mkdir -p "dist/$archive"
           cp "target/${{ matrix.target }}/release/briskdb" "dist/$archive/"
           cp "target/${{ matrix.target }}/release/briskdb-import" "dist/$archive/"
+          cp "target/${{ matrix.target }}/release/briskdb-s3-overlay" "dist/$archive/"
           cp README.md RELEASE_NOTES.md LICENSE ROADMAP.md CONTRIBUTING.md "dist/$archive/"
           cp -R docs "dist/$archive/docs"
           tar -C dist -czf "dist/$archive.tar.gz" "$archive"

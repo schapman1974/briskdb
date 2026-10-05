@@ -84,7 +84,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
-  # TEMPORARY Relay-Then-Verify gate; remove for final ISAM CI verification.
   mongo-soak:
     name: Mongo mixed CRUD and restart soak (opt-in)
     if: github.event_name == 'workflow_dispatch' && inputs.mongo_soak
@@ -179,7 +178,6 @@ jobs:
 
   mongo-contract:
     name: Mongo compatibility contract
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -309,7 +307,6 @@ jobs:
 
   mongo-candidate:
     name: Mongo full frozen candidate corpus (456 executions)
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # Run independently of the long reference/oracle job. Both remain required;
     # no existing timeout, source contract, or intentional difference is relaxed.
@@ -369,7 +366,6 @@ jobs:
 
   mongo-wire:
     name: Mongo real-wire discovery and documents (PyMongo 4.17.0)
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # The complete beta gate builds independent anonymous, TLS, authenticated,
     # composed-host and daemon feature sets after the real driver corpus.
@@ -457,7 +453,6 @@ jobs:
 
   mongo-odm:
     name: Mongo real ODM and Talk Python applications
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -532,7 +527,6 @@ jobs:
 
   mongo-server:
     name: Mongo daemon activation and lifecycle
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -560,7 +554,6 @@ jobs:
 
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -580,6 +573,9 @@ jobs:
           - postgres
           - sqlite-import
           - tinymongo-import
+          - experimental-isam
+          - s3-overlay
+          - duckdb-reader
           - default
     steps:
       - name: Check out source
@@ -667,19 +663,10 @@ jobs:
           cargo test --locked --no-default-features --features listeners,tokio/rt-multi-thread \
             --lib core::engine::tests::weak_readiness_probe_tracks_live_gates_without_retaining_engine
 
-  deferred-quality:
-    name: Format and Clippy (stable)
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Report intentionally deferred CI
-        run: echo "Full CI is intentionally deferred during Relay-Then-Verify; local format and Clippy checks are recorded in the PR."
-
   quality:
-    name: Full quality checks (manual)
-    if: github.event_name == 'workflow_dispatch'
+    name: Format and Clippy (stable)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -718,29 +705,12 @@ jobs:
             exit 1
           fi
 
-  deferred-tests-msrv:
-    name: Tests (1.85.0)
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Report intentionally deferred CI
-        run: echo "Full CI is intentionally deferred during Relay-Then-Verify; Rust 1.85 ISAM tests are recorded in the PR."
-
-  deferred-tests-stable:
-    name: Tests (stable)
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Report intentionally deferred CI
-        run: echo "Full CI is intentionally deferred during Relay-Then-Verify; stable ISAM tests are recorded in the PR."
-
   test:
-    name: Full test matrix (manual, ${{ matrix.rust }})
-    if: github.event_name == 'workflow_dispatch'
+    name: Tests (${{ matrix.rust }})
     runs-on: ubuntu-24.04
-    # The beta rehearsal reached the final benchmark correctness smoke tests on
-    # MSRV at the 30-minute limit. Keep every test and leave room for doc tests.
-    timeout-minutes: 45
+    # Keep every test, including the new storage suites, and leave room for
+    # all-feature compilation and documentation tests on MSRV.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -793,11 +763,11 @@ jobs:
 
   python:
     name: Python source build (${{ matrix.python }})
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    # Python 3.9's full installed suite and isolated index-model oracle reached
-    # the old 20-minute limit at the final native lint step in the beta gate.
-    timeout-minutes: 30
+    env:
+      BRISKDB_REQUIRE_S3_OVERLAY: "1"
+    # Include the full suite and native lint after compiling the S3 engine.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -863,6 +833,7 @@ jobs:
           PY
           python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
+          python -m pytest -q python/tests/test_s3_overlay.py python/tests/test_s3_overlay_queue.py
 
       - name: Check out locked index-model oracle
         if: matrix.python == '3.9'
@@ -914,7 +885,6 @@ jobs:
 
   postgres-clients:
     name: PostgreSQL client matrix
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

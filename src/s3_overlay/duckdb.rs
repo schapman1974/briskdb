@@ -33,7 +33,7 @@ fn default_memory() -> u16 {
 
 type Handle = *mut c_void;
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct RawResult {
     columns: u64,
     rows: u64,
@@ -41,6 +41,19 @@ struct RawResult {
     column_ptr: Handle,
     error_ptr: Handle,
     internal: Handle,
+}
+impl Default for RawResult {
+    fn default() -> Self {
+        // Raw pointers do not implement Default on our Rust 1.85 MSRV.
+        Self {
+            columns: 0,
+            rows: 0,
+            changed: 0,
+            column_ptr: ptr::null_mut(),
+            error_ptr: ptr::null_mut(),
+            internal: ptr::null_mut(),
+        }
+    }
 }
 #[repr(C)]
 struct RawString {
@@ -531,5 +544,19 @@ impl Database {
             quote(&schema.name)
         ))?;
         duck.query(sql, params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RawResult;
+
+    #[test]
+    fn raw_result_starts_with_zero_counts_and_null_handles() {
+        let result = RawResult::default();
+        assert_eq!((result.columns, result.rows, result.changed), (0, 0, 0));
+        assert!(result.column_ptr.is_null());
+        assert!(result.error_ptr.is_null());
+        assert!(result.internal.is_null());
     }
 }

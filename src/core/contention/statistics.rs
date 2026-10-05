@@ -82,6 +82,8 @@ impl ContentionMetrics {
     }
 }
 
+// The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+#[allow(deprecated)]
 fn saturating_add(counter: &AtomicU64, amount: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(amount))

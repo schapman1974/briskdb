@@ -1,6 +1,6 @@
 # BriskDB for Python
 
-`0.1.0b1` is a **local/developer beta**, not full MongoDB compatibility or a
+`0.1.0b2` is a **local/developer beta**, not full MongoDB compatibility or a
 production-ready remote database service. The
 [beta scope](https://github.com/schapman1974/briskdb/blob/main/docs/MONGO_PARITY.md#localdeveloper-beta-scope)
 lists exclusions, including full database statistics, advanced collection
@@ -15,13 +15,13 @@ Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
 macOS and Linux targets:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb==0.1.0b1'
+python -m pip install --only-binary=:all: 'briskdb==0.1.0b2'
 ```
 
 Document commands use PyMongo's public BSON classes as an optional companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b2'
 ```
 
 The BriskDB wheel does not require or import PyMongo for SQL-only applications.
@@ -46,10 +46,11 @@ db.close()
 
 ## Optional S3/Parquet storage mode
 
-An opt-in Unix source build can combine ISAM metadata/file pruning, immutable
-SQLite base shards and S3 Parquet writes. Normal SQLite remains the default.
-Build a local wheel with `maturin build --manifest-path python/Cargo.toml
---features s3-overlay` from the repository root, then install that wheel.
+The beta.2 Linux/macOS wheels include an opt-in engine combining ISAM
+metadata/file pruning, immutable SQLite base shards and S3 Parquet writes.
+Normal SQLite remains the default; no compiler or separate AWS SDK is required
+for the native S3 engine. A source install with `python -m pip install ./python`
+also includes this capability.
 Provision a **new** overlay with the [creation example](../README.md#optional-s3parquet-write-overlay-experimental-source-builds).
 
 ```python
@@ -68,7 +69,7 @@ This uses a separate synchronous SQL API, not the ordinary sessions,
 transactions, Mongo adapters or network listeners. Missing build support and
 incompatible flags fail explicitly. See [configuration and limits](SERVERLESS.md#selecting-and-configuring-this-mode)
 and [fresh-per-request Lambda setup](SERVERLESS.md#optional-s3parquet-overlay-fresh-database-per-request).
-The feature is experimental and is not automatically available in published wheels.
+The feature remains experimental and is never selected automatically.
 
 For bounded, duplicate-safe point edits use `db.update(UpdateRequest(...))`;
 optional `QueuedUpdates(...).submit(..., mode="quick")` hands a slow write to
@@ -81,7 +82,7 @@ The beta wheel includes `briskdb.patch()`, a TinyMongo-style
 context manager/decorator. Install its optional pinned driver companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b1'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b2'
 # Or build a repository checkout with Rust 1.85+:
 python -m pip install './python[pymongo]'
 # For a supplied test wheel (replacing any same-version older build):

@@ -159,10 +159,11 @@ fn run(request: Request) -> briskdb::EngineResult<Value> {
     };
     let operation_ms = operation.elapsed().as_secs_f64() * 1000.0;
     let read_stats = database.read_stats().clone();
+    let open_stats = database.open_stats().cloned();
     drop(database);
     Ok(
         json!({"ok":true,"result":result,"open_ms":open_ms,"operation_ms":operation_ms,
-        "total_ms":started.elapsed().as_secs_f64()*1000.0,"closed":true,"read_stats":read_stats}),
+        "total_ms":started.elapsed().as_secs_f64()*1000.0,"closed":true,"open_stats":open_stats,"read_stats":read_stats}),
     )
 }
 

@@ -44,7 +44,9 @@ def test_public_surface_and_close(monkeypatch, tmp_path):
         def set_parquet_pruning(self, enabled):
             calls.append(("pruning", enabled))
         def read_stats(self):
-            return '{"parquet_files_skipped": 31}'
+            return '{"parquet_files_skipped":31,"sqlite_base_opens":1,"sqlite_base_cache_hits":2,"sqlite_base_cache_evictions":0}'
+        def open_stats(self):
+            return "null"
         def settings(self):
             return '{"storage_mode":"s3-overlay","options":{"read_only":false}}'
         def close(self):
@@ -58,12 +60,35 @@ def test_public_surface_and_close(monkeypatch, tmp_path):
         db.set_parquet_pruning(False)
         assert ("pruning", False) in calls
         assert db.read_stats()["parquet_files_skipped"] == 31
+        assert db.read_stats()["sqlite_base_cache_hits"] == 2
+        assert db.open_stats() is None
         assert db.settings()["storage_mode"] == "s3-overlay"
         with pytest.raises(TypeError):
             db.set_parquet_pruning("false")
     assert calls[0][1]["prefix"] == "example"
     assert calls[0][2] == {"items":[[{"Text":"one"},{"Blob":[120]}]]}
     assert calls[-1] == ("close",)
+
+
+def test_open_stats_decodes_timings_and_catalog_counts(monkeypatch, tmp_path):
+    stats = {"total_ms": 2.5, "catalog_ms": 1.2, "catalog_root_reads": 1,
+             "catalog_lock_requests": 1}
+
+    class Native:
+        def __init__(self, path, options="{}"):
+            self.closed = False
+        def open_stats(self):
+            if self.closed:
+                raise RuntimeError("S3 overlay is closed")
+            return json.dumps(stats)
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(overlay, "_native", lambda: Native)
+    with overlay.Database(tmp_path) as db:
+        assert db.open_stats() == stats
+    with pytest.raises(RuntimeError, match="closed"):
+        db.open_stats()
 
 
 def test_duckdb_opt_in_arguments(monkeypatch, tmp_path):
@@ -166,6 +191,8 @@ def test_native_options_validate_before_touching_storage(tmp_path):
     from briskdb import _briskdb
     native = getattr(_briskdb, "S3OverlayDatabase", None)
     if native is None:
+        if os.environ.get("BRISKDB_REQUIRE_S3_OVERLAY") == "1":
+            pytest.fail("release wheel is missing its native S3/EFS engine")
         pytest.skip("requires a source wheel built with s3-overlay")
     root = tmp_path / "never-created"
     for options in ('{"unknown":true}', '{"read_only":"false"}', '{"parquet_pruning":0}'):
@@ -187,7 +214,11 @@ def test_native_read_only_existing_fixture_without_cloud_io():
         parquet_pruning=False, read_only=True,
     )) as db:
         assert db.settings()["options"] == {"parquet_pruning": False, "read_only": True}
+        stats = db.open_stats()
+        assert stats["catalog_root_reads"] == stats["catalog_lock_requests"] == 1
+        assert stats["total_ms"] >= stats["catalog_ms"] >= 0
         assert db.query("SELECT ? AS value", [42]).rows == [(42,)]
+        assert db.read_stats()["sqlite_base_opens"] == 0
         for operation in (lambda: db.execute("DELETE FROM items"), db.compact,
                           lambda: db.compact("items", 0)):
             with pytest.raises(briskdb.ReadOnlyError):
@@ -196,6 +227,8 @@ def test_native_read_only_existing_fixture_without_cloud_io():
         assert db.settings()["options"] == {"parquet_pruning": True, "read_only": True}
     with pytest.raises(briskdb.FailedPreconditionError):
         db.settings()
+    with pytest.raises(briskdb.FailedPreconditionError):
+        db.open_stats()
     with overlay.Database.from_env({"BRISKDB_STORAGE_MODE": "s3-overlay", "BRISKDB_OVERLAY_ROOT": root}) as reopened:
         assert reopened.settings()["options"] == {"parquet_pruning": True, "read_only": False}
         assert reopened.query("SELECT 7").rows == [(7,)]

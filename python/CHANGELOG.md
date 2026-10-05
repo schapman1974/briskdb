@@ -1,6 +1,24 @@
 # Python changelog
 
-## Unreleased
+## 0.1.0-beta.2 — optional serverless engine and storage efficiency
+
+Python distribution version: `0.1.0b2`. The version is published only after
+the matching tag and full cross-platform artifact gates pass.
+
+- Supported Linux/macOS wheels now include the native S3/EFS engine. Ordinary
+  SQLite remains the default; select `storage_mode="s3-overlay"` explicitly.
+  Its synchronous SQL API uses an ISAM catalog, immutable SQLite bases and
+  S3 Parquet updates, with pruning, explicit compaction, guarded retries, and
+  optional SQS handoff. DuckDB is not bundled; Mongo does not use this mode.
+- Catalog opens reuse one validated shared-lock snapshot; each handle caches
+  at most eight immutable SQLite base connections and still fetches current
+  S3 heads for every statement. `open_stats()` and SQLite-base read counters
+  report the work; closing the handle releases all retained connections.
+- Shared contention budgets and diagnostics are exposed in native, sync/async,
+  managed Mongo and patch APIs. Index-build deadlines are configurable;
+  cancelled index operations recover without requiring a process restart.
+- Selective membership reads and streaming startup/index audits avoid repeated
+  BSON reads. Bounded fallback sort files honor `allow_disk_use=False`.
 
 - Eligible newly built ordinary secondary indexes now serve exact/inverse
   ordered `find().sort()` reads and bounded top-K prefixes (#563), with added
@@ -9,8 +27,7 @@
   Local startup upgrades manifest v22 directly to v24 with digest 16; older
   binaries reject that root. Keep a complete stopped-owner pre-upgrade backup.
   Explicitly drop/recreate an old sort index with other processes closed to
-  enable ordered reads; stop writes before dropping a unique index. No new
-  package version or PyPI publication is implied by this source change.
+  enable ordered reads; stop writes before dropping a unique index.
 
 - Document-store startup now uses ordered ownership-key comparison and a
   physical record scan, reducing repeated reads of large BSON records (#550).
