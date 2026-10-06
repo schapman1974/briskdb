@@ -1,6 +1,6 @@
 #[test]
 fn beta_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-beta.2");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-beta.3");
     assert!(include_str!("../fuzz/Cargo.lock").contains(&format!(
         "name = \"briskdb\"\nversion = {:?}",
         env!("CARGO_PKG_VERSION")

@@ -12,6 +12,12 @@ fn hybrid_metadata_runs_real_sqlite_shards_and_reopens_without_sqlite_manifest()
     for backend in [MetadataBackend::Sqlite, MetadataBackend::Isam] {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open_with_metadata_backend(directory.path(), 2, backend).unwrap();
+        if backend == MetadataBackend::Isam {
+            let metadata =
+                briskdb::isam::Store::open_read_only(directory.path().join("manifest.isam"))
+                    .unwrap();
+            assert_eq!(metadata.format_version(), 4);
+        }
         let ddl = "CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL);";
         database.broadcast(ddl).unwrap();
         database.broadcast(ddl).unwrap(); // durable DDL receipt, not a second CREATE

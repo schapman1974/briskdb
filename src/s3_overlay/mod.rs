@@ -24,6 +24,8 @@ mod file_index;
 mod metadata;
 mod parquet;
 #[cfg(test)]
+mod point_tests;
+#[cfg(test)]
 mod pruning_tests;
 mod registry;
 mod schema;
@@ -252,7 +254,7 @@ pub struct OpenStats {
 
 /// A distinct SQL connection. Request-scoped snapshots and pending-file caches
 /// are discarded between statements. Only immutable base connections are
-/// retained, bounded to eight and keyed by table/partition/published base ID.
+/// retained, bounded to 64 and keyed by table/partition/published base ID.
 pub struct Database {
     connection: Connection,
     registry: Arc<registry::Registry>,

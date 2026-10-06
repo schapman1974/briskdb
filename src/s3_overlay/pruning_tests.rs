@@ -43,8 +43,9 @@ fn same_partition_index_skips_31_of_32_files_and_preserves_results() {
     db.set_parquet_pruning(false);
     let slow = db.query("SELECT * FROM items WHERE id='a'", &[]).unwrap();
     assert_eq!(slow.rows, fast.rows);
-    assert_eq!(db.read_stats().parquet_files_read, 32);
-    assert_eq!(db.read_stats().parquet_files_skipped, 0);
+    assert_eq!(db.read_stats().parquet_files_read, 1);
+    assert_eq!(db.read_stats().parquet_files_skipped, 31);
+    assert_eq!(db.read_stats().index_files_opened, 0);
 }
 
 #[test]
@@ -140,8 +141,8 @@ fn absent_or_corrupt_index_and_old_unindexed_deltas_fall_back_safely() {
             .rows,
         vec![tests::row("a", "changed")]
     );
-    assert_eq!(db.read_stats().parquet_files_read, 32);
-    assert_eq!(db.read_stats().index_fallback_files, 32);
+    assert_eq!(db.read_stats().parquet_files_read, 1);
+    assert_eq!(db.read_stats().index_fallback_files, 1);
     drop(index);
     // Move, don't delete: simulate a missing advisory index on reopen.
     std::fs::rename(&path, path.with_extension("saved")).unwrap();
@@ -153,7 +154,7 @@ fn absent_or_corrupt_index_and_old_unindexed_deltas_fall_back_safely() {
             .rows,
         vec![tests::row("a", "changed")]
     );
-    assert_eq!(db.read_stats().parquet_files_read, 32);
+    assert_eq!(db.read_stats().parquet_files_read, 1);
     std::fs::write(&path, b"not a valid ISAM file").unwrap();
     db.execute("UPDATE items SET value='index-failed' WHERE id='a'", &[])
         .unwrap();

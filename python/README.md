@@ -1,6 +1,6 @@
 # BriskDB for Python
 
-`0.1.0b2` is a **local/developer beta**, not full MongoDB compatibility or a
+`0.1.0b3` is a **local/developer beta**, not full MongoDB compatibility or a
 production-ready remote database service. The
 [beta scope](https://github.com/schapman1974/briskdb/blob/main/docs/MONGO_PARITY.md#localdeveloper-beta-scope)
 lists exclusions, including full database statistics, advanced collection
@@ -15,13 +15,13 @@ Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
 macOS and Linux targets:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb==0.1.0b2'
+python -m pip install --only-binary=:all: 'briskdb==0.1.0b3'
 ```
 
 Document commands use PyMongo's public BSON classes as an optional companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b2'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b3'
 ```
 
 The BriskDB wheel does not require or import PyMongo for SQL-only applications.
@@ -46,7 +46,7 @@ db.close()
 
 ## Optional S3/Parquet storage mode
 
-The beta.2 Linux/macOS wheels include an opt-in engine combining ISAM
+The beta.3 Linux/macOS wheels include an opt-in engine combining ISAM
 metadata/file pruning, immutable SQLite base shards and S3 Parquet writes.
 Normal SQLite remains the default; no compiler or separate AWS SDK is required
 for the native S3 engine. A source install with `python -m pip install ./python`
@@ -82,7 +82,7 @@ The beta wheel includes `briskdb.patch()`, a TinyMongo-style
 context manager/decorator. Install its optional pinned driver companion:
 
 ```bash
-python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b2'
+python -m pip install --only-binary=:all: 'briskdb[pymongo]==0.1.0b3'
 # Or build a repository checkout with Rust 1.85+:
 python -m pip install './python[pymongo]'
 # For a supplied test wheel (replacing any same-version older build):

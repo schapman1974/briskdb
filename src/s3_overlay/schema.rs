@@ -194,6 +194,30 @@ impl Table {
         Ok(())
     }
 
+    pub(crate) fn point_key(&self, predicates: &[(usize, Cell)]) -> Option<Vec<u8>> {
+        let values = self
+            .primary_key
+            .iter()
+            .map(|name| {
+                let column = self
+                    .columns
+                    .iter()
+                    .position(|column| column.name == *name)?;
+                predicates.iter().find_map(|(index, value)| {
+                    (*index == column
+                        && matches!(
+                            (self.columns[column].kind, value),
+                            (ColumnType::Integer, Cell::Integer(_))
+                                | (ColumnType::Text, Cell::Text(_))
+                                | (ColumnType::Blob, Cell::Blob(_))
+                        ))
+                    .then_some(value)
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(serde_json::to_vec(&values).expect("finite validated primary key"))
+    }
+
     pub(crate) fn key(&self, row: &[Cell]) -> Vec<u8> {
         let values = self
             .primary_key

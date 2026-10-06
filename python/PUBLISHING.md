@@ -40,7 +40,7 @@ Verify a downloaded artifact with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify briskdb-0.1.0b2-*.whl --repo schapman1974/briskdb
+gh attestation verify briskdb-0.1.0b3-*.whl --repo schapman1974/briskdb
 ```
 
 Do not reuse or move a release tag. Update both Cargo package versions and the

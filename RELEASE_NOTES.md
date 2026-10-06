@@ -1,3 +1,71 @@
+# BriskDB 0.1.0-beta.3 — overlay read efficiency and pipelined metadata
+
+Rust crate version: `0.1.0-beta.3`; Python distribution version: `0.1.0b3`.
+This is release preparation, not publication. Full CI, cross-platform builds,
+and installed-artifact checks must pass before tagging and publishing.
+
+## Changes since beta 2
+
+- Increase the immutable SQLite-base cache from eight to 64 connections per
+  handle. Opens remain lazy, LRU-bounded, and keyed by table, partition, and
+  published base ID. Larger working sets can retain more file descriptors and
+  SQLite page-cache memory; closing the handle releases the cache.
+- Complete, exactly typed BINARY primary-key equality probes inspect pending
+  Parquet files newest first. A matching row or tombstone ends the search,
+  avoiding superseded files and the SQLite base. Missing keys fall through to
+  the base; partial keys, coercions, and other collations retain the scan path.
+- Guarded updates reuse the pinned head for receipt resolution and SQL within
+  each attempt. With disjoint-row rebasing enabled, the exact-key lookup also
+  reuses the row read for conflict detection. Expected-value guards, archived
+  receipts, conditional publication, and retry-state clearing remain intact.
+- New hybrid ISAM metadata manifests use V4 pipelined durable commits by
+  default. Existing V3 manifests remain readable and writable without conversion.
+  This changes neither SQLite data-shard commits nor S3-overlay catalog formats.
+  Older V3-only hybrid-metadata binaries reject newly created V4 manifests.
+- Extend regression coverage for exact-key reads, tombstones, mixed probes,
+  caching, update retries, fault handling, and V3/V4 metadata compatibility.
+
+Every overlay statement still fetches fresh S3 heads. Cached point results are
+not promoted into complete snapshots for later probes, joins, or scans. No new
+NFS/EFS qualification or general SQLite-write speedup is claimed. Disposable
+AWS benchmark runners and fixtures are not part of these release changes.
+
+## Retained beta scope and safety boundaries
+
+S3/EFS support is included in the Python wheels and native archives;
+ordinary SQLite remains the default. The S3 overlay is an explicit, separate
+synchronous SQL API, not an automatic migration or Mongo adapter. Writes remain
+atomic within one table/key partition. Preserve pending objects, operation
+receipts, and snapshots; ordinary SQLite WAL roots remain unsupported on EFS.
+
+PostgreSQL retains TLS and SCRAM-SHA-256, bounded simple and parameterized
+text/binary extended queries, and single-shard transactions. Python's
+Mongo listener remains anonymous and loopback-only. Secure remote Mongo hosting
+remains experimental and requires explicitly configured Rust hosts or the
+separate authenticated daemon. The read-only SQLite virtual-table addon remains
+experimental. SQL and BSON remain separate models; MySQL and general
+cross-shard transactions are not implemented.
+
+This is not full MongoDB or TinyMongo parity. `briskdb.patch()` and local
+sync/async clients retain their developer-testing scope. Explicit beta exclusions
+include full database disk statistics, advanced collection options, Mongo
+sessions/transactions, TTL expiration, full-text search, and alternative
+TinyMongo storage backends. The external large-application check (#181) remains
+pending the project owner's tester; it is not counted as passed.
+
+## Artifacts and upgrade safety
+
+Cross-platform artifact tests and native dependency audits are required before
+publishing. Wheels retain CPython 3.9–3.14 support on macOS 11+/manylinux_2_28,
+x86-64 and ARM64. Windows, Alpine/musl, PyPy, and free-threaded Python remain
+unsupported; the source distribution requires Rust 1.85+.
+
+There is no stable pre-1.0 on-disk compatibility promise. Stop every owner and
+take a complete data-directory copy before upgrading. In-place downgrade is
+unsupported; restore the complete pre-upgrade backup for rollback. Ordinary
+local roots retain manifest version 24 and semantic digest 16. Existing ISAM
+V3 roots are not silently upgraded to V4; no format-conversion tool is added.
+
 # BriskDB 0.1.0-beta.2 — serverless preview and storage efficiency
 
 Rust crate version: `0.1.0-beta.2`; Python distribution version: `0.1.0b2`.

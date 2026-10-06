@@ -26,6 +26,146 @@ fn fixture() -> (tempfile::TempDir, Arc<InMemory>, Database) {
 }
 
 #[test]
+fn prepared_point_rows_are_only_reused_for_the_same_unmodified_probe() {
+    let (_root, _store, mut db) = fixture();
+    let prepared = request(&nonce().unwrap(), "new")
+        .prepare(db.config())
+        .unwrap();
+    db.registry.reset(false).unwrap();
+    assert!(
+        db.registry
+            .begin_update(&prepared, true, false)
+            .unwrap()
+            .is_none()
+    );
+    let rows = db.registry.scan(0, &prepared.predicates).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        db.registry
+            .state
+            .lock()
+            .unwrap()
+            .stats
+            .sqlite_base_cache_hits,
+        0
+    );
+    assert!(
+        db.registry
+            .scan(1, &prepared.predicates)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.registry
+            .scan(0, &[(0, Cell::Text("absent".into()))])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.registry
+            .scan(0, &[(0, Cell::Integer(7))])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.registry.scan(0, &[]).unwrap().len(), 1);
+    db.registry
+        .update(0, rows[0].0, tests::row("a", "staged"))
+        .unwrap();
+    let updated = db.registry.scan(0, &prepared.predicates).unwrap();
+    assert_eq!(updated[0].1, tests::row("a", "staged"));
+    db.finish_statement().unwrap();
+    assert_eq!(
+        db.query("SELECT * FROM items WHERE id='a'", &[])
+            .unwrap()
+            .rows,
+        vec![tests::row("a", "original")]
+    );
+}
+
+#[test]
+fn composite_point_updates_preserve_typed_keys_null_guards_and_fresh_attempts() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemory::new());
+    let mut config = tests::config();
+    let table = &mut config.tables[0];
+    table.columns[0].kind = ColumnType::Integer;
+    table.columns[1].nullable = true;
+    table.columns.extend([
+        Column {
+            name: "suffix".into(),
+            kind: ColumnType::Blob,
+            nullable: false,
+        },
+        Column {
+            name: "counter".into(),
+            kind: ColumnType::Integer,
+            nullable: false,
+        },
+    ]);
+    table.primary_key.push("suffix".into());
+    let target = vec![
+        Cell::Integer(7),
+        Cell::Null,
+        Cell::Blob(vec![0, 255]),
+        Cell::Integer(0),
+    ];
+    let other = vec![
+        Cell::Integer(7),
+        Cell::Text("other".into()),
+        Cell::Blob(vec![1]),
+        Cell::Integer(0),
+    ];
+    let mut db = Database::create(
+        root.path().join("db"),
+        config,
+        store,
+        BTreeMap::from([("items".into(), vec![target, other.clone()])]),
+    )
+    .unwrap();
+    let mut update = UpdateRequest {
+        operation_id: nonce().unwrap(),
+        table: "items".into(),
+        key: BTreeMap::from([
+            ("id".into(), Cell::Integer(7)),
+            ("suffix".into(), Cell::Blob(vec![0, 255])),
+        ]),
+        set: BTreeMap::from([("value".into(), Cell::Text("new".into()))]),
+        increment: BTreeMap::from([("counter".into(), Cell::Integer(1))]),
+        expected: BTreeMap::from([("value".into(), Cell::Null)]),
+    };
+    let options = RetryOptions {
+        timeout_ms: 10_000,
+        ..Default::default()
+    };
+    assert_eq!(db.update(&update, options).unwrap().affected_rows, 1);
+    assert_eq!(db.read_stats().sqlite_base_opens, 1);
+    assert_eq!(db.read_stats().sqlite_base_cache_hits, 0);
+    update.operation_id = nonce().unwrap();
+    assert_eq!(db.update(&update, options).unwrap().affected_rows, 0);
+    assert_eq!(db.read_stats().sqlite_base_cache_hits, 0);
+    update.operation_id = nonce().unwrap();
+    update
+        .expected
+        .insert("value".into(), Cell::Text("new".into()));
+    assert_eq!(db.update(&update, options).unwrap().affected_rows, 1);
+    assert_eq!(db.read_stats().sqlite_base_cache_hits, 0);
+    assert_eq!(
+        db.query("SELECT * FROM items ORDER BY suffix", &[])
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                Cell::Integer(7),
+                Cell::Text("new".into()),
+                Cell::Blob(vec![0, 255]),
+                Cell::Integer(2)
+            ],
+            other
+        ]
+    );
+}
+
+#[test]
 fn point_update_commits_and_repeated_operation_returns_original_result() {
     let (_root, _store, mut db) = fixture();
     let update = request(&nonce().unwrap(), "new");

@@ -8,8 +8,11 @@ there is no format conversion, compaction, or NFS/EFS qualification.
 
 ## Hybrid SQL metadata manifest (experimental)
 
-Explicit `MetadataBackend::Isam` uses `manifest.isam`: packed v3 tree pages,
-17-byte keys, and values of at most 1024 bytes. This is a distinct format from
+Explicit `MetadataBackend::Isam` creates `manifest.isam` with packed v4 tree
+pages and pipelined durable commits, 17-byte keys, and values of at most 1024
+bytes. Existing v3 manifests remain readable and writable as v3; opening them
+does not enable pipelining or convert their format. Older hybrid-metadata
+binaries that accept only v3 reject newly created v4 manifests. This is a distinct format from
 the low-level `NativeCatalog`. Its root record carries the marker
 `briskdb.hybrid-metadata.v1`, random 16-byte shard-layout identity, fixed shard
 count and routing algorithm versions, schema generation, trusted schema

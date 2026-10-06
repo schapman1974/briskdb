@@ -4,7 +4,7 @@ use super::{ReadStats, Result};
 use rusqlite::Connection;
 use std::collections::VecDeque;
 
-const CAPACITY: usize = 8;
+const CAPACITY: usize = 64;
 
 pub(super) struct BaseCache {
     entries: VecDeque<Entry>,
@@ -75,6 +75,65 @@ mod tests {
 
     fn connection() -> Result<Connection> {
         Connection::open_in_memory().map_err(super::super::storage_error)
+    }
+
+    #[test]
+    fn default_cache_retains_64_bases_without_churn() {
+        let mut cache = BaseCache::default();
+        let mut stats = ReadStats::default();
+        for _ in 0..3 {
+            for partition in 0..64 {
+                cache
+                    .get_or_open(0, partition, "base", &mut stats, connection)
+                    .unwrap();
+            }
+        }
+        assert_eq!(stats.sqlite_base_opens, 64);
+        assert_eq!(stats.sqlite_base_cache_hits, 128);
+        assert_eq!(stats.sqlite_base_cache_evictions, 0);
+        assert_eq!(cache.entries.len(), 64);
+        cache
+            .get_or_open(0, 64, "base", &mut stats, connection)
+            .unwrap();
+        assert_eq!(stats.sqlite_base_cache_evictions, 1);
+        assert_eq!(cache.entries.len(), 64);
+        assert_eq!(cache.entries.front().unwrap().partition, 1);
+        cache
+            .get_or_open(0, 1, "base", &mut stats, || panic!("expected cache hit"))
+            .unwrap();
+        cache
+            .get_or_open(0, 65, "base", &mut stats, connection)
+            .unwrap();
+        assert_eq!(stats.sqlite_base_cache_evictions, 2);
+        assert_eq!(cache.entries.len(), 64);
+        assert_eq!(cache.entries.front().unwrap().partition, 3);
+    }
+
+    #[test]
+    fn full_default_cache_does_not_retain_a_failed_replacement() {
+        let mut cache = BaseCache::default();
+        let mut stats = ReadStats::default();
+        for partition in 0..64 {
+            cache
+                .get_or_open(0, partition, "base", &mut stats, connection)
+                .unwrap();
+        }
+        assert!(
+            cache
+                .get_or_open(0, 64, "base", &mut stats, || Err(super::super::invalid(
+                    "test failure"
+                )))
+                .is_err()
+        );
+        assert_eq!(cache.entries.len(), 63);
+        assert_eq!(stats.sqlite_base_opens, 64);
+        assert_eq!(stats.sqlite_base_cache_evictions, 1);
+        cache
+            .get_or_open(0, 64, "base", &mut stats, connection)
+            .unwrap();
+        assert_eq!(cache.entries.len(), 64);
+        assert_eq!(stats.sqlite_base_opens, 65);
+        assert_eq!(stats.sqlite_base_cache_evictions, 1);
     }
 
     #[test]
