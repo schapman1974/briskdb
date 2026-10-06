@@ -803,10 +803,19 @@ storage. Non-loopback binding requires an explicit address. SIGINT/SIGTERM drain
 the listener and owned engine (Ctrl-C on Windows, subject to security-root platform
 support). Engine limits retain their defaults; the shared `--contention-*`
 options configure contention without replaying application writes. Companion
-listener flags and `--reload-on-sighup` are rejected: certificate reload is not
-implemented for this dedicated command yet. Rust process hosts may call
+listener flags are rejected. On Unix, opt in with `--reload-on-sighup` (or
+`BRISKDB_RELOAD_ON_SIGHUP=true`) to reread the configured certificate/key paths.
+Reload preparation is serialized and bounded by the existing 15-second deadline;
+an invalid pair retains the active identity. New sockets use a successfully
+replaced identity; existing authenticated sockets keep their identity and current
+authorization. This is not credential rotation or session revocation. Signal
+bursts are coalesced, never an unbounded worker queue; shutdown takes priority.
+Non-Unix targets reject this option before opening storage. Rust process hosts may call
 `server::run_authenticated_mongo(AuthenticatedMongoConfig, EngineOptions)` with
 explicit engine limits. Existing composed-host security guards remain unchanged.
+For reload, use `run_authenticated_mongo_with_options` and
+`AuthenticatedMongoOptions::default().with_sighup_reload()`; the original entry
+point and default options leave reload disabled.
 
 Open that already-provisioned root and explicitly start TLS:
 
