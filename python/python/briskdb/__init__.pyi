@@ -38,7 +38,6 @@ from ._briskdb import (
     UniqueViolationError as UniqueViolationError,
     UnsupportedError as UnsupportedError,
     __version__ as __version__,
-    open as open,
 )
 from .remote import RemoteAttachment as RemoteAttachment, attach_remote as attach_remote
 from .patching import MongoPatch as MongoPatch, patch as patch
@@ -61,3 +60,5 @@ from .api import (
     connect_async as connect_async,
     open_async as open_async,
 )
+
+open = connect

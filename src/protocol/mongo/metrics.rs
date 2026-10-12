@@ -368,6 +368,8 @@ impl Default for Metrics {
     }
 }
 
+// The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+#[allow(deprecated)]
 fn add(counter: &AtomicU64, amount: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some(old.saturating_add(amount))

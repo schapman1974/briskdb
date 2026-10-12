@@ -115,6 +115,12 @@ impl BriskDbBuilder {
         self
     }
 
+    /// Choose metadata persistence; does not convert an existing database.
+    pub const fn with_metadata_backend(mut self, backend: crate::MetadataBackend) -> Self {
+        self.engine_options = self.engine_options.with_metadata_backend(backend);
+        self
+    }
+
     /// Return the configured runtime ownership behavior.
     pub const fn runtime_behavior(&self) -> RuntimeBehavior {
         self.runtime_behavior
@@ -147,6 +153,15 @@ impl BriskDbBuilder {
 
     /// Validate the complete configuration without touching the filesystem.
     pub fn validate(&self) -> EngineResult<()> {
+        self.engine_options.metadata_backend().require_available()?;
+        if self.engine_options.metadata_backend() == crate::MetadataBackend::Isam
+            && self.document_support == DocumentSupport::Enabled
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "document metadata is not yet supported by the experimental ISAM metadata adapter",
+            ));
+        }
         #[cfg(feature = "auth-scram")]
         if self.authenticated_root
             && (self.shard_count.is_none() || self.document_support != DocumentSupport::Enabled)

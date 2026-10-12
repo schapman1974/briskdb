@@ -171,6 +171,8 @@ impl ListenerGuard {
 }
 
 impl Drop for ListenerGuard {
+    // The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+    #[allow(deprecated)]
     fn drop(&mut self) {
         // The future owns this guard even before its first poll. Aborts and
         // unwinds must never leave a dead listener reporting Running/Closing.

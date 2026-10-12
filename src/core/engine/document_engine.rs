@@ -145,6 +145,12 @@ impl Engine {
         request: DocumentRequest,
         _authorization: Option<&DocumentCommand>,
     ) -> EngineResult<DocumentExecution> {
+        if self.inner.database.metadata_backend() == crate::MetadataBackend::Isam {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "document metadata is not yet supported by the experimental ISAM metadata adapter",
+            ));
+        }
         let (request_id, context, command) = request.into_parts();
         let mut operation = self.operation_lifecycle(context)?;
         if session.owner != self.inner.id {
@@ -2577,6 +2583,8 @@ fn next_server_timestamp() -> EngineResult<BsonTimestamp> {
     advance_server_timestamp(&SERVER_TIMESTAMP, seconds)
 }
 
+// The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+#[allow(deprecated)]
 fn advance_server_timestamp(clock: &AtomicU64, seconds: u32) -> EngineResult<BsonTimestamp> {
     let mut next = 0;
     clock

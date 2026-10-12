@@ -6,7 +6,7 @@ import asyncio
 import functools
 from collections.abc import AsyncIterator
 from os import PathLike
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, TYPE_CHECKING
 from uuid import UUID
 
 from ._briskdb import (
@@ -20,6 +20,9 @@ from ._briskdb import (
     open as _native_open,
 )
 
+if TYPE_CHECKING:
+    from .s3_overlay import OpenOptions, Database as OverlayDatabase
+
 
 def connect(
     path: Union[str, PathLike[str]],
@@ -28,9 +31,26 @@ def connect(
     documents: bool = False,
     uuid_representation: Optional[str] = None,
     config: Optional[Config] = None,
-) -> Database:
-    """Open an in-process database; no listener starts unless ``serve()`` is called."""
+    storage_mode: str = "sqlite",
+    overlay_options: Optional[OpenOptions] = None,
+) -> Database | OverlayDatabase:
+    """Open ordinary SQLite storage, or explicitly select a separate SQL overlay.
 
+    ``storage_mode='s3-overlay'`` opens an existing overlay through its sync
+    query/execute API, not the ordinary session/Mongo/listener API. Environment
+    variables never change this selector. No listener starts automatically.
+    """
+
+    if storage_mode not in ("sqlite", "s3-overlay"):
+        raise ValueError("storage_mode must be 'sqlite' or 's3-overlay'")
+    if storage_mode == "s3-overlay":
+        if shards is not None or documents or uuid_representation is not None or config is not None:
+            raise ValueError("s3-overlay does not accept ordinary Config, shards, documents, or UUID options; "
+                             "create with briskdb.s3_overlay.Database.create and reopen with overlay_options")
+        from .s3_overlay import Database as OverlayDatabase
+        return OverlayDatabase(path, options=overlay_options)
+    if overlay_options is not None:
+        raise ValueError("overlay_options requires storage_mode='s3-overlay'")
     return _native_open(
         path,
         shards=shards,

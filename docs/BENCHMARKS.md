@@ -4,6 +4,88 @@ BriskDB's Criterion suite establishes repeatable controls for the synchronous
 storage path and the bounded asynchronous engine. It is a measurement tool, not
 a claim about production capacity or a timing threshold for shared CI runners.
 
+## Optional S3/Parquet overlay: Lambda/EFS, 2026-10-02
+
+These source-build measurements use ISAM metadata, immutable indexed SQLite
+bases directly on EFS and Parquet changes in S3. They are not ordinary
+SQL/Mongo-engine tests or SQLite-metadata-versus-ISAM-metadata comparisons.
+See the [serverless guide](../python/SERVERLESS.md) for current setup and limits.
+
+All cloud cases below used 30 callers and ARM64 Lambda at 2048 MiB. Each
+request opened and closed a fresh native BriskDB process. Full workload time
+includes process/catalog startup, network calls, retries and shutdown; no
+warmup was subtracted. AWS could reuse execution environments and filesystem
+caches. Fixture setup and final correctness/compaction checks were outside
+the timer. These are individual runs, not production-capacity guarantees.
+
+| Workload | Elapsed | Chapters/second | Failed requests |
+| --- | ---: | ---: | ---: |
+| 400 chapter pulls + 400 distinct inserts | 15.152478 s | 26.398322 | 0 |
+
+Each pull verified all 36 John 3 verses from a 31,103-verse fixture. Writes
+targeted separate activity records, not repeated updates of the chapter.
+Inserts spread 97/97/100/106 across four shard directories; all 420 activity
+rows, including 20 seeded rows, survived compaction. This does not measure
+many clients refreshing the same record.
+
+## Optional DuckDB reader: Lambda/EFS, 2026-10-02
+
+The same 400-read/400-insert workload compared the default SQLite reader with
+DuckDB 1.5.6 over one overlay partition. Storage and writes were unchanged;
+DuckDB initialization and extension loading were included in every read.
+
+| Reader | Elapsed | Chapters/second | Failed requests |
+| --- | ---: | ---: | ---: |
+| SQLite control | 15.379767 s | 26.008197 | 0 |
+| DuckDB, 1 thread | 108.285190 s | 3.693949 | 0 |
+| DuckDB, 2 threads | 110.152495 s | 3.631329 | 0 |
+| DuckDB, 4 threads | 109.341794 s | 3.658254 | 0 |
+
+More threads did not help this workload. The bases use `WITHOUT ROWID`, for
+which the [SQLite scanner](https://github.com/duckdb/sqlite_scanner/blob/5274128/src/sqlite_scanner.cpp)
+uses one scan thread. This is not DuckDB directly scanning S3 Parquet, a
+DuckDB storage backend, or a test of a large pending-file backlog.
+
+## ISAM Parquet-file pruning: Lambda/EFS, 2026-10-02
+
+These paired runs put 32 pending files in the queried verse partition:
+one contains the requested chapter and 31 contain other keys. Both use the
+SQLite reader and ISAM metadata; only the pruning switch changes.
+
+| Workload | Without pruning | With pruning | Chapters/s without | Chapters/s with | Failed requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 400 reads + 400 distinct inserts | 22.060870 s | 15.907662 s | 18.131651 | 25.145115 | 0 |
+| 400 reads, no writes | 16.794936 s | 8.951054 s | 23.816703 | 44.687474 | 0 |
+
+Pruning fetched one rather than 32 Parquet payloads per chapter. Every chapter
+was checked; mixed-run activity rows were checked before and after compaction.
+The mixed enabled run had 34 advisory write-index publication fallbacks:
+those writes committed and remained readable without pruning. Read-scan
+counters do not include separate publication/retry/compaction I/O.
+
+### Scale-up: 2,200 reads + 2,200 writes
+
+The same backlog and native executable were used at 2,200 reads and 2,200
+distinct activity inserts. Both mixed sizes used a 128-file compaction
+threshold for the experiment, not the normal default of 32.
+
+| SQLite reader | Elapsed | Chapters/second | Successful reads | Successful writes | Failed requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pruning disabled | 150.819066 s | 14.587015 | 2,200 | 2,200 | 0 |
+| ISAM pruning enabled | 80.822156 s | 27.220259 | 2,200 | 2,200 | 0 |
+
+All 2,220 activity rows and chapter results were verified before/after
+compaction. There were 153 advisory write-index fallbacks in the enabled run;
+they did not lose writes. These tests do not cover contention from many
+clients updating the same row or guarantee that bounded updates never time
+out. See [safe-update outcomes](../python/SERVERLESS.md#safe-updates-and-optional-durable-queue-handoff).
+
+Detailed cloud logs, source fingerprints and restoration records are retained
+in the external `nfs-lock-lab` workspace, not distributed with this repository.
+These dated results describe those builds, not every later checkout. The test
+Lambda configuration was restored after each run. Local comparative artifacts
+are retained under [benchmarks/results](../benchmarks/results/).
+
 ## Global-index before/after gate
 
 Issue [#226](https://github.com/schapman1974/briskdb/issues/226) freezes the
@@ -255,6 +337,127 @@ session creation, routing-context setup, and pool warm-up. Both groups use warm
 operating-system caches after Criterion's warm-up period; neither measures first
 process access or a cold page cache. A deliberate change to either workload
 contract must be documented before comparing it with an older result.
+
+## Experimental ISAM and SQLite comparison
+
+The opt-in [#536](https://github.com/schapman1974/briskdb/issues/536) harnesses
+compare native ISAM primitives/catalog operations with SQLite controls.
+They do **not** compare the full BriskDB engine with only its metadata backend
+switched. Local timings do not qualify NFS/EFS or establish production capacity.
+
+| Harness | Comparison | Important boundary |
+| --- | --- | --- |
+| `tests/isam_benchmark.rs` | Native store/catalog, BriskDB SQLite storage API, fixed-file floor | Default durability policies; different physical index layouts |
+| `tests/isam_commit_benchmark.rs` | Native store versus direct SQLite | Strict flush-policy control, without BriskDB SQL-routing overhead |
+| `tests/isam_pipeline_benchmark.rs` | Packed-v3 versus pipelined-v4 native catalogs | No SQLite control; same-process flush sharing is not cross-Lambda group commit |
+
+### Run the comparison
+
+Bounded correctness smoke, with no timing gate:
+
+```bash
+cargo test --locked --no-default-features --features isam-benchmark \
+  --test isam_benchmark bounded_comparison_smoke
+```
+
+Release-mode comparison on a quiet local host:
+
+```bash
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+BRISKDB_ISAM_BENCH_OUTPUT=target/isam-benchmark.tsv \
+cargo test --release --locked --no-default-features --features isam-benchmark \
+  --test isam_benchmark release_isam_sqlite_comparison -- \
+  --ignored --exact --nocapture
+```
+
+The default is 100 samples; `BRISKDB_ISAM_BENCH_SAMPLES` accepts 2–100.
+`BRISKDB_ISAM_PACKED=1` selects new packed-v3 fixtures instead of fixed-v2
+fixtures. Packing omits unused value padding; it is not compression.
+The optional CI `isam_benchmark` dispatch retains TSV/log artifacts, including
+failed runs, and does not run on normal pushes or PRs.
+
+### Workloads and interpretation
+
+Paired fixtures use 11-byte keys, 128-byte payloads and 36-row chapter-style
+ranges. SQLite has two physical shards, but all work routes to one shard.
+Warm operations retain handles. Cases include open-existing, point/range
+reads, 36-row insert/update/delete, duplicate rejection, four disjoint writers,
+typed catalog CRUD/index maintenance and matched JSON serialization.
+
+Explicit bulk cases compare 36 individual native commits with one native
+bulk commit and one SQLite statement. Native commit counts are checked:
+36 root publications/72 syncs versus one publication/two syncs. This measures
+caller-driven batching, not automatic grouping of independent requests.
+Result/index verification is outside the timer. JSON-only measurements exclude
+database reads and conversion into the common row shape.
+
+The default SQLite control uses BriskDB's local WAL/FULL policy. On macOS this
+is not the same flush policy as Rust's `File::sync_all`; use the strict control
+below for that comparison. The fixed-file floor has no database locking,
+atomicity, indexing or recovery guarantees.
+
+Reports retain the tested revision, schema, timings, throughput, directory
+growth, process peak RSS and available logical I/O/lock/commit counters.
+Striped-lock totals identify 64 lock buckets, not record IDs. SQLite/fixed-file
+`NA` counters are unavailable, not zero. These are application-side counters,
+not syscalls or NFS RPCs. Publication/lock/sync phase timers can overlap;
+growth and RSS are whole-run measurements, not per-operation allocations.
+Keep each TSV's metadata with its results.
+
+### Direct-engine durability control
+
+The strict control stores identical keys/values in one primary tree without
+secondary indexes. Every SQLite connection verifies `WITHOUT ROWID`,
+4096-byte pages, WAL, `synchronous=FULL`, `fullfsync=ON` and
+`checkpoint_fullfsync=ON`. ISAM retains two durability barriers per commit.
+Matching the requested flush policy does not prove identical power-loss
+behavior; production SQLite settings are unchanged.
+
+```bash
+BRISKDB_ISAM_REVISION="$(git rev-parse HEAD)" \
+BRISKDB_ISAM_COMMIT_OUTPUT=target/isam-strict.tsv \
+cargo test --release --locked --no-default-features \
+  --features isam-benchmark --test isam_commit_benchmark \
+  release_strict_commit_control -- --ignored --exact --nocapture
+```
+
+The release run uses 100 single-worker samples and 4/10/30 retained workers
+for finite bursts: 400 reads, 400 independent single-record writes, or
+400 reads **plus** 400 writes. Each read returns 36 records. Mixed throughput
+uses the whole burst completion time, not the reader-only completion time.
+Setup and verification are excluded; checkpoint work during operations remains
+included. Short read bursts do not establish sustained throughput or fairness.
+
+### Pipelined-commit experiment
+
+The separate local harness seeds 100,000 typed records with primary and
+secondary indexes, then runs 400 reads and 400 updates with 15 readers and
+15 writers. It alternates packed-v3 and pipelined-v4 execution order across
+three fresh-fixture trials and verifies reopened rows/indexes afterward.
+
+```bash
+cargo test --release --locked --no-default-features --features experimental-isam \
+  --test isam_pipeline_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+Set `BRISK_ISAM_PIPELINE_REPORT` to a new TSV path to retain results; existing
+files are not overwritten. Same-process flush sharing can improve aggregate
+write time without improving every read/write latency. It does not combine
+independent Lambda clients' flushes or prove shared-filesystem recovery.
+
+### Retained results
+
+[Raw local reports](../benchmarks/results/) preserve the baseline and optimization
+runs without repeating their development history here. For the most recent
+archived local controls, see the [API/default-policy report](../benchmarks/results/isam-v6-macos-arm64.tsv),
+[fixed-format control](../benchmarks/results/isam-v6-fixed-macos-arm64.tsv) and
+[strict direct-engine report](../benchmarks/results/isam-strict-v6-macos-arm64.tsv).
+Experiment labels such as “v6” are not on-disk format versions.
+
+Keep comparisons within the same harness, fixture, durability policy and
+startup/cache conditions. Old measurements are not performance claims for the
+current checkout. Storage formats and locking guarantees are defined in the
+[format contract](STORAGE_FORMAT.md), not inferred from benchmark speed.
 
 ## Run and compare
 

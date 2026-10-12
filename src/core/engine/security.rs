@@ -62,6 +62,12 @@ impl Engine {
         options: EngineOptions,
     ) -> EngineResult<Self> {
         options.storage_profile().require_available()?;
+        if options.metadata_backend() != crate::MetadataBackend::Sqlite {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "authenticated roots are not yet supported with ISAM metadata",
+            ));
+        }
         crate::storage::validate_shard_count(requested_shards)?;
         let root = root.as_ref().to_path_buf();
         let workers = BlockingPool::new(options.worker_limit(requested_shards)?);

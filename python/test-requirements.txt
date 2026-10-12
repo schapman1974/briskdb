@@ -1,2 +1,4 @@
 pymongo==4.17.0
 psycopg[binary]==3.2.13
+pytest==8.4.2
+boto3==1.40.76

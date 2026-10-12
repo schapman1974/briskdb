@@ -1028,6 +1028,14 @@ pub(super) struct ManifestIntegrity {
 }
 
 impl ManifestIntegrity {
+    #[cfg(all(unix, feature = "experimental-isam"))]
+    pub(super) fn native_ready(digest: Option<[u8; 32]>) -> Self {
+        Self {
+            state: DatabaseIntegrityState::Ready,
+            committed_schema_digest: digest,
+            target_schema_digest: None,
+        }
+    }
     pub(super) const fn state(self) -> DatabaseIntegrityState {
         self.state
     }

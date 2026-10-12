@@ -90,6 +90,8 @@ struct FrontierBudget {
 }
 
 impl FrontierBudget {
+    // The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+    #[allow(deprecated)]
     fn reserve(&self, bytes: u64) -> EngineResult<()> {
         self.retained
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {

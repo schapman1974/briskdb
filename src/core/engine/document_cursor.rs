@@ -186,6 +186,8 @@ impl ReadStats {
         Self::add(&self.matches_by_shard[usize::from(shard)], 1);
     }
 
+    // The renamed Atomic::try_update is unavailable on our Rust 1.85 MSRV.
+    #[allow(deprecated)]
     fn add(counter: &AtomicU64, value: u64) {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_add(value))

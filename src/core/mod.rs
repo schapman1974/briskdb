@@ -18,6 +18,7 @@ mod global_index;
 mod idempotency;
 mod index_key;
 mod lifecycle;
+mod metadata_backend;
 mod operations;
 mod options;
 mod planner;
@@ -97,6 +98,7 @@ pub use index_key::{
 };
 pub use lifecycle::{EngineState, ShutdownReport};
 pub(crate) use lifecycle::{Lifecycle, OperationLease};
+pub use metadata_backend::MetadataBackend;
 pub(crate) use operations::ActiveQueryRegistry;
 pub use operations::{
     ActiveQueryStatus, MAX_ACTIVE_QUERIES, ParseQueryIdError, QueryId, ReadinessSnapshot,
@@ -176,9 +178,32 @@ pub struct Database {
     global_index_worker_id: [u8; 16],
 }
 
-#[cfg(all(test, unix, feature = "documents"))]
 impl Database {
+    /// Open a hybrid database with explicit metadata persistence. Does not convert roots.
+    pub fn open_with_metadata_backend(
+        root: impl AsRef<Path>,
+        requested_shards: u16,
+        backend: MetadataBackend,
+    ) -> EngineResult<Self> {
+        Ok(Self {
+            storage: Storage::open_with_metadata_control(
+                root,
+                requested_shards,
+                None,
+                None,
+                StorageProfile::Local,
+                backend,
+            )?,
+            global_index_worker_id: random_global_index_worker_id()?,
+        })
+    }
+
+    pub fn metadata_backend(&self) -> MetadataBackend {
+        self.storage.metadata_backend()
+    }
+
     /// Test-only assembly for storage qualification; no public profile bypass.
+    #[cfg(all(test, unix, any(feature = "documents", feature = "experimental-isam")))]
     pub(crate) fn from_test_storage(storage: Storage) -> EngineResult<Self> {
         Ok(Self {
             storage,

@@ -1,6 +1,46 @@
 # Python changelog
 
-## Unreleased
+## 0.1.0-beta.3 — overlay read efficiency and pipelined metadata
+
+Python distribution version: `0.1.0b3`. Publication requires the matching tag
+and the full CI and installed-artifact gates; this checkout is release preparation.
+
+- Exact, fully typed BINARY primary-key probes search pending Parquet files
+  newest first, stopping at the authoritative row or tombstone and avoiding
+  superseded files and unnecessary SQLite-base reads. Other queries retain
+  the general scan path; every statement still reads fresh S3 heads.
+- Guarded updates share one pinned head for receipt resolution and SQL within
+  an attempt, and reuse the conflict-check row for eligible exact-key scans.
+  Expected-value guards, archived receipts, conditional publication, and
+  retry-state clearing are preserved.
+- New roots selected with `metadata_backend="isam"` use V4 pipelined durable
+  metadata commits. Existing V3 roots are not converted; SQLite data-shard
+  commits and the S3-overlay format are unchanged. Older V3-only binaries
+  cannot open newly created V4 metadata manifests.
+- Increase the per-handle immutable SQLite-base cache bound from eight to 64
+  connections to reduce churn across larger partition working sets. Connections
+  remain lazy and LRU-bounded; every statement still reads current S3 heads.
+  Retaining more connections can increase memory and file-descriptor use.
+
+## 0.1.0-beta.2 — optional serverless engine and storage efficiency
+
+Python distribution version: `0.1.0b2`. The version is published only after
+the matching tag and full cross-platform artifact gates pass.
+
+- Supported Linux/macOS wheels now include the native S3/EFS engine. Ordinary
+  SQLite remains the default; select `storage_mode="s3-overlay"` explicitly.
+  Its synchronous SQL API uses an ISAM catalog, immutable SQLite bases and
+  S3 Parquet updates, with pruning, explicit compaction, guarded retries, and
+  optional SQS handoff. DuckDB is not bundled; Mongo does not use this mode.
+- Catalog opens reuse one validated shared-lock snapshot; each handle caches
+  at most eight immutable SQLite base connections and still fetches current
+  S3 heads for every statement. `open_stats()` and SQLite-base read counters
+  report the work; closing the handle releases all retained connections.
+- Shared contention budgets and diagnostics are exposed in native, sync/async,
+  managed Mongo and patch APIs. Index-build deadlines are configurable;
+  cancelled index operations recover without requiring a process restart.
+- Selective membership reads and streaming startup/index audits avoid repeated
+  BSON reads. Bounded fallback sort files honor `allow_disk_use=False`.
 
 - Eligible newly built ordinary secondary indexes now serve exact/inverse
   ordered `find().sort()` reads and bounded top-K prefixes (#563), with added
@@ -9,8 +49,7 @@
   Local startup upgrades manifest v22 directly to v24 with digest 16; older
   binaries reject that root. Keep a complete stopped-owner pre-upgrade backup.
   Explicitly drop/recreate an old sort index with other processes closed to
-  enable ordered reads; stop writes before dropping a unique index. No new
-  package version or PyPI publication is implied by this source change.
+  enable ordered reads; stop writes before dropping a unique index.
 
 - Document-store startup now uses ordered ownership-key comparison and a
   physical record scan, reducing repeated reads of large BSON records (#550).

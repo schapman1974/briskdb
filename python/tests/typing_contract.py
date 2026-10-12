@@ -5,6 +5,21 @@ import sqlite3
 
 import briskdb
 from briskdb._briskdb import DocumentScanAccess
+from briskdb.s3_overlay import Database as OverlayDatabase, OpenOptions as OverlayOptions
+
+
+def overlay_storage_mode_contract(path: str) -> None:
+    flags = OverlayOptions(parquet_pruning=True, read_only=True)
+    selected: OverlayDatabase = briskdb.open(path, storage_mode="s3-overlay", overlay_options=flags)
+    with selected as database:
+        columns: Tuple[str, ...] = database.query("SELECT id FROM events").columns
+        print(columns, database.settings(), database.read_stats())
+    with briskdb.connect(path, storage_mode="s3-overlay") as writable:
+        writable.execute("INSERT INTO events VALUES (?, ?)", ["typed", "message"])
+        writable.compact("events", 0)
+    with OverlayDatabase.from_env({"BRISKDB_STORAGE_MODE": "s3-overlay",
+                                  "BRISKDB_OVERLAY_ROOT": path}) as configured:
+        configured.set_parquet_pruning(False)
 
 
 def scalar_count_access_contract() -> DocumentScanAccess:

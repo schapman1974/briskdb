@@ -5262,6 +5262,12 @@ fn update_framed(hasher: &mut blake3::Hasher, value: &[u8]) {
 }
 
 fn open_or_create(root: &StorageRoot) -> EngineResult<(Connection, PathBuf)> {
+    if root.metadata_backend() != crate::MetadataBackend::Sqlite {
+        return Err(EngineError::new(
+            EngineErrorKind::Unsupported,
+            "global-index metadata is not implemented for ISAM",
+        ));
+    }
     let directory = root.join(DIRECTORY_NAME);
     ensure_real_directory(&directory)?;
     let path = directory.join(SHARED_FILE_NAME);
