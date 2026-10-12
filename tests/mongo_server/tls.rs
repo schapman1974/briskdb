@@ -260,7 +260,7 @@ fn real_pymongo_uses_daemon_tls_and_reopens_persisted_collections() {
     }
 }
 
-fn wait_message(child: &mut Process, log: &Path, message: &str, count: usize) {
+pub(super) fn wait_message(child: &mut Process, log: &Path, message: &str, count: usize) {
     let until = Instant::now() + DEADLINE;
     loop {
         let text = fs::read_to_string(log).unwrap();
@@ -276,7 +276,7 @@ fn wait_message(child: &mut Process, log: &Path, message: &str, count: usize) {
     }
 }
 
-fn reload(child: &Process) {
+pub(super) fn reload(child: &Process) {
     assert_eq!(
         unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGHUP) },
         0

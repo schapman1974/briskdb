@@ -21,6 +21,22 @@ impl std::fmt::Debug for AuthenticatedMongoConfig {
     }
 }
 
+/// Optional process behavior for the authenticated Mongo-only host.
+#[derive(Clone, Debug, Default)]
+pub struct AuthenticatedMongoOptions {
+    reload_on_sighup: bool,
+}
+
+impl AuthenticatedMongoOptions {
+    /// On Unix, reread the configured TLS identity on SIGHUP. Existing sockets
+    /// keep their identity; this does not rotate credentials or revoke sessions.
+    #[must_use]
+    pub fn with_sighup_reload(mut self) -> Self {
+        self.reload_on_sighup = true;
+        self
+    }
+}
+
 /// Serve only TLS/SCRAM Mongo until SIGINT/SIGTERM (Ctrl-C on Windows).
 /// Existing anonymous and composed server entry points are unchanged.
 /// The security catalog must already exist; startup never falls back to an
@@ -30,20 +46,68 @@ pub async fn run_authenticated_mongo(
     config: AuthenticatedMongoConfig,
     options: EngineOptions,
 ) -> anyhow::Result<()> {
-    let signal = shutdown_signal()?;
-    run_until(config, options, signal).await
+    run_authenticated_mongo_with_options(config, options, AuthenticatedMongoOptions::default())
+        .await
 }
 
+/// Serve authenticated Mongo with explicit process options. Reload remains
+/// disabled by default; unsupported signal options fail before opening storage.
+pub async fn run_authenticated_mongo_with_options(
+    config: AuthenticatedMongoConfig,
+    options: EngineOptions,
+    process: AuthenticatedMongoOptions,
+) -> anyhow::Result<()> {
+    let signal = shutdown_signal()?;
+    run_until_with_options(config, options, process, signal).await
+}
+
+#[cfg(test)]
 async fn run_until(
     config: AuthenticatedMongoConfig,
     options: EngineOptions,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
+    run_until_with_options(
+        config,
+        options,
+        AuthenticatedMongoOptions::default(),
+        shutdown,
+    )
+    .await
+}
+
+async fn run_until_with_options(
+    config: AuthenticatedMongoConfig,
+    options: EngineOptions,
+    process: AuthenticatedMongoOptions,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
     options.validate_for_shards(config.shards)?;
-    let tls = config.tls;
-    let identity = tokio::task::spawn_blocking(move || tls.load())
-        .await
-        .context("Mongo TLS preparation worker failed")??;
+    anyhow::ensure!(
+        !process.reload_on_sighup || cfg!(unix),
+        "SIGHUP security reload requires a Unix target"
+    );
+    let tls = config.tls.clone();
+    let identity = ReloadableTls::new(
+        tokio::task::spawn_blocking(move || tls.load())
+            .await
+            .context("Mongo TLS preparation worker failed")??,
+    );
+    let reloader = daemon::Reloader::prepare(
+        process.reload_on_sighup,
+        daemon::Sources {
+            http: None,
+            admin: None,
+            postgres: None,
+            mongo: Some(config.tls),
+        },
+        daemon::Targets {
+            http: None,
+            admin: None,
+            postgres: None,
+            mongo: Some(identity.clone()),
+        },
+    )?;
     let database = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options)
@@ -53,21 +117,34 @@ async fn run_until(
         .await?;
     let mut guard = ShutdownOnDrop::new(database.engine().clone());
     let result = async {
+        let stopped = crate::CancellationToken::new();
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
         let mut server = MongoServer::from_bound_tls(
             &database,
             listener,
             crate::CancellationToken::new(),
-            ReloadableTls::new(identity),
+            identity,
         )?;
         info!(mongo_listen = %server.address(), "Authenticated Mongo-only BriskDB is ready");
-        let outcome = tokio::select! {
-            () = shutdown => Ok(()),
-            result = server.wait() => match result {
-                Err(error) => Err(anyhow::Error::from(error)),
-                Ok(()) => Err(anyhow::anyhow!("authenticated Mongo listener stopped unexpectedly")),
-            },
+        let outcome = {
+            let serving = async {
+                tokio::select! {
+                    biased;
+                    () = shutdown => Ok(()),
+                    result = server.wait() => match result {
+                        Err(error) => Err(anyhow::Error::from(error)),
+                        Ok(()) => Err(anyhow::anyhow!("authenticated Mongo listener stopped unexpectedly")),
+                    },
+                }
+            };
+            tokio::pin!(serving);
+            tokio::select! {
+                biased;
+                result = &mut serving => result,
+                () = reloader.run(database.engine(), &stopped) => serving.await,
+            }
         };
+        stopped.cancel();
         let closed = server.close().await;
         outcome?;
         closed?;
